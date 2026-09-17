@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+image=${DGPP_CROSS_IMAGE:-dgpp-spark-cross:cuda13}
+case "${1:-build}" in
+  image)
+    exec docker build --platform linux/amd64 -t "$image" -f "$repo/dev/Dockerfile.spark-cross" "$repo/dev"
+    ;;
+  build)
+    if [[ $# -gt 0 ]]; then shift; fi
+    set -- bash -c 'cmake --preset spark-cross && cmake --build --preset spark-cross --parallel "${DGPP_BUILD_JOBS:-2}" "$@"' bash "$@"
+    ;;
+  shell)
+    shift
+    set -- bash "$@"
+    ;;
+  command)
+    shift
+    if [[ $# -eq 0 ]]; then echo "command requires a program" >&2; exit 2; fi
+    ;;
+  *)
+    echo "Usage: $0 {image|build [build options]|shell|command [args...]}" >&2
+    exit 2
+    ;;
+esac
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "Build the development image first: $repo/scripts/spark-cross image" >&2
+  exit 1
+fi
+interactive=()
+if [[ -t 0 && -t 1 ]]; then interactive=(-it); fi
+exec docker run --rm "${interactive[@]}" --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" --env HOME=/tmp --env "DGPP_BUILD_JOBS=${DGPP_BUILD_JOBS:-2}" \
+  --volume "$repo:$repo" --workdir "$repo" "$image" "$@"

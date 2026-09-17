@@ -2,6 +2,12 @@
   "version": 6,
   "configurePresets": [
     {
+      "name": "spark-cross",
+      "inherits": "release",
+      "generator": "Ninja",
+      "toolchainFile": "${sourceDir}/cmake/spark-cross.cmake"
+    },
+    {
       "name": "base",
       "binaryDir": "${sourceDir}/build-${presetName}",
       "cacheVariables": {
@@ -42,6 +48,7 @@
     }
   ],
   "buildPresets": [
+    {"name": "spark-cross", "configurePreset": "spark-cross", "targets": ["dgpp_serve_app"]},
     {"name": "release", "configurePreset": "release"},
     {"name": "debug", "configurePreset": "debug"},
     {"name": "asan", "configurePreset": "asan"},
