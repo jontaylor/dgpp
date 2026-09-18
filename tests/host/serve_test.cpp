@@ -77,6 +77,12 @@ bool fake_eos_prefill(size_t prompt_len) { return prompt_len % 4 == 2; }
 
 class FakeEngine : public SchedulerEngine {
  public:
+  std::atomic<bool> report_mtp{false};
+  MtpAcceptance mtp_acceptance() const override {
+    if (!report_mtp.load()) return {};
+    // Variable verification depth: 10 rounds, then only 8 and 6 attempts.
+    return MtpAcceptance{3, {10, 8, 6}, {7, 4, 2}};
+  }
   struct Live {
     size_t prompt_len = 0;
     int64_t held_blocks = 0;
@@ -926,6 +932,29 @@ DGPP_TEST(serve_modelsHealthMetrics_theOpsSurface) {
   require(met.find("\"scheduler\":{") != std::string::npos &&
               met.find("\"service\":{") != std::string::npos,
           "metrics sections: " + met.substr(0, 200));
+}
+
+DGPP_TEST(serve_specDecodeMetrics_preserveRoundDenominator) {
+  ServiceRig rig;
+  auto metrics = [&] {
+    Client c(rig.port());
+    c.send_all("GET /v1/metrics HTTP/1.1\r\nHost: t\r\n\r\n");
+    return c.read_available(800);
+  };
+  require(metrics().find("\"spec_decode\":{\"depth\":0,\"num_drafts_total\":0,"
+                         "\"num_draft_tokens_total\":0,\"num_accepted_tokens_total\":0,"
+                         "\"num_draft_tokens_per_pos_total\":[],"
+                         "\"num_accepted_tokens_per_pos_total\":[]}") != std::string::npos,
+          "non-MTP engine has empty positions and zero counters");
+  rig.engine.report_mtp.store(true);
+  for (int i = 0; i < 100 && rig.service.meters().mtp.depth != 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const auto result = metrics();
+  require(result.find("\"spec_decode\":{\"depth\":3,\"num_drafts_total\":10,"
+                         "\"num_draft_tokens_total\":24,\"num_accepted_tokens_total\":13,"
+                         "\"num_draft_tokens_per_pos_total\":[10,8,6],"
+                         "\"num_accepted_tokens_per_pos_total\":[7,4,2]}") != std::string::npos,
+          "rounds and per-position attempts stay distinct: " + result);
 }
 
 DGPP_TEST(serve_legacyCompletions_theTextCompletionObject) {
