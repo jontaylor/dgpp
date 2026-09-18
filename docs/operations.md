@@ -605,8 +605,29 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 Qwen supports `max_concurrency: 16` with `engine.mtp_depth: 3` (MTP enabled),
 using 64 verification rows. Smaller graph families are selected to cover
 the occupied slots. Request capacity remains 16 even at lower MTP depths.
-Qwen prefill uses 1024-token chunks. Wider graphs increase working and
+Qwen prefill uses 512-token chunks. Wider graphs increase working and
 capture memory; validate the startup memory plan on your deployment.
 Upgrade all ranks together because the internal picker layout changed.
 See the [implementation and validation record](../benchmarks/results/2026-09-17-qwen-spark-decode/README.md)
 for tests, numerical caveats and measurement limits.
+
+### Decode bucket metrics
+
+`GET /v1/metrics` includes `scheduler.decode_batch` for graph engines:
+
+- `last_slots`, `last_active`, `last_rows_per_request`: the last launched
+  verification graph's capacity, occupied requests and rows per request.
+  Values start at zero and remain at the last replay while idle/prefilling.
+  They describe a scheduler-published snapshot, not instantaneous GPU activity.
+- `replays_by_slots`: cumulative graph launches by request-slot capacity;
+  key `1` counts scalar replays, including scalar fallback. Zero-valued
+  keys are not necessarily supported graph families.
+- `replays`, `rows`, `padded_rows`: cumulative graph launches, verification
+  rows launched and rows belonging to inactive request slots. Difference
+  `padded_rows` and `rows` between scrapes for the interval's padding ratio.
+  These do not count draft-chain work or rejected speculative tokens and
+  are not estimates of wasted GPU time. Non-graph engines report zeros.
+
+For example, `last_slots=6`, `last_active=5`, `last_rows_per_request=4`
+means a 24-row verification graph with four inactive rows. Sparse slot IDs
+can select a larger bucket than the active count alone would suggest.

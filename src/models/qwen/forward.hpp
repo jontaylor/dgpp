@@ -163,7 +163,7 @@ class QwenModel : public SessionModel<QwenModel> {
 
  private:
   static constexpr int kBlockTokens = 64;
-  static constexpr int kPrefillChunkTokens = 1024;
+  static constexpr int kPrefillChunkTokens = 512;
 
   void build_layer_objects(const QwenLayerResident& r);
   void lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream);

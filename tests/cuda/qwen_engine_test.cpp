@@ -517,7 +517,18 @@ DGPP_TEST(qwen_engines_loopback_world_2_wide_mtp_slot_reuse_and_continuation) {
             live.push_back(req);
           }
           for (int step = 0; step < kSteps; ++step) {
+            const auto before_batch = graph.decode_batch_stats();
             const auto tokens = graph.step_batch(live);
+            const auto batch = graph.decode_batch_stats();
+            require(batch.active == static_cast<int>(live.size()) && batch.slots == count &&
+                        batch.rows_per_request == 1 + mtp_depth,
+                    "batch metrics report occupied slots and selected verification shape");
+            require(batch.replays == before_batch.replays + 1 &&
+                        batch.rows - before_batch.rows == static_cast<uint64_t>(count * (1 + mtp_depth)) &&
+                        batch.padded_rows - before_batch.padded_rows ==
+                            static_cast<uint64_t>((count - live.size()) * (1 + mtp_depth)) &&
+                        batch.replays_by_slots[count] == before_batch.replays_by_slots[count] + 1,
+                    "batch metrics count replay rows and cancellation padding");
             for (size_t i = 0; i < live.size(); ++i) {
               auto& out = got[live[i]];
               out.insert(out.end(), tokens[i].begin(), tokens[i].end());

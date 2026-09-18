@@ -1976,7 +1976,7 @@ The request capacity is sixteen slots. Qwen supports up to 64 batched
 decode rows, including C16/MTP3; GLM-4.7 retains its 32-row cap. MTP uses
 `1 + depth` rows per request. Intermediate graph families cover
 2/3/4/6/8/12 slots where they fit below the full family. Qwen uses
-1024-token prefill chunks, also defining regular prefix-cache cuts.
+512-token prefill chunks, also defining regular prefix-cache cuts.
 Each graph
 variant owns its bus generation cells and parity-specific buffers so a
 shape switch preserves collective ordering.
