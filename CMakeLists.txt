@@ -1114,6 +1114,15 @@ add_test(NAME qwen_engine_mtp3_rows64_row_independent
 set_tests_properties(qwen_engine_fp8_mtp3_rows64 qwen_engine_mtp3_rows64_row_independent
   PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
 
+foreach(compact_candidates IN ITEMS 1 32)
+  add_test(NAME qwen_engine_compact_sampling_${compact_candidates}
+    COMMAND ${CMAKE_COMMAND} -E env DGPP_DENSE_GEMV_ROWS=256 DGPP_TEST_DENSE_FP8=1
+            DGPP_TEST_QWEN_ROWS64=1 DGPP_TEST_FILTER=wide DGPP_TEST_COMPACT_SAMPLING=${compact_candidates}
+            $<TARGET_FILE:qwen_engine_test>)
+  set_tests_properties(qwen_engine_compact_sampling_${compact_candidates}
+    PROPERTIES RESOURCE_LOCK qwen_engine_world LABELS "gpu;rdma")
+endforeach()
+
 add_executable(qwen_forward_check apps/qwen_forward_check.cpp)
 target_link_libraries(qwen_forward_check PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(qwen_forward_check)

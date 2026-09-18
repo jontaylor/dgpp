@@ -603,8 +603,8 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
 ### Qwen 64-row decode
 
 Qwen supports `max_concurrency: 16` with `engine.mtp_depth: 3` (MTP enabled),
-using 64 verification rows. Smaller graph families are selected to cover
-the occupied slots. Request capacity remains 16 even at lower MTP depths.
+using 64 verification rows. For fixed-depth Qwen, smaller graph families are selected by active
+request count using compact batch mappings. Request capacity remains 16 even at lower MTP depths.
 Qwen prefill uses 512-token chunks. Wider graphs increase working and
 capture memory; validate the startup memory plan on your deployment.
 Upgrade all ranks together because the internal picker layout changed.
@@ -629,5 +629,19 @@ for tests, numerical caveats and measurement limits.
   are not estimates of wasted GPU time. Non-graph engines report zeros.
 
 For example, `last_slots=6`, `last_active=5`, `last_rows_per_request=4`
-means a 24-row verification graph with four inactive rows. Sparse slot IDs
-can select a larger bucket than the active count alone would suggest.
+means a 24-row verification graph with four inactive rows. For fixed-depth Qwen, compact mappings remove padding caused by sparse
+physical slot IDs; rounding up to a supported bucket can still leave padding.
+
+### Compact Qwen batch mappings
+
+Fixed-depth Qwen graph serving compacts active requests into the smallest
+available bucket by count. Persistent KV, recurrent/conv and prefix-cache
+state stays in the physical request slots; only row mappings and token feeds
+are staged. Sampling RNG/counts/bias/proposals remain indexed by physical
+request ID. Graph masks and verdicts are indexed by compact batch group.
+The mapping is double-buffered per graph family for pipelined replays.
+
+Set `DGPP_COMPACT_BATCH=0` consistently on all ranks before startup to retain
+the previous physical-prefix policy for comparison. Confidence-scheduled
+verify depth and other model families currently use the previous policy.
+This changes neither model capacity nor the set of graph bucket sizes.
