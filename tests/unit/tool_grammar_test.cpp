@@ -124,7 +124,7 @@ void feed(GrammarState& g, const std::vector<int64_t>& ids) {
 }
 
 // ---- the Qwen3.8 XML format --------------------------------------
-GrammarVocab qwen_vocab() {
+GrammarVocab qwen_vocab(bool compact = false) {
   std::vector<std::string> texts(static_cast<size_t>(kVocab));
   for (int b = 0; b < 256; ++b) texts[static_cast<size_t>(b)] = std::string(1, static_cast<char>(b));
   texts[kGet] = "get";
@@ -145,6 +145,12 @@ GrammarVocab qwen_vocab() {
   m.think_close = ChatMarker{kThinkClose, "</think>"};
   m.tool_call_open = ChatMarker{kToolOpen, "<tool_call>"};
   m.tool_call_close = ChatMarker{kToolClose, "</tool_call>"};
+  texts[280] = "></";
+  texts[281] = "<function=get_weather><parameter=city>Paris</parameter><parameter=days>3</parameter></function>";
+  texts[282] = "></function>";
+  texts[283] = "><parameter=unknown>";
+  texts[284] = "3</parameter><parameter=city>Paris</parameter></function>";
+  m.compact_tool_xml = compact;
   return GrammarVocab(std::move(texts), m, {kEosText, kEosUser}, kVocab, kEosUser);
 }
 std::vector<int64_t> bytes_of(const std::string& s) {
@@ -947,3 +953,94 @@ DGPP_TEST(tool_grammar_closedKeysOnceAndStrictRequiredKeysGateTheClose) {
 }
 
 }  // namespace
+
+DGPP_TEST(tool_grammar_mimo_compact_calls_empty_text_and_typed_values) {
+  const GrammarVocab vocab = qwen_vocab(true);
+  for (const std::string& value : {std::string(""), std::string("."), std::string("/home/jon/dgpp")}) {
+    auto spec = spec_of(GrammarSpec::Mode::kAuto, false);
+    GrammarState g(&vocab, spec, false);
+    g.advance(kToolOpen);
+    require(!g.allows('\n') && g.allows('<'), "MiMo uses compact function tags");
+    feed(g, bytes_of("<function=get_weather><parameter=city>" + value + "</parameter>"));
+    require(std::string(g.state_name()) == "q-key-or-close", "compact/empty value closes");
+    feed(g, bytes_of("</function>"));
+    require(same(allowed_ids(g), {kToolClose}), "call closes without a newline");
+    g.advance(kToolClose);
+    g.advance(kEosUser);
+    require(std::string(g.state_name()) == "done", "compact automatic call completes");
+  }
+  auto spec = spec_of(GrammarSpec::Mode::kNamed, false, "get_weather");
+  GrammarArg days;
+  days.key = "days";
+  days.kind = GrammarArg::Kind::kJson;
+  days.schema = R"({"type":"integer"})";
+  GrammarArg city;
+  city.key = "city";
+  city.kind = GrammarArg::Kind::kText;
+  city.texts = {"Paris"};
+  spec.tools[0].args = {days, city};
+  GrammarState g(&vocab, spec, false);
+  g.advance(kToolOpen);
+  feed(g, bytes_of("<function=get_weather><parameter=days>3</parameter>"));
+  feed(g, bytes_of("<parameter=city>Paris</parameter></function>"));
+  g.advance(kToolClose);
+  g.advance(kEosUser);
+  require(std::string(g.state_name()) == "done", "typed compact call completes");
+}
+
+DGPP_TEST(tool_grammar_mimo_tokens_can_cross_xml_fields_without_bypassing_masks) {
+  const GrammarVocab vocab = qwen_vocab(true);
+  GrammarState g(&vocab, spec_of(GrammarSpec::Mode::kAuto), false);
+  g.advance(kToolOpen);
+  feed(g, bytes_of("<function=get_weather><parameter=city>Paris</parameter"));
+  require(g.allows(280), "merged closing delimiter/next tag is legal");
+  require(!g.allows(283), "unknown next key cannot bypass its mask");
+  g.advance(280);
+  feed(g, bytes_of("function>"));
+  g.advance(kToolClose);
+  require(std::string(g.state_name()) == "top", "cross-token call completed");
+  g.advance(kToolOpen);
+  require(g.allows(281), "one token may span an entire valid call body");
+  g.advance(281);
+  g.advance(kToolClose);
+  require(std::string(g.state_name()) == "top", "multi-field token completed");
+  auto spec = spec_of(GrammarSpec::Mode::kAuto);
+  spec.tools[0].required_keys = {"city", "days"};
+  spec.tools[0].args = {{"days", GrammarArg::Kind::kJson, R"({"type":"integer"})", {}},
+                      {"city", GrammarArg::Kind::kText, "", {"Paris"}}};
+  GrammarState typed(&vocab, spec, false);
+  typed.advance(kToolOpen);
+  feed(typed, bytes_of("<function=get_weather><parameter=days>"));
+  require(typed.allows(284), "JSON/enum values and their closing tags can share a token");
+  typed.advance(284);
+  typed.advance(kToolClose);
+  require(std::string(typed.state_name()) == "top", "typed multi-field token completed");
+  GrammarState required(&vocab, spec, false);
+  required.advance(kToolOpen);
+  feed(required, bytes_of("<function=get_weather><parameter=days>3</parameter"));
+  require(!required.allows(282), "cross-state token cannot skip a required argument");
+}
+
+DGPP_TEST(tool_grammar_mimo_non_strict_required_fields_block_empty_and_partial_calls) {
+  const GrammarVocab vocab = qwen_vocab(true);
+  for (const bool closed : {true, false}) {
+    auto spec = spec_of(GrammarSpec::Mode::kAuto);
+    spec.tools[0].strict = false;
+    spec.tools[0].required_keys = {"city", "days"};
+    spec.tools[0].constrain_keys = closed;
+    GrammarState g(&vocab, spec, false);
+    g.advance(kToolOpen);
+    feed(g, bytes_of("<function=get_weather><"));
+    require(!g.allows('/'), "non-strict MiMo call cannot close before required fields");
+    feed(g, bytes_of("parameter=city>Paris</parameter><"));
+    require(!g.allows('/'), "partial required fields cannot close the call");
+    feed(g, bytes_of("parameter=days>3</parameter></function>"));
+    g.advance(kToolClose);
+    require(std::string(g.state_name()) == "top", "all required keys permit closing");
+    // A legitimate no-argument tool remains callable.
+    g.advance(kToolOpen);
+    feed(g, bytes_of("<function=ping></function>"));
+    g.advance(kToolClose);
+    require(std::string(g.state_name()) == "top", "no required keys permits an empty call");
+  }
+}

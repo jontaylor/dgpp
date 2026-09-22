@@ -77,6 +77,8 @@ bool fake_eos_prefill(size_t prompt_len) { return prompt_len % 4 == 2; }
 
 class FakeEngine : public SchedulerEngine {
  public:
+  std::atomic<int64_t> request_limit{std::numeric_limits<int64_t>::max()};
+  int64_t max_request_tokens() const override { return request_limit.load(); }
   std::atomic<bool> report_mtp{false};
   MtpAcceptance mtp_acceptance() const override {
     if (!report_mtp.load()) return {};
@@ -402,6 +404,7 @@ class FakeFrontend : public ModelFrontend {
     }
     return out;
   }
+  std::atomic<bool> template_opens_thinking{true};
   std::string render_chat(const dgpp::minijson::Value& globals) const override {
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -418,7 +421,7 @@ class FakeFrontend : public ModelFrontend {
           if (const auto* text = part.find("text")) out.append(text->as_string());
       }
     }
-    if (with_markers_) out.append("<think>");
+    if (with_markers_ && template_opens_thinking.load()) out.append("<think>");
     return out;
   }
   dgpp::text::ChatMarkers markers() const override {
@@ -786,6 +789,24 @@ DGPP_TEST(serve_eosMidAnswer_finishReasonStop) {
   require(resp.find("\"content\":\"" + fake_text(3, 1) + "\"") !=
               std::string::npos,
           "one text token, then EOS (decoded to nothing)");
+}
+
+DGPP_TEST(serve_private_cache_request_limit_is_distinct_from_aggregate_pool) {
+  ServiceRig rig;
+  rig.engine.request_limit = 8;
+  for (const std::string path : {"/v1/chat/completions", "/v1/completions"}) {
+    const std::string body = path == "/v1/chat/completions"
+                                 ? chat_body("abcd", 8)
+                                 : "{\"model\":\"" + kModel +
+                                       "\",\"prompt\":\"abcd\",\"max_tokens\":8}";
+    Client c(rig.port());
+    c.send_all("POST " + path + " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body);
+    const auto response = c.read_available(200);
+    require(response.find("400 ") != std::string::npos &&
+                response.find("context_length_exceeded") != std::string::npos,
+            "per-request limit must reject despite spare aggregate capacity: " + response);
+  }
 }
 
 DGPP_TEST(serve_refusalLadder_openAIErrorObjects) {
@@ -2775,4 +2796,30 @@ DGPP_TEST(serve_usage_reportsCachedAndReasoningTokens) {
 int main() {
   dgpp::set_log_level_from_env("DGPP_LOG_LEVEL");
   return dgpp::test::run_all();
+}
+
+DGPP_TEST(serve_generatedThinkingPrefix_splitsAndCountsTokens) {
+  for (bool fold : {false, true}) {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true, fold);
+    rig.frontend.template_opens_thinking.store(false);
+    rig.engine.script(4, script_of(rig, "<think>Th</think>Sure"));
+    const auto resp = post_until_usage(rig, chat_body("abcd", 32));
+    require(resp.find("\"reasoning_tokens\":4") != std::string::npos, "generated opener usage: " + resp);
+    if (fold) {
+      require(resp.find("\"content\":\"<think>Th</think>Sure\"") != std::string::npos,
+              "generated opener folded transcript: " + resp);
+    } else {
+      require(resp.find("\"content\":\"Sure\"") != std::string::npos &&
+              resp.find("\"reasoning_content\":\"Th\"") != std::string::npos,
+              "generated opener split transcript: " + resp);
+    }
+  }
+  ServiceRig stream(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+  stream.frontend.template_opens_thinking.store(false);
+  stream.engine.script(4, script_of(stream, "<think>Th</think>Sure"));
+  const auto resp = post_chat(stream, chat_body("abcd", 32,
+      ",\"stream\":true,\"stream_options\":{\"include_usage\":true}"), "[DONE]", 5000);
+  require(resp.find("reasoning_content") != std::string::npos &&
+          resp.find("\"reasoning_tokens\":4") != std::string::npos &&
+          resp.find("<think>") == std::string::npos, "generated opener stream: " + resp);
 }

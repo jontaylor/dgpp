@@ -52,6 +52,20 @@ limitations, including the one-hour soak used for that release.
 
 ## Additional model work
 
+- [MiMo-V2.6-Flash-RL port](docs/mimo26_flash_rl_plan.md): host configuration
+  and checkpoint binding, all text-weight host loading and sampled unpack parity
+  are implemented. Initial CUDA attention passes parity, graph replay and
+  sanitizer checks independently on both Sparks; the CPU reference matches
+  PyTorch goldens. Layer assembly, TP collectives and initial eager HTTP
+  serving are implemented. Tensor-core chunked prefill, eight independent
+  64K sessions, scalar/batched CUDA graphs, prefix snapshots and budgeted
+  prefill are implemented and exercised on both Sparks. Native MTP depth three
+  uses checkpoint blocks 0, 1 and 2 with independent caches and shifted backbone
+  hidden histories. The 256K/context, concurrency-two template retains four snapshots.
+  See the [native MTP record](benchmarks/results/2026-09-22-mimo-native-mtp3.md)
+  and [recursive baseline](benchmarks/results/2026-09-22-mimo-mtp3.md).
+  Full-model numerical parity and multimodal execution remain pending.
+
 The shared engine and loader interfaces support both additional families.
 Their implementation and evaluation records are maintained separately:
 

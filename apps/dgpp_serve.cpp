@@ -77,6 +77,7 @@
 #include "models/qwen/forward.hpp"
 #include "models/glm4/config.hpp"
 #include "models/glm4/forward.hpp"
+#include "models/mimo/model.hpp"
 #include "models/glm_dsa/config.hpp"
 #include "models/dsv41/config.hpp"
 #include "models/dsv41/loader.hpp"
@@ -246,7 +247,7 @@ struct ServeFamily {
   virtual size_t lat_slot_bytes(int decode_rows) const = 0;
   virtual dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world, bool fabric,
                                 int slots, bool mtp, int decode_rows) const = 0;
-  virtual size_t snapshot_bytes(int world, bool mtp) const = 0;
+  virtual size_t snapshot_bytes(int world, bool mtp, int64_t context, int rows) const = 0;
   virtual void build_model(dgpp::BoundaryReducer* reducer, int rank, int world, bool fabric,
                            int forward_rows, int64_t pool_tokens, int slots, bool mtp, int decode_rows) = 0;
   virtual void destroy_model() = 0;
@@ -302,7 +303,7 @@ struct GlmFamily final : ServeFamily {
         fabric ? dgpp::GlmHeadSharding::VocabSharded : dgpp::GlmHeadSharding::Full, slots, fabric && mtp,
         kv_format);
   }
-  size_t snapshot_bytes(int world_, bool mtp) const override {
+  size_t snapshot_bytes(int world_, bool mtp, int64_t, int) const override {
     return dgpp::GlmDiagnosticModel::session_snapshot_bytes(cfg, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
@@ -366,7 +367,7 @@ struct QwenFamily final : ServeFamily {
                                         fabric ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming,
                                         slots, fabric && mtp, decode_rows);
   }
-  size_t snapshot_bytes(int world_, bool mtp) const override {
+  size_t snapshot_bytes(int world_, bool mtp, int64_t, int) const override {
     return dgpp::QwenModel::session_snapshot_bytes(cfg, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
@@ -400,6 +401,61 @@ struct QwenFamily final : ServeFamily {
 // GLM-4.7 (Glm4MoeForCausalLM, NVFP4): the paged K/V pool (64-token
 // blocks, bf16), no recurrent state (snapshots at any position), the
 // resident fabric model / the streaming world-1 one.
+struct MimoFamily final : ServeFamily {
+  dgpp::MimoTextConfig cfg;
+  std::string ckpt;
+  std::unique_ptr<dgpp::MimoModel> model;
+  explicit MimoFamily(const std::string& checkpoint)
+      : cfg(dgpp::MimoTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())), ckpt(checkpoint) {}
+  const char* name() const override { return "mimo_v2"; }
+  int64_t vocab_size() const override { return cfg.vocab_size; }
+  std::vector<int64_t>& eos_token_ids() override { return cfg.eos_token_ids; }
+  int64_t block_tokens() const override { return 1; }
+  int prefill_chunk_tokens() const override { return dgpp::MimoModel::prefill_chunk_tokens(); }
+  std::string pool_check(int64_t context) const override {
+    return context <= cfg.max_position_embeddings ? "" : "exceeds MiMo context capacity";
+  }
+  const char* kv_format_name() const override { return "bf16"; }
+  int decode_rows_cap() const override { return dgpp::kDecodeRows; } // single-token decode batches, up to eight slots
+  size_t lat_slot_bytes(int rows) const override { return size_t(rows) * cfg.hidden_size * 2; }
+  dgpp::MemoryPlan plan(int rows, int64_t context, int rank, int world, bool, int slots,
+                        bool mtp, int) const override {
+    if (slots < 1 || slots > dgpp::kDecodeRows / (mtp ? 2 : 1))
+      throw std::invalid_argument("MiMo concurrency exceeds the eight decode rows");
+    return dgpp::MimoModel::plan_memory(cfg, rows, context, rank, world, slots, mtp);
+  }
+  size_t snapshot_bytes(int world, bool mtp, int64_t context, int rows) const override {
+    return dgpp::MimoModel::snapshot_bytes(cfg, context, world, rows) +
+        (mtp ? size_t(dgpp::mimo_ring_capacity(std::max(dgpp::kDecodeRows, rows))) *
+                   (cfg.mtp_blocks * (cfg.swa_num_key_value_heads / world) * 320 * 2 +
+                    cfg.hidden_size * 2) + cfg.hidden_size * 2 : 0);
+  }
+  void build_model(dgpp::BoundaryReducer* reducer, int rank, int world, bool, int rows,
+                   int64_t context, int slots, bool mtp, int) override {
+    if (slots < 1 || slots > dgpp::kDecodeRows / (mtp ? 2 : 1))
+      throw std::invalid_argument("MiMo concurrency exceeds the eight decode rows");
+    model = std::make_unique<dgpp::MimoModel>(cfg, ckpt, rows, context, reducer, rank, world, slots, mtp);
+  }
+  void destroy_model() override { model.reset(); }
+  size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
+  std::unique_ptr<ServeGraphEngine> make_graph_engine(
+      dgpp::net::CollectiveBus* bus, int rank, int world, uint16_t* pick_scratch, int batch_min_live,
+      uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
+      const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth) override {
+    if (mtp_depth < 1 || mtp_depth > 3)
+      throw std::invalid_argument("MiMo native MTP supports one to three draft tokens");
+    return std::make_unique<ServeGraphEngineOf<dgpp::MimoModel>>(
+        model.get(), bus, rank, world, pick_scratch, cfg.vocab_size, 60000,
+        batch_min_live, prefix_scratch, gather_scratch, candidates, grammar, prefix_slots, mtp_depth);
+  }
+  std::unique_ptr<dgpp::sched::SchedulerEngine> make_eager_engine(
+      int slots, dgpp::DecodePick pick, dgpp::DecodeSample sample, const dgpp::text::GrammarVocab* grammar,
+      int prefix_slots) override {
+    return std::make_unique<dgpp::EagerEngineAdapter<dgpp::MimoModel>>(
+        model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
+  }
+};
+
 struct Glm4Family final : ServeFamily {
   dgpp::Glm4TextConfig cfg;
   std::string ckpt;
@@ -428,7 +484,7 @@ struct Glm4Family final : ServeFamily {
                                         fabric ? dgpp::Glm4Residency::Resident : dgpp::Glm4Residency::Streaming,
                                         slots, fabric && mtp, decode_rows);
   }
-  size_t snapshot_bytes(int world_, bool mtp) const override {
+  size_t snapshot_bytes(int world_, bool mtp, int64_t, int) const override {
     return dgpp::Glm4Model::session_snapshot_bytes(cfg, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
@@ -494,7 +550,7 @@ struct GlmDsaFamily final : ServeFamily {
                                           fabric ? dgpp::GlmDsaResidency::Resident : dgpp::GlmDsaResidency::Streaming,
                                           slots, fabric && mtp, decode_rows, kv_format);
   }
-  size_t snapshot_bytes(int world_, bool mtp) const override {
+  size_t snapshot_bytes(int world_, bool mtp, int64_t, int) const override {
     return dgpp::GlmDsaModel::session_snapshot_bytes(cfg, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
@@ -565,7 +621,7 @@ struct Dsv41Family final : ServeFamily {
                                          fabric ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming,
                                          slots, fabric && mtp, decode_rows);
   }
-  size_t snapshot_bytes(int world_, bool mtp) const override {
+  size_t snapshot_bytes(int world_, bool mtp, int64_t, int) const override {
     return dgpp::Dsv41Model::session_snapshot_bytes(cfg, world_, mtp);
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world_, bool fabric, int forward_rows,
@@ -599,6 +655,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world, dgp
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
   if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp) return std::make_unique<QwenFamily>(ckpt);
+  if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::GlmMoeDsa) return std::make_unique<GlmDsaFamily>(ckpt, world, kv_format);
   return std::make_unique<GlmFamily>(ckpt, world, kv_format);
@@ -1486,8 +1543,10 @@ int main(int argc, char** argv) {
       DGPP_LOG_WARN("engine.embed_sharding = vocab applies to the full GLM-5.3 and DeepSeek-V4.1; {} keeps its "
                     "embedding replicated", family->name());
     DGPP_LOG_INFO("serve: model family {} ({})", family->name(), ckpt);
-    if (prefill_budget_tokens > 0 && (!decode_graph || std::string(family->name()) != "qwen4_exp")) {
-      DGPP_LOG_ERROR("--prefill-budget-tokens is supported on the Qwen graph engine only");
+    if (prefill_budget_tokens > 0 &&
+        (!decode_graph || (std::string(family->name()) != "qwen4_exp" &&
+                           std::string(family->name()) != "mimo_v2"))) {
+      DGPP_LOG_ERROR("--prefill-budget-tokens requires the Qwen or MiMo graph engine");
       return 1;
     }
     // The decode rows (2026-09-10, engine/decode_outputs.hpp): the fixed
@@ -1498,6 +1557,8 @@ int main(int argc, char** argv) {
     // GLM-5.3 up to 16. Fitting batch families remain available when
     // a deeper configuration exceeds the full-batch ceiling.
     // Reject configurations whose depth-1 batch already exceeds the cap.
+    if (mtp && std::string(family->name()) == "mimo_v2" && mtp_depth > 3)
+      throw std::invalid_argument("MiMo native MTP supports one to three draft tokens");
     const int graph_rows_per_request = mtp ? 1 + mtp_depth : 1;
     int decode_rows = std::max(dgpp::kDecodeRows, max_concurrency * graph_rows_per_request);
     if (decode_graph && decode_rows > family->decode_rows_cap()) {
@@ -1595,7 +1656,7 @@ int main(int argc, char** argv) {
     // The pre-flight memory check's inputs (see check_memory_plan): the
     // prefix arena at this shape, and the engine's own buffers (the sampler
     // tables per slot, the prompt id buffers per context token, a margin).
-    const size_t snapshot_bytes = family->snapshot_bytes(world, mtp && world > 1);
+    const size_t snapshot_bytes = family->snapshot_bytes(world, mtp && world > 1, pool_tokens, forward_rows);
     const size_t prefix_arena_bytes =
         snapshot_bytes == 0 || prefix_cache_gib <= 0.0
             ? 0

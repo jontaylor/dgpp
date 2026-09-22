@@ -23,6 +23,8 @@ char** g_argv = nullptr;
 #include "common/test.hpp"
 #include "loaders/hf_cache.hpp"
 #include "text/tokenizer.hpp"
+#include "text/tool_parser.hpp"
+#include "text/tool_grammar.hpp"
 #include "text/unicode_normalize.hpp"
 
 namespace {
@@ -66,6 +68,7 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
   if (env_model && *env_model) model_id = env_model;
   if (model_id.empty()) model_id = "unsloth/GLM-5.3-Flash-FP8";
   const bool qwen = model_id.find("Qwen") != std::string::npos;
+  const bool mimo = model_id.find("MiMo") != std::string::npos;
   const bool dsv41 = model_id.find("DeepSeek-V4") != std::string::npos;
   std::string err;
   const std::string snap = dgpp::hf::model_dir(model_id, &err);
@@ -79,6 +82,30 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
 
   const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load(tok_path);
 
+  require(dgpp::text::ChatMarkers::from_tokenizer(tok).compact_tool_xml == mimo,
+          "MiMo compact tool format is detected without changing other families");
+
+  if (mimo) {
+    using namespace dgpp::text;
+    const auto def = dgpp::minijson::parse(
+        R"({"name":"read_file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"],"additionalProperties":false}})");
+    GrammarSpec spec;
+    spec.mode = GrammarSpec::Mode::kAuto;
+    spec.tools.push_back(grammar_tool_from_function(def.root, nullptr));
+    // GrammarVocab needs a real EOS; read it from the tokenizer's role markers.
+    int64_t eos = -1;
+    for (const auto& t : tok.added_tokens()) if (t.content == "<|im_end|>") eos = t.id;
+    require(eos >= 0, "MiMo EOS exists");
+    const auto grammar_vocab = GrammarVocab::from_tokenizer(tok, {eos}, static_cast<int>(tok.max_id() + 1));
+    GrammarState grammar(&grammar_vocab, spec, false);
+    const std::string call = "<tool_call><function=read_file><parameter=file_path>astroid/builder.py</parameter><parameter=offset>80</parameter><parameter=limit>70</parameter></function></tool_call>";
+    for (const int64_t id : tok.encode(call)) {
+      require(grammar.allows(id), "native MiMo token rejected in " + std::string(grammar.state_name()) + ": " + tok.decode(id, false));
+      grammar.advance(id);
+    }
+    require(std::string(grammar.state_name()) == "top", "native MiMo multi-argument call completes");
+  }
+
   // Hand-carried anchors: the fabric-run prompt and first generations.
   if (dsv41) {
     // The DeepSeek-V4.1 corpus's first cases (HF tokenizers 0.23.2 on the
@@ -87,6 +114,11 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
             "deepseek anchor prompt does not encode to the recorded ids");
     require(tok.encode(" Paris") == std::vector<int64_t>{11111}, "deepseek anchor ' Paris' != id 11111");
     require(tok.decode(std::vector<int64_t>{11111, 16}, false) == " Paris.", "deepseek anchor does not decode to ' Paris.'");
+  } else if (mimo) {
+    require(tok.encode("The capital of France is") == std::vector<int64_t>{785, 6722, 315, 9625, 374},
+            "MiMo anchor prompt does not encode to the HF ids");
+    require(tok.encode(" Paris") == std::vector<int64_t>{12095}, "MiMo anchor Paris");
+    require(tok.decode(std::vector<int64_t>{12095, 13}, false) == " Paris.", "MiMo anchor decode");
   } else if (!qwen) {
     const std::vector<int64_t> got =
         tok.encode("The capital of France is");
@@ -214,7 +246,7 @@ DGPP_TEST(glm_tokenizer_differential_goldens) {
                      " ids, want " + std::to_string(want.size()));
     const std::string rt = tok.decode(got, /*skip_special_tokens=*/false);
     // An NFC tokenizer round-trips to the NFC form of the input.
-    require(rt == text || (qwen && rt == dgpp::text::unicode::nfc(text)),
+    require(rt == text || ((qwen || mimo) && rt == dgpp::text::unicode::nfc(text)),
                  "verbatim round-trip mismatch on case " +
                      std::to_string(i) + ": got " + rt);
     ++checked;

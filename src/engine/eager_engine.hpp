@@ -62,6 +62,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         arena_(model, prefix_slots) {}
 
   int max_concurrent_requests() const override { return slots_; }
+  int64_t max_request_tokens() const override { return model_->max_context(); }
   int64_t pool_blocks_total() const override {
     return model_->kv_blocks_total();
   }

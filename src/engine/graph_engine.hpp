@@ -942,6 +942,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         "before the first request",
         rank_, slots_, slots_ == 1 ? "" : "s", batches);
   }
+  int64_t max_request_tokens() const override { return model_->max_context(); }
   int64_t pool_blocks_total() const override {
     return model_->kv_blocks_total();
   }

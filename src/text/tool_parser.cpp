@@ -36,6 +36,9 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   m.arg_value_open = lookup("<arg_value>");
   m.arg_value_close = lookup("</arg_value>");
   m.dsml = lookup("｜DSML｜");
+  // The MiMo tokenizer has its own audio sentinel; its published tool
+  // template writes compact XML rather than Qwen's newline-delimited tags.
+  m.compact_tool_xml = lookup("<|mimo_audio_start|>").available();
   for (const char* role : {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>",
                            "<|im_start|>", "<|im_end|>", "<｜System｜>", "<｜User｜>", "<｜Assistant｜>"}) {
     const ChatMarker r = lookup(role);
@@ -252,7 +255,7 @@ bool ToolCallParser::parse_qwen_block(const std::string& text) {
   name_ = text.substr(i, name_end - i);
   if (name_.find('\n') != std::string::npos || name_.find('<') != std::string::npos) return false;
   i = name_end + 1;
-  if (i < text.size() && text[i] == '\n') ++i;
+  if (!markers_.compact_tool_xml && i < text.size() && text[i] == '\n') ++i;
   args_.clear();
   for (;;) {
     if (accept("<parameter=")) {
@@ -261,14 +264,14 @@ bool ToolCallParser::parse_qwen_block(const std::string& text) {
       const std::string key = text.substr(i, key_end - i);
       if (key.find('\n') != std::string::npos || key.find('<') != std::string::npos) return false;
       i = key_end + 1;
-      if (i < text.size() && text[i] == '\n') ++i;
+      if (!markers_.compact_tool_xml && i < text.size() && text[i] == '\n') ++i;
       const size_t close = text.find("</parameter>", i);
       if (close == std::string::npos) return false;
       std::string value = text.substr(i, close - i);
-      if (!value.empty() && value.back() == '\n') value.pop_back();
+      if (!markers_.compact_tool_xml && !value.empty() && value.back() == '\n') value.pop_back();
       args_.emplace_back(key, std::move(value));
       i = close + std::strlen("</parameter>");
-      if (i < text.size() && text[i] == '\n') ++i;
+      if (!markers_.compact_tool_xml && i < text.size() && text[i] == '\n') ++i;
       continue;
     }
     break;
@@ -552,6 +555,8 @@ void ToolCallParser::complete_block(std::vector<Event>* out) {
 }
 
 void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
+  const bool first = first_generated_token_;
+  first_generated_token_ = false;
   switch (state_) {
     case State::kReasoning:
       if (is_marker(id, markers_.think_close)) {
@@ -568,6 +573,17 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
       return;
 
     case State::kContent:
+      // MiMo's template leaves thinking unopened; the model emits the
+      // opening marker as its first generated token. Later literal mentions
+      // of <think> in content retain their existing text behavior.
+      if (first && is_marker(id, markers_.think_open) && markers_.reasoning_available()) {
+        state_ = State::kReasoning;
+        run_ = Run{};
+        Event ev;
+        ev.kind = Event::Kind::kReasoningOpened;
+        out->push_back(std::move(ev));
+        return;
+      }
       if (markers_.tool_format() == ToolFormat::kDsml) {
         dsml_content_append(id, out);
         return;

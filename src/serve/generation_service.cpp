@@ -1493,7 +1493,8 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
   // a 400, never a scheduler deadlock.
   const int64_t reserve =
       engine_->blocks_for_tokens(static_cast<int64_t>(prompt.size()) + steps);
-  if (reserve > engine_->pool_blocks_total()) {
+  if (reserve > engine_->pool_blocks_total() ||
+      static_cast<int64_t>(prompt.size()) + steps > engine_->max_request_tokens()) {
     respond_error(
         w, 400,
         "the request's token budget (prompt " +
@@ -1687,7 +1688,8 @@ void GenerationService::route_completions(const HttpRequest& req,
   }
   const int64_t reserve =
       engine_->blocks_for_tokens(static_cast<int64_t>(ids.size()) + steps);
-  if (reserve > engine_->pool_blocks_total()) {
+  if (reserve > engine_->pool_blocks_total() ||
+      static_cast<int64_t>(ids.size()) + steps > engine_->max_request_tokens()) {
     respond_error(w, 400,
                   "the request's token budget exceeds the model's KV capacity",
                   "invalid_request_error", "max_tokens",
@@ -2034,6 +2036,11 @@ void GenerationService::request_stop(StreamRecord& r) {
 }
 
 void GenerationService::absorb(StreamRecord& r, ParserEvent ev) {
+  // A generated opener was not counted by on_token's prior state.
+  if (ev.kind == ParserEvent::Kind::kReasoningOpened) {
+    r.reasoning_open = true;
+    ++r.reasoning_tokens;
+  }
   // usage's reasoning_tokens: the ids up to and including </think>.
   if (ev.kind == ParserEvent::Kind::kReasoningClosed) r.reasoning_open = false;
   // Past a stop match nothing more is shown (the request is retiring).
@@ -2044,6 +2051,9 @@ void GenerationService::absorb(StreamRecord& r, ParserEvent ev) {
   if (cfg_.reasoning_in_content) {
     if (ev.kind == ParserEvent::Kind::kReasoning) {
       ev.kind = ParserEvent::Kind::kContent;
+    } else if (ev.kind == ParserEvent::Kind::kReasoningOpened) {
+      ev.kind = ParserEvent::Kind::kContent;
+      ev.text = markers_.think_open.text;
     } else if (ev.kind == ParserEvent::Kind::kReasoningClosed) {
       ev.kind = ParserEvent::Kind::kContent;
       ev.text = markers_.think_close.text;
@@ -2070,6 +2080,7 @@ void GenerationService::absorb(StreamRecord& r, ParserEvent ev) {
       r.calls.push_back(ev.call);
       stats_.tool_calls_out++;
       break;
+    case ParserEvent::Kind::kReasoningOpened:
     case ParserEvent::Kind::kReasoningClosed:
       return;  // structural only
   }
@@ -2429,6 +2440,7 @@ void GenerationService::flush_chat_stream(StreamRecord& r) {
         delta = delta_tool_call_arguments(index, args);
         break;
       }
+      case ParserEvent::Kind::kReasoningOpened:
       case ParserEvent::Kind::kReasoningClosed:
         continue;
     }

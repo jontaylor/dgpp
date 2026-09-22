@@ -200,7 +200,7 @@ DGPP_TEST(fp4_gemv_mxfp4_matches_oracle_across_row_geometries) {
   };
   const Shape shapes[] = {{1, 520, 1024}, {3, 264, 512},  {2, 100, 256}, {4, 40, 128},
                           {1, 33, 64},    {2, 17, 32},    {1, 390, 5120}, {3, 130, 5120},
-                          {2, 520, 576},  {1, 77, 1152},  {4, 70, 2304},  {4, 300, 1024}};
+                          {2, 520, 576},  {1, 77, 1152},  {4, 70, 2304},  {4, 300, 1024}, {1, 520, 4096}, {4, 264, 2048}};
   int i = 0;
   for (const Shape& s : shapes) {
     const Problem p = make_problem_mx(s.m, s.n, s.k, 0x3F40 + i++);
@@ -223,7 +223,7 @@ DGPP_TEST(fp4_gemv_mxfp4_is_exact_beyond_the_f16_window) {
 }
 
 DGPP_TEST(fp4_gemv_mxfp4_rows_are_independent_of_row_count) {
-  for (int k : {1024, 576, 5120, 2304}) {
+  for (int k : {1024, 576, 5120, 2304, 2048, 4096}) {
     const Problem p8 = make_problem_mx(8, 136, k, 0x3E8 + k);
     const std::vector<uint16_t> got8 = run_bf16(p8);
     const std::vector<float> got8f = run_f32(p8);
@@ -270,7 +270,9 @@ DGPP_TEST(fp4_gemv_mxfp4_rejects_geometry_outside_its_set) {
     return false;
   };
   require(rejects(48), "k=48 rejected (not a multiple of 32)");
-  require(rejects(4096), "k=4096 rejected (not in the MXFP4 compiled set)");
+  require(rejects(3072), "k=3072 rejected (not in the MXFP4 compiled set)");
+  require(!rejects(4096), "k=4096 accepted (MiMo hidden)");
+  require(!rejects(2048), "k=2048 accepted (MiMo world-1 down)");
   require(!rejects(576), "k=576 accepted (world-4 down)");
   require(!rejects(1152), "k=1152 accepted (world-2 down)");
   require(!rejects(2304), "k=2304 accepted (world-1 down)");

@@ -198,9 +198,11 @@ def main():
     args = ap.parse_args()
     model = args.model
     is_qwen = "Qwen" in model
+    is_mimo = "MiMo" in model
     is_dsv41 = "DeepSeek-V4" in model
-    cases = DSV41_CASES if is_dsv41 else QWEN_CASES if is_qwen else CASES
+    cases = DSV41_CASES if is_dsv41 else QWEN_CASES if is_qwen or is_mimo else CASES
     out_path = args.out_opt or args.out or (
+        "tests/data/mimo_tokenizer_goldens.jsonl" if is_mimo else
         "tests/data/dsv41_tokenizer_goldens.jsonl" if is_dsv41 else
         "tests/data/qwen_tokenizer_goldens.jsonl" if is_qwen else "tests/data/glm_tokenizer_goldens.jsonl")
     if args.tokenizer_json:

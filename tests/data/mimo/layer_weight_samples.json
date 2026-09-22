@@ -1,0 +1,2065 @@
+{
+  "revision": "3b38d063180c3e4aed9691fdc735f3d10b266ee4",
+  "samples": [
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15393,
+        48023,
+        15429,
+        15428,
+        15268,
+        15301,
+        15144,
+        15131,
+        14989,
+        15284,
+        14904,
+        14528,
+        48003,
+        48145,
+        47955,
+        15251
+      ]
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 120,
+      "values": [
+        47928,
+        47998,
+        47907,
+        15312,
+        15441,
+        15314,
+        15413,
+        48184,
+        48035,
+        15313,
+        14878,
+        48137,
+        47890,
+        14835,
+        15118,
+        48127
+      ]
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 38144,
+      "col": 120,
+      "values": [
+        48141,
+        48088,
+        48063,
+        15494,
+        48177,
+        15519,
+        14858,
+        15155,
+        15256,
+        47951,
+        14732,
+        15534,
+        15542,
+        48310,
+        15329,
+        48253
+      ]
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 76288,
+      "col": 120,
+      "values": [
+        48009,
+        48219,
+        48366,
+        14638,
+        48392,
+        15436,
+        15576,
+        15323,
+        48331,
+        48214,
+        15426,
+        48166,
+        15595,
+        48299,
+        48168,
+        15549
+      ]
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 114432,
+      "col": 120,
+      "values": [
+        48391,
+        15295,
+        15554,
+        48295,
+        15657,
+        48361,
+        48034,
+        15420,
+        15416,
+        15357,
+        47318,
+        48004,
+        15478,
+        48074,
+        15379,
+        47733
+      ]
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 152575,
+      "col": 4095,
+      "values": [
+        13587
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 0,
+      "col": 0,
+      "values": [
+        48012,
+        48027,
+        48167,
+        15144,
+        48143,
+        48283,
+        48171,
+        48176,
+        15250,
+        48297,
+        15161,
+        47853,
+        48213,
+        47899,
+        48020,
+        14741
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 0,
+      "col": 120,
+      "values": [
+        15507,
+        15242,
+        48068,
+        48189,
+        15255,
+        48169,
+        15316,
+        14844,
+        15450,
+        15325,
+        15289,
+        15277,
+        47543,
+        48013,
+        15406,
+        15104
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 38143,
+      "col": 120,
+      "values": [
+        15282,
+        15468,
+        15140,
+        15524,
+        15411,
+        15321,
+        47865,
+        48183,
+        48035,
+        47893,
+        48129,
+        47750,
+        15427,
+        47929,
+        15081,
+        15087
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 38144,
+      "col": 120,
+      "values": [
+        15115,
+        48196,
+        15240,
+        47851,
+        15365,
+        47893,
+        48171,
+        14985,
+        47634,
+        47942,
+        48098,
+        48038,
+        48155,
+        15427,
+        47961,
+        15492
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 76287,
+      "col": 120,
+      "values": [
+        14961,
+        15207,
+        15500,
+        15493,
+        15556,
+        47563,
+        47987,
+        15054,
+        48128,
+        47954,
+        48219,
+        15407,
+        15246,
+        48287,
+        47937,
+        48048
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 76288,
+      "col": 120,
+      "values": [
+        48184,
+        47948,
+        15278,
+        15329,
+        48159,
+        15316,
+        48282,
+        48073,
+        48249,
+        48010,
+        48213,
+        48078,
+        47998,
+        48091,
+        48251,
+        14994
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 114431,
+      "col": 120,
+      "values": [
+        15383,
+        48226,
+        48053,
+        48082,
+        15472,
+        15129,
+        48217,
+        15140,
+        15340,
+        15234,
+        15248,
+        15397,
+        15380,
+        15171,
+        15126,
+        15282
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 114432,
+      "col": 120,
+      "values": [
+        47966,
+        15230,
+        47891,
+        15627,
+        48234,
+        48009,
+        48417,
+        15385,
+        15418,
+        47954,
+        15521,
+        15431,
+        48130,
+        47753,
+        48084,
+        15150
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 152575,
+      "col": 120,
+      "values": [
+        47895,
+        15162,
+        15157,
+        47979,
+        48014,
+        15376,
+        48137,
+        15124,
+        48190,
+        48094,
+        15268,
+        47880,
+        14744,
+        15137,
+        15226,
+        15127
+      ]
+    },
+    {
+      "name": "lm_head.weight",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 152575,
+      "col": 4095,
+      "values": [
+        14791
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        16483
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 1024,
+      "col": 0,
+      "values": [
+        16492
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 2048,
+      "col": 0,
+      "values": [
+        16480
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 3072,
+      "col": 0,
+      "values": [
+        16497
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 4095,
+      "col": 0,
+      "values": [
+        16483
+      ]
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15390
+      ]
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 1024,
+      "col": 0,
+      "values": [
+        15460
+      ]
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 2048,
+      "col": 0,
+      "values": [
+        15205
+      ]
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 3072,
+      "col": 0,
+      "values": [
+        15335
+      ]
+    },
+    {
+      "name": "model.layers.0.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 4095,
+      "col": 0,
+      "values": [
+        15321
+      ]
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15630
+      ]
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 1024,
+      "col": 0,
+      "values": [
+        15547
+      ]
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 2048,
+      "col": 0,
+      "values": [
+        15578
+      ]
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 3072,
+      "col": 0,
+      "values": [
+        15595
+      ]
+    },
+    {
+      "name": "model.layers.0.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 4095,
+      "col": 0,
+      "values": [
+        15532
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15429,
+        15419,
+        15501,
+        15362,
+        15228,
+        15530,
+        48208,
+        15392,
+        48161,
+        48268,
+        15313,
+        48100,
+        15409,
+        48181,
+        15497,
+        47959
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 120,
+      "values": [
+        48240,
+        48248,
+        48177,
+        48148,
+        15407,
+        15389,
+        47889,
+        15189,
+        48044,
+        47938,
+        47972,
+        15186,
+        15296,
+        47958,
+        48012,
+        47899
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 2168,
+      "values": [
+        47844,
+        15427,
+        48156,
+        48132,
+        47929,
+        14901,
+        15360,
+        15064,
+        15509,
+        15189,
+        48260,
+        15262,
+        48076,
+        48188,
+        15033,
+        14730
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 4216,
+      "values": [
+        15026,
+        15346,
+        15112,
+        15325,
+        15403,
+        48020,
+        47866,
+        15474,
+        48035,
+        15708,
+        48018,
+        48208,
+        14992,
+        15223,
+        48278,
+        15388
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 6264,
+      "values": [
+        47993,
+        15181,
+        47956,
+        48071,
+        15218,
+        14998,
+        15368,
+        15193,
+        14278,
+        15263,
+        48100,
+        48034,
+        48028,
+        15234,
+        48105,
+        15283
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 2032,
+      "values": [
+        47977,
+        48015,
+        15346,
+        48172,
+        15315,
+        48038,
+        15296,
+        15276,
+        48053,
+        14993,
+        48169,
+        15512,
+        48154,
+        47742,
+        15323,
+        15417
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 4080,
+      "values": [
+        15174,
+        48174,
+        15217,
+        15368,
+        15405,
+        48023,
+        48251,
+        15265,
+        15212,
+        48033,
+        15303,
+        47699,
+        48003,
+        48096,
+        15049,
+        15177
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 6128,
+      "values": [
+        15057,
+        47818,
+        15532,
+        47687,
+        47528,
+        48196,
+        48078,
+        48200,
+        14786,
+        47913,
+        15237,
+        48111,
+        48326,
+        15433,
+        15113,
+        15322
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 8176,
+      "values": [
+        15190,
+        15324,
+        48066,
+        47871,
+        48022,
+        15278,
+        14966,
+        14890,
+        47504,
+        15379,
+        15256,
+        15185,
+        15367,
+        15197,
+        14517,
+        14891
+      ]
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 4095,
+      "col": 8191,
+      "values": [
+        15186
+      ]
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15702
+      ]
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 1024,
+      "col": 0,
+      "values": [
+        15878
+      ]
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 2048,
+      "col": 0,
+      "values": [
+        15763
+      ]
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 3072,
+      "col": 0,
+      "values": [
+        15549
+      ]
+    },
+    {
+      "name": "model.layers.1.input_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 4095,
+      "col": 0,
+      "values": [
+        15253
+      ]
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15970
+      ]
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 1024,
+      "col": 0,
+      "values": [
+        15754
+      ]
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 2048,
+      "col": 0,
+      "values": [
+        16015
+      ]
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 3072,
+      "col": 0,
+      "values": [
+        15952
+      ]
+    },
+    {
+      "name": "model.layers.1.post_attention_layernorm.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 4095,
+      "col": 0,
+      "values": [
+        15955
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 0,
+      "col": 0,
+      "values": [
+        47975,
+        15401,
+        15383,
+        48211,
+        48044,
+        47892,
+        48048,
+        15424,
+        15254,
+        15215,
+        15426,
+        14994,
+        15383,
+        15334,
+        15239,
+        15493
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 120,
+      "values": [
+        15304,
+        48190,
+        48036,
+        48273,
+        48083,
+        15425,
+        47936,
+        15405,
+        48049,
+        47049,
+        48138,
+        15113,
+        48087,
+        15394,
+        15165,
+        48150
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 2168,
+      "values": [
+        47697,
+        47977,
+        14965,
+        15296,
+        48027,
+        47948,
+        15108,
+        15150,
+        15400,
+        48087,
+        48197,
+        48204,
+        15461,
+        48263,
+        15379,
+        48136
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 4216,
+      "values": [
+        15430,
+        15206,
+        15249,
+        15144,
+        47802,
+        48085,
+        47763,
+        48033,
+        48105,
+        15137,
+        15378,
+        48074,
+        48049,
+        15453,
+        48252,
+        48161
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 127,
+      "col": 6264,
+      "values": [
+        47980,
+        48125,
+        15131,
+        48264,
+        14777,
+        47810,
+        15493,
+        15287,
+        48103,
+        15193,
+        48152,
+        15398,
+        15177,
+        48235,
+        48188,
+        15325
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 2032,
+      "values": [
+        15158,
+        48326,
+        15182,
+        15247,
+        48090,
+        47941,
+        15141,
+        15011,
+        47956,
+        15406,
+        15450,
+        47892,
+        47912,
+        48108,
+        15508,
+        15355
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 4080,
+      "values": [
+        47862,
+        15442,
+        15369,
+        48081,
+        15442,
+        15307,
+        15411,
+        48089,
+        15162,
+        48094,
+        15377,
+        48138,
+        47797,
+        48217,
+        47964,
+        15448
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 6128,
+      "values": [
+        48255,
+        15180,
+        15448,
+        48094,
+        14947,
+        48182,
+        15350,
+        15221,
+        15417,
+        48191,
+        15356,
+        15483,
+        15193,
+        15142,
+        48291,
+        15424
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 128,
+      "col": 8176,
+      "values": [
+        15363,
+        48134,
+        48181,
+        15345,
+        15006,
+        15435,
+        48085,
+        15278,
+        48064,
+        15256,
+        15088,
+        15401,
+        15119,
+        48204,
+        15496,
+        15002
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "axis": "column",
+      "row": 4095,
+      "col": 8191,
+      "values": [
+        15292
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 0,
+      "col": 0,
+      "values": [
+        16196
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 15,
+      "col": 0,
+      "values": [
+        16183
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 16,
+      "col": 0,
+      "values": [
+        16188
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 31,
+      "col": 0,
+      "values": [
+        16214
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 32,
+      "col": 0,
+      "values": [
+        16274
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 47,
+      "col": 0,
+      "values": [
+        16212
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 48,
+      "col": 0,
+      "values": [
+        16152
+      ]
+    },
+    {
+      "name": "model.layers.1.self_attn.attention_sink_bias",
+      "dtype": "BF16",
+      "axis": "row",
+      "row": 63,
+      "col": 0,
+      "values": [
+        16209
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        48412,
+        15663,
+        15680,
+        48486,
+        48389,
+        48262,
+        48404,
+        15831,
+        15727,
+        48134,
+        48390,
+        48393,
+        48040,
+        48502,
+        15362,
+        15343
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 0,
+      "col": 120,
+      "values": [
+        48503,
+        15682,
+        15225,
+        48590,
+        14911,
+        15718,
+        15659,
+        15351,
+        15666,
+        15770,
+        15350,
+        48206,
+        48367,
+        15539,
+        15107,
+        15455
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 64,
+      "col": 120,
+      "values": [
+        48087,
+        48183,
+        48243,
+        48342,
+        48307,
+        15512,
+        48013,
+        15236,
+        15296,
+        15606,
+        48326,
+        47933,
+        15398,
+        15630,
+        15554,
+        15600
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 128,
+      "col": 120,
+      "values": [
+        14554,
+        48136,
+        15469,
+        48270,
+        48294,
+        48498,
+        14717,
+        48295,
+        15492,
+        15742,
+        48557,
+        15518,
+        15686,
+        15347,
+        48283,
+        48443
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 192,
+      "col": 120,
+      "values": [
+        48454,
+        48426,
+        15016,
+        15695,
+        15581,
+        48465,
+        15392,
+        15590,
+        15570,
+        48270,
+        15442,
+        48588,
+        48306,
+        48148,
+        15640,
+        15407
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.weight",
+      "dtype": "BF16",
+      "axis": "replicated",
+      "row": 255,
+      "col": 4095,
+      "values": [
+        15296
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.e_score_correction_bias",
+      "dtype": "F32",
+      "axis": "replicated",
+      "row": 0,
+      "col": 0,
+      "values": [
+        2.073155403137207
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.e_score_correction_bias",
+      "dtype": "F32",
+      "axis": "replicated",
+      "row": 64,
+      "col": 0,
+      "values": [
+        2.0587565898895264
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.e_score_correction_bias",
+      "dtype": "F32",
+      "axis": "replicated",
+      "row": 128,
+      "col": 0,
+      "values": [
+        2.052551746368408
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.e_score_correction_bias",
+      "dtype": "F32",
+      "axis": "replicated",
+      "row": 192,
+      "col": 0,
+      "values": [
+        1.8996403217315674
+      ]
+    },
+    {
+      "name": "model.layers.1.mlp.gate.e_score_correction_bias",
+      "dtype": "F32",
+      "axis": "replicated",
+      "row": 255,
+      "col": 0,
+      "values": [
+        2.059790849685669
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 0,
+      "col": 0,
+      "values": [
+        48069,
+        48295,
+        48069,
+        48197,
+        48137,
+        15256,
+        15475,
+        14985,
+        15347,
+        48069,
+        48212,
+        48325,
+        15414,
+        48212,
+        15384,
+        15301
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 0,
+      "col": 120,
+      "values": [
+        47896,
+        48084,
+        47926,
+        15158,
+        48167,
+        15015,
+        48212,
+        48024,
+        15380,
+        15344,
+        48203,
+        15417,
+        48038,
+        48203,
+        48094,
+        15115
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 4095,
+      "col": 120,
+      "values": [
+        15388,
+        15226,
+        48187,
+        47978,
+        48315,
+        47916,
+        47947,
+        15404,
+        15411,
+        48277,
+        14977,
+        15323,
+        47745,
+        48139,
+        15361,
+        47745
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 4096,
+      "col": 120,
+      "values": [
+        48102,
+        15524,
+        48260,
+        47908,
+        15364,
+        48230,
+        15140,
+        47764,
+        15433,
+        48113,
+        48093,
+        48032,
+        48241,
+        48180,
+        48329,
+        15217
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 8191,
+      "col": 120,
+      "values": [
+        48132,
+        48589,
+        48333,
+        15265,
+        15664,
+        48388,
+        48363,
+        48260,
+        15496,
+        15468,
+        48309,
+        48199,
+        48199,
+        48529,
+        48419,
+        15925
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 8192,
+      "col": 120,
+      "values": [
+        47966,
+        48478,
+        48290,
+        15281,
+        15493,
+        48290,
+        48177,
+        48335,
+        15524,
+        15396,
+        48265,
+        15469,
+        48274,
+        48456,
+        48420,
+        15926
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 12287,
+      "col": 120,
+      "values": [
+        15355,
+        48262,
+        15110,
+        48197,
+        48215,
+        47878,
+        15429,
+        48343,
+        48304,
+        48348,
+        15346,
+        15558,
+        48198,
+        15068,
+        48004,
+        15346
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 12288,
+      "col": 120,
+      "values": [
+        48149,
+        48550,
+        48310,
+        15509,
+        15492,
+        48294,
+        48260,
+        48182,
+        48159,
+        15303,
+        15215,
+        15451,
+        15175,
+        48415,
+        48277,
+        15903
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 16383,
+      "col": 120,
+      "values": [
+        48081,
+        48545,
+        14849,
+        15537,
+        15105,
+        48273,
+        48001,
+        48257,
+        14860,
+        15413,
+        48130,
+        48160,
+        48309,
+        48534,
+        48416,
+        15904
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 16383,
+      "col": 4095,
+      "values": [
+        15443
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15366,
+        15376,
+        15494,
+        15386,
+        48078,
+        47991,
+        15479,
+        48026,
+        15376,
+        48026,
+        15397,
+        48057,
+        48098,
+        15310,
+        15289,
+        48165
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 0,
+      "col": 120,
+      "values": [
+        14926,
+        48098,
+        15161,
+        47991,
+        15458,
+        48247,
+        48226,
+        14864,
+        15310,
+        15258,
+        48078,
+        48009,
+        48223,
+        48095,
+        15455,
+        14380
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 4095,
+      "col": 120,
+      "values": [
+        15519,
+        15362,
+        47976,
+        48031,
+        15106,
+        15391,
+        48046,
+        15435,
+        15439,
+        48255,
+        48063,
+        15520,
+        15199,
+        48079,
+        15487,
+        15231
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 4096,
+      "col": 120,
+      "values": [
+        14767,
+        15235,
+        15425,
+        15518,
+        48245,
+        48210,
+        47535,
+        15297,
+        48101,
+        48101,
+        15396,
+        15349,
+        47924,
+        47763,
+        48147,
+        14979
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 8191,
+      "col": 120,
+      "values": [
+        15093,
+        15274,
+        48117,
+        47695,
+        48023,
+        47620,
+        48042,
+        47804,
+        15494,
+        48015,
+        47940,
+        15080,
+        15375,
+        14223,
+        47922,
+        47631
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 8192,
+      "col": 120,
+      "values": [
+        15329,
+        47921,
+        15121,
+        48049,
+        15232,
+        15441,
+        15441,
+        15360,
+        15205,
+        47973,
+        47810,
+        15223,
+        48119,
+        47938,
+        48211,
+        47757
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 12287,
+      "col": 120,
+      "values": [
+        15097,
+        15242,
+        48024,
+        15609,
+        15426,
+        48010,
+        48066,
+        15481,
+        48052,
+        15338,
+        15367,
+        48263,
+        15376,
+        47996,
+        15356,
+        15356
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 12288,
+      "col": 120,
+      "values": [
+        48001,
+        48145,
+        14913,
+        47969,
+        15185,
+        48049,
+        48241,
+        48289,
+        15408,
+        48322,
+        48031,
+        48141,
+        48176,
+        15426,
+        15444,
+        48287
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 16383,
+      "col": 120,
+      "values": [
+        48029,
+        14895,
+        15389,
+        15075,
+        47971,
+        15500,
+        48303,
+        48175,
+        48059,
+        48204,
+        15402,
+        15291,
+        15240,
+        48136,
+        48128,
+        47897
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "row",
+      "row": 16383,
+      "col": 4095,
+      "values": [
+        48068
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 0,
+      "col": 0,
+      "values": [
+        15267,
+        48237,
+        47493,
+        15169,
+        15469,
+        15454,
+        47892,
+        48065,
+        47681,
+        48133,
+        48193,
+        15109,
+        48222,
+        15282,
+        15439,
+        15085
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 127,
+      "col": 120,
+      "values": [
+        48163,
+        47410,
+        15183,
+        15154,
+        48020,
+        47779,
+        47809,
+        15011,
+        47954,
+        48157,
+        15235,
+        48227,
+        47901,
+        15244,
+        15235,
+        48099
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 127,
+      "col": 4216,
+      "values": [
+        48012,
+        15428,
+        15556,
+        47996,
+        48282,
+        48012,
+        15228,
+        15456,
+        14221,
+        15117,
+        48013,
+        15126,
+        15254,
+        15164,
+        47476,
+        48169
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 127,
+      "col": 8312,
+      "values": [
+        14798,
+        15020,
+        48129,
+        15345,
+        15131,
+        15217,
+        14474,
+        48224,
+        47739,
+        47897,
+        47884,
+        15441,
+        15313,
+        14759,
+        48153,
+        48012
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 127,
+      "col": 12408,
+      "values": [
+        48147,
+        48221,
+        48176,
+        15251,
+        48093,
+        15364,
+        48206,
+        14739,
+        48116,
+        48195,
+        47972,
+        15411,
+        48067,
+        47907,
+        15332,
+        48195
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 128,
+      "col": 4080,
+      "values": [
+        47712,
+        48205,
+        47821,
+        48149,
+        15125,
+        15200,
+        48168,
+        47840,
+        48277,
+        15475,
+        15144,
+        47893,
+        48268,
+        47968,
+        47912,
+        15200
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 128,
+      "col": 8176,
+      "values": [
+        47998,
+        15183,
+        47535,
+        15198,
+        47998,
+        48079,
+        47663,
+        48015,
+        48094,
+        48159,
+        47486,
+        47966,
+        14479,
+        47791,
+        47966,
+        47966
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 128,
+      "col": 12272,
+      "values": [
+        48198,
+        48004,
+        48004,
+        15236,
+        15558,
+        48260,
+        15408,
+        15302,
+        48242,
+        15269,
+        15119,
+        15218,
+        15364,
+        15430,
+        15280,
+        15068
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 128,
+      "col": 16368,
+      "values": [
+        48191,
+        14864,
+        47622,
+        15334,
+        15020,
+        48025,
+        15097,
+        15494,
+        47827,
+        48083,
+        15443,
+        15039,
+        15404,
+        48016,
+        15334,
+        15423
+      ]
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "dtype": "F8_E4M3",
+      "axis": "column",
+      "row": 4095,
+      "col": 16383,
+      "values": [
+        48187
+      ]
+    }
+  ]
+}

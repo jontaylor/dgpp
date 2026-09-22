@@ -168,7 +168,8 @@ add_library(dgpp_kernels STATIC
   src/kernels/qwen_mtp.cu
   src/kernels/qsa.cu
   src/kernels/qsa_prefill.cu
-  src/kernels/glm4_attn.cu)
+  src/kernels/glm4_attn.cu
+  src/kernels/mimo_attn.cu)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
@@ -319,6 +320,36 @@ add_library(dgpp_models_dsv41_layers STATIC
 target_include_directories(dgpp_models_dsv41_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_dsv41_layers PUBLIC dgpp_models_dsv41_loader dgpp_models_csa2 dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_dsv41_layers)
+
+# MiMo-V2.6-Flash-RL: checkpoint contract, resident layers and eager serving.
+add_library(dgpp_models_mimo STATIC
+  src/models/mimo/config.cpp
+  src/models/mimo/binding.cpp
+  src/models/mimo/attention.cpp
+  src/models/mimo/weights.cpp)
+target_include_directories(dgpp_models_mimo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_mimo PUBLIC dgpp_loaders)
+dgpp_set_common(dgpp_models_mimo)
+
+add_library(dgpp_models_mimo_layers STATIC
+  src/models/mimo/loader.cpp
+  src/models/mimo/layers.cpp
+  src/models/mimo/model.cpp)
+target_include_directories(dgpp_models_mimo_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_mimo_layers PUBLIC dgpp_models_mimo dgpp_models_moe dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_mimo_layers)
+
+add_executable(mimo_layer_check apps/mimo_layer_check.cpp)
+target_link_libraries(mimo_layer_check PRIVATE dgpp_models_mimo_layers)
+dgpp_set_common(mimo_layer_check)
+
+add_executable(mimo_checkpoint_check apps/mimo_checkpoint_check.cpp)
+target_link_libraries(mimo_checkpoint_check PRIVATE dgpp_models_mimo)
+dgpp_set_common(mimo_checkpoint_check)
+
+add_executable(mimo_weight_check apps/mimo_weight_check.cpp)
+target_link_libraries(mimo_weight_check PRIVATE dgpp_models_mimo)
+dgpp_set_common(mimo_weight_check)
 
 # Qwen3.8-Flash-Next: the host-side model description.
 add_library(dgpp_models_qwen STATIC
@@ -522,7 +553,7 @@ if(DGPP_ENABLE_IBV)
   # The server binary: target dgpp_serve_app, installed as dgpp-serve (the
   # layout split of 2026-09-06; dgpp_serve is the library it links).
   add_executable(dgpp_serve_app apps/dgpp_serve.cpp)
-  target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
+  target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_mimo_layers dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
                                              dgpp_models_dsv41_layers
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
@@ -592,6 +623,9 @@ add_executable(unit_tests
   tests/unit/net_test.cpp
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
+  tests/unit/mimo_config_test.cpp
+  tests/unit/mimo_weights_test.cpp
+  tests/unit/mimo_attention_test.cpp
   tests/unit/qwen_binding_test.cpp
   tests/unit/glm4_config_test.cpp
   tests/unit/glm4_binding_test.cpp
@@ -605,7 +639,7 @@ add_executable(unit_tests
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_glm4
-                                        dgpp_models_glm_dsa dgpp_models_dsv41
+                                        dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_mimo
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 dgpp_set_common(unit_tests)
@@ -621,6 +655,9 @@ dgpp_set_common(tokenizer_test)
 add_test(NAME tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/glm_tokenizer_goldens.jsonl)
 set_tests_properties(tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME mimo_tokenizer_test
+  COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mimo_tokenizer_goldens.jsonl)
+set_tests_properties(mimo_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME qwen_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/qwen_tokenizer_goldens.jsonl)
 add_test(NAME dsv41_tokenizer_test
@@ -907,6 +944,13 @@ target_include_directories(glm4_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_link_libraries(glm4_attn_test PRIVATE dgpp_models_glm4 dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_attn_test)
 add_test(NAME glm4_attn_test COMMAND glm4_attn_test)
+
+add_executable(mimo_attn_test tests/cuda/mimo_attn_test.cpp)
+target_include_directories(mimo_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(mimo_attn_test PRIVATE dgpp_models_mimo dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(mimo_attn_test)
+add_test(NAME mimo_attn_test COMMAND mimo_attn_test)
+set_tests_properties(mimo_attn_test PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE)
 
 add_executable(glm4_loader_test tests/cuda/glm4_loader_test.cpp)
 target_include_directories(glm4_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)

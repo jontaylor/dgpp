@@ -97,6 +97,8 @@ struct ChatMarkers {
   // Qwen template's generation prompt ends in "<think>\n", the GLM one
   // in "<think>" — both open the reply inside the reasoning.
   ChatMarker newline;
+  // MiMo uses the same XML tags as Qwen, without structural newlines.
+  bool compact_tool_xml = false;
 
   // Whether a rendered prompt leaves the reply inside an opened <think>
   // (its last token is think_open, or think_open followed by the bare
@@ -164,7 +166,7 @@ class ToolCallParser {
   struct Event {
     // kReasoningClosed marks the </think> id itself (no text): the fold
     // knob needs the position to reproduce the model's own transcript.
-    enum class Kind { kReasoning, kReasoningClosed, kContent, kToolCall };
+    enum class Kind { kReasoning, kReasoningOpened, kReasoningClosed, kContent, kToolCall };
     Kind kind = Kind::kContent;
     std::string text;  // kReasoning / kContent: the delta
     Call call;         // kToolCall
@@ -239,6 +241,7 @@ class ToolCallParser {
   Options options_;
 
   State state_ = State::kContent;
+  bool first_generated_token_ = true;
   Run run_;  // the current reasoning/content run
 
   // The open block.

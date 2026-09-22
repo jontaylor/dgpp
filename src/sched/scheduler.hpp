@@ -22,6 +22,7 @@
 // See DESIGN §11 and docs/operations.md for the journal and resource policy.
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,6 +55,8 @@ class SchedulerEngine {
   virtual int max_concurrent_requests() const = 0;
   // DSA pool meters (a no-DSA model reports an unbounded pool).
   virtual int64_t pool_blocks_total() const = 0;
+  // Per-request bound can be smaller than the aggregate pool (flat private caches).
+  virtual int64_t max_request_tokens() const { return std::numeric_limits<int64_t>::max(); }
   virtual int64_t pool_blocks_in_use() const = 0;
   // Block count covering `tokens` tokens — the reserve arithmetic.
   virtual int64_t blocks_for_tokens(int64_t tokens) const = 0;

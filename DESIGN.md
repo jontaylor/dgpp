@@ -12,6 +12,21 @@ operators are documented in [its architecture study](docs/qwen38_flash_next_plan
 and GLM-4.7's GQA and NVFP4 layout in [its implementation notes](docs/glm47_plan.md).
 Shared session and engine interfaces live in `src/engine/`.
 
+The [MiMo port](docs/mimo26_flash_rl_plan.md) binds the checkpoint's complete text
+backbone across two Sparks. It uses tensor-core global/sliding prefill, split
+global decode attention, up to eight independent flat-cache sessions, scalar/batched
+CUDA graphs and prefix snapshots. Snapshots copy committed global history and
+pack live sliding windows. Shared execution workspace bounds memory use;
+budgeted prefill yields to live decode requests. The example configuration uses
+256K context per request, two concurrent sessions and an 11.54 GiB prefix-cache
+budget (four packed snapshots). See the [deployment record](benchmarks/results/2026-09-22-mimo-256k.md). Kernel, real-layer and
+HTTP evidence is in the [optimization record](benchmarks/results/2026-09-22-mimo-optimization.md).
+Native MTP supports one to three drafts through distinct dense sliding-attention
+heads, normalized backbone hidden states and up to four verified rows per
+request. Each block keeps independent history. Chain state is rolled back separately
+from committed draft history. See the [native MTP record](benchmarks/results/2026-09-22-mimo-native-mtp3.md).
+Full-model numerical equivalence and multimodal execution remain open.
+
 Use [PLAN.md](PLAN.md) for implementation status and
 [operations](docs/operations.md) for deployment. Dated measurements here
 explain design choices; current benchmark tables and reproduction commands

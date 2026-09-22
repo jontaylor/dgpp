@@ -110,7 +110,7 @@ ToolSchemas weather_schemas() {
 
 struct Run {
   std::string reasoning, content;
-  int reasoning_closed = 0;
+  int reasoning_closed = 0, reasoning_opened = 0;
   std::vector<ToolCallParser::Call> calls;
   std::vector<Kind> order;
 };
@@ -126,6 +126,7 @@ Run drive(const std::vector<int64_t>& ids, ToolCallParser::Options opts = {},
     run.order.push_back(ev.kind);
     switch (ev.kind) {
       case Kind::kReasoning: run.reasoning += ev.text; break;
+      case Kind::kReasoningOpened: ++run.reasoning_opened; break;
       case Kind::kReasoningClosed: ++run.reasoning_closed; break;
       case Kind::kContent: run.content += ev.text; break;
       case Kind::kToolCall: run.calls.push_back(ev.call); break;
@@ -167,8 +168,10 @@ std::vector<int64_t> qwen_ids_of(const std::string& text) {
   }
   return out;
 }
-Run drive_qwen(const std::string& text, ToolCallParser::Options opts = {}) {
-  ToolCallParser parser(qwen_markers(), fake_decode, weather_schemas(), opts);
+Run drive_qwen(const std::string& text, ToolCallParser::Options opts = {}, bool compact = false) {
+  auto markers = qwen_markers();
+  markers.compact_tool_xml = compact;
+  ToolCallParser parser(markers, fake_decode, weather_schemas(), opts);
   std::vector<Event> events;
   for (const int64_t id : qwen_ids_of(text)) parser.feed(id, &events);
   parser.finish(&events);
@@ -177,6 +180,7 @@ Run drive_qwen(const std::string& text, ToolCallParser::Options opts = {}) {
     run.order.push_back(ev.kind);
     switch (ev.kind) {
       case Kind::kReasoning: run.reasoning += ev.text; break;
+      case Kind::kReasoningOpened: ++run.reasoning_opened; break;
       case Kind::kReasoningClosed: ++run.reasoning_closed; break;
       case Kind::kContent: run.content += ev.text; break;
       case Kind::kToolCall: run.calls.push_back(ev.call); break;
@@ -225,6 +229,7 @@ Run drive_dsml(const std::string& text, ToolCallParser::Options opts = {}) {
     run.order.push_back(ev.kind);
     switch (ev.kind) {
       case Kind::kReasoning: run.reasoning += ev.text; break;
+      case Kind::kReasoningOpened: ++run.reasoning_opened; break;
       case Kind::kReasoningClosed: ++run.reasoning_closed; break;
       case Kind::kContent: run.content += ev.text; break;
       case Kind::kToolCall: run.calls.push_back(ev.call); break;
@@ -598,3 +603,26 @@ DGPP_TEST(tool_parser_schemasReadBothToolForms) {
 }
 
 }  // namespace
+
+DGPP_TEST(tool_parser_generated_thinking_prefix) {
+  ToolCallParser::Options opts;
+  opts.start_in_reasoning = false;
+  const auto r = drive(ids_of("<think>seven times eight</think>56"), opts);
+  require(r.reasoning == "seven times eight" && r.content == "56", "generated reasoning split");
+  require(r.reasoning_opened == 1 && r.reasoning_closed == 1, "generated reasoning markers");
+  const auto literal = drive(ids_of("Use <think> as a tag."), opts);
+  require(literal.reasoning.empty() && literal.content == "Use <think> as a tag.",
+          "later literal marker remains content");
+}
+
+DGPP_TEST(tool_parser_mimo_compact_empty_and_multiline_values) {
+  ToolCallParser::Options opts;
+  opts.start_in_reasoning = false;
+  const auto empty = drive_qwen(
+      "<tool_call><function=get_weather><parameter=city></parameter></function></tool_call>", opts, true);
+  require(empty.calls.size() == 1 && empty.calls[0].arguments == "{\"city\": \"\"}", "empty compact argument");
+  const auto multiline = drive_qwen(
+      "<tool_call><function=get_weather><parameter=city>\nParis\n</parameter></function></tool_call>", opts, true);
+  require(multiline.calls.size() == 1 && multiline.calls[0].arguments == "{\"city\": \"\\nParis\\n\"}",
+          "compact argument preserves boundary newlines");
+}

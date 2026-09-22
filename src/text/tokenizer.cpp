@@ -25,6 +25,10 @@ constexpr const char* kSplitPattern =
 constexpr const char* kSplitPatternQwen =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"
     "| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// MiMo keeps GLM's letter/punctuation classes but splits numbers singly.
+constexpr const char* kSplitPatternMimo =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}"
+    "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 // The DeepSeek-V4.1 pre-tokenizer: THREE Split stages (each Isolated,
 // applied to the previous stage's pieces) then ByteLevel. Stage 1 cuts
 // number runs into pieces of at most three; stage 2 isolates CJK runs
@@ -143,8 +147,8 @@ void build_byte_level_maps(uint32_t* byte_to_cp, int32_t* cp_to_byte) {
 // in the run, A3 is one number, A4's class excludes marks).
 class SplitScanner {
  public:
-  SplitScanner(std::string_view text, std::vector<std::string_view>* out, bool qwen)
-      : text_(text), out_(out), qwen_(qwen) {
+  SplitScanner(std::string_view text, std::vector<std::string_view>* out, bool qwen, bool single_number = false)
+      : text_(text), out_(out), qwen_(qwen), single_number_(qwen || single_number) {
     // Decode codepoint boundaries once. Strict UTF-8: a chat prompt
     // arrives as valid UTF-8; anything else is a caller bug, not a
     // tokenization ambiguity.
@@ -279,7 +283,7 @@ class SplitScanner {
     // A3: 1..3 numbers (Qwen: exactly one).
     if (!eos(i) && number(i)) {
       size_t j = i + 1;
-      if (!qwen_)
+      if (!single_number_)
         while (j < i + 3 && !eos(j) && number(j)) ++j;
       return j;
     }
@@ -306,6 +310,7 @@ class SplitScanner {
   std::string_view text_;
   std::vector<std::string_view>* out_;
   bool qwen_ = false;
+  bool single_number_ = false;
   std::vector<uint32_t> cps_;
   std::vector<size_t> starts_;  // size = cps+1 (end sentinel)
 };
@@ -542,8 +547,9 @@ Tokenizer Tokenizer::load(const std::string& path) {
     const std::string_view regex = split_regex(0);
     if (regex == kSplitPattern) t.pattern_ = 0;
     else if (regex == kSplitPatternQwen) t.pattern_ = 1;
+    else if (regex == kSplitPatternMimo) t.pattern_ = 3;
     else
-      reject("Split pattern differs from both pinned regexes (the scanner "
+      reject("Split pattern differs from the pinned regexes (the scanner "
              "hardcodes them — update the scanner or the checkpoint)");
   } else {
     if (split_regex(0) != kSplitPatternDsv41Numbers || split_regex(1) != kSplitPatternDsv41Cjk ||
@@ -703,7 +709,7 @@ Tokenizer Tokenizer::load(const std::string& path) {
       "tokenizer: loaded vocab {} merges {} added {} (revision 0x{:016x}; "
       "{} pattern, {}, ignore_merges {})",
       t.vocab_.size(), t.merge_rank_.size(), t.added_tokens_.size(),
-      t.revision_hash_, t.pattern_ == 2 ? "deepseek-v4.1" : t.pattern_ == 1 ? "qwen" : "glm", t.nfc_ ? "NFC" : "no normalizer",
+      t.revision_hash_, t.pattern_ == 2 ? "deepseek-v4.1" : t.pattern_ == 1 ? "qwen" : t.pattern_ == 3 ? "mimo" : "glm", t.nfc_ ? "NFC" : "no normalizer",
       t.ignore_merges_);
   return t;
 }
@@ -759,7 +765,7 @@ void Tokenizer::encode_segment(std::string_view segment,
     Dsv41Scanner scanner(segment, &pretokens);
     scanner.run();
   } else {
-    SplitScanner scanner(segment, &pretokens, pattern_ == 1);
+    SplitScanner scanner(segment, &pretokens, pattern_ == 1, pattern_ == 3);
     scanner.run();
   }
   for (const std::string_view p : pretokens) {
