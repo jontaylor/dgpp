@@ -1,0 +1,29 @@
+"""Long-context retrieval checks: arithmetic changes need more than generation smoke."""
+import hashlib,json,pathlib,re,sys
+from benchmark import ROOT,call,metrics
+
+def prompt(n):
+ keys=['amber','cobalt','ivory'];expected={k:hashlib.sha256(f'recipe-retrieval-v1:{n}:{k}'.encode()).hexdigest()[:16] for k in keys}
+ records=[f'Record {i}: value {i%17}.\n' for i in range(n)]
+ for key,fraction in zip(keys,[.1,.5,.9]):records[int(n*fraction)]=f'The secret registration for {key} is {expected[key]}.\n'
+ text='Read the records carefully and retrieve the exact secret registrations.\n'+''.join(records)+'\nReturn only a JSON object mapping amber, cobalt, and ivory to their exact secret registrations. Do not infer or invent values.'
+ return text,expected
+
+def main(tag,counts):
+ out=ROOT/'raw'/tag;out.mkdir(parents=True,exist_ok=True)
+ dest=out/'quality.json';assert not dest.exists(),'Preserve previous quality evidence'
+ before=metrics();assert before['scheduler']['active']==before['scheduler']['queued']==0
+ rows=[]
+ for n in counts:
+  p,expected=prompt(n);r=call(f'retrieval-{n}',p,1024,False)
+  text=r['content'].strip();parsed=None
+  try:parsed=json.loads(text.removeprefix('```json').removeprefix('```').removesuffix('```').strip())
+  except ValueError:pass
+  r.update(expected=expected,parsed=parsed,exact_answer=parsed==expected,values_found={k:v in text for k,v in expected.items()})
+  rows.append(r);dest.write_text(json.dumps(rows,indent=2))
+  print('QUALITY',n,'exact JSON',r['exact_answer'],'values',r['values_found'],flush=True)
+ after=metrics();assert after['service']['requests_total']-before['service']['requests_total']==len(rows),'external traffic'
+ assert after['service']['requests_failed']==before['service']['requests_failed'] and not after['service']['engine_failed']
+ (out/'quality-metrics.json').write_text(json.dumps(dict(before=before,after=after),indent=2))
+ print('QUALITY SUMMARY',sum(r['exact_answer'] for r in rows),'/',len(rows),'exact; this is fixed retrieval evidence, not broad quality equivalence',flush=True)
+if __name__=='__main__':main(sys.argv[1],[int(x) for x in sys.argv[2:]] or [6000,11000])
