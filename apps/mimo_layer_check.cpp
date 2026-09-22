@@ -60,14 +60,14 @@ int main(int argc, char** argv) {
     const auto shape = block.shape();
     dgpp::LayerBump state;
     state.init(size_t(chunk) * (256 + 8192 + 256) +
-               size_t(shape.capacity) * (shape.k_width() + shape.v_width()) * 2);
+               size_t(shape.capacity) * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes());
     auto* pos = static_cast<int64_t*>(state.alloc(chunk * 8));
     auto* x = static_cast<uint16_t*>(state.alloc(chunk * 8192));
     auto* status = static_cast<int32_t*>(state.alloc(chunk * 4));
-    auto* k = static_cast<uint16_t*>(state.alloc(size_t(shape.capacity) * shape.k_width() * 2));
-    auto* v = static_cast<uint16_t*>(state.alloc(size_t(shape.capacity) * shape.v_width() * 2));
-    DGPP_CUDA_OK(cudaMemset(k, 0, size_t(shape.capacity) * shape.k_width() * 2));
-    DGPP_CUDA_OK(cudaMemset(v, 0, size_t(shape.capacity) * shape.v_width() * 2));
+    auto* k = state.alloc(size_t(shape.capacity) * shape.k_width() * shape.cache_element_bytes());
+    auto* v = state.alloc(size_t(shape.capacity) * shape.v_width() * shape.cache_element_bytes());
+    DGPP_CUDA_OK(cudaMemset(k, 0, size_t(shape.capacity) * shape.k_width() * shape.cache_element_bytes()));
+    DGPP_CUDA_OK(cudaMemset(v, 0, size_t(shape.capacity) * shape.v_width() * shape.cache_element_bytes()));
     const bool cache_prefix = std::getenv("DGPP_MIMO_LAYER_CACHE_ONLY_PREFIX") != nullptr;
     if (cache_prefix && !draft)
       throw std::invalid_argument("cache-only prefix probe requires an MTP head");
@@ -139,7 +139,14 @@ int main(int argc, char** argv) {
       std::ofstream cache_out(std::string(argv[3]) + ".kv", std::ios::binary);
       for (auto [data, width] : {std::pair{k, shape.k_width()}, std::pair{v, shape.v_width()}}) {
         std::vector<uint16_t> cache(size_t(shape.capacity) * width);
-        DGPP_CUDA_OK(cudaMemcpy(cache.data(), data, cache.size() * 2, cudaMemcpyDeviceToHost));
+        if (shape.fp8_cache) {
+          std::vector<uint8_t> bytes(cache.size());
+          DGPP_CUDA_OK(cudaMemcpy(bytes.data(), data, bytes.size(), cudaMemcpyDeviceToHost));
+          for (size_t i = 0; i < bytes.size(); ++i)
+            cache[i] = dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(bytes[i]));
+        } else {
+          DGPP_CUDA_OK(cudaMemcpy(cache.data(), data, cache.size() * 2, cudaMemcpyDeviceToHost));
+        }
         cache_out.write(reinterpret_cast<const char*>(cache.data()), cache.size() * 2);
       }
       if (!cache_out) throw std::runtime_error("cannot write K/V output");
