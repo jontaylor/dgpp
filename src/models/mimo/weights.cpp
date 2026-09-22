@@ -123,6 +123,35 @@ MimoBf16Matrix mimo_load_fp8_bf16(const TensorInfo& w, const TensorInfo& s, int6
   return out;
 }
 
+MimoFp8Matrix mimo_load_fp8(const TensorInfo& w, const TensorInfo& s, int64_t row_begin,
+                            int64_t rows, int64_t col_begin, int64_t cols, const MimoQkvLayout* qkv,
+                            int rank, int world) {
+  rank_check(rank, world);
+  matrix(w, DType::F8_E4M3);
+  fp8_pair(w, s, qkv ? qkv->scale_rows() : (w.shape[0] + 127) / 128);
+  if (qkv && w.shape[0] != qkv->rows()) fail("wrong QKV row count");
+  range(row_begin, rows, qkv ? qkv->rows() / world : w.shape[0], "row");
+  range(col_begin, cols, w.shape[1], "column");
+  if (row_begin % 64 || col_begin % 64 || rows % 64 || cols % 64)
+    fail("FP8 resident slices must align to 64x64 blocks");
+  MimoFp8Matrix out{rows, cols, {}, {}};
+  out.payload.resize(elements(rows, cols));
+  out.scales.resize(elements(rows / 64, cols / 64));
+  for (int64_t r = 0; r < rows; ++r) {
+    const auto source = qkv ? qkv->source_row(row_begin + r, rank, world) : row_begin + r;
+    std::memcpy(out.payload.data() + r * cols,
+                static_cast<const uint8_t*>(w.data) + source * w.shape[1] + col_begin, cols);
+    if (r % 64 == 0) {
+      const auto sr = qkv ? qkv->source_scale_row(source) : source / 128;
+      for (int64_t k = 0; k < cols; k += 64)
+        std::memcpy(
+            &out.scales[(r / 64) * (cols / 64) + k / 64],
+            static_cast<const uint8_t*>(s.data) + (sr * s.shape[1] + (col_begin + k) / 128) * 4, 4);
+    }
+  }
+  return out;
+}
+
 MimoBf16Matrix mimo_slice_bf16(const TensorInfo& weight, int64_t row_begin, int64_t rows,
                                int64_t col_begin, int64_t cols) {
   TensorInfo w = weight;
@@ -291,6 +320,32 @@ MimoBf16Matrix MimoCheckpointWeights::bf16(const std::string& name, int rank, in
   const auto sf = shard(scale_name);
   return mimo_load_fp8_bf16(w, sf->at(scale_name), local.row_begin + row_begin, rows,
                             local.col_begin + col_begin, cols);
+}
+
+MimoFp8Matrix MimoCheckpointWeights::fp8(const std::string& name, int rank, int world) {
+  const auto local = placement(name, rank, world);
+  const auto wf = shard(name);
+  const auto& w = wf->at(name);
+  const auto& expected = expected_.at(name);
+  if (w.dtype != expected.dtype || w.shape != expected.shape)
+    fail("tensor contract mismatch: " + name);
+  const auto sn = name.substr(0, name.size() - 7) + ".weight_scale_inv";
+  const auto sf = shard(sn);
+  return mimo_load_fp8(w, sf->at(sn), local.row_begin, local.rows, local.col_begin, local.cols);
+}
+MimoFp8Matrix MimoCheckpointWeights::qkv_fp8(int layer, int rank, int world) {
+  if (layer < 0 || layer >= cfg_.mtp_layer(cfg_.mtp_blocks)) fail("layer outside backbone/draft");
+  const auto base =
+      cfg_.is_mtp(layer)
+          ? "model.mtp.layers." + std::to_string(layer - cfg_.mtp_layer()) + ".self_attn.qkv_proj"
+          : "model.layers." + std::to_string(layer) + ".self_attn.qkv_proj";
+  const auto wf = shard(base + ".weight"), sf = shard(base + ".weight_scale_inv");
+  const auto& w = wf->at(base + ".weight");
+  if (w.shape.size() != 2 || w.shape[1] != cfg_.hidden_size) fail("QKV hidden dimension mismatch");
+  const MimoQkvLayout layout(cfg_, layer);
+  rank_check(rank, world);
+  return mimo_load_fp8(w, sf->at(base + ".weight_scale_inv"), 0, layout.rows() / world, 0,
+                       cfg_.hidden_size, &layout, rank, world);
 }
 
 std::vector<float> MimoCheckpointWeights::router_bias(int layer) {

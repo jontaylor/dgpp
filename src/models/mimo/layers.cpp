@@ -6,6 +6,7 @@
 
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
+#include "kernels/scale_gemm.hpp"
 
 namespace dgpp {
 MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextConfig& c,
@@ -23,8 +24,9 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
       max_tokens_(max_tokens),
       attention_scores_(attention_scores) {
   shape_.validate();
-  if (requests < 1 || max_tokens < 1 || requests > kGemmDecodeLoweringRows || !w.qkv || !w.output ||
-      !w.input_norm || !w.post_norm || (shape_.window && !w.sinks))
+  if (requests < 1 || max_tokens < 1 || requests > kGemmDecodeLoweringRows ||
+      (!w.qkv && !(w.qkv_fp8.payload && w.qkv_fp8.scales)) || !w.output || !w.input_norm ||
+      !w.post_norm || (shape_.window && !w.sinks))
     throw std::invalid_argument("MiMo decoder: incomplete weights or too many rows");
   // One aligned allocation, with an identical count and address pass.
   auto layout = [&](LayerBump& buffer) {
@@ -41,7 +43,9 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
     if (c.moe(w.layer)) {
       moe_sum_ = static_cast<float*>(buffer.alloc(size_t(max_tokens_) * c.hidden_size * 4));
     } else {
-      if (w.dense_inter <= 0 || !w.gate || !w.up || !w.down)
+      if (w.dense_inter <= 0 || (!w.gate && !(w.gate_fp8.payload && w.gate_fp8.scales)) ||
+          (!w.up && !(w.up_fp8.payload && w.up_fp8.scales)) ||
+          (!w.down && !(w.down_fp8.payload && w.down_fp8.scales)))
         throw std::invalid_argument("MiMo decoder: incomplete dense weights");
       gate_ = bf(w.dense_inter);
       up_ = bf(w.dense_inter);
@@ -90,7 +94,12 @@ size_t MimoDecoderLayer::workspace_bytes(const MimoTextConfig& c, int layer, int
   return bytes;
 }
 void MimoDecoderLayer::project(const uint16_t* x, const uint16_t* w, uint16_t* y, int n, int k,
-                               cudaStream_t stream, int tokens) {
+                               cudaStream_t stream, int tokens, const MimoFp8Resident& fp8) {
+  if (fp8.payload) {
+    launch_scale_gemm_grid_bf16(x, k, fp8.payload, fp8.scales, y, tokens, n, k, stream, 0, 6, 6,
+                                tokens > dense_gemv_rows());
+    return;
+  }
   gemm_.matmul(x, w, y, tokens, n, k, DType::BF16, GemmOut::BF16, k, gemm_ws_, gemm_ws_bytes_,
                stream);
 }
@@ -113,7 +122,7 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uin
   const auto n = int64_t(tokens) * cfg_.hidden_size;
   glm_rmsnorm_bf16(residual, w_.input_norm, x_, tokens, cfg_.hidden_size, cfg_.rms_norm_eps,
                    stream);
-  project(x_, w_.qkv, fused_, shape_.fused_width(), cfg_.hidden_size, stream, tokens);
+  project(x_, w_.qkv, fused_, shape_.fused_width(), cfg_.hidden_size, stream, tokens, w_.qkv_fp8);
   // Expanded rings retain the oldest window plus this entire chunk. All
   // queries can therefore execute concurrently with causal position bounds.
   auto chunk = shape_;
@@ -159,7 +168,7 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uin
     return result ? result : y_;
   };
   auto* partial = stage();
-  project(attn_, w_.output, partial, cfg_.hidden_size, shape_.q_heads * 128, stream, tokens);
+  project(attn_, w_.output, partial, cfg_.hidden_size, shape_.q_heads * 128, stream, tokens, {});
   fold(partial, boundary, stream, tokens, capture);
   add_inplace_bf16(residual, partial, n, stream);
   glm_rmsnorm_bf16(residual, w_.post_norm, x_, tokens, cfg_.hidden_size, cfg_.rms_norm_eps, stream);
@@ -174,11 +183,11 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uin
       moe_->enqueue_prefill_f32(x_, moe_sum_, tokens, nullptr, stream);
     launch_moe_round_bf16(partial, moe_sum_, n, stream);
   } else {
-    project(x_, w_.gate, gate_, w_.dense_inter, cfg_.hidden_size, stream, tokens);
-    project(x_, w_.up, up_, w_.dense_inter, cfg_.hidden_size, stream, tokens);
+    project(x_, w_.gate, gate_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.gate_fp8);
+    project(x_, w_.up, up_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.up_fp8);
     launch_moe_swiglu_clamp(gate_, up_, act_, int64_t(tokens) * w_.dense_inter,
                             std::numeric_limits<float>::infinity(), stream);
-    project(act_, w_.down, partial, cfg_.hidden_size, w_.dense_inter, stream, tokens);
+    project(act_, w_.down, partial, cfg_.hidden_size, w_.dense_inter, stream, tokens, w_.down_fp8);
   }
   fold(partial, boundary, stream, tokens, capture);
   add_inplace_bf16(residual, partial, n, stream);

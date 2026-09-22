@@ -41,7 +41,7 @@ class MimoDecoderLayer {
  private:
   friend struct MimoLayerProbe;
   void project(const uint16_t* x, const uint16_t* w, uint16_t* y, int n, int k, cudaStream_t stream,
-               int tokens);
+               int tokens, const MimoFp8Resident& fp8);
   void fold(uint16_t* partial, BoundaryReducer* boundary, cudaStream_t stream, int tokens,
             bool capture);
   const MimoLayerResident& w_;

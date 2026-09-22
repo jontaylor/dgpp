@@ -339,6 +339,10 @@ target_include_directories(dgpp_models_mimo_layers PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dgpp_models_mimo_layers PUBLIC dgpp_models_mimo dgpp_models_moe dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_mimo_layers)
 
+add_executable(mimo_fp8_dense_check apps/mimo_fp8_dense_check.cpp)
+target_link_libraries(mimo_fp8_dense_check PRIVATE dgpp_models_mimo_layers)
+dgpp_set_common(mimo_fp8_dense_check)
+
 add_executable(mimo_layer_check apps/mimo_layer_check.cpp)
 target_link_libraries(mimo_layer_check PRIVATE dgpp_models_mimo_layers)
 dgpp_set_common(mimo_layer_check)

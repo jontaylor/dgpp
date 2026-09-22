@@ -1,6 +1,8 @@
 #include "models/mimo/loader.hpp"
 
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace dgpp {
 namespace {
@@ -39,15 +41,26 @@ GlmMoeWeights MimoLayerResident::moe_view() const {
   w.experts_fp4 = experts.data();
   return w;
 }
+bool mimo_fp8_dense_enabled() {
+  const char* mode = std::getenv("DGPP_MIMO_FP8_DENSE");
+  if (mode && std::string(mode) != "0" && std::string(mode) != "1")
+    throw std::invalid_argument("DGPP_MIMO_FP8_DENSE must be 0 or 1");
+  return mode && std::string(mode) == "1";
+}
 MimoDeviceLoader::MimoDeviceLoader(const std::string& checkpoint, int rank, int world)
     : reader_(checkpoint), rank_(rank), world_(world) {
+  fp8_dense_ = mimo_fp8_dense_enabled();
   config().validate_tp(world);
   if (rank < 0 || rank >= world) throw std::invalid_argument("MiMo loader: invalid rank");
 }
-size_t MimoDeviceLoader::layer_bytes(const MimoTextConfig& c, int layer, int world) {
+size_t MimoDeviceLoader::layer_bytes(const MimoTextConfig& c, int layer, int world,
+                                     bool fp8_dense) {
   c.validate_tp(world);
   const size_t h = c.hidden_size;
-  size_t bytes = 2 * aligned(h * 2) + aligned(size_t(c.qkv_rows(layer) / world) * h * 2) +
+  auto dense = [&](size_t n, size_t k) {
+    return fp8_dense ? aligned(n * k) + aligned((n / 64) * (k / 64) * 4) : aligned(n * k * 2);
+  };
+  size_t bytes = 2 * aligned(h * 2) + dense(c.qkv_rows(layer) / world, h) +
                  aligned(h * (c.num_attention_heads / world) * c.v_head_dim * 2);
   if (c.sliding(layer)) bytes += aligned((c.num_attention_heads / world) * 2);
   if (c.moe(layer)) {
@@ -55,7 +68,7 @@ size_t MimoDeviceLoader::layer_bytes(const MimoTextConfig& c, int layer, int wor
     const size_t n = h * (c.moe_intermediate_size / world);
     bytes += size_t(c.n_routed_experts) * 3 * (aligned(n / 2) + aligned(n / 32));
   } else {
-    bytes += 3 * aligned(h * (c.intermediate_size / world) * 2);
+    bytes += 3 * dense(h, c.intermediate_size / world);
   }
   if (c.is_mtp(layer)) bytes += 3 * aligned(h * 2) + aligned(h * h * 4);
   return bytes;
@@ -69,7 +82,7 @@ MimoLayerResident MimoDeviceLoader::load_layer(int layer) {
   const auto& c = config();
   MimoLayerResident r;
   r.storage = std::make_unique<LayerBump>();
-  r.storage->init(layer_bytes(c, layer, world_));
+  r.storage->init(layer_bytes(c, layer, world_, fp8_dense_));
   Upload u{*r.storage};
   r.layer = layer;
   r.q_heads = c.num_attention_heads / world_;
@@ -82,7 +95,14 @@ MimoLayerResident MimoDeviceLoader::load_layer(int layer) {
   };
   r.input_norm = ordinary("input_layernorm.weight");
   r.post_norm = ordinary(draft ? "pre_mlp_layernorm.weight" : "post_attention_layernorm.weight");
-  r.qkv = u.copy(reader_.qkv(layer, rank_, world_, 0, c.hidden_size).values);
+  auto packed = [&](const MimoFp8Matrix& m) {
+    return MimoFp8Resident{u.copy(m.payload), u.copy(m.scales)};
+  };
+  if (fp8_dense_) {
+    r.qkv_fp8 = packed(reader_.qkv_fp8(layer, rank_, world_));
+  } else {
+    r.qkv = u.copy(reader_.qkv(layer, rank_, world_, 0, c.hidden_size).values);
+  }
   r.output = ordinary("self_attn.o_proj.weight");
   if (c.sliding(layer)) r.sinks = ordinary("self_attn.attention_sink_bias");
   if (c.moe(layer)) {
@@ -103,9 +123,15 @@ MimoLayerResident MimoDeviceLoader::load_layer(int layer) {
     }
   } else {
     r.dense_inter = c.intermediate_size / world_;
-    r.gate = ordinary("mlp.gate_proj.weight");
-    r.up = ordinary("mlp.up_proj.weight");
-    r.down = ordinary("mlp.down_proj.weight");
+    if (fp8_dense_) {
+      r.gate_fp8 = packed(reader_.fp8(p + "mlp.gate_proj.weight", rank_, world_));
+      r.up_fp8 = packed(reader_.fp8(p + "mlp.up_proj.weight", rank_, world_));
+      r.down_fp8 = packed(reader_.fp8(p + "mlp.down_proj.weight", rank_, world_));
+    } else {
+      r.gate = ordinary("mlp.gate_proj.weight");
+      r.up = ordinary("mlp.up_proj.weight");
+      r.down = ordinary("mlp.down_proj.weight");
+    }
   }
   if (draft) {
     r.enorm = ordinary("enorm.weight");

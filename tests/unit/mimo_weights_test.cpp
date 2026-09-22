@@ -381,3 +381,49 @@ DGPP_TEST(mimo_native_mtp_contract_and_tp_placement) {
     }
   }
 }
+
+DGPP_TEST(mimo_fp8_resident_preserves_qkv_chunk_scales_and_rank_slices) {
+  const auto cfg = config();
+  for (int layer : {0, 1}) {
+    dgpp::MimoQkvLayout layout(cfg, layer);
+    constexpr int cols = 256;
+    std::vector<uint8_t> codes(size_t(layout.rows()) * cols);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t(1 + i % 120);
+    std::vector<float> scales(size_t(layout.scale_rows()) * 2);
+    for (size_t i = 0; i < scales.size(); ++i) scales[i] = float(i + 1) * .001f;
+    auto w = tensor(codes, dgpp::DType::F8_E4M3, layout.rows(), cols);
+    auto s = tensor(scales, dgpp::DType::F32, layout.scale_rows(), 2);
+    for (int world : {1, 2, 4})
+      for (int rank = 0; rank < world; ++rank) {
+        auto p = dgpp::mimo_load_fp8(w, s, 0, layout.rows() / world, 64, 128, &layout, rank, world);
+        auto ref = dgpp::mimo_load_qkv_bf16(w, s, layout, rank, world, 64, 128);
+        for (int64_t r = 0; r < p.rows; ++r)
+          for (int64_t c = 0; c < p.cols; ++c)
+            check(dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(p.payload[r * p.cols + c]) *
+                                           p.scales[(r / 64) * (p.cols / 64) + c / 64]) ==
+                      ref.values[r * p.cols + c],
+                  "resident QKV mismatch");
+      }
+    rejects([&] { dgpp::mimo_load_fp8(w, s, 0, layout.rows(), 1, 128, &layout); }, "align");
+  }
+}
+
+DGPP_TEST(mimo_fp8_resident_preserves_ordinary_tp_column_offsets) {
+  constexpr int rows = 256, cols = 384;
+  std::vector<uint8_t> codes(rows * cols);
+  for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t(1 + i % 120);
+  const std::vector<float> scales{.01f, .02f, .03f, .04f, .05f, .06f};
+  const auto w = tensor(codes, dgpp::DType::F8_E4M3, rows, cols);
+  const auto s = tensor(scales, dgpp::DType::F32, 2, 3);
+  for (int rb : {0, 64, 128})
+    for (int cb : {0, 64, 192}) {
+      auto p = dgpp::mimo_load_fp8(w, s, rb, 128, cb, 192);
+      auto ref = dgpp::mimo_load_fp8_bf16(w, s, rb, 128, cb, 192);
+      for (int64_t r = 0; r < p.rows; ++r)
+        for (int64_t c = 0; c < p.cols; ++c)
+          check(dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(p.payload[r * p.cols + c]) *
+                                         p.scales[(r / 64) * (p.cols / 64) + c / 64]) ==
+                    ref.values[r * p.cols + c],
+                "resident ordinary mismatch");
+    }
+}

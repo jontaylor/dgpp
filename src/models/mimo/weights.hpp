@@ -28,6 +28,16 @@ struct MimoBf16Matrix {
   int64_t rows = 0, cols = 0;
   std::vector<uint16_t> values;
 };
+// Exact source E4M3 codes, reblocked scales on 64x64 boundaries. QKV
+// source chunks restart their 128-row scale grid, including partial blocks.
+struct MimoFp8Matrix {
+  int64_t rows = 0, cols = 0;
+  std::vector<uint8_t> payload;
+  std::vector<float> scales;
+};
+MimoFp8Matrix mimo_load_fp8(const TensorInfo& weight, const TensorInfo& scales, int64_t row_begin,
+                            int64_t rows, int64_t col_begin, int64_t cols,
+                            const MimoQkvLayout* qkv = nullptr, int rank = 0, int world = 1);
 struct MimoMxfp4Matrix {
   int64_t rows = 0, cols = 0;
   std::vector<uint8_t> payload;  // packed low-nibble-first e2m1
@@ -76,6 +86,8 @@ class MimoCheckpointWeights {
   explicit MimoCheckpointWeights(const std::string& directory);
   const MimoTextConfig& config() const { return cfg_; }
   MimoBf16Matrix qkv(int layer, int rank, int world, int64_t col_begin, int64_t cols);
+  MimoFp8Matrix fp8(const std::string& name, int rank, int world);
+  MimoFp8Matrix qkv_fp8(int layer, int rank, int world);
   MimoMxfp4Matrix expert(int layer, int expert, const std::string& projection, int rank, int world);
   MimoMatrixSlice placement(const std::string& name, int rank, int world) const;
   // Norms, sinks, output projections, dense MLP, router, embedding and head.
