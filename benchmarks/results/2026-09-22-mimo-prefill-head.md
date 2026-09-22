@@ -65,6 +65,22 @@ actual width and vocab slice (TP2: H=4096, V=76288); it is not approximated by a
 smaller fake matrix. World 1 can also be tested with rank 0, at higher memory
 cost. Run a partial-chunk case under Compute Sanitizer memcheck.
 
+Set `DGPP_MIMO_HEAD_BENCH=1` to additionally time the two projection shapes
+using CUDA events after correctness checks. The probe warms each shape twice,
+then measures five pairs with alternating execution order. It prints each
+full-row/final-row duration and their means in milliseconds. For example:
+
+```bash
+DGPP_MIMO_HEAD_BENCH=1 ./mimo_head_check "$CHECKPOINT" 2048 0 2 /tmp/head-bench-r0
+```
+
+This measures the isolated head on the default CUDA stream, with plans already
+cached. It excludes checkpoint loading, normalization, backbone layers, MTP,
+fabric communication and service scheduling. All correctness checks and exit
+codes remain active; timings do not turn a numerical difference into a pass.
+Use an idle GPU and retain the per-repetition values when interpreting small
+effects. These component timings alone do not establish an end-to-end gain.
+
 For model acceptance, compare baseline/candidate fixed greedy prompts with
 MTP3 on and off, cold and cached multi-chunk prompts, concurrency two, and
 speculative verification. Preserve existing logits tolerances and near-tie

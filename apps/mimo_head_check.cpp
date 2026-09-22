@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 
@@ -93,6 +94,49 @@ int main(int argc, char** argv) {
           if (!file) throw std::runtime_error("cannot write logits output");
         }
       }
+    }
+    if (const char* bench = std::getenv("DGPP_MIMO_HEAD_BENCH"); bench && std::string(bench) == "1") {
+      // Plans are already populated by the correctness checks. Warm both
+      // shapes explicitly, then alternate pair order to expose repeat noise.
+      auto project = [&](bool full) {
+        dgpp::mimo_project_head(gemm, h, w, out, rows, V, H, false, full, nullptr);
+      };
+      for (int i = 0; i < 2; ++i) {
+        project(true);
+        project(false);
+      }
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      cudaEvent_t start, stop;
+      DGPP_CUDA_OK(cudaEventCreate(&start));
+      DGPP_CUDA_OK(cudaEventCreate(&stop));
+      auto timed = [&](bool full) {
+        DGPP_CUDA_OK(cudaEventRecord(start, nullptr));
+        project(full);
+        DGPP_CUDA_OK(cudaEventRecord(stop, nullptr));
+        DGPP_CUDA_OK(cudaEventSynchronize(stop));
+        float ms = 0;
+        DGPP_CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
+        return ms;
+      };
+      float full_sum = 0, final_sum = 0;
+      for (int i = 0; i < 5; ++i) {
+        float full_ms, final_ms;
+        if (i % 2 == 0) {
+          full_ms = timed(true);
+          final_ms = timed(false);
+        } else {
+          final_ms = timed(false);
+          full_ms = timed(true);
+        }
+        full_sum += full_ms;
+        final_sum += final_ms;
+        std::cout << "head_bench repetition=" << i + 1 << " full_ms=" << full_ms
+                  << " final_ms=" << final_ms << '\n';
+      }
+      DGPP_CUDA_OK(cudaEventDestroy(start));
+      DGPP_CUDA_OK(cudaEventDestroy(stop));
+      std::cout << "head_bench repetitions=5 warmup=2 full_mean_ms=" << full_sum / 5
+                << " final_mean_ms=" << final_sum / 5 << '\n';
     }
     // No numerical tolerance is silently introduced by this probe. Exit 2
     // means a shape-induced difference requiring the existing numerical gate.
