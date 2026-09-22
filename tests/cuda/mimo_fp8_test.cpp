@@ -97,3 +97,131 @@ int main() {
   if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices) return 2;
   return dgpp::test::run_all();
 }
+
+// Isolate storage integration from the online algorithm's intentional changes
+// to softmax rounding: compare each algorithm with itself on dequantized data.
+DGPP_TEST(mimo_fp8_bounded_online_same_algorithm_graph_and_mapping) {
+  auto stream = dgpp::kda_test::test_stream();
+  for (int window : {0, 128}) {
+    for (bool mapped : {false, true}) {
+      for (int rows : (mapped ? std::vector<int>{4} : std::vector<int>{1, 17, 33})) {
+        const int capacity = window ? 263 : 640;
+        const int planes = mapped ? 3 : 1;
+        dgpp::MimoAttentionShape shape{rows, 4, 2, capacity, window, true};
+        auto bf = shape;
+        bf.fp8_cache = false;
+        const size_t nk = size_t(planes) * capacity * shape.k_width();
+        const size_t nv = size_t(planes) * capacity * shape.v_width();
+        const size_t nq = size_t(rows) * shape.q_width();
+        const size_t no = size_t(rows) * shape.q_heads * 128;
+        DevBuf k(nk), v(nv), rk(nk * 2), rv(nv * 2), q(nq * 2), positions(rows * 8),
+            mapping(rows * 4), sinks(shape.q_heads * 2), actual(no * 2), reference(no * 2);
+        std::vector<uint8_t> packed_k(nk), packed_v(nv);
+        std::vector<uint16_t> expanded_k(nk), expanded_v(nv), queries(nq), got(no), expected(no);
+        std::vector<uint16_t> sink_values(shape.q_heads);
+        std::vector<int64_t> pos(rows);
+        std::vector<int32_t> ids(rows);
+        uint32_t rng = 0xabcdef01;
+        auto fill = [&](auto& packed, auto& expanded) {
+          for (size_t i = 0; i < packed.size(); ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            // Finite E4M3 payloads include zero, subnormals and +/-448.
+            packed[i] = uint8_t((rng % 127) | ((rng >> 16) & 128));
+            expanded[i] = dgpp::float_to_bf16_bits(decode(packed[i]));
+          }
+        };
+        const int end_key = window ? capacity * 3 + 17 : capacity;
+        for (bool online : {false, true}) {
+          for (bool with_sink : {false, true}) {
+            auto launch = [&](auto s, void* keys, void* values, DevBuf& output) {
+              const auto* sink = with_sink ? sinks.as<uint16_t>() : nullptr;
+              if (mapped && !online)
+                dgpp::mimo_attention(s, q.as<uint16_t>(), keys, values,
+                    positions.as<int64_t>(), sink, output.as<uint16_t>(), stream,
+                    false, nullptr, mapping.as<int32_t>());
+              else if (mapped)
+                dgpp::mimo_attention_online_decode(s, q.as<uint16_t>(), keys, values,
+                    positions.as<int64_t>(), sink, output.as<uint16_t>(), stream,
+                    mapping.as<int32_t>());
+              else
+                dgpp::mimo_attention_bounded_prefill(s, q.as<uint16_t>(), keys, values,
+                    positions.as<int64_t>(), sink, output.as<uint16_t>(), end_key, stream, online);
+            };
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            launch(shape, k.as<uint8_t>(), v.as<uint8_t>(), actual);
+            DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+            size_t count = 0;
+            DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+            require(count > 0, "empty FP8 attention graph");
+            std::vector<cudaGraphNode_t> nodes(count);
+            DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
+            for (auto node : nodes) {
+              cudaGraphNodeType type;
+              DGPP_CUDA_OK(cudaGraphNodeGetType(node, &type));
+              require(type == cudaGraphNodeTypeKernel, "FP8 attention graph has non-kernel node");
+            }
+            DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            for (int replay = 0; replay < 3; ++replay) {
+              fill(packed_k, expanded_k);
+              fill(packed_v, expanded_v);
+              for (auto& value : queries) {
+                rng = rng * 1664525u + 1013904223u;
+                value = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+              }
+              for (int h = 0; h < shape.q_heads; ++h)
+                sink_values[h] = dgpp::float_to_bf16_bits(float((h % 2 ? 1 : -1) * (4 + replay)));
+              for (int row = 0; row < rows; ++row) {
+                if (mapped) {
+                  ids[row] = row == 1 ? -1 : (row + replay) % planes;
+                  pos[row] = row == 1 ? -1 : (row == 2 ? 2 : end_key - 1 - row * 17);
+                } else {
+                  pos[row] = end_key - rows + row;
+                }
+              }
+              // An invalid global row must zero output before dereferencing -1's cache plane.
+              if (mapped && !window && replay == 2) {
+                ids[3] = -1;
+                pos[3] = capacity;
+              }
+              k.upload(packed_k.data(), nk);
+              v.upload(packed_v.data(), nv);
+              rk.upload(expanded_k.data(), nk * 2);
+              rv.upload(expanded_v.data(), nv * 2);
+              q.upload(queries.data(), nq * 2);
+              sinks.upload(sink_values.data(), sink_values.size() * 2);
+              positions.upload(pos.data(), rows * 8);
+              mapping.upload(ids.data(), rows * 4);
+              DGPP_CUDA_OK(cudaMemsetAsync(actual.as<uint16_t>(), 0xa5, no * 2, stream));
+              DGPP_CUDA_OK(cudaMemsetAsync(reference.as<uint16_t>(), 0x5a, no * 2, stream));
+              launch(bf, rk.as<uint16_t>(), rv.as<uint16_t>(), reference);
+              DGPP_CUDA_OK(cudaGraphLaunch(executable, stream));
+              DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+              actual.download(got.data(), no * 2);
+              reference.download(expected.data(), no * 2);
+              if (got != expected) {
+                const auto first = std::mismatch(got.begin(), got.end(), expected.begin());
+                throw std::runtime_error("FP8/dequantized BF16 same-algorithm mismatch: window=" +
+                    std::to_string(window) + " mapped=" + std::to_string(mapped) +
+                    " rows=" + std::to_string(rows) + " online=" + std::to_string(online) +
+                    " sink=" + std::to_string(with_sink) + " replay=" + std::to_string(replay) +
+                    " element=" + std::to_string(first.first - got.begin()));
+              }
+              for (int row = 0; row < rows; ++row) {
+                const bool padded = mapped && (pos[row] < 0 || (!window && pos[row] >= capacity));
+                for (int i = 0; i < shape.q_heads * 128; ++i) {
+                  const auto value = got[size_t(row) * shape.q_heads * 128 + i];
+                  require(std::isfinite(dgpp::bf16_bits_to_float(value)), "nonfinite FP8 attention output");
+                  if (padded) require(value == 0, "padded/invalid FP8 decode output is nonzero");
+                }
+              }
+            }
+            DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+            DGPP_CUDA_OK(cudaGraphDestroy(graph));
+          }
+        }
+      }
+    }
+  }
+}
