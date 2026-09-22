@@ -1,11 +1,11 @@
 #include "models/mimo/model.hpp"
 #include "models/mimo/cache_format.hpp"
-#include "models/mimo/head.hpp"
-
-#include "models/mimo/snapshot_copy.hpp"
 
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
+#include "kernels/mimo_dflash.hpp"
+#include "models/mimo/head.hpp"
+#include "models/mimo/snapshot_copy.hpp"
 
 namespace dgpp {
 namespace {
@@ -40,25 +40,28 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
   validate(c, context, rank, world);
   if (requests < 1 || requests > kDecodeRows)
     throw std::invalid_argument("MiMo concurrency must be in [1, 8]");
-  const int rows = std::max(kDecodeRows, forward_rows);
+  const bool dflash = mtp && mimo_dflash_enabled();
+  const int rows = std::max(dflash ? requests * 8 : kDecodeRows, forward_rows);
   MemoryPlan plan;
   plan.context_tokens = context;
   size_t weights = MimoDeviceLoader::globals_bytes(c, world), device = 0, pinned = 0;
   size_t block_scratch = 0, moe_scratch = 0, moe_pinned = 0;
-  moe_scratch = GlmMoeLayer::scratch_bytes(mimo_moe_config(c, world), rows, kDecodeRows,
+  moe_scratch = GlmMoeLayer::scratch_bytes(mimo_moe_config(c, world), rows,
+                                           dflash ? requests * 8 : kDecodeRows,
                                            c.num_hidden_layers - 1, &moe_pinned);
   for (int l = 0; l < c.num_hidden_layers; ++l) {
     weights += MimoDeviceLoader::layer_bytes(c, l, world);
     block_scratch = std::max(block_scratch, MimoDecoderLayer::workspace_bytes(c, l, rows, world));
   }
-  if (mtp)
+  if (mtp && !dflash)
     block_scratch =
         std::max(block_scratch, MimoDecoderLayer::workspace_bytes(c, c.mtp_layer(), rows, world));
-  session_core_plan_bytes(std::max(kDecodeRows, forward_rows), requests, c.hidden_size,
-                          c.vocab_size / world, mtp, c.hidden_size, &device, &pinned);
+  session_core_plan_bytes(rows, requests, c.hidden_size, c.vocab_size / world, mtp,
+                          dflash ? MimoDFlash::width : c.hidden_size, &device, &pinned,
+                          dflash ? requests * 8 : kDecodeRows);
   plan.add("MiMo resident text weights", weights);
   plan.add(mimo_fp8_cache_enabled() ? "MiMo flat global and ring K/V (unit E4M3)" : "MiMo flat global and ring K/V (BF16)",
-           requests * cache_bytes(c, context, world, std::max(kDecodeRows, forward_rows)));
+           requests * cache_bytes(c, context, world, rows));
   plan.add("MiMo layer scratch", block_scratch + moe_scratch + size_t(c.num_hidden_layers) * 256,
            moe_pinned);
   plan.add("MiMo session core",
@@ -69,7 +72,10 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
            size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) * c.num_attention_heads /
                world * std::max<int64_t>(global_capacity(context), mimo_ring_capacity(rows)) *
                (sizeof(float) + sizeof(uint16_t)));
-  if (mtp) {
+  if (dflash)
+    plan.add("MiMo DFlash drafter",
+             MimoDFlash::memory_bytes(rows, requests, c.vocab_size / world, world));
+  if (mtp && !dflash) {
     const size_t plane =
         size_t(mimo_ring_capacity(rows)) * (c.swa_num_key_value_heads / world) * 320 * 2;
     plan.add("MiMo native MTP weights",
@@ -93,7 +99,9 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     throw std::invalid_argument("MiMo: TP requires a boundary reducer");
   init_stream();
   SessionParams sp;
-  sp.max_tokens = std::max(kDecodeRows, forward_rows);
+  const bool dflash = mtp && mimo_dflash_enabled();
+  sp.decode_rows = dflash ? requests * 8 : kDecodeRows;
+  sp.max_tokens = std::max(sp.decode_rows, forward_rows);
   sp.max_cache_tokens = context;
   sp.rank = rank;
   sp.world = world;
@@ -102,7 +110,7 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     throw std::invalid_argument("MiMo concurrency must be in [1, 8]");
   sp.max_requests = requests;
   sp.mtp = mtp;
-  sp.draft_width = c.hidden_size;
+  sp.draft_width = dflash ? MimoDFlash::width : c.hidden_size;
   sp.vocab_size = c.vocab_size;
   sp.hidden = c.hidden_size;
   sp.lm_vocab_count = c.vocab_size / world;
@@ -115,7 +123,7 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   globals_ = loader.load_globals();
   DGPP_LOG_INFO("MiMo rank {}: base K/V and prefix snapshots use {}", rank,
                 mimo_fp8_cache_enabled() ? "unit-scale E4M3 FP8" : "BF16");
-  cache_.init(requests * cache_bytes(c, context, world, std::max(kDecodeRows, forward_rows)));
+  cache_.init(requests * cache_bytes(c, context, world, sp.max_tokens));
   DGPP_CUDA_OK(cudaMemsetAsync(cache_.base, 0, cache_.capacity, stream_));
   const int rows = sp.max_tokens;
   chunk_capacity_ = rows;
@@ -130,7 +138,7 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   size_t layer_bytes = 0;
   for (int l = 0; l < c.num_hidden_layers; ++l)
     layer_bytes = std::max(layer_bytes, MimoDecoderLayer::workspace_bytes(c, l, rows, world));
-  if (mtp)
+  if (mtp && !dflash)
     layer_bytes =
         std::max(layer_bytes, MimoDecoderLayer::workspace_bytes(c, c.mtp_layer(), rows, world));
   layer_workspace_.init(layer_bytes);
@@ -145,14 +153,18 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     values_.push_back(static_cast<uint8_t*>(cache_.alloc(requests * value_plane_.back())));
     if (c.moe(l) && !shared_moe_)
       shared_moe_ = std::make_unique<GlmMoeLayer>(w.moe_view(), mimo_moe_config(c, world), rows,
-                                                  kDecodeRows, c.num_hidden_layers - 1);
+                                                  sp.decode_rows, c.num_hidden_layers - 1);
     layers_.push_back(std::make_unique<MimoDecoderLayer>(
         w, c, requests, global_capacity(context), gemm_, nullptr, 0, rows,
         static_cast<float*>(attention_scores_.base), shared_moe_.get(), &layer_workspace_));
     DGPP_LOG_INFO("MiMo rank {}: loaded layer {}/{} ({} weight bytes)", rank, l + 1,
                   c.num_hidden_layers, w.storage->capacity);
   }
-  if (mtp) {
+  if (dflash)
+    dflash_ = std::make_unique<MimoDFlash>(checkpoint + "/dflash", rows, requests,
+                                           globals_.vocab_count, globals_.embed, globals_.head,
+                                           stream_, rank, world, boundary_);
+  if (mtp && !dflash) {
     draft_weights_.reserve(c.mtp_blocks);
     for (int d = 0; d < c.mtp_blocks; ++d) {
       draft_weights_.push_back(loader.load_layer(c.mtp_layer(d)));
@@ -200,8 +212,10 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
   check_req(run.req, "MiMo run");
   const int groups = std::max(1, run.batch_requests);
   if (run.T < 1 || run.T > chunk_capacity_ || run.num_spans || run.batch_requests > max_requests_ ||
-      (run.decode &&
-       (run.T > max_decode_rows_ || run.T % groups || run.T / groups > (mtp_ ? 4 : 1))))
+      (run.decode && (run.T > max_decode_rows_ || run.T % groups ||
+                      run.T / groups > (dflash_ ? 8
+                                        : mtp_  ? 4
+                                                : 1))))
     throw std::invalid_argument(
         "MiMo requires single-sequence prefill or at most four decode rows per request");
   const auto in = begin_run(run);
@@ -213,6 +227,11 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
                         status_ + l * run.T, boundary_, stream_, run.T,
                         run.decode ? 0 : int(run.pos0 + run.T), run.capture,
                         run.decode ? in.req_ids : nullptr);
+    if (dflash_) {
+      for (int f = 0; f < 5; ++f)
+        if (l == MimoDFlash::target_layers[f])
+          dflash_features(residual_, dflash_->features(), run.T, f, stream_);
+    }
     if (run.capture_layers) {
       std::vector<uint16_t> row(size_t(run.T) * cfg_.hidden_size);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
@@ -226,11 +245,12 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
   // (vLLM MiMoV2Model and SGLang's default hidden-state capture contract).
   if (mtp_) {
     const int n = std::min(run.T, max_decode_rows_);
-    store_draft_hidden(h_ + size_t(run.T - n) * cfg_.hidden_size, in.req_ids + run.T - n,
+    const uint16_t* features = dflash_ ? dflash_->features() : h_;
+    store_draft_hidden(features + size_t(run.T - n) * draft_width_, in.req_ids + run.T - n,
                        in.pos + run.T - n, n);
   }
   mimo_project_head(gemm_, h_, globals_.head, logits_, run.T, globals_.vocab_count,
-                     cfg_.hidden_size, run.decode, run.all_rows, stream_);
+                    cfg_.hidden_size, run.decode, run.all_rows, stream_);
   if (run.capture) return finish_run(run, std::move(out));
   if (boundary_) boundary_->settle();
   // Session bounds validate positions before entry; status still gates commit.
@@ -242,6 +262,7 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
   return finish_run(run, std::move(out));
 }
 void MimoModel::graph_prepare() {
+  if (dflash_) dflash_->prepare();
   for (auto& layer : layers_) layer->prepare_graph(stream_);
 }
 void MimoModel::reset_slot_state(int req) {
@@ -260,9 +281,9 @@ void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
   for (size_t l = 0; l < layers_.size(); ++l) {
     const auto& shape = layers_[l]->shape();
     const size_t slots = shape.window ? shape.window : shape.capacity;
-    snapshot_copied_bytes_ += mimo_write_snapshot_layer(
-        shape, position, previous, keys_[l] + req * key_plane_[l],
-        values_[l] + req * value_plane_[l], dst, stream_);
+    snapshot_copied_bytes_ +=
+        mimo_write_snapshot_layer(shape, position, previous, keys_[l] + req * key_plane_[l],
+                                  values_[l] + req * value_plane_[l], dst, stream_);
     if (!shape.window)
       snapshot_saved_bytes_ += size_t(previous) * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes();
     dst += slots * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes();
@@ -282,11 +303,19 @@ void MimoModel::read_state_snapshot(int req, const uint8_t* src, int64_t positio
 }
 
 size_t MimoModel::draft_state_bytes() const {
+  if (dflash_) return MimoDFlash::state_bytes(chunk_capacity_, world_);
   return mtp_ ? cfg_.mtp_blocks * (draft_key_plane_ + draft_value_plane_) * 2 +
                     1 * size_t(draft_history_rows_) * cfg_.hidden_size * 2
               : 0;
 }
 void MimoModel::write_draft_snapshot(int req, uint8_t* dst, bool live, int64_t position) {
+  if (dflash_) {
+    if (!live && mtp_pos_[req] > position)
+      glm_device_copy(dst, dflash_->backup(req, false), draft_state_bytes(), stream_);
+    else
+      dflash_->snapshot(req, dst, stream_);
+    return;
+  }
   if (!live && mtp_pos_[req] > position) {
     glm_device_copy(dst, draft_backup_ + req * draft_state_bytes(), draft_state_bytes(), stream_);
     return;
@@ -305,6 +334,10 @@ void MimoModel::write_draft_snapshot(int req, uint8_t* dst, bool live, int64_t p
   }
 }
 void MimoModel::read_draft_snapshot(int req, const uint8_t* src) {
+  if (dflash_) {
+    dflash_->restore(req, src, stream_);
+    return;
+  }
   for (int d = 0; d < cfg_.mtp_blocks; ++d) {
     glm_device_copy(draft_keys_[d] + req * draft_key_plane_, src, draft_key_plane_ * 2, stream_);
     src += draft_key_plane_ * 2;
@@ -319,9 +352,17 @@ void MimoModel::read_draft_snapshot(int req, const uint8_t* src) {
   }
 }
 void MimoModel::snapshot_draft_state(int req) {
+  if (dflash_) {
+    dflash_->snapshot(req, dflash_->backup(req, false), stream_);
+    return;
+  }
   write_draft_snapshot(req, draft_backup_ + req * draft_state_bytes(), true, 0);
 }
 void MimoModel::restore_draft_state(int req) {
+  if (dflash_) {
+    dflash_->restore(req, dflash_->backup(req, false), stream_);
+    return;
+  }
   read_draft_snapshot(req, draft_backup_ + req * draft_state_bytes());
 }
 // Chain guesses must not become committed draft history. Keep a separate
@@ -329,14 +370,16 @@ void MimoModel::restore_draft_state(int req) {
 // pre-draft rollback point used by scalar fallback and prefix snapshots.
 void MimoModel::snapshot_chain_state(int req) {
   check_req(req, "MiMo chain snapshot");
+  if (dflash_) return;  // Block queries never mutate committed context K/V.
   write_draft_snapshot(req, chain_backup_ + req * draft_state_bytes(), true, 0);
 }
 void MimoModel::restore_chain_state(int req) {
   check_req(req, "MiMo chain restore");
+  if (dflash_) return;
   read_draft_snapshot(req, chain_backup_ + req * draft_state_bytes());
 }
 void MimoModel::mtp_select_block(int block) {
-  if (block < 0 || block >= cfg_.mtp_blocks)
+  if (block < 0 || block >= (dflash_ ? 7 : cfg_.mtp_blocks))
     throw std::invalid_argument("MiMo MTP block outside [0, 2]");
   draft_block_ = block;
 }
@@ -347,6 +390,28 @@ void MimoModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   if (T < 1 || T > max_tokens_ || head_rows < 0 || head_rows > T ||
       (decode && T > max_decode_rows_) || batch_requests > max_requests_)
     throw std::invalid_argument("MiMo draft rows");
+  if (dflash_) {
+    const int groups = std::max(1, batch_requests);
+    if (T % groups || head_rows % groups) throw std::invalid_argument("DFlash grouped rows");
+    if (!decode) stage_prefill_meta(req, first_pos, T);
+    const auto* pos = decode ? d_step_pos_ : d_prefill_pos_;
+    const auto* ids = decode ? d_req_ids_ : d_prefill_req_;
+    if (!decode || draft_block_ == 0) {
+      const uint16_t* features = dflash_->features();
+      if (decode) {
+        gather_draft_hidden(ids, pos, dflash_->gather(), T);
+        features = dflash_->gather();
+      }
+      dflash_->context(features, pos, ids, T, stream_);
+      if (head_rows) dflash_->propose(tokens, pos, ids, groups, T / groups, stream_, capture);
+    }
+    if (!head_rows) return;
+    dflash_->select(logits_, groups, head_rows / groups, draft_block_, stream_);
+    if (decode && (!capture || decode_tail_mirrors_))
+      DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, size_t(head_rows) * lm_vocab_count_ * 4,
+                                   cudaMemcpyDeviceToHost, stream_));
+    return;
+  }
   const int H = cfg_.hidden_size;
   if (!decode) stage_prefill_meta(req, first_pos, T);
   const auto* pos = decode ? d_step_pos_ : d_prefill_pos_;

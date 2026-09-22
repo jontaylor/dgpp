@@ -183,7 +183,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // kSpecRows - 1
+          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 7));  // kSpecRows - 1
           e.mtp_depth_set = true;
         }
         else if (p.key == "graph_batch_min_live") e.graph_batch_min_live = static_cast<int>(integer(x, ek, what, 0, 1 << 20));

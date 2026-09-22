@@ -1,11 +1,12 @@
 // The cluster config: the schema is checked by name, the
 // engine defaults are the binary's own, the launcher's resolved configuration
 // parses, and the digest is stable and sensitive.
+#include "serve/cluster_config.hpp"
+
 #include <stdexcept>
 #include <string>
 
 #include "common/test.hpp"
-#include "serve/cluster_config.hpp"
 
 namespace {
 
@@ -44,17 +45,17 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
           "the ports: given ones taken, the fabric port defaulted");
   require(c.engine.max_concurrency == 2 && c.engine.decode_graph && !c.engine.mtp &&
               c.engine.mtp_depth == 2 && c.engine.prefix_cache_gib == 0.5 &&
-              c.engine.admission == "grow" && c.engine.stats_interval_s == 0.0 && c.engine.prefill == "exact" &&
-              c.engine.prefill_budget_tokens == 256 && c.engine.prefill_idle_budget_tokens == 2048,
+              c.engine.admission == "grow" && c.engine.stats_interval_s == 0.0 &&
+              c.engine.prefill == "exact" && c.engine.prefill_budget_tokens == 256 &&
+              c.engine.prefill_idle_budget_tokens == 2048,
           "the given engine knobs");
   // The engine defaults are the binary's flag defaults — one set of defaults.
   require(c.engine.kv_capacity == 8192 && c.engine.default_max_tokens == 256 &&
-              c.engine.queue_limit == 64 && c.engine.max_connections == 64 &&
-              !c.engine.no_eos && c.engine.graph_batch_min_live == 0 &&
-              c.engine.sampling_candidates == 128 && c.engine.admission_window == 256 &&
-              c.engine.bulk_pace_gbps == -1.0 && c.engine.bulk_inflight == -1 &&
-              c.engine.rendezvous_timeout_ms == 120000 && !c.engine.reasoning_in_content &&
-              c.engine.kv_dtype == "bf16",
+              c.engine.queue_limit == 64 && c.engine.max_connections == 64 && !c.engine.no_eos &&
+              c.engine.graph_batch_min_live == 0 && c.engine.sampling_candidates == 128 &&
+              c.engine.admission_window == 256 && c.engine.bulk_pace_gbps == -1.0 &&
+              c.engine.bulk_inflight == -1 && c.engine.rendezvous_timeout_ms == 120000 &&
+              !c.engine.reasoning_in_content && c.engine.kv_dtype == "bf16",
           "the engine defaults");
   // The KV dtype: named by the config, checked by name.
   const dgpp::serve::ClusterConfig fp8 = dgpp::serve::parse_cluster_config(
@@ -72,11 +73,15 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
 
 DGPP_TEST(cluster_config_http_override_is_order_independent) {
   const auto c = dgpp::serve::parse_cluster_config(
-      R"({"model":"m","nodes":["h"],"http":{"bind_host":"0.0.0.0","port":8080},"ports":{"http":18080},"node_env":[{"HF_HUB_CACHE":"~/cache"}]})", "t");
-  require(c.http_bind == "0.0.0.0" && c.http_port == 8080, "deployment HTTP wins over legacy ports");
+      R"({"model":"m","nodes":["h"],"http":{"bind_host":"0.0.0.0","port":8080},"ports":{"http":18080},"node_env":[{"HF_HUB_CACHE":"~/cache"}]})",
+      "t");
+  require(c.http_bind == "0.0.0.0" && c.http_port == 8080,
+          "deployment HTTP wins over legacy ports");
   require(c.node_env.at(0).at("HF_HUB_CACHE") == "~/cache", "node cache retained");
-  require(!refusal(R"({"model":"m","nodes":["h"],"http":{"bind_host":"localhost"}})").empty(), "bind must be IPv4");
-  require(!refusal(R"({"model":"m","nodes":["h"],"node_env":[{"HF_TOKEN":"x"}]})").empty(), "credentials disallowed");
+  require(!refusal(R"({"model":"m","nodes":["h"],"http":{"bind_host":"localhost"}})").empty(),
+          "bind must be IPv4");
+  require(!refusal(R"({"model":"m","nodes":["h"],"node_env":[{"HF_TOKEN":"x"}]})").empty(),
+          "credentials disallowed");
 }
 
 DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
@@ -88,20 +93,34 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
       {R"({"model":"m"})", "'nodes' is required"},
       {R"({"model":"m","nodes":[]})", "'nodes' must be a non-empty array"},
       {R"({"model":"m","nodes":["h"],"nodez":1})", "unknown key 'nodez'"},
-      {R"({"model":"m","nodes":["h"],"engine":{"max_concurency":2}})", "unknown key 'engine.max_concurency'"},
-      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":"2"}})", "'engine.max_concurrency' must be an integer"},
-      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":1.5}})", "'engine.max_concurrency' must be an integer"},
-      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":0}})", "'engine.max_concurrency' must be in [1,"},
-      {R"({"model":"m","nodes":["h"],"engine":{"mtp":"yes"}})", "'engine.mtp' must be true or false"},
-      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":6}})", "'engine.mtp_depth' must be in [1, 5]"},
-      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":0}})", "'engine.mtp_depth' must be in [1, 5]"},
-      {R"({"model":"m","nodes":["h"],"engine":{"admission":"fast"}})", "'engine.admission' must be \"full\" or \"grow\""},
-      {R"({"model":"m","nodes":["h"],"engine":{"prefix_cache_gib":-1}})", "'engine.prefix_cache_gib' must be >= 0"},
-      {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"int8"}})", "'engine.kv_dtype' must be \"bf16\", \"fp8\" or \"fp4\""},
-      {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":8}})", "'engine.kv_dtype' must be a string"},
-      {R"({"model":"m","nodes":["h"],"engine":{"prefill":"fast"}})", "'engine.prefill' must be \"bounded\" or \"exact\""},
-      {R"({"model":"m","nodes":["h"],"ports":{"http":70000}})", "'ports.http' must be in [1, 65535]"},
-      {R"({"model":"m","nodes":["h"],"ports":{"fabric":5,"journal":5}})", "'ports.fabric' and 'ports.journal' must differ"},
+      {R"({"model":"m","nodes":["h"],"engine":{"max_concurency":2}})",
+       "unknown key 'engine.max_concurency'"},
+      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":"2"}})",
+       "'engine.max_concurrency' must be an integer"},
+      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":1.5}})",
+       "'engine.max_concurrency' must be an integer"},
+      {R"({"model":"m","nodes":["h"],"engine":{"max_concurrency":0}})",
+       "'engine.max_concurrency' must be in [1,"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp":"yes"}})",
+       "'engine.mtp' must be true or false"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":8}})",
+       "'engine.mtp_depth' must be in [1, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":0}})",
+       "'engine.mtp_depth' must be in [1, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"admission":"fast"}})",
+       "'engine.admission' must be \"full\" or \"grow\""},
+      {R"({"model":"m","nodes":["h"],"engine":{"prefix_cache_gib":-1}})",
+       "'engine.prefix_cache_gib' must be >= 0"},
+      {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"int8"}})",
+       "'engine.kv_dtype' must be \"bf16\", \"fp8\" or \"fp4\""},
+      {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":8}})",
+       "'engine.kv_dtype' must be a string"},
+      {R"({"model":"m","nodes":["h"],"engine":{"prefill":"fast"}})",
+       "'engine.prefill' must be \"bounded\" or \"exact\""},
+      {R"({"model":"m","nodes":["h"],"ports":{"http":70000}})",
+       "'ports.http' must be in [1, 65535]"},
+      {R"({"model":"m","nodes":["h"],"ports":{"fabric":5,"journal":5}})",
+       "'ports.fabric' and 'ports.journal' must differ"},
       {R"({"model":"m","nodes":["h"],"paths":{"logs":"/x"}})", "unknown key 'paths.logs'"},
       {R"({"model":"m","nodes":["h"],"paths":{"log_dir":3}})", "'paths.log_dir' must be a string"},
       {R"({"model":"m","nodes":["h"],)", "invalid JSON"},
@@ -109,9 +128,9 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
   };
   for (const auto& c : cases) {
     const std::string what = refusal(c.json);
-    require(what.find(c.needle) != std::string::npos,
-            std::string("expected a refusal naming ") + c.needle + " for " + c.json +
-                " — got: " + what);
+    require(what.find(c.needle) != std::string::npos, std::string("expected a refusal naming ") +
+                                                          c.needle + " for " + c.json +
+                                                          " — got: " + what);
   }
 }
 
@@ -122,16 +141,14 @@ DGPP_TEST(cluster_config_theResolvedFileParsesAndTheDigestIsStable) {
   require(ex.world() == 4 && ex.model == "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8" &&
               ex.http_port == 18080 && ex.engine.max_concurrency == 4 &&
               ex.engine.kv_capacity == 786432 && ex.engine.queue_limit == 8 &&
-              ex.engine.kv_dtype == "bf16" &&
-              ex.engine.decode_graph && ex.engine.mtp && ex.release.empty() &&
-              ex.ssh_user == "ops",
+              ex.engine.kv_dtype == "bf16" && ex.engine.decode_graph && ex.engine.mtp &&
+              ex.release.empty() && ex.ssh_user == "ops",
           "the resolved deployment has the model settings and example site values");
   require(dgpp::serve::config_digest("a") == dgpp::serve::config_digest("a") &&
               dgpp::serve::config_digest("a") != dgpp::serve::config_digest("b") &&
               dgpp::serve::config_digest("x").size() == 16,
           "the digest is stable, sensitive and 16 hex digits");
-  require(dgpp::serve::expand_home("~/x") != "~/x" &&
-              dgpp::serve::expand_home("/abs") == "/abs" &&
+  require(dgpp::serve::expand_home("~/x") != "~/x" && dgpp::serve::expand_home("/abs") == "/abs" &&
               dgpp::serve::expand_home("~user/x") == "~user/x",
           "~ expands, ~user and absolute paths do not change");
   try {
@@ -140,4 +157,10 @@ DGPP_TEST(cluster_config_theResolvedFileParsesAndTheDigestIsStable) {
   } catch (const std::runtime_error& e) {
     require(std::string(e.what()).find("cannot read") != std::string::npos, e.what());
   }
+}
+
+DGPP_TEST(cluster_config_accepts_dflash_seven_drafts) {
+  auto config = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"mtp":true,"mtp_depth":7}})", "dflash");
+  require(config.engine.mtp_depth == 7 && config.engine.mtp, "DFlash seven-token configuration");
 }

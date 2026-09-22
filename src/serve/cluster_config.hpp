@@ -63,7 +63,7 @@ struct ClusterConfig {
     bool no_eos = false;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
+    int mtp_depth = 1;             // draft tokens per step (1..7); needs mtp
     bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
     // The confidence-scheduled verify depth (engine/verify_schedule.hpp,
     // 2026-09-14; needs mtp and a family with a confidence head — DSpark):

@@ -416,15 +416,17 @@ struct MimoFamily final : ServeFamily {
     return context <= cfg.max_position_embeddings ? "" : "exceeds MiMo context capacity";
   }
   const char* kv_format_name() const override { return "bf16"; }
-  int decode_rows_cap() const override { return dgpp::kDecodeRows; } // single-token decode batches, up to eight slots
+  int decode_rows_cap() const override { return dgpp::mimo_dflash_enabled() ? 64 : dgpp::kDecodeRows; } // single-token decode batches, up to eight slots
   size_t lat_slot_bytes(int rows) const override { return size_t(rows) * cfg.hidden_size * 2; }
   dgpp::MemoryPlan plan(int rows, int64_t context, int rank, int world, bool, int slots,
                         bool mtp, int) const override {
-    if (slots < 1 || slots > dgpp::kDecodeRows / (mtp ? 2 : 1))
+    if (slots < 1 || slots > (dgpp::mimo_dflash_enabled() ? 8 : dgpp::kDecodeRows / (mtp ? 2 : 1)))
       throw std::invalid_argument("MiMo concurrency exceeds the eight decode rows");
     return dgpp::MimoModel::plan_memory(cfg, rows, context, rank, world, slots, mtp);
   }
   size_t snapshot_bytes(int world, bool mtp, int64_t context, int rows) const override {
+    if (mtp && dgpp::mimo_dflash_enabled())
+      return dgpp::MimoModel::snapshot_bytes(cfg, context, world, rows) + dgpp::MimoDFlash::state_bytes(std::max(rows, 64), world) + dgpp::MimoDFlash::width * 2;
     return dgpp::MimoModel::snapshot_bytes(cfg, context, world, rows) +
         (mtp ? size_t(dgpp::mimo_ring_capacity(std::max(dgpp::kDecodeRows, rows))) *
                    (cfg.mtp_blocks * (cfg.swa_num_key_value_heads / world) * 320 * 2 +
@@ -432,7 +434,7 @@ struct MimoFamily final : ServeFamily {
   }
   void build_model(dgpp::BoundaryReducer* reducer, int rank, int world, bool, int rows,
                    int64_t context, int slots, bool mtp, int) override {
-    if (slots < 1 || slots > dgpp::kDecodeRows / (mtp ? 2 : 1))
+    if (slots < 1 || slots > (dgpp::mimo_dflash_enabled() ? 8 : dgpp::kDecodeRows / (mtp ? 2 : 1)))
       throw std::invalid_argument("MiMo concurrency exceeds the eight decode rows");
     model = std::make_unique<dgpp::MimoModel>(cfg, ckpt, rows, context, reducer, rank, world, slots, mtp);
   }
@@ -442,7 +444,7 @@ struct MimoFamily final : ServeFamily {
       dgpp::net::CollectiveBus* bus, int rank, int world, uint16_t* pick_scratch, int batch_min_live,
       uint16_t* prefix_scratch, uint16_t* gather_scratch, int candidates,
       const dgpp::text::GrammarVocab* grammar, int prefix_slots, int mtp_depth) override {
-    if (mtp_depth < 1 || mtp_depth > 3)
+    if (mtp_depth < 1 || mtp_depth > (dgpp::mimo_dflash_enabled() ? 7 : 3))
       throw std::invalid_argument("MiMo native MTP supports one to three draft tokens");
     return std::make_unique<ServeGraphEngineOf<dgpp::MimoModel>>(
         model.get(), bus, rank, world, pick_scratch, cfg.vocab_size, 60000,
@@ -996,7 +998,7 @@ int main(int argc, char** argv) {
       "    [--graph-batch-min-live N (default min(2, max-concurrency);\n"
       "      must be in [1, max-concurrency])]\n"
       "      (the row batch needs max-concurrency * (1 + mtp depth) <= 8)\n"
-      "    [--mtp-depth N]  draft tokens per step (1..5; the verify runs 1+N rows)\n"
+      "    [--mtp-depth N]  draft tokens per step (1..7; the verify runs 1+N rows)\n"
       "    [--mtp-schedule]  the confidence-scheduled verify depth (DeepSeek-V4.1's\n"
       "      DSpark): a step verifies only the drafts whose prefix survival beats\n"
       "      the value of a verify row; greedy slots; exact\n"
@@ -1480,8 +1482,8 @@ int main(int argc, char** argv) {
                    mtp_schedule_row_ms, mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth);
     return 2;
   }
-  if (mtp_depth < 1 || mtp_depth > 5) {
-    DGPP_LOG_ERROR("--mtp-depth must be in [1, 5], got {}", mtp_depth);
+  if (mtp_depth < 1 || mtp_depth > 7) {
+    DGPP_LOG_ERROR("--mtp-depth must be in [1, 7], got {}", mtp_depth);
     return 2;
   }
   if (!mtp && mtp_depth != 1) {
@@ -1557,7 +1559,7 @@ int main(int argc, char** argv) {
     // GLM-5.3 up to 16. Fitting batch families remain available when
     // a deeper configuration exceeds the full-batch ceiling.
     // Reject configurations whose depth-1 batch already exceeds the cap.
-    if (mtp && std::string(family->name()) == "mimo_v2" && mtp_depth > 3)
+    if (mtp && std::string(family->name()) == "mimo_v2" && mtp_depth > (dgpp::mimo_dflash_enabled() ? 7 : 3))
       throw std::invalid_argument("MiMo native MTP supports one to three draft tokens");
     const int graph_rows_per_request = mtp ? 1 + mtp_depth : 1;
     int decode_rows = std::max(dgpp::kDecodeRows, max_concurrency * graph_rows_per_request);

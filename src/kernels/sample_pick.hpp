@@ -86,7 +86,7 @@ constexpr int kSampleMaxTopLogprobs = 20;
 // up to kSampleVerdictRows - 1 drafts — the families' kSpecRows (6 since
 // the DeepSeek-V4.1 DSpark block of five drafts, 2026-09-14; the kernel's
 // per-row tables moved to dynamic shared memory for it).
-constexpr int kSampleVerdictRows = 6;
+constexpr int kSampleVerdictRows = 8;
 
 // The sampling verdict's outcome per request, beside the PickVerdict the
 // device consumers (commit, token feeds) keep reading.

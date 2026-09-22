@@ -169,7 +169,8 @@ add_library(dgpp_kernels STATIC
   src/kernels/qsa.cu
   src/kernels/qsa_prefill.cu
   src/kernels/glm4_attn.cu
-  src/kernels/mimo_attn.cu)
+  src/kernels/mimo_attn.cu
+  src/kernels/mimo_dflash.cu)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
@@ -334,7 +335,8 @@ dgpp_set_common(dgpp_models_mimo)
 add_library(dgpp_models_mimo_layers STATIC
   src/models/mimo/loader.cpp
   src/models/mimo/layers.cpp
-  src/models/mimo/model.cpp)
+  src/models/mimo/model.cpp
+  src/models/mimo/dflash.cpp)
 target_include_directories(dgpp_models_mimo_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_mimo_layers PUBLIC dgpp_models_mimo dgpp_models_moe dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_mimo_layers)
@@ -342,6 +344,10 @@ dgpp_set_common(dgpp_models_mimo_layers)
 add_executable(mimo_fp8_dense_check apps/mimo_fp8_dense_check.cpp)
 target_link_libraries(mimo_fp8_dense_check PRIVATE dgpp_models_mimo_layers)
 dgpp_set_common(mimo_fp8_dense_check)
+
+add_executable(mimo_dflash_check apps/mimo_dflash_check.cpp)
+target_link_libraries(mimo_dflash_check PRIVATE dgpp_models_mimo_layers)
+dgpp_set_common(mimo_dflash_check)
 
 add_executable(mimo_layer_check apps/mimo_layer_check.cpp)
 target_link_libraries(mimo_layer_check PRIVATE dgpp_models_mimo_layers)
