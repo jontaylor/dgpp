@@ -75,6 +75,8 @@ void mimo_attention_online_decode(const MimoAttentionShape& shape, const uint16_
 // Three fused tiled passes, no global workspace or capture-time allocation.
 // Retains BF16 score/subtraction/probability roundings; tensor-core QK/PV
 // and sequential denominator summation can differ from parallel prefill.
+// online=true uses one-pass recurrence with BF16 unnormalized PV weights;
+// it changes subtraction/probability rounding and FP32 accumulation order.
 void mimo_attention_bounded_prefill(const MimoAttentionShape& shape, const uint16_t* q,
     const uint16_t* k_cache, const uint16_t* v_cache, const int64_t* positions,
     const uint16_t* sinks, uint16_t* out, int end_key, cudaStream_t stream, bool online = false);
