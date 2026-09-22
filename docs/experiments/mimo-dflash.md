@@ -45,7 +45,7 @@ Local cross-build (no GPU execution):
 
 ```sh
 cmake --preset spark-cross
-cmake --build --preset spark-cross --parallel 2 --target dgpp_serve_app mimo_dflash_check glm_pick_test
+cmake --build --preset spark-cross --parallel 2 --target dgpp_serve_app mimo_dflash_check mimo_dflash_test glm_pick_test
 ```
 
 On idle Spark hardware, the standalone probe loads only the target global
@@ -54,6 +54,7 @@ world 1). It checks a real-weight two-request block, exact eager/graph replay,
 and context snapshot/restore after poisoning the cache:
 
 ```sh
+./mimo_dflash_test
 ./mimo_dflash_check "$CHECKPOINT" "$OUT"
 python3 tools/mimo_dflash_reference.py "$CHECKPOINT" "$OUT"
 DGPP_TEST_FILTER=sample_pick_full_block ./glm_pick_test

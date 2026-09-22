@@ -345,6 +345,10 @@ add_executable(mimo_fp8_dense_check apps/mimo_fp8_dense_check.cpp)
 target_link_libraries(mimo_fp8_dense_check PRIVATE dgpp_models_mimo_layers)
 dgpp_set_common(mimo_fp8_dense_check)
 
+add_executable(mimo_dflash_test tests/cuda/mimo_dflash_test.cpp)
+target_link_libraries(mimo_dflash_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(mimo_dflash_test)
+
 add_executable(mimo_dflash_check apps/mimo_dflash_check.cpp)
 target_link_libraries(mimo_dflash_check PRIVATE dgpp_models_mimo_layers)
 dgpp_set_common(mimo_dflash_check)
