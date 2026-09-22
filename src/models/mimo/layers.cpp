@@ -1,5 +1,7 @@
 #include "models/mimo/layers.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 #include "kernels/glm_norm.hpp"
@@ -122,13 +124,20 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uin
   if (!request_ids && tokens > 1 && attention_scores_ && end_key > 0) {
     // Projection/MoE chunks can be large while attention's temporary score
     // matrix stays bounded. The expanded ring preserves the whole chunk.
+    // Read once outside the captured kernel path; explicit opt-in until
+    // real-weight and whole-service validation establishes a benefit.
+    static const bool fused_prefill = [] {
+      const char* value = std::getenv("DGPP_MIMO_FUSED_PREFILL");
+      return value && std::strcmp(value, "1") == 0;
+    }();
     for (int first = 0; first < tokens; first += attention_tile_rows) {
       auto tile = chunk;
       tile.requests = std::min(attention_tile_rows, tokens - first);
       mimo_attention_prefill(tile, q_ + size_t(first) * shape_.q_width(), k_cache, v_cache,
                              positions + first, w_.sinks,
                              attn_ + size_t(first) * shape_.q_heads * 128, attention_scores_,
-                             end_key - tokens + first + tile.requests, stream);
+                             end_key - tokens + first + tile.requests, stream, true, true,
+                             fused_prefill);
     }
   } else if (request_ids && !shape_.window && attention_scores_) {
     mimo_attention_decode(chunk, q_, k_cache, v_cache, positions, w_.sinks, attn_,

@@ -96,6 +96,81 @@ struct Fixture {
 };
 }  // namespace
 
+// Exact A/B gate: this candidate must not introduce a new numerical tolerance.
+DGPP_TEST(mimo_cuda_fused_prefill_is_bitwise_equal_and_kernel_only) {
+  for (int window : {0, 128}) {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      const int rows = scenario == 1 ? 17 : (scenario == 2 ? 128 : 1);
+      const int capacity = window ? 263 : (scenario == 0 ? 3 : (scenario == 3 ? 65536 : 8192));
+      const int end_key = window ? capacity * 3 + 7 : capacity;  // wrapped non-power-of-two ring
+      Fixture f({rows, 32, window ? 4 : 2, capacity, window}, true);
+      DevBuf scores(size_t(rows) * 32 * capacity * 6);
+      uint32_t rng = 0x12345678;
+      auto fill = [&](std::vector<uint16_t>& data) {
+        for (auto& x : data) {
+          rng = rng * 1664525u + 1013904223u;
+          x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+        }
+      };
+      for (int h = 0; h < f.shape.q_heads; ++h)
+        f.sinks[h] = dgpp::float_to_bf16_bits(h % 2 ? 20.f : -20.f);
+      f.dsinks.upload(f.sinks.data(), f.sinks.size() * 2);
+      fill(f.q);
+      fill(f.k);
+      fill(f.v);
+      f.dq.upload(f.q.data(), f.q.size() * 2);
+      f.dk.upload(f.k.data(), f.k.size() * 2);
+      f.dv.upload(f.v.data(), f.v.size() * 2);
+      for (bool parallel : {false, true}) {
+        for (bool sink : {false, true}) {
+          auto run = [&](bool fused) {
+            dgpp::mimo_attention_prefill(
+                f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
+                f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+                f.dout.as<uint16_t>(), scores.as<float>(), end_key, f.stream,
+                parallel, true, fused);
+          };
+          // end_key is fixed across replay; positions follow its public contract.
+          for (int r = 0; r < rows; ++r) f.positions[r] = end_key - rows + r;
+          f.dpos.upload(f.positions.data(), rows * 8);
+          cudaGraph_t graph;
+          DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+          run(true);
+          DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+          size_t count = 0;
+          DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+          std::vector<cudaGraphNode_t> nodes(count);
+          DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
+          for (auto node : nodes) {
+            cudaGraphNodeType type;
+            DGPP_CUDA_OK(cudaGraphNodeGetType(node, &type));
+            if (type != cudaGraphNodeTypeKernel)
+              throw std::runtime_error("fused prefill graph contains non-kernel node");
+          }
+          cudaGraphExec_t executable;
+          DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+          for (int replay = 0; replay < 2; ++replay) {
+            // Mutated values detect stale scratch/output on graph replay.
+            fill(f.v);
+            f.dv.upload(f.v.data(), f.v.size() * 2);
+            run(false);
+            DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+            std::vector<uint16_t> expected(f.output.size()), got(f.output.size());
+            f.dout.download(expected.data(), expected.size() * 2);
+            DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+            DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+            f.dout.download(got.data(), got.size() * 2);
+            if (expected != got)
+              throw std::runtime_error("fused prefill changed BF16 output bits");
+          }
+          DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+          DGPP_CUDA_OK(cudaGraphDestroy(graph));
+        }
+      }
+    }
+  }
+}
+
 DGPP_TEST(mimo_cuda_global_and_ring_attention_match_reference) {
   for (int window : {0, 128}) {
     // Actual TP4 head shapes: 16 Q heads, 1 global / 2 sliding KV heads.
@@ -512,7 +587,7 @@ void benchmark() {
     dgpp::mimo_qkv_append(f.shape, f.df.as<uint16_t>(), f.dfreq.as<float>(), f.dpos.as<int64_t>(),
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream, true);
-    for (int tensor = 0; tensor < 4; ++tensor) {
+    for (int tensor = 0; tensor < 5; ++tensor) {
       cudaEvent_t start, end;
       DGPP_CUDA_OK(cudaEventCreate(&start));
       DGPP_CUDA_OK(cudaEventCreate(&end));
@@ -522,7 +597,7 @@ void benchmark() {
                                        f.dv.as<uint16_t>(), f.dpos.as<int64_t>(),
                                        window ? f.dsinks.as<uint16_t>() : nullptr,
                                        f.dout.as<uint16_t>(), scores.as<float>(), context, f.stream,
-                                       tensor >= 2, tensor == 3);
+                                       tensor >= 2, tensor >= 3, tensor == 4);
         else
           dgpp::mimo_attention(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
                                f.dv.as<uint16_t>(), f.dpos.as<int64_t>(),

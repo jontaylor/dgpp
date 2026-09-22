@@ -162,7 +162,8 @@ __global__ void attention_kernel(MimoAttentionShape s, const uint16_t* q, const 
                                  float* scores, bool precomputed = false,
                                  uint16_t* probabilities = nullptr,
                                  const int32_t* request_ids = nullptr,
-                                 bool parallel_softmax = false, bool adaptive_decode = false) {
+                                 bool parallel_softmax = false, bool adaptive_decode = false,
+                                 float* normalizers = nullptr) {
   const int r = blockIdx.y, h = blockIdx.x, lane = threadIdx.x;
   const int64_t pos = positions[r];
   float* saved = scores ? scores + (int64_t(r) * s.q_heads + h) * s.capacity : nullptr;
@@ -230,6 +231,13 @@ __global__ void attention_kernel(MimoAttentionShape s, const uint16_t* q, const 
   if (lane == 0 && sinks)
     denominator = __fadd_rn(denominator, expf(rb(bf16_bits_to_float(sinks[h]) - max_score)));
   __syncthreads();
+  if (normalizers) {
+    if (lane == 0) {
+      normalizers[(int64_t(r) * s.q_heads + h) * 2] = max_score;
+      normalizers[(int64_t(r) * s.q_heads + h) * 2 + 1] = denominator;
+    }
+    return;
+  }
   float sum = 0;
   for (int64_t t = begin; t <= pos; t += 128) {
     values[lane] =
@@ -303,9 +311,11 @@ __global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities,
 }
 // Four warps share one probability tile across all 128 value columns.
 // Each output fragment retains the same ordered MMA chain as value_tiles.
+template <bool fused = false>
 __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabilities,
                                  const uint16_t* vc, const int64_t* positions, uint16_t* out,
-                                 int first_key, int end_key) {
+                                 int first_key, int end_key, const float* scores = nullptr,
+                                 const float* normalizers = nullptr) {
   using namespace nvcuda;
   const int row0 = blockIdx.x * 16, head = blockIdx.y, tid = threadIdx.x;
   const int warp = tid / 32, kh = head / (s.q_heads / s.kv_heads);
@@ -325,9 +335,18 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
       uint16_t probability = 0;
       if (row < s.requests && key < end) {
         const int64_t pos = positions[row];
-        if (key <= pos && (!s.window || key >= pos - s.window + 1))
-          probability =
-              probabilities[(int64_t(row) * s.q_heads + head) * s.capacity + cache_slot(s, key)];
+        if (key <= pos && (!s.window || key >= pos - s.window + 1)) {
+          const int64_t index = int64_t(row) * s.q_heads + head;
+          if constexpr (fused) {
+            // Identical BF16 difference/probability rounding and ordered PV
+            // MMA chain to the materialized path. No online rescaling.
+            probability = float_to_bf16_bits(
+                expf(rb(scores[index * s.capacity + cache_slot(s, key)] -
+                        normalizers[index * 2])) / normalizers[index * 2 + 1]);
+          } else {
+            probability = probabilities[index * s.capacity + cache_slot(s, key)];
+          }
+        }
       }
       reinterpret_cast<uint16_t*>(a)[i] = probability;
     }
@@ -488,7 +507,7 @@ void mimo_attention_decode(const MimoAttentionShape& s, const uint16_t* q, const
 void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, const uint16_t* kc,
                             const uint16_t* vc, const int64_t* positions, const uint16_t* sinks,
                             uint16_t* out, float* scores, int end_key, cudaStream_t stream,
-                            bool parallel_softmax, bool wide_values) {
+                            bool parallel_softmax, bool wide_values, bool fused_probabilities) {
   s.validate();
   if (!q || !kc || !vc || !positions || !out || !scores || end_key < s.requests ||
       end_key > 1048576 || (!s.window && end_key > s.capacity) ||
@@ -500,12 +519,19 @@ void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, cons
   DGPP_CUDA_OK(cudaGetLastError());
   auto* probabilities =
       reinterpret_cast<uint16_t*>(scores + int64_t(s.requests) * s.q_heads * s.capacity);
+  // Reuse the probability region for two FP32 normalizers per query/head.
+  // Tiny capacities retain the baseline because its region is too small.
+  const bool fused = fused_probabilities && wide_values && s.capacity >= 4;
+  auto* normalizers = fused ? reinterpret_cast<float*>(probabilities) : nullptr;
   attention_kernel<<<dim3(s.q_heads, s.requests), 128, 0, stream>>>(
       s, q, kc, vc, positions, sinks, out, true, scores, true, probabilities, nullptr,
-      parallel_softmax);
+      parallel_softmax, false, normalizers);
   DGPP_CUDA_OK(cudaGetLastError());
-  if (wide_values)
-    value_tiles_wide<<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+  if (fused)
+    value_tiles_wide<true><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+        s, nullptr, vc, positions, out, first, end_key, scores, normalizers);
+  else if (wide_values)
+    value_tiles_wide<false><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
         s, probabilities, vc, positions, out, first, end_key);
   else
     value_tiles<<<dim3(8, (s.requests + 15) / 16, s.q_heads), 32, 0, stream>>>(

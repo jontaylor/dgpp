@@ -54,10 +54,15 @@ void mimo_attention_decode(const MimoAttentionShape& shape, const uint16_t* q,
 // Consecutive, nonnegative rows of one sequence ending at end_key - 1.
 // Tensor-core QK and PV, preserving BF16 score/probability roundings.
 // Workspace at scores must hold rows * q_heads * capacity * 6 bytes:
-// FP32 scores followed by BF16 probabilities.
+// FP32 scores followed by BF16 probabilities. Experimental fused_probabilities
+// keeps QK/normalization/PV accumulation unchanged but builds probabilities in
+// shared PV tiles. Uses the same workspace allocation, with only two FP32
+// normalizers per query/head in its probability region; falls back unless
+// wide_values is enabled and capacity >= 4. Decode is unaffected.
 void mimo_attention_prefill(const MimoAttentionShape& shape, const uint16_t* q,
                             const uint16_t* k_cache, const uint16_t* v_cache,
                             const int64_t* positions, const uint16_t* sinks, uint16_t* out,
                             float* scores, int end_key, cudaStream_t stream,
-                            bool parallel_softmax = true, bool wide_values = true);
+                            bool parallel_softmax = true, bool wide_values = true,
+                            bool fused_probabilities = false);
 }  // namespace dgpp
