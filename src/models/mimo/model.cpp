@@ -1,4 +1,5 @@
 #include "models/mimo/model.hpp"
+#include "models/mimo/head.hpp"
 
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
@@ -219,8 +220,8 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
     store_draft_hidden(h_ + size_t(run.T - n) * cfg_.hidden_size, in.req_ids + run.T - n,
                        in.pos + run.T - n, n);
   }
-  gemm_.matmul(h_, globals_.head, logits_, run.T, globals_.vocab_count, cfg_.hidden_size,
-               DType::BF16, GemmOut::F32, cfg_.hidden_size, nullptr, 0, stream_);
+  mimo_project_head(gemm_, h_, globals_.head, logits_, run.T, globals_.vocab_count,
+                     cfg_.hidden_size, run.decode, run.all_rows, stream_);
   if (run.capture) return finish_run(run, std::move(out));
   if (boundary_) boundary_->settle();
   // Session bounds validate positions before entry; status still gates commit.

@@ -343,6 +343,10 @@ add_executable(mimo_layer_check apps/mimo_layer_check.cpp)
 target_link_libraries(mimo_layer_check PRIVATE dgpp_models_mimo_layers)
 dgpp_set_common(mimo_layer_check)
 
+add_executable(mimo_head_check apps/mimo_head_check.cpp)
+target_link_libraries(mimo_head_check PRIVATE dgpp_models_mimo_layers)
+dgpp_set_common(mimo_head_check)
+
 add_executable(mimo_checkpoint_check apps/mimo_checkpoint_check.cpp)
 target_link_libraries(mimo_checkpoint_check PRIVATE dgpp_models_mimo)
 dgpp_set_common(mimo_checkpoint_check)
