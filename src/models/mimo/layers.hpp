@@ -29,7 +29,7 @@ class MimoDecoderLayer {
   // cache_only appends exactly the same K/V, leaves residual unchanged and
   // skips attention, output/MLP projections and all collectives. Use it only
   // when no hidden output is needed from this layer.
-  void enqueue(uint16_t* residual, const int64_t* positions, uint16_t* k_cache, uint16_t* v_cache,
+  void enqueue(uint16_t* residual, const int64_t* positions, void* k_cache, void* v_cache,
                int32_t* status, BoundaryReducer* boundary, cudaStream_t stream, int tokens = 1,
                int end_key = 0, bool capture = false, const int32_t* request_ids = nullptr,
                bool cache_only = false);

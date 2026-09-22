@@ -36,6 +36,8 @@ struct MimoAttentionShape {
   int kv_heads = 4;
   int capacity = 0;
   int window = 0;  // 0: global, 128: SWA; capacity >=128 retains the window plus chunk history
+  bool fp8_cache = false;  // unit-scale E4M3, base model only
+  int cache_element_bytes() const { return fp8_cache ? 1 : 2; }
   int q_width() const { return q_heads * 192; }
   int k_width() const { return kv_heads * 192; }
   int v_width() const { return kv_heads * 128; }

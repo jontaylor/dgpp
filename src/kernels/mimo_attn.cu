@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include <cuda_bf16.h>
+#include "kernels/mimo_cache.cuh"
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -26,7 +27,7 @@ __device__ bool invalid(MimoAttentionShape s, int64_t p) {
 }
 
 __global__ void append_kernel(MimoAttentionShape s, const uint16_t* fused, const float* freq,
-                              const int64_t* positions, uint16_t* q, uint16_t* kc, uint16_t* vc,
+                              const int64_t* positions, uint16_t* q, void* kc, void* vc,
                               int32_t* status, bool shared_cache, const int32_t* request_ids) {
   const int r = blockIdx.y, head = blockIdx.x, d = threadIdx.x;
   const int64_t p = positions[r];
@@ -40,8 +41,8 @@ __global__ void append_kernel(MimoAttentionShape s, const uint16_t* fused, const
   if (head >= s.q_heads + s.kv_heads) {
     if (d < 128) {
       const int h = head - s.q_heads - s.kv_heads;
-      vc[slot * v_width + h * 128 + d] = float_to_bf16_bits(
-          __fmul_rn(bf16_bits_to_float(source[q_width + k_width + h * 128 + d]), 0.707f));
+      mimo_cache_store(vc, slot * v_width + h * 128 + d, rb(
+          __fmul_rn(bf16_bits_to_float(source[q_width + k_width + h * 128 + d]), 0.707f)), s.fp8_cache);
     }
     return;
   }
@@ -49,7 +50,7 @@ __global__ void append_kernel(MimoAttentionShape s, const uint16_t* fused, const
   const bool is_q = head < s.q_heads;
   const int h = is_q ? head : head - s.q_heads;
   source += (is_q ? 0 : q_width) + h * 192;
-  auto* dest = is_q ? q + int64_t(r) * q_width + h * 192 : kc + slot * k_width + h * 192;
+
   float value = bf16_bits_to_float(source[d]);
   if (d < 64) {
     const float angle = __fmul_rn(static_cast<float>(p), freq[d % 32]);
@@ -57,24 +58,25 @@ __global__ void append_kernel(MimoAttentionShape s, const uint16_t* fused, const
     const float mate = bf16_bits_to_float(source[d < 32 ? d + 32 : d - 32]);
     value = rb(__fadd_rn(rb(__fmul_rn(value, cos)), rb(__fmul_rn(d < 32 ? -mate : mate, sin))));
   }
-  dest[d] = float_to_bf16_bits(value);
+  if (is_q) q[int64_t(r) * q_width + h * 192 + d] = float_to_bf16_bits(value);
+  else mimo_cache_store(kc, slot * k_width + h * 192 + d, value, s.fp8_cache);
 }
 
-__device__ float score(MimoAttentionShape s, const uint16_t* q, const uint16_t* kc, int r, int h,
+__device__ float score(MimoAttentionShape s, const uint16_t* q, const void* kc, int r, int h,
                        int kh, int64_t pos, bool shared_cache, const int32_t* request_ids) {
   const int64_t slot = int64_t(shared_cache ? 0 : (request_ids ? request_ids[r] : r)) * s.capacity +
                        cache_slot(s, pos);
   float dot = 0;
   for (int d = 0; d < 192; ++d)
     dot = __fmaf_rn(bf16_bits_to_float(q[(int64_t(r) * s.q_heads + h) * 192 + d]),
-                    bf16_bits_to_float(kc[slot * s.kv_heads * 192 + kh * 192 + d]), dot);
+                    bf16_bits_to_float(mimo_cache_load(kc, slot * s.kv_heads * 192 + kh * 192 + d, s.fp8_cache)), dot);
   // 192^-0.5 narrowed once, as in the reference Python scalar multiplier.
   return rb(__fmul_rn(rb(dot), 0.07216878364870322f));
 }
 
 // One warp computes a 16-query by 16-key QK tile with BF16 tensor cores.
 // Absolute positions retain the same causal/ring mapping as the scalar path.
-__global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const uint16_t* kc,
+__global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const void* kc,
                             const int64_t* positions, float* scores, int first_key, int end_key) {
   using namespace nvcuda;
   const int row0 = blockIdx.y * 16, head = blockIdx.z;
@@ -93,7 +95,7 @@ __global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const uint1
     reinterpret_cast<uint16_t*>(a)[i] =
         row < s.requests ? q[(int64_t(row) * s.q_heads + head) * 192 + dim] : 0;
     reinterpret_cast<uint16_t*>(b)[i] =
-        key < end_key ? kc[(int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 192 + dim] : 0;
+        key < end_key ? mimo_cache_load(kc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 192 + dim, s.fp8_cache) : 0;
   }
   __syncwarp();
   wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
@@ -121,7 +123,7 @@ __global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const uint1
 // Decode tiles share coalesced Q/K loads while preserving each score's
 // scalar FP32 FMA order. Tensor QK changes BF16 rounding at rare ties and
 // can switch routed experts in real layers, so it is not used for decode.
-__global__ void decode_score_tiles(MimoAttentionShape s, const uint16_t* q, const uint16_t* kc,
+__global__ void decode_score_tiles(MimoAttentionShape s, const uint16_t* q, const void* kc,
                                    const int64_t* positions, const int32_t* request_ids,
                                    float* scores) {
   const int row = blockIdx.z, kh = blockIdx.y, tid = threadIdx.x;
@@ -141,7 +143,7 @@ __global__ void decode_score_tiles(MimoAttentionShape s, const uint16_t* q, cons
                  : 0;
       const int64_t slot = int64_t(request) * s.capacity + cache_slot(s, key);
       b[dim * 16 + h] =
-          key <= pos ? bf16_bits_to_float(kc[(slot * s.kv_heads + kh) * 192 + dim]) : 0;
+          key <= pos ? bf16_bits_to_float(mimo_cache_load(kc, (slot * s.kv_heads + kh) * 192 + dim, s.fp8_cache)) : 0;
     }
     __syncthreads();
     const int h = tid / 16, key = key0 + tid % 16;
@@ -156,8 +158,8 @@ __global__ void decode_score_tiles(MimoAttentionShape s, const uint16_t* q, cons
   }
 }
 
-__global__ void attention_kernel(MimoAttentionShape s, const uint16_t* q, const uint16_t* kc,
-                                 const uint16_t* vc, const int64_t* positions,
+__global__ void attention_kernel(MimoAttentionShape s, const uint16_t* q, const void* kc,
+                                 const void* vc, const int64_t* positions,
                                  const uint16_t* sinks, uint16_t* out, bool shared_cache,
                                  float* scores, bool precomputed = false,
                                  uint16_t* probabilities = nullptr,
@@ -259,14 +261,14 @@ __global__ void attention_kernel(MimoAttentionShape s, const uint16_t* q, const 
       const int64_t slot =
           int64_t(shared_cache ? 0 : (request_ids ? request_ids[r] : r)) * s.capacity +
           cache_slot(s, t + j);
-      sum = __fmaf_rn(values[j], bf16_bits_to_float(vc[slot * s.kv_heads * 128 + kh * 128 + lane]),
+      sum = __fmaf_rn(values[j], bf16_bits_to_float(mimo_cache_load(vc, slot * s.kv_heads * 128 + kh * 128 + lane, s.fp8_cache)),
                       sum);
     }
     __syncthreads();
   }
   if (!probabilities) dest[lane] = float_to_bf16_bits(sum);
 }
-__global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities, const uint16_t* vc,
+__global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities, const void* vc,
                             const int64_t* positions, uint16_t* out, int first_key, int end_key) {
   using namespace nvcuda;
   const int row0 = blockIdx.y * 16, head = blockIdx.z, dim0 = blockIdx.x * 16;
@@ -292,7 +294,7 @@ __global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities,
       reinterpret_cast<uint16_t*>(a)[i] = prob;
       const int vkey = key0 + i / 16;
       reinterpret_cast<uint16_t*>(b)[i] =
-          vkey < end ? vc[(int64_t(cache_slot(s, vkey)) * s.kv_heads + kh) * 128 + dim0 + i % 16]
+          vkey < end ? mimo_cache_load(vc, (int64_t(cache_slot(s, vkey)) * s.kv_heads + kh) * 128 + dim0 + i % 16, s.fp8_cache)
                      : 0;
     }
     __syncwarp();
@@ -313,7 +315,7 @@ __global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities,
 // Each output fragment retains the same ordered MMA chain as value_tiles.
 template <bool fused = false>
 __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabilities,
-                                 const uint16_t* vc, const int64_t* positions, uint16_t* out,
+                                 const void* vc, const int64_t* positions, uint16_t* out,
                                  int first_key, int end_key, const float* scores = nullptr,
                                  const float* normalizers = nullptr) {
   using namespace nvcuda;
@@ -353,7 +355,7 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
     for (int i = tid; i < 16 * 128; i += 128) {
       const int key = key0 + i / 128, dim = i % 128;
       reinterpret_cast<uint16_t*>(b)[i] =
-          key < end ? vc[(int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 128 + dim] : 0;
+          key < end ? mimo_cache_load(vc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 128 + dim, s.fp8_cache) : 0;
     }
     __syncthreads();
     wmma::load_matrix_sync(af, a, 16);
@@ -379,7 +381,7 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
 // A single online rescale would change that contract. Global workspace: zero.
 template <bool online>
 __global__ void bounded_prefill(MimoAttentionShape s, const uint16_t* q,
-                               const uint16_t* kc, const uint16_t* vc,
+                               const void* kc, const void* vc,
                                const int64_t* positions, const uint16_t* sinks,
                                uint16_t* out, bool shared_cache = true, const int32_t* request_ids = nullptr) {
   using namespace nvcuda;
@@ -418,7 +420,7 @@ __global__ void bounded_prefill(MimoAttentionShape s, const uint16_t* q,
       for (int i = tid; i < 16 * 192; i += 128) {
         const int key = key0 + i / 192;
         reinterpret_cast<uint16_t*>(kb)[i] = key < end ?
-            kc[((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 192 + i % 192] : 0;
+            mimo_cache_load(kc, ((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 192 + i % 192, s.fp8_cache) : 0;
       }
       __syncthreads();
       if (warp == 0) {
@@ -488,7 +490,7 @@ __global__ void bounded_prefill(MimoAttentionShape s, const uint16_t* q,
         for (int i = tid; i < 16 * 128; i += 128) {
           const int key = key0 + i / 128;
           reinterpret_cast<uint16_t*>(vb)[i] = key < end ?
-              vc[((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 128 + i % 128] : 0;
+              mimo_cache_load(vc, ((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 128 + i % 128, s.fp8_cache) : 0;
         }
         __syncthreads();
         wmma::load_matrix_sync(af, pa, 16);
@@ -516,7 +518,7 @@ __global__ void bounded_prefill(MimoAttentionShape s, const uint16_t* q,
 
 constexpr int decode_value_split = 512;
 __global__ void decode_value_parts(MimoAttentionShape s, const uint16_t* probabilities,
-                                   const uint16_t* vc, const int64_t* positions,
+                                   const void* vc, const int64_t* positions,
                                    const int32_t* request_ids, float* parts, int splits) {
   using namespace nvcuda;
   const int split = blockIdx.x, kh = blockIdx.y, row = blockIdx.z, tid = threadIdx.x;
@@ -547,7 +549,7 @@ __global__ void decode_value_parts(MimoAttentionShape s, const uint16_t* probabi
     for (int i = tid; i < 16 * 128; i += 128) {
       const int key = key0 + i / 128, dim = i % 128;
       const int64_t slot = int64_t(request) * s.capacity + cache_slot(s, key);
-      reinterpret_cast<uint16_t*>(b)[i] = key < end ? vc[(slot * s.kv_heads + kh) * 128 + dim] : 0;
+      reinterpret_cast<uint16_t*>(b)[i] = key < end ? mimo_cache_load(vc, (slot * s.kv_heads + kh) * 128 + dim, s.fp8_cache) : 0;
     }
     __syncthreads();
     wmma::load_matrix_sync(af, a, 16);
@@ -584,7 +586,7 @@ __global__ void decode_value_reduce(MimoAttentionShape s, const float* parts,
 }  // namespace
 
 void mimo_qkv_append(const MimoAttentionShape& s, const uint16_t* fused, const float* freq,
-                     const int64_t* positions, uint16_t* q, uint16_t* kc, uint16_t* vc,
+                     const int64_t* positions, uint16_t* q, void* kc, void* vc,
                      int32_t* status, cudaStream_t stream, bool shared_cache,
                      const int32_t* request_ids) {
   s.validate();
@@ -596,8 +598,8 @@ void mimo_qkv_append(const MimoAttentionShape& s, const uint16_t* fused, const f
       s, fused, freq, positions, q, kc, vc, status, shared_cache, request_ids);
   DGPP_CUDA_OK(cudaGetLastError());
 }
-void mimo_attention(const MimoAttentionShape& s, const uint16_t* q, const uint16_t* kc,
-                    const uint16_t* vc, const int64_t* positions, const uint16_t* sinks,
+void mimo_attention(const MimoAttentionShape& s, const uint16_t* q, const void* kc,
+                    const void* vc, const int64_t* positions, const uint16_t* sinks,
                     uint16_t* out, cudaStream_t stream, bool shared_cache, float* scores,
                     const int32_t* request_ids) {
   s.validate();
@@ -609,8 +611,8 @@ void mimo_attention(const MimoAttentionShape& s, const uint16_t* q, const uint16
       s, q, kc, vc, positions, sinks, out, shared_cache, scores, false, nullptr, request_ids);
   DGPP_CUDA_OK(cudaGetLastError());
 }
-void mimo_attention_decode(const MimoAttentionShape& s, const uint16_t* q, const uint16_t* kc,
-                           const uint16_t* vc, const int64_t* positions, const uint16_t* sinks,
+void mimo_attention_decode(const MimoAttentionShape& s, const uint16_t* q, const void* kc,
+                           const void* vc, const int64_t* positions, const uint16_t* sinks,
                            uint16_t* out, float* scores, cudaStream_t stream,
                            const int32_t* request_ids) {
   s.validate();
@@ -644,7 +646,7 @@ void mimo_attention_decode(const MimoAttentionShape& s, const uint16_t* q, const
 }
 
 void mimo_attention_online_decode(const MimoAttentionShape& s, const uint16_t* q,
-    const uint16_t* kc, const uint16_t* vc, const int64_t* positions,
+    const void* kc, const void* vc, const int64_t* positions,
     const uint16_t* sinks, uint16_t* out, cudaStream_t stream, const int32_t* request_ids) {
   s.validate();
   if (!q || !kc || !vc || !positions || !out)
@@ -655,7 +657,7 @@ void mimo_attention_online_decode(const MimoAttentionShape& s, const uint16_t* q
 }
 
 void mimo_attention_bounded_prefill(const MimoAttentionShape& s, const uint16_t* q,
-    const uint16_t* kc, const uint16_t* vc, const int64_t* positions,
+    const void* kc, const void* vc, const int64_t* positions,
     const uint16_t* sinks, uint16_t* out, int end_key, cudaStream_t stream, bool online) {
   s.validate();
   if (!q || !kc || !vc || !positions || !out || end_key < s.requests ||
@@ -671,8 +673,8 @@ void mimo_attention_bounded_prefill(const MimoAttentionShape& s, const uint16_t*
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
-void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, const uint16_t* kc,
-                            const uint16_t* vc, const int64_t* positions, const uint16_t* sinks,
+void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, const void* kc,
+                            const void* vc, const int64_t* positions, const uint16_t* sinks,
                             uint16_t* out, float* scores, int end_key, cudaStream_t stream,
                             bool parallel_softmax, bool wide_values, bool fused_probabilities) {
   s.validate();

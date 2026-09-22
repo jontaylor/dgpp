@@ -1,4 +1,5 @@
 #include "models/mimo/weights.hpp"
+#include "models/mimo/cache_format.hpp"
 
 #include <cstring>
 #include <filesystem>
@@ -280,6 +281,13 @@ MimoCheckpointWeights::MimoCheckpointWeights(const std::string& directory)
   const auto& weights = doc.root.at("weight_map");
   if (!weights.is_object()) fail("weight_map must be an object");
   for (const auto& entry : weights.members()) {
+    // This experiment implements the recipe's unscaled cache only. Never
+    // silently discard checkpoint scale metadata (even an apparent unit scale).
+    if (mimo_fp8_cache_enabled()) {
+      const std::string_view key = entry.key;
+      for (const auto suffix : {".k_scale", ".v_scale", ".kv_scale", ".k_scale_inv", ".v_scale_inv"})
+        if (key.ends_with(suffix)) fail("unit-scale FP8 cache rejects checkpoint KV scales: " + std::string(key));
+    }
     if (!entry.value.is_string()) fail("shard name must be a string");
     const std::filesystem::path name(entry.value.as_string());
     if (name.empty() || name != name.filename() || name.extension() != ".safetensors")

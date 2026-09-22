@@ -1,4 +1,5 @@
 #include "models/mimo/config.hpp"
+#include "models/mimo/cache_format.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -50,6 +51,21 @@ std::vector<int> pattern(const minijson::Value& root, const std::string& name, i
 
 MimoTextConfig MimoTextConfig::parse(const minijson::Value& root) {
   if (!root.is_object()) reject("root", "expected object");
+  if (mimo_fp8_cache_enabled()) {
+    auto check_cache_scales = [&](const minijson::Value& object) {
+      for (const auto name : {"k_scale", "v_scale", "kv_scale"}) {
+        if (const auto* scale = object.find(name))
+          if (!scale->is_number() || scale->as_double() != 1.0)
+            reject(name, "FP8 cache experiment requires unit scales");
+      }
+      if (const auto* dynamic = object.find("calculate_kv_scales"))
+        if (!dynamic->is_bool() || dynamic->as_bool())
+          reject("calculate_kv_scales", "dynamic FP8 cache scales are unsupported");
+    };
+    check_cache_scales(root);
+    if (const auto* quantization = root.find("quantization_config"))
+      if (quantization->is_object()) check_cache_scales(*quantization);
+  }
   MimoTextConfig c;
   string(root, "model_type", "mimo_v2");
   const auto& arch = field(root, "architectures");

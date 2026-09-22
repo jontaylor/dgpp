@@ -1,4 +1,5 @@
 #include "models/mimo/model.hpp"
+#include "models/mimo/cache_format.hpp"
 #include "models/mimo/head.hpp"
 
 #include "models/mimo/snapshot_copy.hpp"
@@ -23,7 +24,7 @@ size_t cache_bytes(const MimoTextConfig& c, int64_t context, int world, int rows
   size_t bytes = 0;
   for (int l = 0; l < c.num_hidden_layers; ++l) {
     const size_t slots = c.sliding(l) ? mimo_ring_capacity(rows) : global_capacity(context);
-    bytes += slots * (c.kv_heads(l) / world) * (192 + 128) * 2;
+    bytes += slots * (c.kv_heads(l) / world) * (192 + 128) * (mimo_fp8_cache_enabled() ? 1 : 2);
   }
   return bytes;  // every request plane is 256-byte aligned, even at tiny contexts
 }
@@ -56,7 +57,7 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
   session_core_plan_bytes(std::max(kDecodeRows, forward_rows), requests, c.hidden_size,
                           c.vocab_size / world, mtp, c.hidden_size, &device, &pinned);
   plan.add("MiMo resident text weights", weights);
-  plan.add("MiMo flat global and ring K/V",
+  plan.add(mimo_fp8_cache_enabled() ? "MiMo flat global and ring K/V (unit E4M3)" : "MiMo flat global and ring K/V (BF16)",
            requests * cache_bytes(c, context, world, std::max(kDecodeRows, forward_rows)));
   plan.add("MiMo layer scratch", block_scratch + moe_scratch + size_t(c.num_hidden_layers) * 256,
            moe_pinned);
@@ -112,6 +113,8 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   if (boundary_) boundary_->bind_stream(stream_);
   MimoDeviceLoader loader(checkpoint, rank, world);
   globals_ = loader.load_globals();
+  DGPP_LOG_INFO("MiMo rank {}: base K/V and prefix snapshots use {}", rank,
+                mimo_fp8_cache_enabled() ? "unit-scale E4M3 FP8" : "BF16");
   cache_.init(requests * cache_bytes(c, context, world, std::max(kDecodeRows, forward_rows)));
   DGPP_CUDA_OK(cudaMemsetAsync(cache_.base, 0, cache_.capacity, stream_));
   const int rows = sp.max_tokens;
@@ -136,10 +139,10 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     weights_.push_back(loader.load_layer(l));
     const auto& w = weights_.back();
     const size_t slots = c.sliding(l) ? mimo_ring_capacity(rows) : global_capacity(context);
-    key_plane_.push_back(slots * w.kv_heads * 192);
-    value_plane_.push_back(slots * w.kv_heads * 128);
-    keys_.push_back(static_cast<uint16_t*>(cache_.alloc(requests * key_plane_.back() * 2)));
-    values_.push_back(static_cast<uint16_t*>(cache_.alloc(requests * value_plane_.back() * 2)));
+    key_plane_.push_back(slots * w.kv_heads * 192 * (mimo_fp8_cache_enabled() ? 1 : 2));
+    value_plane_.push_back(slots * w.kv_heads * 128 * (mimo_fp8_cache_enabled() ? 1 : 2));
+    keys_.push_back(static_cast<uint8_t*>(cache_.alloc(requests * key_plane_.back())));
+    values_.push_back(static_cast<uint8_t*>(cache_.alloc(requests * value_plane_.back())));
     if (c.moe(l) && !shared_moe_)
       shared_moe_ = std::make_unique<GlmMoeLayer>(w.moe_view(), mimo_moe_config(c, world), rows,
                                                   kDecodeRows, c.num_hidden_layers - 1);
@@ -185,6 +188,8 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   }
 
   if (cache_.cursor != cache_.capacity) throw std::logic_error("MiMo cache byte plan mismatch");
+  DGPP_LOG_INFO("MiMo rank {}: base live K/V {} bytes, prefix snapshot {} bytes including draft state",
+                rank, cache_.capacity, session_snapshot_bytes());
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 MimoModel::~MimoModel() {
@@ -259,8 +264,8 @@ void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
         shape, position, previous, keys_[l] + req * key_plane_[l],
         values_[l] + req * value_plane_[l], dst, stream_);
     if (!shape.window)
-      snapshot_saved_bytes_ += size_t(previous) * (shape.k_width() + shape.v_width()) * 2;
-    dst += slots * (shape.k_width() + shape.v_width()) * 2;
+      snapshot_saved_bytes_ += size_t(previous) * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes();
+    dst += slots * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes();
   }
   snapshot_history_.commit(req, base, position);
 }
@@ -272,7 +277,7 @@ void MimoModel::read_state_snapshot(int req, const uint8_t* src, int64_t positio
     const size_t slots = shape.window ? shape.window : shape.capacity;
     mimo_read_snapshot_layer(shape, position, src, keys_[l] + req * key_plane_[l],
                               values_[l] + req * value_plane_[l], stream_);
-    src += slots * (shape.k_width() + shape.v_width()) * 2;
+    src += slots * (shape.k_width() + shape.v_width()) * shape.cache_element_bytes();
   }
 }
 

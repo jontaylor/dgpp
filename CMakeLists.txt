@@ -632,6 +632,7 @@ add_executable(unit_tests
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
   tests/unit/mimo_config_test.cpp
+  tests/unit/mimo_cache_format_test.cpp
   tests/unit/mimo_weights_test.cpp
   tests/unit/mimo_attention_test.cpp
   tests/unit/mimo_snapshot_test.cpp
@@ -1446,3 +1447,10 @@ if(DGPP_ENABLE_IBV)
   set_tests_properties(nic_regress_selftest PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
 endif()
 set_tests_properties(roster_selftest PROPERTIES LABELS "host")
+
+add_executable(mimo_fp8_test tests/cuda/mimo_fp8_test.cpp)
+target_include_directories(mimo_fp8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(mimo_fp8_test PRIVATE dgpp_models_mimo dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(mimo_fp8_test)
+add_test(NAME mimo_fp8_test COMMAND mimo_fp8_test)
+set_tests_properties(mimo_fp8_test PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE)

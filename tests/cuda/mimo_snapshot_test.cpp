@@ -20,6 +20,7 @@ struct Buffer {
   explicit Buffer(size_t n) { DGPP_CUDA_OK(cudaMalloc(&p, n)); }
   ~Buffer() { cudaFree(p); }
 };
+template<class CacheT>
 struct Model {
   struct SessionSnapshotMeta {
     int64_t position = 0;
@@ -31,13 +32,13 @@ struct Model {
     bool taken = false;
   };
   // Capacity deliberately not a multiple of the window, to exercise both spans.
-  std::array<dgpp::MimoAttentionShape, 2> shapes{{{1, 2, 1, 1024, 0}, {1, 2, 1, 137, 128}}};
+  std::array<dgpp::MimoAttentionShape, 2> shapes{{{1, 2, 1, 1024, 0, sizeof(CacheT)==1}, {1, 2, 1, 137, 128, sizeof(CacheT)==1}}};
   dgpp::MimoSnapshotHistory history;
-  Buffer live{(1024 + 137) * 320 * 2};
+  Buffer live{(1024 + 137) * 320 * sizeof(CacheT)};
   int64_t pos = 0;
   uint64_t copied = 0;
   cudaStream_t stream() const { return nullptr; }
-  size_t session_snapshot_bytes() const { return (1024 + 128) * 320 * 2; }
+  size_t session_snapshot_bytes() const { return (1024 + 128) * 320 * sizeof(CacheT); }
   int64_t session_position(int) const { return pos; }
   void register_state_snapshot(const void* dst) { history.register_destination(dst); }
   void unregister_state_snapshot(const void* dst) { history.unregister_destination(dst); }
@@ -54,17 +55,17 @@ struct Model {
   void fill(int64_t first, int64_t end, int salt) {
     size_t offset = 0;
     for (const auto& s : shapes) {
-      std::vector<uint16_t> values(size_t(s.capacity) * 320);
-      DGPP_CUDA_OK(cudaMemcpy(values.data(), live.p + offset, values.size() * 2, cudaMemcpyDeviceToHost));
+      std::vector<CacheT> values(size_t(s.capacity) * 320);
+      DGPP_CUDA_OK(cudaMemcpy(values.data(), live.p + offset, values.size() * sizeof(CacheT), cudaMemcpyDeviceToHost));
       for (int64_t p = first; p < end; ++p) {
         const int64_t slot = s.window ? p % s.capacity : p;
         for (int j = 0; j < s.k_width(); ++j)
-          values[slot * s.k_width() + j] = uint16_t(p * 71 + j + salt);
+          values[slot * s.k_width() + j] = CacheT(p * 71 + j + salt);
         for (int j = 0; j < s.v_width(); ++j)
-          values[size_t(s.capacity) * s.k_width() + slot * s.v_width() + j] = uint16_t(p * 37 + j + salt);
+          values[size_t(s.capacity) * s.k_width() + slot * s.v_width() + j] = CacheT(p * 37 + j + salt);
       }
-      DGPP_CUDA_OK(cudaMemcpy(live.p + offset, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
-      offset += values.size() * 2;
+      DGPP_CUDA_OK(cudaMemcpy(live.p + offset, values.data(), values.size() * sizeof(CacheT), cudaMemcpyHostToDevice));
+      offset += values.size() * sizeof(CacheT);
     }
     pos = end;
   }
@@ -73,10 +74,10 @@ struct Model {
     auto* d = static_cast<uint8_t*>(dst);
     size_t offset = 0;
     for (const auto& s : shapes) {
-      auto* k = reinterpret_cast<uint16_t*>(live.p + offset);
+      auto* k = reinterpret_cast<CacheT*>(live.p + offset);
       copied += dgpp::mimo_write_snapshot_layer(s, p, previous, k, k + s.capacity * s.k_width(), d, stream());
-      d += size_t(s.window ? s.window : s.capacity) * 320 * 2;
-      offset += size_t(s.capacity) * 320 * 2;
+      d += size_t(s.window ? s.window : s.capacity) * 320 * sizeof(CacheT);
+      offset += size_t(s.capacity) * 320 * sizeof(CacheT);
     }
     history.commit(req, dst, p);
     return {p};
@@ -90,10 +91,10 @@ struct Model {
     const auto* d = static_cast<const uint8_t*>(src);
     size_t offset = 0;
     for (const auto& s : shapes) {
-      auto* k = reinterpret_cast<uint16_t*>(live.p + offset);
+      auto* k = reinterpret_cast<CacheT*>(live.p + offset);
       dgpp::mimo_read_snapshot_layer(s, meta.position, d, k, k + s.capacity * s.k_width(), stream());
-      offset += size_t(s.capacity) * 320 * 2;
-      d += size_t(s.window ? s.window : s.capacity) * 320 * 2;
+      offset += size_t(s.capacity) * 320 * sizeof(CacheT);
+      d += size_t(s.window ? s.window : s.capacity) * 320 * sizeof(CacheT);
     }
     pos = meta.position;
   }
@@ -102,9 +103,9 @@ struct Model {
   void verify(const void* src, int64_t p) {
     size_t live_offset = 0, snap_offset = 0;
     for (const auto& s : shapes) {
-      std::vector<uint16_t> cache(size_t(s.capacity) * 320), snap(size_t(s.window ? s.window : s.capacity) * 320);
-      DGPP_CUDA_OK(cudaMemcpy(cache.data(), live.p + live_offset, cache.size() * 2, cudaMemcpyDeviceToHost));
-      DGPP_CUDA_OK(cudaMemcpy(snap.data(), static_cast<const uint8_t*>(src) + snap_offset, snap.size() * 2, cudaMemcpyDeviceToHost));
+      std::vector<CacheT> cache(size_t(s.capacity) * 320), snap(size_t(s.window ? s.window : s.capacity) * 320);
+      DGPP_CUDA_OK(cudaMemcpy(cache.data(), live.p + live_offset, cache.size() * sizeof(CacheT), cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(snap.data(), static_cast<const uint8_t*>(src) + snap_offset, snap.size() * sizeof(CacheT), cudaMemcpyDeviceToHost));
       const int64_t count = s.window ? std::min<int64_t>(p, s.window) : p;
       for (int64_t i = 0; i < count; ++i) {
         const int64_t index = s.window ? (p - count + i) % s.capacity : i;
@@ -114,14 +115,15 @@ struct Model {
           check(snap[size_t(s.window ? s.window : s.capacity) * s.k_width() + i * s.v_width() + j] ==
                     cache[size_t(s.capacity) * s.k_width() + index * s.v_width() + j], "V differs from full-copy oracle");
       }
-      live_offset += cache.size() * 2;
-      snap_offset += snap.size() * 2;
+      live_offset += cache.size() * sizeof(CacheT);
+      snap_offset += snap.size() * sizeof(CacheT);
     }
   }
 };
+template<class CacheT>
 void run() {
-  Model m;
-  dgpp::PrefixArena<Model> arena(&m, 4);
+  Model<CacheT> m;
+  dgpp::PrefixArena<Model<CacheT>> arena(&m, 4);
   m.fill(0, 120, 1);
   for (int s = 0; s < 4; ++s) arena.snapshot(0, s, m.pos);
   for (int end : {127, 128, 129, 137, 138, 260, 400}) {
@@ -130,7 +132,7 @@ void run() {
       const auto before = m.copied;
       const auto old = arena.position(s);
       arena.snapshot(0, s, m.pos);
-      check(m.copied - before == uint64_t(end - old + std::min(end, 128)) * 640, "incremental byte budget");
+      check(m.copied - before == uint64_t(end - old + std::min(end, 128)) * (320 * sizeof(CacheT)), "incremental byte budget");
       m.verify(arena.slot_data(s), end);
     }
   }
@@ -144,19 +146,19 @@ void run() {
   m.fill(401, 407, 3);
   const auto before = m.copied;
   arena.snapshot(0, 1, 407);
-  check(m.copied - before == uint64_t(407 + 128) * 640, "rollback did not force full copy");
+  check(m.copied - before == uint64_t(407 + 128) * (320 * sizeof(CacheT)), "rollback did not force full copy");
   m.verify(arena.slot_data(1), 407);
   // Restore must exactly replace populated entries while preserving all tails.
-  Buffer expected((1024 + 137) * 320 * 2);
-  DGPP_CUDA_OK(cudaMemcpy(expected.p, m.live.p, (1024 + 137) * 320 * 2, cudaMemcpyDeviceToDevice));
+  Buffer expected((1024 + 137) * 320 * sizeof(CacheT));
+  DGPP_CUDA_OK(cudaMemcpy(expected.p, m.live.p, (1024 + 137) * 320 * sizeof(CacheT), cudaMemcpyDeviceToDevice));
   m.reset();
-  DGPP_CUDA_OK(cudaMemset(m.live.p, 0xa5, (1024 + 137) * 320 * 2));
+  DGPP_CUDA_OK(cudaMemset(m.live.p, 0xa5, (1024 + 137) * 320 * sizeof(CacheT)));
   arena.attach(0, 1);
   m.verify(arena.slot_data(1), 407);
   // Restored live data must match the pre-reset cache wherever attention reads.
-  std::vector<uint16_t> old((1024 + 137) * 320), restored(old.size());
-  DGPP_CUDA_OK(cudaMemcpy(old.data(), expected.p, old.size() * 2, cudaMemcpyDeviceToHost));
-  DGPP_CUDA_OK(cudaMemcpy(restored.data(), m.live.p, restored.size() * 2, cudaMemcpyDeviceToHost));
+  std::vector<CacheT> old((1024 + 137) * 320), restored(old.size());
+  DGPP_CUDA_OK(cudaMemcpy(old.data(), expected.p, old.size() * sizeof(CacheT), cudaMemcpyDeviceToHost));
+  DGPP_CUDA_OK(cudaMemcpy(restored.data(), m.live.p, restored.size() * sizeof(CacheT), cudaMemcpyDeviceToHost));
   size_t offset = 0;
   for (const auto& s : m.shapes) {
     for (int slot = 0; slot < s.capacity; ++slot) {
@@ -165,7 +167,7 @@ void run() {
       for (int width : {s.k_width(), s.v_width()}) {
         const size_t base = offset + (width == s.k_width() ? 0 : s.capacity * s.k_width());
         for (int j = 0; j < width; ++j)
-          check(restored[base + slot * width + j] == (populated ? old[base + slot * width + j] : 0xa5a5), "restore altered tail or populated bits");
+          check(restored[base + slot * width + j] == (populated ? old[base + slot * width + j] : CacheT(0xa5a5)), "restore altered tail or populated bits");
       }
     }
     offset += size_t(s.capacity) * 320;
@@ -181,16 +183,16 @@ void run() {
   arena.release(0);
   auto b = m.copied;
   arena.snapshot(0, 0, 500);
-  check(m.copied - b == uint64_t(500 + 128) * 640, "release provenance");
+  check(m.copied - b == uint64_t(500 + 128) * (320 * sizeof(CacheT)), "release provenance");
   b = m.copied;
   arena.snapshot(1, 0, 500);
-  check(m.copied - b == uint64_t(500 + 128) * 640, "reassignment provenance");
+  check(m.copied - b == uint64_t(500 + 128) * (320 * sizeof(CacheT)), "reassignment provenance");
   auto request = arena.request(0, 500);
   b = m.copied;
   *request.meta = m.session_snapshot(1, request.dst);
   request.taken = true;
   arena.commit(0, request);
-  check(m.copied - b == uint64_t(500 + 128) * 640, "prefill request provenance");
+  check(m.copied - b == uint64_t(500 + 128) * (320 * sizeof(CacheT)), "prefill request provenance");
   m.verify(arena.slot_data(0), 500);
   std::cout << "PASS: exact rolling/hop snapshots, wraps, rollback, restore, four-slot reuse; copied=" << m.copied << " bytes\n";
 }
@@ -199,7 +201,8 @@ int main() {
   int count = 0;
   if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 2;
   try {
-    run();
+    run<uint16_t>();
+    run<uint8_t>();
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

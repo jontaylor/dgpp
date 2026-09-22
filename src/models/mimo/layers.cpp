@@ -1,4 +1,5 @@
 #include "models/mimo/layers.hpp"
+#include "models/mimo/cache_format.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
       gemm_ws_bytes_(workspace_bytes),
       max_tokens_(max_tokens),
       attention_scores_(attention_scores) {
+  shape_.fp8_cache = !c.is_mtp(w.layer) && mimo_fp8_cache_enabled();
   shape_.validate();
   if (requests < 1 || max_tokens < 1 || requests > kGemmDecodeLoweringRows ||
       (!w.qkv && !(w.qkv_fp8.payload && w.qkv_fp8.scales)) || !w.output || !w.input_norm ||
@@ -109,8 +111,8 @@ void MimoDecoderLayer::fold(uint16_t* partial, BoundaryReducer* boundary, cudaSt
   if (!capture && !boundary->stream_ordered()) DGPP_CUDA_OK(cudaStreamSynchronize(stream));
   boundary->reduce(partial, tokens, cfg_.hidden_size);
 }
-void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uint16_t* k_cache,
-                               uint16_t* v_cache, int32_t* status, BoundaryReducer* boundary,
+void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, void* k_cache,
+                               void* v_cache, int32_t* status, BoundaryReducer* boundary,
                                cudaStream_t stream, int tokens, int end_key, bool capture,
                                const int32_t* request_ids, bool cache_only) {
   if (tokens < 1 || tokens > max_tokens_)
