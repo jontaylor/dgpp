@@ -825,6 +825,25 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
     parallel = ptc->as_bool(true);
   }
 
+  // An opt-in response boundary, independent of constrained decoding.
+  if (const Value* cap = body.find("max_tool_calls")) {
+    const double n = cap->as_double(0.0);
+    if (!cap->is_number() || !std::isfinite(n) || n != std::floor(n) ||
+        n < 1 || n > 2147483647.0)
+      return refuse("max_tool_calls must be a positive 32-bit integer",
+                    "max_tool_calls");
+    if (!have_tools || choice == Choice::kNone)
+      return refuse("max_tool_calls requires tools and tool_choice other than none",
+                    "max_tool_calls");
+    // DSML emits a whole container's calls atomically. Cutting that event
+    // batch would silently discard completed calls; reject until its parser
+    // exposes individual invoke boundaries.
+    if (markers_.tool_format() == dgpp::text::ToolFormat::kDsml)
+      return refuse("max_tool_calls is unsupported for DSML tool containers",
+                    "max_tool_calls", "tool_call_cap_unsupported");
+    plan->max_tool_calls = static_cast<int>(n);
+  }
+
   // ---- the grammar (M6 6g) ---------------------------------------------
   // tool_choice none / required / named and parallel_tool_calls false are
   // enforced by constrained decoding: the pick's mask on every rank.
@@ -1535,6 +1554,7 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
     record->model = cfg_.model_id;
     record->created_unix = created;
     record->chat = true;
+    record->max_tool_calls = plan.max_tool_calls;
     record->stream = stream;
     record->include_usage = include_usage;
     record->prompt_tokens = static_cast<int>(prompt.size());
@@ -2036,6 +2056,7 @@ void GenerationService::request_stop(StreamRecord& r) {
 }
 
 void GenerationService::absorb(StreamRecord& r, ParserEvent ev) {
+  if (r.tool_cap_hit) return;
   // A generated opener was not counted by on_token's prior state.
   if (ev.kind == ParserEvent::Kind::kReasoningOpened) {
     r.reasoning_open = true;
@@ -2079,6 +2100,11 @@ void GenerationService::absorb(StreamRecord& r, ParserEvent ev) {
     case ParserEvent::Kind::kToolCall:
       r.calls.push_back(ev.call);
       stats_.tool_calls_out++;
+      if (r.max_tool_calls > 0 &&
+          r.calls.size() >= static_cast<size_t>(r.max_tool_calls)) {
+        r.tool_cap_hit = true;
+        request_stop(r);
+      }
       break;
     case ParserEvent::Kind::kReasoningOpened:
     case ParserEvent::Kind::kReasoningClosed:
@@ -2108,14 +2134,14 @@ void GenerationService::on_token(const std::string& id, int64_t token,
         }
       }
       r->ids.push_back(token);
-      if (r->chat) {
+      if (r->chat && !r->tool_cap_hit) {
         if (r->reasoning_open) ++r->reasoning_tokens;
         // The parser routes the id by state (reasoning / content / a tool
         // call block) and yields the exact text deltas of each run.
         std::vector<ParserEvent> events;
         r->parser->feed(token, &events);
         for (ParserEvent& ev : events) absorb(*r, std::move(ev));
-      } else {
+      } else if (!r->chat) {
         // Exact incremental text: the suffix diff of successive full
         // decodes — UTF-8 splits and special tokens come out right by
         // construction (the tokenizer's own decode gates, pinned by its
@@ -2172,11 +2198,11 @@ std::vector<int64_t> GenerationService::prompt_boundaries(
 void GenerationService::on_token_logprobs(const std::string& id,
                                           int steps_done,
                                           const sample::Result& logprobs) {
-  (void)steps_done;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& r : records_) {
     if (r->sched_id != id || r->done) continue;
-    if (r->logprobs >= 0) r->lps.push_back(logprobs);
+    if (r->logprobs >= 0 && (!r->tool_cap_hit || steps_done <= r->stop_tokens))
+      r->lps.push_back(logprobs);
     break;
   }
 }
@@ -2602,7 +2628,8 @@ void GenerationService::pump_records() {
             r->lps_flushed = r->lps.size();
           }
         }
-        const char* finish = finish_reason(r->reason, !r->calls.empty());
+        const char* finish = r->tool_cap_hit ? "tool_calls"
+            : finish_reason(r->reason, !r->calls.empty());
         r->writer->write_event(
             r->chat ? chat_chunk_final(r->id, r->created_unix, r->model,
                                        finish, lp_json, r->choice)
@@ -2633,7 +2660,8 @@ void GenerationService::pump_records() {
           lp_json = r->chat ? logprobs_content(*r, 0, r->lps.size())
                             : legacy_logprobs(*r);
         }
-        const char* finish = finish_reason(r->reason, !r->calls.empty());
+        const char* finish = r->tool_cap_hit ? "tool_calls"
+            : finish_reason(r->reason, !r->calls.empty());
         if (r->chat) {
           // {"role","content"(null when only calls),"reasoning_content"?,
           //  "tool_calls"?}

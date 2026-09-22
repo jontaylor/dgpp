@@ -79,6 +79,8 @@ class FakeEngine : public SchedulerEngine {
  public:
   std::atomic<int64_t> request_limit{std::numeric_limits<int64_t>::max()};
   int64_t max_request_tokens() const override { return request_limit.load(); }
+  std::atomic<int> step_tokens{1};
+  int max_tokens_per_step() const override { return step_tokens.load(); }
   std::atomic<bool> report_mtp{false};
   MtpAcceptance mtp_acceptance() const override {
     if (!report_mtp.load()) return {};
@@ -280,10 +282,14 @@ class FakeEngine : public SchedulerEngine {
       throw std::runtime_error("fake: injected engine failure at step " +
                                std::to_string(fail_at_step_));
     Live& live = live_.at(req);
-    live.last_token = next_token(live, live.served);
-    note_logprobs(req, live.last_token, live.served);
-    ++live.served;
-    return {live.last_token};
+    std::vector<int32_t> tokens;
+    for (int i = 0; i < step_tokens.load(); ++i) {
+      live.last_token = next_token(live, live.served);
+      note_logprobs(req, live.last_token, live.served);
+      ++live.served;
+      tokens.push_back(live.last_token);
+    }
+    return tokens;
   }
   void fail_at_step(int n) { fail_at_step_ = n; }
 
@@ -363,8 +369,8 @@ std::string json_of(const dgpp::minijson::Value& v) {
 // the same rule. It keeps the last globals the service handed it.
 class FakeFrontend : public ModelFrontend {
  public:
-  explicit FakeFrontend(bool with_markers = false)
-      : with_markers_(with_markers) {}
+  explicit FakeFrontend(bool with_markers = false, int tool_format = 0)
+      : with_markers_(with_markers), tool_format_(tool_format) {}
   // The template knob gate: a template that reads enable_thinking (Qwen3.8-
   // Flash-Next, GLM-4.7) accepts it in chat_template_kwargs; the default
   // fake, like GLM-5.3-Flash's template, does not.
@@ -431,6 +437,16 @@ class FakeFrontend : public ModelFrontend {
     m.think_close = {kThinkClose, "</think>"};
     m.tool_call_open = {kToolOpen, "<tool_call>"};
     m.tool_call_close = {kToolClose, "</tool_call>"};
+    if (tool_format_ == 1) {
+      m.compact_tool_xml = true;
+      return m;
+    }
+    if (tool_format_ == 2) {
+      m.tool_call_open = {};
+      m.tool_call_close = {};
+      m.dsml = {1009, "｜DSML｜"};
+      return m;
+    }
     m.arg_key_open = {kKeyOpen, "<arg_key>"};
     m.arg_key_close = {kKeyClose, "</arg_key>"};
     m.arg_value_open = {kValueOpen, "<arg_value>"};
@@ -449,6 +465,7 @@ class FakeFrontend : public ModelFrontend {
 
  private:
   bool with_markers_;
+  int tool_format_;
   mutable std::mutex mu_;
   mutable std::string last_globals_;
 };
@@ -568,9 +585,9 @@ struct ServiceRig {
                       bool with_markers = false,
                       bool reasoning_in_content = false,
                       dgpp::sched::AdmissionPolicy admission = {},
-                      int prefix_slots = 0)
+                      int prefix_slots = 0, int tool_format = 0)
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
-        frontend(with_markers),
+        frontend(with_markers, tool_format),
         cfg([&] {
           ServiceConfig c;
           c.model_id = "glm-5.3-flash-fp8";
@@ -2822,4 +2839,185 @@ DGPP_TEST(serve_generatedThinkingPrefix_splitsAndCountsTokens) {
   require(resp.find("reasoning_content") != std::string::npos &&
           resp.find("\"reasoning_tokens\":4") != std::string::npos &&
           resp.find("<think>") == std::string::npos, "generated opener stream: " + resp);
+}
+
+DGPP_TEST(serve_toolCallCap_completeBoundariesAndDefault) {
+  const std::string call = "<tool_call>get_weather<arg_key>city</arg_key>"
+                           "<arg_value>Paris</arg_value></tool_call>";
+  for (bool stream : {false, true}) {
+    for (int cap : {0, 1, 2}) {
+      ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+      const auto prefix = script_of(rig, "Think</think>Sure" + call);
+      rig.engine.script(5, script_of(rig, "Think</think>Sure" + call + call + "TAIL"));
+      std::string extra = kWeatherTools;
+      if (cap) extra += ",\"max_tool_calls\":" + std::to_string(cap);
+      if (stream) extra += ",\"stream\":true,\"stream_options\":{\"include_usage\":true}";
+      const auto response = stream
+          ? post_chat(rig, chat_body("abcd", 256, extra), "[DONE]", 5000)
+          : post_until_usage(rig, chat_body("abcd", 256, extra));
+      require(response.find("\"finish_reason\":\"tool_calls\"") != std::string::npos,
+              "cap finishes as tool_calls: " + response);
+      require(response.find("Paris") != std::string::npos &&
+                  concat_field(response, "content").find("Sure") != std::string::npos &&
+                  response.find("reasoning_content") != std::string::npos,
+              "complete call and earlier text preserved: " + response);
+      require((concat_field(response, "content").find("TAIL") != std::string::npos) == (cap == 0),
+              "default unchanged, cap suppresses later content: " + response);
+      if (cap) {
+        const auto expected = prefix.size() - 1 + (cap - 1) * (script_of(rig, call).size() - 1);
+        require(response.find("\"completion_tokens\":" + std::to_string(expected)) != std::string::npos,
+                "usage ends at complete call: " + response);
+      }
+      Client metrics(rig.port());
+      metrics.send_all("GET /v1/metrics HTTP/1.1\r\nHost: t\r\n\r\n");
+      const auto m = metrics.read_until("tool_calls_out", 2000);
+      require(m.find("\"tool_calls_out\":" + std::to_string(cap ? cap : 2)) != std::string::npos,
+              "exact completed call count: " + m);
+      // A subsequent request proves the slot was released normally.
+      require(post_until_usage(rig, chat_body("abcd", 2)).find("chat.completion") != std::string::npos,
+              "scheduler usable after capped retirement");
+    }
+  }
+}
+
+DGPP_TEST(serve_toolCallCap_validationAndIncompleteBlocks) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+  for (const std::string value : {"0", "-1", "1.5", "true", "null", "\"1\"", "2147483648"}) {
+    const auto response = post_chat(rig, chat_body("abcd", 64, kWeatherTools + ",\"max_tool_calls\":" + value));
+    require(response.find("400 Bad Request") != std::string::npos &&
+                response.find("\"param\":\"max_tool_calls\"") != std::string::npos,
+            "bad cap refused: " + response);
+  }
+  for (const std::string extra : {std::string(",\"max_tool_calls\":1"),
+       kWeatherTools + ",\"max_tool_calls\":1,\"tool_choice\":\"none\""}) {
+    require(post_chat(rig, chat_body("abcd", 64, extra)).find("400 Bad Request") != std::string::npos,
+            "cap without eligible tools refused");
+  }
+  for (bool stream : {false, true}) {
+    // A closed malformed block and an unclosed final block are content,
+    // never counted as calls and never repaired into synthetic JSON.
+    rig.engine.script(5, script_of(rig, "Think</think><tool_call></arg_value></tool_call>"
+                                      "AFTER<tool_call>get_weather<arg_key>city"));
+    std::string extra = kWeatherTools + ",\"max_tool_calls\":1";
+    if (stream) extra += ",\"stream\":true";
+    const auto response = stream
+        ? post_chat(rig, chat_body("abcd", 256, extra), "[DONE]", 5000)
+        : post_until_usage(rig, chat_body("abcd", 256, extra));
+    require(concat_field(response, "content").find("AFTER") != std::string::npos && response.find("<tool_call>") != std::string::npos &&
+                response.find("\"tool_calls\":") == std::string::npos &&
+                response.find("\"finish_reason\":\"stop\"") != std::string::npos,
+            "malformed/incomplete calls stay literal: " + response);
+  }
+}
+
+DGPP_TEST(serve_toolCallCap_concurrentChoicesAndRequests) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+  const std::string call = "<tool_call>get_weather<arg_key>city</arg_key>"
+                           "<arg_value>Paris</arg_value></tool_call>";
+  rig.engine.script(5, script_of(rig, "Think</think>" + call + call + "TAIL"));
+  std::string capped, uncapped;
+  std::thread a([&] { capped = post_until_usage(rig, chat_body("abcd", 256,
+      kWeatherTools + ",\"max_tool_calls\":1,\"n\":2")); });
+  std::thread b([&] { uncapped = post_until_usage(rig, chat_body("abcd", 256, kWeatherTools)); });
+  a.join();
+  b.join();
+  require(capped.find("\"index\":1") != std::string::npos && capped.find("TAIL") == std::string::npos,
+          "both choices independently capped: " + capped);
+  require(uncapped.find("TAIL") != std::string::npos,
+          "concurrent uncapped request unaffected: " + uncapped);
+}
+
+DGPP_TEST(serve_toolCallCap_mimoXmlAndDsmlRefusal) {
+  for (bool stream : {false, true}) {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true,
+                   false, {}, 0, 1);
+    const std::string call = "<tool_call><function=get_weather><parameter=city>"
+                             "Paris</parameter></function></tool_call>";
+    rig.engine.script(5, script_of(rig, "Think</think>" + call + call));
+    std::string extra = kWeatherTools + ",\"max_tool_calls\":1";
+    if (stream) extra += ",\"stream\":true";
+    const auto response = stream
+        ? post_chat(rig, chat_body("abcd", 256, extra), "[DONE]", 5000)
+        : post_until_usage(rig, chat_body("abcd", 256, extra));
+    require(concat_field(response, "arguments") == R"({\"city\": \"Paris\"})" &&
+                response.find("\"finish_reason\":\"tool_calls\"") != std::string::npos,
+            "compact XML completes one full call: " + response);
+  }
+  ServiceRig dsml(8, dgpp::sample::greedy_params(), false, std::nullopt, true,
+                 false, {}, 0, 2);
+  const auto response = post_chat(dsml, chat_body("abcd", 64, kWeatherTools + ",\"max_tool_calls\":1"));
+  require(response.find("400 Bad Request") != std::string::npos &&
+              response.find("tool_call_cap_unsupported") != std::string::npos,
+          "atomic DSML batches refused explicitly: " + response);
+}
+
+DGPP_TEST(serve_toolCallCap_tokenBudgetAtBoundary) {
+  for (bool stream : {false, true}) {
+    for (int offset : {-1, 0}) {
+      ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+      const auto script = script_of(rig, "</think><tool_call>get_weather<arg_key>city"
+                                         "</arg_key><arg_value>Paris</arg_value></tool_call>");
+      rig.engine.script(5, script);
+      const int budget = static_cast<int>(script.size()) - 1 + offset;
+      std::string extra = kWeatherTools + ",\"max_tool_calls\":1";
+      if (stream) extra += ",\"stream\":true";
+      const auto response = stream
+          ? post_chat(rig, chat_body("abcd", budget, extra), "[DONE]", 5000)
+          : post_until_usage(rig, chat_body("abcd", budget, extra));
+      require(response.find(offset ? "\"finish_reason\":\"length\""
+                                   : "\"finish_reason\":\"tool_calls\"") != std::string::npos,
+              "token cap respects complete-call boundary: " + response);
+      require((response.find("\"tool_calls\":") != std::string::npos) == (offset == 0),
+              "no partial call fabricated: " + response);
+    }
+  }
+}
+
+DGPP_TEST(serve_toolCallCap_disconnectStillCancels) {
+  ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, true);
+  rig.gate = true;
+  Client c(rig.port());
+  const auto body = chat_body("abcd", 256, kWeatherTools + ",\"max_tool_calls\":1,\"stream\":true");
+  c.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+             "Content-Type: application/json\r\nContent-Length: " +
+             std::to_string(body.size()) + "\r\n\r\n" + body);
+  require(c.read_available(100).find("text/event-stream") != std::string::npos,
+          "capped stream admitted before disconnect");
+  c.hard_close();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  rig.gate = false;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  Client m(rig.port());
+  m.send_all("GET /v1/metrics HTTP/1.1\r\nHost: t\r\n\r\n");
+  require(m.read_until("requests_cancelled", 2000).find("\"requests_cancelled\":1") != std::string::npos,
+          "capped request cancellation counted");
+  require(post_until_usage(rig, chat_body("abcd", 2)).find("chat.completion") != std::string::npos,
+          "scheduler usable after cancelled capped request");
+}
+
+DGPP_TEST(serve_toolCallCap_speculativeBurstStopsParserAndLogprobs) {
+  for (bool stream : {false, true}) {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), true, std::nullopt, true);
+    rig.engine.step_tokens = 4;
+    // The closing token falls inside a four-token burst. Following content
+    // and thinking markers in that same burst must never enter the response.
+    const auto prefix = script_of(rig, "</think><tool_call>get_weather<arg_key>city"
+                                       "</arg_key><arg_value>Paris</arg_value></tool_call>", false);
+    auto script = prefix;
+    const auto suffix = script_of(rig, "<think>LEAK</think>TAIL");
+    script.insert(script.end(), suffix.begin(), suffix.end());
+    rig.engine.script(5, script);
+    std::string extra = kWeatherTools + ",\"max_tool_calls\":1,\"logprobs\":true";
+    if (stream) extra += ",\"stream\":true,\"stream_options\":{\"include_usage\":true}";
+    const auto response = stream
+        ? post_chat(rig, chat_body("abcd", 128, extra), "[DONE]", 5000)
+        : post_until_usage(rig, chat_body("abcd", 128, extra));
+    require(concat_field(response, "content").empty() && concat_field(response, "reasoning_content").empty(),
+            "no post-cap burst content/reasoning: " + response);
+    require(response.find("\"completion_tokens\":" + std::to_string(prefix.size())) != std::string::npos,
+            "burst usage cut at call boundary: " + response);
+    size_t count = 0, pos = 0;
+    while ((pos = response.find("\"logprob\":", pos)) != std::string::npos) { ++count; ++pos; }
+    require(count == prefix.size(), "logprobs cut at call boundary: " + response);
+  }
 }

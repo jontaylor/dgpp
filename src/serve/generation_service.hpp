@@ -368,6 +368,8 @@ class GenerationService : public HttpHandler,
     std::string reasoning;     // accumulated (one-shots)
     std::string content;       // accumulated (one-shots)
     std::vector<ToolCall> calls;
+    int max_tool_calls = 0;  // 0: unlimited, otherwise per choice
+    bool tool_cap_hit = false;
     int calls_announced = 0;   // streaming: calls already sent (HTTP thread)
     HttpResponseWriter* writer = nullptr;  // HTTP thread only
   };
@@ -406,6 +408,7 @@ class GenerationService : public HttpHandler,
     dgpp::minijson::Value globals;
     dgpp::text::GrammarSpec grammar;  // the pick's constraint (inactive: none)
     bool tools_requested = false;
+    int max_tool_calls = 0;
     dgpp::text::ToolSchemas schemas;
   };
   bool parse_chat(const dgpp::minijson::Value& body, HttpResponseWriter& w,
