@@ -62,6 +62,68 @@ __global__ void append_kernel(MimoAttentionShape s, const uint16_t* fused, const
   else mimo_cache_store(kc, slot * k_width + h * 192 + d, value, s.fp8_cache);
 }
 
+
+// Audit is a separately launched, default-off kernel. Recompute exactly the
+// append transformation and E4M3 conversion from immutable fused inputs. This
+// counts duplicate/replayed writes separately without reading a cache location
+// that another row may have overwritten. No context-sized shadow allocation.
+__global__ void fp8_append_audit(MimoAttentionShape s, const uint16_t* fused,
+                                const float* freq, const int64_t* positions,
+                                MimoFp8AuditStats* stats) {
+  const int row = blockIdx.y, head = blockIdx.x, d = threadIdx.x;
+  const int64_t p = positions[row];
+  if (p < 0 || invalid(s, p)) return;
+  const bool value_plane = head >= s.kv_heads;
+  const int h = value_plane ? head - s.kv_heads : head;
+  const int width = value_plane ? 128 : 192;
+  const int qwidth = s.q_heads * 192, kwidth = s.kv_heads * 192;
+  const uint16_t* source = fused + int64_t(row) * (qwidth + kwidth + s.kv_heads * 128)
+      + qwidth + (value_plane ? kwidth : 0) + h * width;
+  double sum[6] = {};
+  if (d < width) {
+    float value = bf16_bits_to_float(source[d]);
+    if (value_plane) value = rb(__fmul_rn(value, 0.707f));
+    else if (d < 64) {
+      const float angle = __fmul_rn(static_cast<float>(p), freq[d % 32]);
+      const float cos = rb(cosf(angle)), sin = rb(sinf(angle));
+      const float mate = bf16_bits_to_float(source[d < 32 ? d + 32 : d - 32]);
+      value = rb(__fadd_rn(rb(__fmul_rn(value, cos)), rb(__fmul_rn(d < 32 ? -mate : mate, sin))));
+    }
+    sum[0] = 1;
+    if (!isfinite(value)) sum[2] = 1;
+    else {
+      __nv_fp8_e4m3 converted;
+      converted.__x = __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+      const float result = static_cast<float>(converted);
+      const double error = double(result) - double(value);
+      sum[1] = fabsf(value) > 448.f ? 1 : 0;
+      sum[3] = result != value ? 1 : 0;
+      sum[4] = error * error;
+      sum[5] = double(value) * double(value);
+    }
+  }
+  __shared__ double partial[8][6];
+  const int lane = d & 31, warp = d / 32;
+  for (int offset = 16; offset; offset >>= 1)
+    for (int i = 0; i < 6; ++i) sum[i] += __shfl_down_sync(0xffffffffu, sum[i], offset);
+  if (!lane) for (int i = 0; i < 6; ++i) partial[warp][i] = sum[i];
+  __syncthreads();
+  if (!warp) {
+    for (int i = 0; i < 6; ++i) sum[i] = lane < 8 ? partial[lane][i] : 0;
+    for (int offset = 16; offset; offset >>= 1)
+      for (int i = 0; i < 6; ++i) sum[i] += __shfl_down_sync(0xffffffffu, sum[i], offset);
+    if (!lane) {
+      auto* dest = stats + (value_plane ? 1 : 0);
+      atomicAdd(reinterpret_cast<unsigned long long*>(&dest->conversions), static_cast<unsigned long long>(sum[0]));
+      atomicAdd(reinterpret_cast<unsigned long long*>(&dest->clipped), static_cast<unsigned long long>(sum[1]));
+      atomicAdd(reinterpret_cast<unsigned long long*>(&dest->nonfinite), static_cast<unsigned long long>(sum[2]));
+      atomicAdd(reinterpret_cast<unsigned long long*>(&dest->changed), static_cast<unsigned long long>(sum[3]));
+      atomicAdd(&dest->error_squared, sum[4]);
+      atomicAdd(&dest->reference_squared, sum[5]);
+    }
+  }
+}
+
 __device__ float score(MimoAttentionShape s, const uint16_t* q, const void* kc, int r, int h,
                        int kh, int64_t pos, bool shared_cache, const int32_t* request_ids) {
   const int64_t slot = int64_t(shared_cache ? 0 : (request_ids ? request_ids[r] : r)) * s.capacity +
@@ -588,8 +650,9 @@ __global__ void decode_value_reduce(MimoAttentionShape s, const float* parts,
 void mimo_qkv_append(const MimoAttentionShape& s, const uint16_t* fused, const float* freq,
                      const int64_t* positions, uint16_t* q, void* kc, void* vc,
                      int32_t* status, cudaStream_t stream, bool shared_cache,
-                     const int32_t* request_ids) {
+                     const int32_t* request_ids, MimoFp8AuditStats* audit) {
   s.validate();
+  if (audit && !s.fp8_cache) throw std::invalid_argument("MiMo FP8 audit requires FP8 cache");
   if (shared_cache && s.window && s.capacity < s.window + s.requests - 1)
     throw std::invalid_argument("MiMo chunk exceeds retained ring history");
   if (!fused || !freq || !positions || !q || !kc || !vc || !status)
@@ -597,6 +660,11 @@ void mimo_qkv_append(const MimoAttentionShape& s, const uint16_t* fused, const f
   append_kernel<<<dim3(s.q_heads + 2 * s.kv_heads, s.requests), 256, 0, stream>>>(
       s, fused, freq, positions, q, kc, vc, status, shared_cache, request_ids);
   DGPP_CUDA_OK(cudaGetLastError());
+  if (audit) {
+    fp8_append_audit<<<dim3(2 * s.kv_heads, s.requests), 256, 0, stream>>>(
+        s, fused, freq, positions, audit);
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
 }
 void mimo_attention(const MimoAttentionShape& s, const uint16_t* q, const void* kc,
                     const void* vc, const int64_t* positions, const uint16_t* sinks,

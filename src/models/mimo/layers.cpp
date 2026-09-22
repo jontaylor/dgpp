@@ -130,7 +130,7 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
   auto chunk = shape_;
   chunk.requests = tokens;
   mimo_qkv_append(chunk, fused_, freq_, positions, q_, k_cache, v_cache, status, stream,
-                  request_ids == nullptr, request_ids);
+                  request_ids == nullptr, request_ids, fp8_audit_);
   if (cache_only) return;
   if (mimo_bounded_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
     mimo_attention_bounded_prefill(chunk, q_, k_cache, v_cache, positions, w_.sinks,

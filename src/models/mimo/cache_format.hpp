@@ -12,4 +12,16 @@ inline bool mimo_fp8_cache_enabled() {
   }();
   return enabled;
 }
+inline bool mimo_fp8_cache_audit_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_FP8_KV_AUDIT");
+    if (!value || std::string_view(value) == "0") return false;
+    if (std::string_view(value) != "1")
+      throw std::invalid_argument("DGPP_MIMO_FP8_KV_AUDIT must be 0 or 1");
+    if (!mimo_fp8_cache_enabled())
+      throw std::invalid_argument("DGPP_MIMO_FP8_KV_AUDIT requires DGPP_MIMO_FP8_KV=1");
+    return true;
+  }();
+  return enabled;
+}
 }  // namespace dgpp

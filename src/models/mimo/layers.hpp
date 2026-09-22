@@ -36,6 +36,10 @@ class MimoDecoderLayer {
   static size_t workspace_bytes(const MimoTextConfig& cfg, int layer, int rows, int world);
   void prepare_graph(cudaStream_t stream);
   const MimoAttentionShape& shape() const { return shape_; }
+  void set_fp8_audit(MimoFp8AuditStats* stats) {
+    if (stats && !shape_.fp8_cache) throw std::invalid_argument("MiMo FP8 audit on BF16 layer");
+    fp8_audit_ = stats;
+  }
   size_t scratch_bytes() const { return scratch_.capacity; }
 
  private:
@@ -52,6 +56,7 @@ class MimoDecoderLayer {
   size_t gemm_ws_bytes_;
   int max_tokens_;
   float* attention_scores_;
+  MimoFp8AuditStats* fp8_audit_ = nullptr;
   LayerBump scratch_, frequencies_;
   uint16_t *x_, *y_, *fused_, *q_, *attn_, *gate_, *up_, *act_;
   float *freq_, *moe_sum_;

@@ -105,6 +105,7 @@ class MimoModel : public SessionModel<MimoModel> {
   CublasLtGemm gemm_;
   MimoGlobalsResident globals_;
   std::vector<MimoLayerResident> weights_;
+  LayerBump cache_audit_;
   LayerBump cache_, scratch_, attention_scores_, layer_workspace_;
   std::vector<uint8_t*> keys_, values_;
   std::vector<size_t> key_plane_, value_plane_;  // bytes per request, unlike BF16 draft planes

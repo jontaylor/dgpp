@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include "models/mimo/attention.hpp"
+#include "models/mimo/cache_audit.hpp"
 
 namespace dgpp {
 // Native MTP head d consumes backbone hidden at absolute row p-d.
@@ -29,10 +30,13 @@ void mimo_mtp_history_store(uint16_t* history, const uint16_t* hidden, const int
 // status[request] is overwritten with 0 on valid/padded rows, 1 for a position
 // beyond the context/cache bounds. Invalid rows do not mutate the cache and
 // produce zero attention output; callers must surface status before use.
+// Optional audit points to two zero-initialized device counters (K,V).
+// It enables a separate reduction kernel; caller owns counter lifetime/reset.
+// No audit work is launched when null. Requires FP8 cache format.
 void mimo_qkv_append(const MimoAttentionShape& shape, const uint16_t* fused, const float* inv_freq,
                      const int64_t* positions, uint16_t* q, void* k_cache, void* v_cache,
                      int32_t* status, cudaStream_t stream, bool shared_cache = false,
-                     const int32_t* request_ids = nullptr);
+                     const int32_t* request_ids = nullptr, MimoFp8AuditStats* audit = nullptr);
 
 // Scalar decode numerics, bounded shared workspace, three score
 // passes with optional score reuse. One CTA per

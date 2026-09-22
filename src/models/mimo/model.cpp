@@ -60,6 +60,8 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
                           dflash ? MimoDFlash::width : c.hidden_size, &device, &pinned,
                           dflash ? requests * 8 : kDecodeRows);
   plan.add("MiMo resident text weights", weights);
+  if (mimo_fp8_cache_audit_enabled())
+    plan.add("MiMo FP8 K/V audit counters", size_t(c.num_hidden_layers) * 256);
   plan.add(mimo_fp8_cache_enabled() ? "MiMo flat global and ring K/V (unit E4M3)" : "MiMo flat global and ring K/V (BF16)",
            requests * cache_bytes(c, context, world, rows));
   plan.add("MiMo layer scratch", block_scratch + moe_scratch + size_t(c.num_hidden_layers) * 256,
@@ -142,6 +144,11 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     layer_bytes =
         std::max(layer_bytes, MimoDecoderLayer::workspace_bytes(c, c.mtp_layer(), rows, world));
   layer_workspace_.init(layer_bytes);
+  if (mimo_fp8_cache_audit_enabled()) {
+    DGPP_LOG_INFO("MiMo rank {}: FP8 K/V audit enabled; counts include warmup and replayed/uncommitted writes", rank);
+    cache_audit_.init(size_t(c.num_hidden_layers) * 256);
+    DGPP_CUDA_OK(cudaMemsetAsync(cache_audit_.base, 0, cache_audit_.capacity, stream_));
+  }
   weights_.reserve(c.num_hidden_layers);  // layer objects retain references
   for (int l = 0; l < c.num_hidden_layers; ++l) {
     weights_.push_back(loader.load_layer(l));
@@ -157,6 +164,8 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
     layers_.push_back(std::make_unique<MimoDecoderLayer>(
         w, c, requests, global_capacity(context), gemm_, nullptr, 0, rows,
         static_cast<float*>(attention_scores_.base), shared_moe_.get(), &layer_workspace_));
+    if (cache_audit_.base)
+      layers_.back()->set_fp8_audit(static_cast<MimoFp8AuditStats*>(cache_audit_.alloc(2 * sizeof(MimoFp8AuditStats))));
     DGPP_LOG_INFO("MiMo rank {}: loaded layer {}/{} ({} weight bytes)", rank, l + 1,
                   c.num_hidden_layers, w.storage->capacity);
   }
@@ -207,6 +216,23 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
 MimoModel::~MimoModel() {
   // Device views and buffers die before the session core destroys its stream.
   if (stream_) cudaStreamSynchronize(stream_);
+  if (cache_audit_.base) {
+    for (size_t layer = 0; layer < layers_.size(); ++layer) {
+      MimoFp8AuditStats stats[2];
+      const auto status = cudaMemcpy(stats, static_cast<const uint8_t*>(cache_audit_.base) + layer * 256,
+                                     sizeof(stats), cudaMemcpyDeviceToHost);
+      if (status != cudaSuccess) {
+        DGPP_LOG_WARN("MiMo FP8 KV audit rank {} layer {} unavailable: {}", rank_, layer, cudaGetErrorString(status));
+        continue;
+      }
+      for (int type = 0; type < 2; ++type) {
+        const auto& a = stats[type];
+        DGPP_LOG_INFO("MiMo FP8 KV audit rank={} layer={} type={} conversions={} clipped={} nonfinite={} changed={} error_squared={} reference_squared={}",
+            rank_, layer, type ? "V" : "K", a.conversions, a.clipped, a.nonfinite, a.changed,
+            a.error_squared, a.reference_squared);
+      }
+    }
+  }
 }
 MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
   check_req(run.req, "MiMo run");

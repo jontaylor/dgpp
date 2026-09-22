@@ -225,3 +225,115 @@ DGPP_TEST(mimo_fp8_bounded_online_same_algorithm_graph_and_mapping) {
     }
   }
 }
+
+DGPP_TEST(mimo_fp8_audit_counts_transformed_inputs_padding_and_graph_replay) {
+  auto stream = dgpp::kda_test::test_stream();
+  for (int window : {0, 128}) {
+    dgpp::MimoAttentionShape shape{4, 2, 1, 263, window, true};
+    const int width = shape.fused_width();
+    std::vector<uint16_t> fused(size_t(shape.requests) * width);
+    for (size_t i = 0; i < fused.size(); ++i)
+      fused[i] = dgpp::float_to_bf16_bits(float(int(i % 31) - 15) / 16.f);
+    for (int row = 0; row < shape.requests; ++row) {
+      const int base = row * width + shape.q_width();
+      const float edges[]{480.f, -512.f, std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::quiet_NaN(), 1.0625f, 1.1875f};
+      for (int i = 0; i < 6; ++i) fused[base + 64 + i] = dgpp::float_to_bf16_bits(edges[i]);
+      for (int i = 0; i < 6; ++i) fused[base + 192 + i] = dgpp::float_to_bf16_bits(edges[i]);
+      fused[base + 192] = dgpp::float_to_bf16_bits(700.f);
+      fused[base + 193] = dgpp::float_to_bf16_bits(-700.f);
+    }
+    std::vector<int64_t> pos{0, -1, 1048576, window ? 797 : 260};
+    std::vector<int32_t> ids{1, -1, -1, 0};
+    const auto frequency = dgpp::mimo_ref::inv_freq(window ? 1e4 : 1e7);
+    DevBuf source(fused.size() * 2), positions(32), mapping(16), freq(128),
+        q(size_t(shape.requests) * shape.q_width() * 2),
+        k(size_t(2) * shape.capacity * shape.k_width()),
+        v(size_t(2) * shape.capacity * shape.v_width()), status(16),
+        counters(2 * sizeof(dgpp::MimoFp8AuditStats));
+    source.upload(fused.data(), fused.size() * 2);
+    positions.upload(pos.data(), 32);
+    mapping.upload(ids.data(), 16);
+    freq.upload(frequency.data(), 128);
+    DGPP_CUDA_OK(cudaMemsetAsync(counters.as<uint8_t>(), 0, 2 * sizeof(dgpp::MimoFp8AuditStats), stream));
+    auto append = [&](bool audit) {
+      dgpp::mimo_qkv_append(shape, source.as<uint16_t>(), freq.as<float>(), positions.as<int64_t>(),
+          q.as<uint16_t>(), k.as<uint8_t>(), v.as<uint8_t>(), status.as<int32_t>(), stream,
+          false, mapping.as<int32_t>(), audit ? counters.as<dgpp::MimoFp8AuditStats>() : nullptr);
+    };
+    cudaGraph_t plain_graph;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    append(false);
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &plain_graph));
+    size_t plain_nodes = 0;
+    DGPP_CUDA_OK(cudaGraphGetNodes(plain_graph, nullptr, &plain_nodes));
+    require(plain_nodes == 1, "disabled FP8 audit added graph work");
+    DGPP_CUDA_OK(cudaGraphDestroy(plain_graph));
+    append(false);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    dgpp::MimoFp8AuditStats actual[2], expected[2]{};
+    counters.download(actual, sizeof(actual));
+    require(actual[0].conversions == 0 && actual[1].conversions == 0,
+            "disabled FP8 audit mutated counters");
+    for (int row : {0, 3}) {
+      auto one = shape;
+      one.requests = 1;
+      one.fp8_cache = false;
+      std::vector<uint16_t> rk(size_t(one.capacity) * one.k_width()),
+          rv(size_t(one.capacity) * one.v_width());
+      DevBuf reference_q(one.q_width() * 2), reference_k(rk.size() * 2), reference_v(rv.size() * 2);
+      // Use production BF16 append for the transformation, then an independent
+      // CPU E4M3 codebook for expected conversion statistics. This avoids
+      // conflating host/device transcendental differences with audit errors.
+      dgpp::mimo_qkv_append(one, source.as<uint16_t>() + row * width, freq.as<float>(),
+          positions.as<int64_t>() + row, reference_q.as<uint16_t>(), reference_k.as<uint16_t>(),
+          reference_v.as<uint16_t>(), status.as<int32_t>(), stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      reference_k.download(rk.data(), rk.size() * 2);
+      reference_v.download(rv.data(), rv.size() * 2);
+      const int slot = pos[row] % one.capacity;
+      for (int type = 0; type < 2; ++type) {
+        auto& a = expected[type];
+        const auto& data = type ? rv : rk;
+        const int dimensions = type ? one.v_width() : one.k_width();
+        for (int i = 0; i < dimensions; ++i) {
+          const float x = dgpp::bf16_bits_to_float(data[size_t(slot) * dimensions + i]);
+          ++a.conversions;
+          if (!std::isfinite(x)) { ++a.nonfinite; continue; }
+          const float y = decode(quant(x));
+          a.clipped += std::abs(x) > 448.f;
+          a.changed += x != y;
+          a.error_squared += double(y - x) * double(y - x);
+          a.reference_squared += double(x) * double(x);
+        }
+      }
+    }
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    append(true);
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int replay = 1; replay <= 3; ++replay) {
+      DGPP_CUDA_OK(cudaGraphLaunch(executable, stream));
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      counters.download(actual, sizeof(actual));
+      for (int type = 0; type < 2; ++type) {
+        const auto& a = actual[type];
+        const auto& e = expected[type];
+        require(a.conversions == e.conversions * replay && a.clipped == e.clipped * replay &&
+                a.nonfinite == e.nonfinite * replay && a.changed == e.changed * replay,
+                "FP8 audit counts differ from transformed CPU reference");
+        require(std::abs(a.error_squared - e.error_squared * replay) <= 1e-10 * std::max(1., e.error_squared * replay),
+                "FP8 audit squared error mismatch");
+        require(std::abs(a.reference_squared - e.reference_squared * replay) <= 1e-10 * std::max(1., e.reference_squared * replay),
+                "FP8 audit reference norm mismatch");
+      }
+    }
+    require(expected[0].nonfinite == 4 && expected[1].nonfinite == 4 &&
+            expected[0].clipped == 4 && expected[1].clipped == 4,
+            "audit fixture failed to exercise nonfinite and finite clipping");
+    DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+  }
+}
