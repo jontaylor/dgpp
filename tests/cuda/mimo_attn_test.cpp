@@ -98,10 +98,12 @@ struct Fixture {
 
 // Exact A/B gate: this candidate must not introduce a new numerical tolerance.
 DGPP_TEST(mimo_cuda_fused_prefill_is_bitwise_equal_and_kernel_only) {
+  // Bound race-instrumentation cost; the default retains full 8K/64K coverage.
+  const bool small = std::getenv("DGPP_MIMO_ATTN_SANITIZER_SMALL") != nullptr;
   for (int window : {0, 128}) {
     for (int scenario = 0; scenario < 4; ++scenario) {
       const int rows = scenario == 1 ? 17 : (scenario == 2 ? 128 : 1);
-      const int capacity = window ? 263 : (scenario == 0 ? 3 : (scenario == 3 ? 65536 : 8192));
+      const int capacity = window ? 263 : (scenario == 0 ? 3 : (small ? 512 : (scenario == 3 ? 65536 : 8192)));
       const int end_key = window ? capacity * 3 + 7 : capacity;  // wrapped non-power-of-two ring
       Fixture f({rows, 32, window ? 4 : 2, capacity, window}, true);
       DevBuf scores(size_t(rows) * 32 * capacity * 6);
