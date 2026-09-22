@@ -27,3 +27,13 @@ DGPP_MIMO_DECODE_BENCH=1 ./mimo_attn_test
 ```
 
 Prefill benchmark modes: 3=wide materialized baseline, 4=old partial probability fusion, 5=bounded three-pass, 6=online. Default starts at mode3. First-mode5 omits the context-sized score allocation entirely (one-byte placeholder in test helper only). Decode modes: 0=saved-score scalar, 1=existing split tensor PV, 2=no-scratch scalar, 3=online. Tests report actual relative L2, max absolute difference and changed BF16 elements on causal chunks, tails, wrap and reset; online synthetic gate is 2.5% relative L2 and is not a quality claim. Real model logit/top-token and long-context retrieval checks remain required; none were run on the build host.
+
+## Existing real-weight layer oracle
+
+`mimo_layer_check` honors both options and omits score allocation for bounded/online
+runs. Use `mimo_layer_check SNAPSHOT LAYER OUTPUT_BF16 CHUNK TOKENS` with
+identical snapshot, layer, chunk and token counts across baseline and candidate runs. Set `DGPP_MIMO_LAYER_ATTN_DUMP=1` to retain pre-output-projection
+attention alongside final layer output; this distinguishes attention drift from
+routing amplification. Compare final rows with `tools/mimo_layer_compare.py
+BASELINE_BF16 CANDIDATE_BF16`. Existing tool tolerance is a layer-output gate,
+not an end-to-end quality guarantee.
