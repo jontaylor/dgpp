@@ -630,6 +630,7 @@ add_executable(unit_tests
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_weights_test.cpp
   tests/unit/mimo_attention_test.cpp
+  tests/unit/mimo_snapshot_test.cpp
   tests/unit/qwen_binding_test.cpp
   tests/unit/glm4_config_test.cpp
   tests/unit/glm4_binding_test.cpp
@@ -1408,6 +1409,15 @@ if(DGPP_ENABLE_IBV)
   target_include_directories(micro_ibv_smoke PRIVATE ${IBVERBS_INCLUDE_DIR})
   dgpp_set_common(micro_ibv_smoke)
 endif()
+
+# Checkpoint-free exact-copy gate for MiMo rolling prefix snapshots.
+add_executable(mimo_snapshot_test tests/cuda/mimo_snapshot_test.cpp)
+target_include_directories(mimo_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(mimo_snapshot_test PRIVATE CUDA::cudart)
+dgpp_set_common(mimo_snapshot_test)
+add_test(NAME mimo_snapshot_test COMMAND mimo_snapshot_test)
+set_tests_properties(mimo_snapshot_test PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE)
+
 
 # Labels describe resources, not coverage guarantees. Some real-checkpoint
 # cases still skip internally when their optional model data is unavailable.

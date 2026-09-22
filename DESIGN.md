@@ -15,8 +15,10 @@ Shared session and engine interfaces live in `src/engine/`.
 The [MiMo port](docs/mimo26_flash_rl_plan.md) binds the checkpoint's complete text
 backbone across two Sparks. It uses tensor-core global/sliding prefill, split
 global decode attention, up to eight independent flat-cache sessions, scalar/batched
-CUDA graphs and prefix snapshots. Snapshots copy committed global history and
-pack live sliding windows. Shared execution workspace bounds memory use;
+CUDA graphs and prefix snapshots. Initial snapshots copy committed global history;
+refreshes of the same arena destination copy only appended global K/V. Request reset,
+restore, destination release/reassignment and rollback past the saved boundary force
+a full copy. Every refresh repacks the live sliding windows and copies MTP state. Shared execution workspace bounds memory use;
 budgeted prefill yields to live decode requests. The example configuration uses
 256K context per request, two concurrent sessions and an 11.54 GiB prefix-cache
 budget (four packed snapshots). See the [deployment record](benchmarks/results/2026-09-22-mimo-256k.md). Kernel, real-layer and

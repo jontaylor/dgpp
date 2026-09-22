@@ -64,6 +64,9 @@ limitations, including the one-hour soak used for that release.
   hidden histories. The 256K/context, concurrency-two template retains four snapshots.
   See the [native MTP record](benchmarks/results/2026-09-22-mimo-native-mtp3.md)
   and [recursive baseline](benchmarks/results/2026-09-22-mimo-mtp3.md).
+  Incremental rolling global-K/V snapshots are implemented with host lifecycle tests
+  and a checkpoint-free exact-copy GPU probe; GPU and real MTP3 graph validation
+  remain pending. See the [snapshot record](benchmarks/results/2026-09-22-mimo-incremental-snapshots.md).
   Full-model numerical parity and multimodal execution remain pending.
 
 The shared engine and loader interfaces support both additional families.

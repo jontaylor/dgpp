@@ -1137,6 +1137,8 @@ void SessionModel<D>::session_rollback(int req, int accepted) {
   }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   session_pos_[static_cast<size_t>(req)] = pos - (T - accepted);
+  if constexpr (requires { derived().rollback_state_snapshots(req, int64_t{}); })
+    derived().rollback_state_snapshots(req, session_pos_[static_cast<size_t>(req)]);
   push_position(req);
 }
 

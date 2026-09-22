@@ -4,6 +4,7 @@
 #include "engine/paged_blocks.hpp"
 #include "engine/session_model.hpp"
 #include "models/mimo/layers.hpp"
+#include "models/mimo/snapshot.hpp"
 
 namespace dgpp {
 // Independent flat-cache sessions with chunked projections, grouped MoE,
@@ -41,6 +42,13 @@ class MimoModel : public SessionModel<MimoModel> {
   }
   size_t draft_state_bytes() const;
   void write_state_snapshot(int req, uint8_t* dst, int spec_row);
+  void register_state_snapshot(const void* dst) { snapshot_history_.register_destination(dst); }
+  void unregister_state_snapshot(const void* dst) { snapshot_history_.unregister_destination(dst); }
+  void invalidate_state_snapshot(const void* dst) { snapshot_history_.release(dst); }
+  void rollback_state_snapshots(int req, int64_t position) { snapshot_history_.rewind(req, position); }
+  // Base K/V only: draft/MTP snapshot bytes are unchanged and excluded.
+  uint64_t snapshot_copied_bytes() const { return snapshot_copied_bytes_; }
+  uint64_t snapshot_saved_bytes() const { return snapshot_saved_bytes_; }
   void read_state_snapshot(int req, const uint8_t* src, int64_t position);
   GlmSpecSegments spec_segments(int, int = 0) const {
     // Expanded rings retain the live window before all verification rows.
@@ -72,6 +80,8 @@ class MimoModel : public SessionModel<MimoModel> {
   void restore_chain_state(int req);
 
  private:
+  MimoSnapshotHistory snapshot_history_;
+  uint64_t snapshot_copied_bytes_ = 0, snapshot_saved_bytes_ = 0;
   MimoTextConfig cfg_;
   std::vector<MimoLayerResident> draft_weights_;
   std::vector<std::unique_ptr<MimoDecoderLayer>> draft_layers_;

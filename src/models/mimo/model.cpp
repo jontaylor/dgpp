@@ -1,6 +1,8 @@
 #include "models/mimo/model.hpp"
 #include "models/mimo/head.hpp"
 
+#include "models/mimo/snapshot_copy.hpp"
+
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
 
@@ -237,6 +239,7 @@ void MimoModel::graph_prepare() {
 }
 void MimoModel::reset_slot_state(int req) {
   check_req(req, "MiMo reset");
+  snapshot_history_.rewind(req);
   // Position zero hides old global/ring tails; no full-cache memset per request.
 }
 void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
@@ -245,47 +248,28 @@ void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
   // by position; packing the earlier prefix does not need a full cache copy.
   const int64_t position =
       session_pos_[static_cast<size_t>(req)] - (spec_row >= 0 ? rows_after_for_snapshot_ : 0);
+  uint8_t* const base = dst;
+  const int64_t previous = snapshot_history_.begin(req, base, position);
   for (size_t l = 0; l < layers_.size(); ++l) {
     const auto& shape = layers_[l]->shape();
     const size_t slots = shape.window ? shape.window : shape.capacity;
-    const size_t snapshot_keys = slots * shape.k_width();
-    size_t packed_tokens = 0;
-    for (const auto span : mimo_snapshot_spans(shape, position)) {
-      if (!span.count) continue;
-      const size_t k_offset = size_t(span.first) * shape.k_width();
-      const size_t v_offset = size_t(span.first) * shape.v_width();
-      DGPP_CUDA_OK(cudaMemcpyAsync(
-          dst + packed_tokens * shape.k_width() * 2, keys_[l] + req * key_plane_[l] + k_offset,
-          size_t(span.count) * shape.k_width() * 2, cudaMemcpyDeviceToDevice, stream_));
-      DGPP_CUDA_OK(cudaMemcpyAsync(dst + snapshot_keys * 2 + packed_tokens * shape.v_width() * 2,
-                                   values_[l] + req * value_plane_[l] + v_offset,
-                                   size_t(span.count) * shape.v_width() * 2,
-                                   cudaMemcpyDeviceToDevice, stream_));
-      packed_tokens += span.count;
-    }
+    snapshot_copied_bytes_ += mimo_write_snapshot_layer(
+        shape, position, previous, keys_[l] + req * key_plane_[l],
+        values_[l] + req * value_plane_[l], dst, stream_);
+    if (!shape.window)
+      snapshot_saved_bytes_ += size_t(previous) * (shape.k_width() + shape.v_width()) * 2;
     dst += slots * (shape.k_width() + shape.v_width()) * 2;
   }
+  snapshot_history_.commit(req, base, position);
 }
 void MimoModel::read_state_snapshot(int req, const uint8_t* src, int64_t position) {
   check_req(req, "MiMo restore");
+  snapshot_history_.rewind(req);
   for (size_t l = 0; l < layers_.size(); ++l) {
     const auto& shape = layers_[l]->shape();
     const size_t slots = shape.window ? shape.window : shape.capacity;
-    const size_t snapshot_keys = slots * shape.k_width();
-    size_t packed_tokens = 0;
-    for (const auto span : mimo_snapshot_spans(shape, position)) {
-      if (!span.count) continue;
-      const size_t k_offset = size_t(span.first) * shape.k_width();
-      const size_t v_offset = size_t(span.first) * shape.v_width();
-      DGPP_CUDA_OK(cudaMemcpyAsync(
-          keys_[l] + req * key_plane_[l] + k_offset, src + packed_tokens * shape.k_width() * 2,
-          size_t(span.count) * shape.k_width() * 2, cudaMemcpyDeviceToDevice, stream_));
-      DGPP_CUDA_OK(cudaMemcpyAsync(values_[l] + req * value_plane_[l] + v_offset,
-                                   src + snapshot_keys * 2 + packed_tokens * shape.v_width() * 2,
-                                   size_t(span.count) * shape.v_width() * 2,
-                                   cudaMemcpyDeviceToDevice, stream_));
-      packed_tokens += span.count;
-    }
+    mimo_read_snapshot_layer(shape, position, src, keys_[l] + req * key_plane_[l],
+                              values_[l] + req * value_plane_[l], stream_);
     src += slots * (shape.k_width() + shape.v_width()) * 2;
   }
 }

@@ -34,6 +34,8 @@ class PrefixArena {
       DGPP_CUDA_OK(cudaMalloc(&base_, bytes_ * static_cast<size_t>(slots_)));
       metas_.resize(static_cast<size_t>(slots_));
       filled_.assign(static_cast<size_t>(slots_), false);
+      if constexpr (requires { model_->register_state_snapshot(ptr(0)); })
+        for (int s = 0; s < slots_; ++s) model_->register_state_snapshot(ptr(s));
       for (Timer& t : timers_) {  // timing events (the default flags)
         DGPP_CUDA_OK(cudaEventCreate(&t.start));
         DGPP_CUDA_OK(cudaEventCreate(&t.end));
@@ -53,6 +55,8 @@ class PrefixArena {
         cudaEventDestroy(t.start);
         cudaEventDestroy(t.end);
       }
+    if constexpr (requires { model_->unregister_state_snapshot(ptr(0)); })
+      for (int s = 0; s < slots_; ++s) model_->unregister_state_snapshot(ptr(s));
     if (base_) cudaFree(base_);
   }
   PrefixArena(const PrefixArena&) = delete;
@@ -79,7 +83,7 @@ class PrefixArena {
           "PrefixArena: session " + std::to_string(req) + " sits at " +
           std::to_string(model_->session_position(req)) + ", the snapshot expects " +
           std::to_string(expected_position));
-    release(slot);
+    release_contents(slot);
     Timer& t = begin_timer();
     metas_[static_cast<size_t>(slot)] = model_->session_snapshot(req, ptr(slot));
     end_timer(t, &snapshot_ms_, &snapshots_);
@@ -101,7 +105,7 @@ class PrefixArena {
           std::to_string(model_->session_position(req)) + ", the hop snapshot expects " +
           std::to_string(expected_position + rows_after) + " (" +
           std::to_string(rows_after) + " past the position)");
-    release(slot);
+    release_contents(slot);
     Timer& t = begin_timer();
     metas_[static_cast<size_t>(slot)] =
         model_->session_snapshot_post_row0(req, ptr(slot), spec_row, rows_after);
@@ -149,10 +153,8 @@ class PrefixArena {
   // Drops the slot's block references; the slot is empty afterwards.
   void release(int slot) {
     check(slot);
-    if (!filled_[static_cast<size_t>(slot)]) return;
-    model_->session_release_snapshot(metas_[static_cast<size_t>(slot)]);
-    metas_[static_cast<size_t>(slot)] = typename Model::SessionSnapshotMeta{};
-    filled_[static_cast<size_t>(slot)] = false;
+    invalidate(slot);
+    release_contents(slot);
   }
 
   // The measured device time so far (events harvested as they complete).
@@ -162,6 +164,18 @@ class PrefixArena {
   double attach_ms() const { harvest(); return attach_ms_; }
 
  private:
+  void invalidate(int slot) {
+    if constexpr (requires { model_->invalidate_state_snapshot(ptr(slot)); })
+      model_->invalidate_state_snapshot(ptr(slot));
+  }
+  // Refresh releases paged ownership but preserves MiMo's destination provenance.
+  // Explicit release/request/destruction also invalidate the destination.
+  void release_contents(int slot) {
+    if (!filled_[static_cast<size_t>(slot)]) return;
+    model_->session_release_snapshot(metas_[static_cast<size_t>(slot)]);
+    metas_[static_cast<size_t>(slot)] = typename Model::SessionSnapshotMeta{};
+    filled_[static_cast<size_t>(slot)] = false;
+  }
   struct Timer {
     cudaEvent_t start = nullptr, end = nullptr;
     bool armed = false;
