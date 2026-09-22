@@ -339,6 +339,36 @@ DGPP_TEST(mimo_cuda_parallel_chunk_preserves_causal_history_and_reset) {
       DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
       f.dout.download(wide.data(), wide.size() * 2);
       if (wide != narrow) throw std::runtime_error("wide PV changed the ordered MMA output");
+      for (bool online : {false, true}) {
+        dgpp::mimo_attention_bounded_prefill(
+            f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
+            f.dpos.as<int64_t>(), window ? f.dsinks.as<uint16_t>() : nullptr,
+            f.dout.as<uint16_t>(), start + count, f.stream, online);
+        DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+        std::vector<uint16_t> bounded(f.output.size());
+        f.dout.download(bounded.data(), bounded.size() * 2);
+        double error = 0, norm = 0, maxabs = 0;
+        int changed = 0;
+        for (int i = 0; i < count * f.shape.q_heads * 128; ++i) {
+          const double ref = dgpp::bf16_bits_to_float(wide[i]);
+          const double got = dgpp::bf16_bits_to_float(bounded[i]);
+          if (!std::isfinite(got)) throw std::runtime_error("nonfinite bounded attention");
+          error += (got - ref) * (got - ref);
+          norm += ref * ref;
+          maxabs = std::max(maxabs, std::abs(got - ref));
+          changed += bounded[i] != wide[i];
+        }
+        const double rel = std::sqrt(error / std::max(norm, 1e-30));
+        std::cout << "bounded window=" << window << " start=" << start << " count=" << count
+                  << " online=" << online << " rel_l2=" << rel << " maxabs=" << maxabs
+                  << " changed=" << changed << '\n';
+        if (rel > (online ? 0.025 : 0.005))
+          throw std::runtime_error("bounded attention exceeds synthetic relative L2 gate");
+      }
+      // Existing CPU-reference comparison below remains on baseline output.
+      DGPP_CUDA_OK(cudaMemcpyAsync(f.dout.as<uint16_t>(), wide.data(), wide.size() * 2,
+                                   cudaMemcpyHostToDevice, f.stream));
+      DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
       for (int t = 0; t < count; ++t) {
         dgpp::mimo_ref::qkv_append(scalar, f.fused.data() + t * scalar.fused_width(), f.freq.data(),
                                    f.positions.data() + t, f.q.data() + t * scalar.q_width(),
@@ -549,16 +579,19 @@ void benchmark_decode() {
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream);
     DevBuf scores(size_t(32) * 65536 * 6);
-    for (bool tensor : {false, true}) {
+    for (int tensor : {0, 1, 2, 3}) {
       auto run = [&] {
-        if (tensor)
+        if (tensor == 3)
+          dgpp::mimo_attention_online_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), nullptr, f.dout.as<uint16_t>(), f.stream);
+        else if (tensor == 1)
           dgpp::mimo_attention_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
                                       f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), nullptr,
                                       f.dout.as<uint16_t>(), scores.as<float>(), f.stream);
         else
           dgpp::mimo_attention(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
                                f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), nullptr,
-                               f.dout.as<uint16_t>(), f.stream, false, scores.as<float>());
+                               f.dout.as<uint16_t>(), f.stream, false, tensor == 2 ? nullptr : scores.as<float>());
       };
       cudaEvent_t start, end;
       DGPP_CUDA_OK(cudaEventCreate(&start));
@@ -581,20 +614,38 @@ void benchmark() {
   const int context = std::getenv("DGPP_MIMO_ATTN_BENCH_CONTEXT")
                           ? std::stoi(std::getenv("DGPP_MIMO_ATTN_BENCH_CONTEXT"))
                           : 8192;
+  if (context < 128 || context > 1048576) throw std::invalid_argument("benchmark context");
+  const int first_mode = std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")
+      ? std::stoi(std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")) : 3;
+  if (first_mode < 0 || first_mode > 6) throw std::invalid_argument("benchmark first mode");
   for (int window : {0, 128}) {
     Fixture f({128, 32, window ? 4 : 2, window ? 256 : context, window}, true);
-    DevBuf scores(size_t(128) * 32 * f.shape.capacity * (sizeof(float) + sizeof(uint16_t)));
+    DevBuf scores(first_mode <= 4 ? size_t(128) * 32 * f.shape.capacity * 6 : 1);
+    uint32_t rng = 37;
+    for (auto* cache : {&f.k, &f.v}) {
+      for (auto& x : *cache) {
+        rng = rng * 1664525u + 1013904223u;
+        x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+      }
+    }
+    f.dk.upload(f.k.data(), f.k.size() * 2);
+    f.dv.upload(f.v.data(), f.v.size() * 2);
     for (int t = 0; t < 128; ++t) f.positions[t] = context - 128 + t;
     f.prepare();
     dgpp::mimo_qkv_append(f.shape, f.df.as<uint16_t>(), f.dfreq.as<float>(), f.dpos.as<int64_t>(),
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream, true);
-    for (int tensor = 0; tensor < 5; ++tensor) {
+    for (int tensor = first_mode; tensor < 7; ++tensor) {
       cudaEvent_t start, end;
       DGPP_CUDA_OK(cudaEventCreate(&start));
       DGPP_CUDA_OK(cudaEventCreate(&end));
       auto run = [&] {
-        if (tensor)
+        if (tensor >= 5)
+          dgpp::mimo_attention_bounded_prefill(f.shape, f.dq.as<uint16_t>(),
+              f.dk.as<uint16_t>(), f.dv.as<uint16_t>(), f.dpos.as<int64_t>(),
+              window ? f.dsinks.as<uint16_t>() : nullptr, f.dout.as<uint16_t>(),
+              context, f.stream, tensor == 6);
+        else if (tensor)
           dgpp::mimo_attention_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
                                        f.dv.as<uint16_t>(), f.dpos.as<int64_t>(),
                                        window ? f.dsinks.as<uint16_t>() : nullptr,
@@ -736,6 +787,127 @@ DGPP_TEST(mimo_native_mtp_history_shift_padding_reorder_and_wrap) {
       std::vector<uint16_t> actual(expected.size());
       history.download(actual.data(), actual.size() * 2);
       if (actual != expected) throw std::runtime_error("native MTP history padding wrote stale state");
+    }
+  }
+}
+
+DGPP_TEST(mimo_cuda_online_mapped_decode_graph_and_padding) {
+  Fixture f({4, 4, 2, 263, 128});
+  uint32_t rng = 23;
+  auto fill = [&](std::vector<uint16_t>& data) {
+    for (auto& x : data) {
+      rng = rng * 1664525u + 1013904223u;
+      x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+    }
+  };
+  fill(f.q); fill(f.k); fill(f.v);
+  f.dq.upload(f.q.data(), f.q.size() * 2);
+  f.dk.upload(f.k.data(), f.k.size() * 2);
+  f.dv.upload(f.v.data(), f.v.size() * 2);
+  DevBuf ids(4 * sizeof(int32_t));
+  const int32_t mapping[] = {2, 0, 3, 1};
+  ids.upload(mapping, sizeof(mapping));
+  cudaGraph_t graph;
+  cudaGraphExec_t executable;
+  DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+  dgpp::mimo_attention_online_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+      f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+      f.dout.as<uint16_t>(), f.stream, ids.as<int32_t>());
+  DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+  size_t nodes = 0;
+  DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &nodes));
+  if (nodes != 1) throw std::runtime_error("online decode must capture one kernel");
+  DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+  for (int step : {0, 1}) {
+    f.positions = {526 + step, -1, 129 + step, 0};
+    f.dpos.upload(f.positions.data(), f.positions.size() * 8);
+    dgpp::mimo_attention(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+        f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+        f.dout.as<uint16_t>(), f.stream, false, nullptr, ids.as<int32_t>());
+    DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+    std::vector<uint16_t> ref(f.output.size()), got(ref.size());
+    f.dout.download(ref.data(), ref.size() * 2);
+    DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+    f.dout.download(got.data(), got.size() * 2);
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double a = dgpp::bf16_bits_to_float(got[i]), b = dgpp::bf16_bits_to_float(ref[i]);
+      if (!std::isfinite(a)) throw std::runtime_error("nonfinite online decode");
+      if (i / (4 * 128) == 1 && got[i]) throw std::runtime_error("online padding nonzero");
+      error += (a - b) * (a - b); norm += b * b;
+    }
+    const double rel = std::sqrt(error / std::max(norm, 1e-30));
+    std::cout << "online mapped decode step=" << step << " rel_l2=" << rel << '\n';
+    if (rel > 0.025) throw std::runtime_error("online decode synthetic L2 gate");
+  }
+  DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+  DGPP_CUDA_OK(cudaGraphDestroy(graph));
+}
+
+DGPP_TEST(mimo_cuda_bounded_random_serial_parallel_oracles) {
+  const bool small = std::getenv("DGPP_MIMO_ATTN_SANITIZER_SMALL") != nullptr;
+  for (int window : {0, 128}) {
+    const int capacity = window ? 263 : (small ? 512 : 8192);
+    const int end = window ? 800 : capacity;
+    Fixture f({17, 4, 2, capacity, window}, true);
+    DevBuf scores(size_t(17) * 4 * capacity * 6);
+    uint32_t rng = 47;
+    for (auto* data : {&f.q, &f.k, &f.v}) {
+      for (auto& x : *data) {
+        rng = rng * 1664525u + 1013904223u;
+        x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+      }
+    }
+    for (int r = 0; r < 17; ++r) f.positions[r] = end - 17 + r;
+    f.dq.upload(f.q.data(), f.q.size() * 2);
+    f.dk.upload(f.k.data(), f.k.size() * 2);
+    f.dv.upload(f.v.data(), f.v.size() * 2);
+    f.dpos.upload(f.positions.data(), f.positions.size() * 8);
+    for (bool sink : {false, true}) {
+      std::vector<uint16_t> serial(f.output.size()), parallel(serial.size());
+      for (bool par : {false, true}) {
+        dgpp::mimo_attention_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+            f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+            f.dout.as<uint16_t>(), scores.as<float>(), end, f.stream, par, true, true);
+        DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+        f.dout.download((par ? parallel : serial).data(), serial.size() * 2);
+      }
+      for (bool online : {false, true}) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+        dgpp::mimo_attention_bounded_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+            f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+            f.dout.as<uint16_t>(), end, f.stream, online);
+        DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+        size_t nodes = 0;
+        DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &nodes));
+        if (nodes != 1) throw std::runtime_error("bounded prefill must capture one kernel");
+        DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+        std::vector<uint16_t> got(serial.size());
+        f.dout.download(got.data(), got.size() * 2);
+        for (bool par : {false, true}) {
+          const auto& ref = par ? parallel : serial;
+          double error = 0, norm = 0, maxabs = 0;
+          int changed = 0;
+          for (size_t i = 0; i < ref.size(); ++i) {
+            const double a = dgpp::bf16_bits_to_float(got[i]), b = dgpp::bf16_bits_to_float(ref[i]);
+            if (!std::isfinite(a)) throw std::runtime_error("nonfinite bounded prefill");
+            error += (a - b) * (a - b); norm += b * b;
+            maxabs = std::max(maxabs, std::abs(a - b)); changed += got[i] != ref[i];
+          }
+          const double rel = std::sqrt(error / std::max(norm, 1e-30));
+          std::cout << "bounded random capacity=" << capacity << " window=" << window
+                    << " sink=" << sink << " online=" << online << " parallel_ref=" << par
+                    << " rel_l2=" << rel << " maxabs=" << maxabs << " changed=" << changed << '\n';
+          if (rel > (online ? 0.025 : 0.005)) throw std::runtime_error("bounded random L2 gate");
+        }
+        DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+        DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
     }
   }
 }

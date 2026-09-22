@@ -65,4 +65,17 @@ void mimo_attention_prefill(const MimoAttentionShape& shape, const uint16_t* q,
                             float* scores, int end_key, cudaStream_t stream,
                             bool parallel_softmax = true, bool wide_values = true,
                             bool fused_probabilities = false);
+// Experimental online decode, including mapped requests and padding.
+// Uses tensor-core QK and online softmax: differs from scalar decode numerics.
+void mimo_attention_online_decode(const MimoAttentionShape& shape, const uint16_t* q,
+    const uint16_t* k_cache, const uint16_t* v_cache, const int64_t* positions,
+    const uint16_t* sinks, uint16_t* out, cudaStream_t stream,
+    const int32_t* request_ids = nullptr);
+// Consecutive nonnegative shared-cache rows, ending at end_key - 1.
+// Three fused tiled passes, no global workspace or capture-time allocation.
+// Retains BF16 score/subtraction/probability roundings; tensor-core QK/PV
+// and sequential denominator summation can differ from parallel prefill.
+void mimo_attention_bounded_prefill(const MimoAttentionShape& shape, const uint16_t* q,
+    const uint16_t* k_cache, const uint16_t* v_cache, const int64_t* positions,
+    const uint16_t* sinks, uint16_t* out, int end_key, cudaStream_t stream, bool online = false);
 }  // namespace dgpp

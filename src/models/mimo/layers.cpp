@@ -121,7 +121,13 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, uin
   mimo_qkv_append(chunk, fused_, freq_, positions, q_, k_cache, v_cache, status, stream,
                   request_ids == nullptr, request_ids);
   if (cache_only) return;
-  if (!request_ids && tokens > 1 && attention_scores_ && end_key > 0) {
+  if (mimo_bounded_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
+    mimo_attention_bounded_prefill(chunk, q_, k_cache, v_cache, positions, w_.sinks,
+                                   attn_, end_key, stream, mimo_online_attention_enabled());
+  } else if (mimo_online_attention_enabled() && (request_ids || tokens == 1)) {
+    mimo_attention_online_decode(chunk, q_, k_cache, v_cache, positions, w_.sinks,
+                                  attn_, stream, request_ids);
+  } else if (!request_ids && tokens > 1 && attention_scores_ && end_key > 0) {
     // Projection/MoE chunks can be large while attention's temporary score
     // matrix stays bounded. The expanded ring preserves the whole chunk.
     // Read once outside the captured kernel path; explicit opt-in until

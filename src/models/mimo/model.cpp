@@ -64,6 +64,7 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
            device + align256(rows * c.hidden_size * 2) + align256(rows * c.num_hidden_layers * 4),
            pinned);
   plan.add("MiMo shared attention scores",
+           mimo_bounded_attention_enabled() ? 0 :
            size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) * c.num_attention_heads /
                world * std::max<int64_t>(global_capacity(context), mimo_ring_capacity(rows)) *
                (sizeof(float) + sizeof(uint16_t)));
@@ -118,7 +119,8 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   scratch_.init(align256(rows * c.hidden_size * 2) + align256(rows * c.num_hidden_layers * 4));
   residual_ = static_cast<uint16_t*>(scratch_.alloc(rows * c.hidden_size * 2));
   status_ = static_cast<int32_t*>(scratch_.alloc(rows * c.num_hidden_layers * 4));
-  attention_scores_.init(size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) *
+  if (!mimo_bounded_attention_enabled())
+    attention_scores_.init(size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) *
                          c.num_attention_heads / world *
                          std::max<int64_t>(global_capacity(context), mimo_ring_capacity(rows)) *
                          (sizeof(float) + sizeof(uint16_t)));

@@ -3,10 +3,29 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
 namespace dgpp {
+
+inline bool mimo_online_attention_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_ONLINE_ATTN");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// Fixed per-process option: set before memory planning/model construction.
+inline bool mimo_bounded_attention_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_BOUNDED_ATTN");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled || mimo_online_attention_enabled();
+}
 
 // One token per request/slot per invocation. SWA uses a bounded ring;
 // global attention uses a linear cache. The GPU shared-cache mode supports

@@ -375,6 +375,145 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
   }
 }
 
+// Three tiled passes preserve eager BF16 subtraction/probability rounding.
+// A single online rescale would change that contract. Global workspace: zero.
+template <bool online>
+__global__ void bounded_prefill(MimoAttentionShape s, const uint16_t* q,
+                               const uint16_t* kc, const uint16_t* vc,
+                               const int64_t* positions, const uint16_t* sinks,
+                               uint16_t* out, bool shared_cache = true, const int32_t* request_ids = nullptr) {
+  using namespace nvcuda;
+  const int tid = threadIdx.x, warp = tid / 32;
+  const int row0 = blockIdx.x * (shared_cache ? 16 : 1), head = blockIdx.y;
+  const int rowlimit = shared_cache ? s.requests : row0 + 1;
+  const int request = shared_cache ? 0 : (request_ids ? request_ids[row0] : row0);
+  if (!shared_cache && (positions[row0] < 0 || invalid(s, positions[row0]))) {
+    out[(int64_t(row0) * s.q_heads + head) * 128 + tid] = 0;
+    return;
+  }
+  const int kh = head / (s.q_heads / s.kv_heads);
+  const int last = min(row0 + 15, rowlimit - 1);
+  const int begin = s.window ? max(0, int(positions[row0]) - s.window + 1) : 0;
+  const int end = int(positions[last]) + 1;
+  __shared__ __align__(32) __nv_bfloat16 qa[16 * 192], kb[16 * 192];
+  __shared__ __align__(32) __nv_bfloat16 pa[256], vb[16 * 128];
+  __shared__ __align__(32) float sc[256], result[16 * 128];
+  __shared__ float maxima[16], denom[16], rescale[16];
+  for (int i = tid; i < 16 * 192; i += 128) {
+    const int row = row0 + i / 192;
+    reinterpret_cast<uint16_t*>(qa)[i] = row < rowlimit ?
+        q[(int64_t(row) * s.q_heads + head) * 192 + i % 192] : 0;
+  }
+  if (tid < 16) {
+    maxima[tid] = sinks ? bf16_bits_to_float(sinks[head]) : -CUDART_INF_F;
+    denom[tid] = online && sinks ? 1.f : 0.f;
+  }
+  __syncthreads();
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> accum[2];
+  for (int tile = 0; tile < 2; ++tile) wmma::fill_fragment(accum[tile], 0.f);
+  for (int pass = online ? 2 : 0; pass < 3; ++pass) {
+    for (int key0 = begin; key0 < end; key0 += 16) {
+      for (int i = tid; i < 16 * 192; i += 128) {
+        const int key = key0 + i / 192;
+        reinterpret_cast<uint16_t*>(kb)[i] = key < end ?
+            kc[((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 192 + i % 192] : 0;
+      }
+      __syncthreads();
+      if (warp == 0) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+        wmma::fill_fragment(dot, 0.f);
+        for (int d = 0; d < 192; d += 16) {
+          wmma::load_matrix_sync(af, qa + d, 192);
+          wmma::load_matrix_sync(kf, kb + d, 192);
+          wmma::mma_sync(dot, af, kf, dot);
+        }
+        wmma::store_matrix_sync(sc, dot, 16, wmma::mem_row_major);
+      }
+      __syncthreads();
+      if constexpr (online) {
+        // Conventional online recurrence. No BF16 subtraction or final
+        // normalized-probability rounding: this is explicitly approximate
+        // relative to MiMo eager numerics and needs model-quality validation.
+        for (int tile = 0; tile < 2; ++tile)
+          wmma::store_matrix_sync(result + (warp * 2 + tile) * 16, accum[tile], 128,
+                                  wmma::mem_row_major);
+        if (tid < 16) {
+          const int row = row0 + tid;
+          const int64_t pos = row < rowlimit ? positions[row] : -1;
+          const float oldmax = maxima[tid];
+          float newmax = oldmax;
+          for (int j = 0; j < 16; ++j) {
+            const int key = key0 + j;
+            const bool valid = key < end && key <= pos && (!s.window || key >= pos - s.window + 1);
+            sc[tid * 16 + j] = valid ? rb(__fmul_rn(rb(sc[tid * 16 + j]),
+                                                      0.07216878364870322f)) : -CUDART_INF_F;
+            newmax = fmaxf(newmax, sc[tid * 16 + j]);
+          }
+          const float alpha = isfinite(oldmax) ? expf(oldmax - newmax) : 0.f;
+          float mass = denom[tid] * alpha;
+          for (int j = 0; j < 16; ++j) {
+            const float weight = isfinite(sc[tid * 16 + j]) ? expf(sc[tid * 16 + j] - newmax) : 0.f;
+            mass += weight;
+            reinterpret_cast<uint16_t*>(pa)[tid * 16 + j] = float_to_bf16_bits(weight);
+          }
+          maxima[tid] = newmax;
+          denom[tid] = mass;
+          rescale[tid] = alpha;
+        }
+        __syncthreads();
+        for (int i = tid; i < 16 * 128; i += 128) result[i] *= rescale[i / 128];
+        __syncthreads();
+        for (int tile = 0; tile < 2; ++tile)
+          wmma::load_matrix_sync(accum[tile], result + (warp * 2 + tile) * 16, 128,
+                                 wmma::mem_row_major);
+      }
+      if (!online && tid < 16 && row0 + tid < rowlimit) {
+        const int64_t pos = positions[row0 + tid];
+        for (int j = 0; j < 16; ++j) {
+          const int key = key0 + j;
+          const bool valid = key < end && key <= pos && (!s.window || key >= pos - s.window + 1);
+          const float score = rb(__fmul_rn(rb(sc[tid * 16 + j]), 0.07216878364870322f));
+          if (valid && pass == 0) maxima[tid] = fmaxf(maxima[tid], score);
+          if (valid && pass == 1) denom[tid] += expf(rb(score - maxima[tid]));
+          if (pass == 2) reinterpret_cast<uint16_t*>(pa)[tid * 16 + j] = valid ?
+              float_to_bf16_bits(expf(rb(score - maxima[tid])) / denom[tid]) : 0;
+        }
+      }
+      if (pass == 2) {
+        for (int i = tid; i < 256; i += 128)
+          if (!online && row0 + i / 16 >= rowlimit) reinterpret_cast<uint16_t*>(pa)[i] = 0;
+        for (int i = tid; i < 16 * 128; i += 128) {
+          const int key = key0 + i / 128;
+          reinterpret_cast<uint16_t*>(vb)[i] = key < end ?
+              vc[((int64_t(request) * s.capacity + cache_slot(s, key)) * s.kv_heads + kh) * 128 + i % 128] : 0;
+        }
+        __syncthreads();
+        wmma::load_matrix_sync(af, pa, 16);
+        for (int tile = 0; tile < 2; ++tile) {
+          wmma::load_matrix_sync(vf, vb + (warp * 2 + tile) * 16, 128);
+          wmma::mma_sync(accum[tile], af, vf, accum[tile]);
+        }
+      }
+      __syncthreads();
+    }
+    if (pass == 1 && tid < 16 && sinks)
+      denom[tid] += expf(rb(bf16_bits_to_float(sinks[head]) - maxima[tid]));
+    __syncthreads();
+  }
+  for (int tile = 0; tile < 2; ++tile)
+    wmma::store_matrix_sync(result + (warp * 2 + tile) * 16, accum[tile], 128, wmma::mem_row_major);
+  __syncthreads();
+  for (int i = tid; i < 16 * 128; i += 128) {
+    const int row = row0 + i / 128;
+    if (row < rowlimit)
+      out[(int64_t(row) * s.q_heads + head) * 128 + i % 128] =
+          float_to_bf16_bits(online ? result[i] / denom[i / 128] : result[i]);
+  }
+}
+
 constexpr int decode_value_split = 512;
 __global__ void decode_value_parts(MimoAttentionShape s, const uint16_t* probabilities,
                                    const uint16_t* vc, const int64_t* positions,
@@ -501,6 +640,34 @@ void mimo_attention_decode(const MimoAttentionShape& s, const uint16_t* q, const
   DGPP_CUDA_OK(cudaGetLastError());
   decode_value_reduce<<<dim3(s.q_heads, s.requests), 128, 0, stream>>>(s, scores, positions, out,
                                                                        splits);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void mimo_attention_online_decode(const MimoAttentionShape& s, const uint16_t* q,
+    const uint16_t* kc, const uint16_t* vc, const int64_t* positions,
+    const uint16_t* sinks, uint16_t* out, cudaStream_t stream, const int32_t* request_ids) {
+  s.validate();
+  if (!q || !kc || !vc || !positions || !out)
+    throw std::invalid_argument("MiMo online decode: null buffer");
+  bounded_prefill<true><<<dim3(s.requests, s.q_heads), 128, 0, stream>>>(
+      s, q, kc, vc, positions, sinks, out, false, request_ids);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void mimo_attention_bounded_prefill(const MimoAttentionShape& s, const uint16_t* q,
+    const uint16_t* kc, const uint16_t* vc, const int64_t* positions,
+    const uint16_t* sinks, uint16_t* out, int end_key, cudaStream_t stream, bool online) {
+  s.validate();
+  if (!q || !kc || !vc || !positions || !out || end_key < s.requests ||
+      end_key > 1048576 || (!s.window && end_key > s.capacity) ||
+      (s.window && s.capacity < s.window + s.requests - 1))
+    throw std::invalid_argument("MiMo bounded prefill: invalid buffers or chunk bounds");
+  if (online)
+    bounded_prefill<true><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+        s, q, kc, vc, positions, sinks, out);
+  else
+    bounded_prefill<false><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+        s, q, kc, vc, positions, sinks, out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
