@@ -12,6 +12,7 @@ namespace dgpp {
 // Cold loading uses bounded host matrices and synchronous copies. It never
 // allocates a full host image of the model or expands MXFP4 experts.
 bool mimo_fp8_dense_enabled();
+bool mimo_fp8_dense_prefill_bf16_enabled();
 struct MimoFp8Resident {
   const uint8_t* payload = nullptr;
   const float* scales = nullptr;

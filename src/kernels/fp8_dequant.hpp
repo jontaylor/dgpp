@@ -20,4 +20,9 @@ void launch_fp8_dequant_blocks(const uint8_t* payload, const float* scales,
                                uint16_t* out_bf16, int64_t rows, int64_t cols,
                                cudaStream_t stream);
 
+// Same conversion on a caller-specified power-of-two square scale grid.
+// MiMo resident dense matrices use block_log2=6 after exact reblocking.
+void launch_fp8_dequant_grid(const uint8_t* payload, const float* scales, uint16_t* out_bf16,
+                             int64_t rows, int64_t cols, int block_log2, cudaStream_t stream);
+
 }  // namespace dgpp

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 
+#include "kernels/fp8_dequant.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -25,6 +26,7 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
       max_tokens_(max_tokens),
       attention_scores_(attention_scores) {
   shape_.fp8_cache = !c.is_mtp(w.layer) && mimo_fp8_cache_enabled();
+  prefill_bridge_ = mimo_fp8_dense_prefill_bf16_enabled();
   shape_.validate();
   if (requests < 1 || max_tokens < 1 || requests > kGemmDecodeLoweringRows ||
       (!w.qkv && !(w.qkv_fp8.payload && w.qkv_fp8.scales)) || !w.output || !w.input_norm ||
@@ -35,6 +37,12 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
     auto bf = [&](size_t cols) {
       return static_cast<uint16_t*>(buffer.alloc(size_t(max_tokens_) * cols * 2));
     };
+    if (prefill_bridge_ && max_tokens_ > 64) {
+      const size_t max_projection =
+          std::max(size_t(shape_.fused_width()) * c.hidden_size,
+                   c.moe(w.layer) ? size_t(0) : size_t(w.dense_inter) * c.hidden_size);
+      projection_bf16_ = static_cast<uint16_t*>(buffer.alloc(max_projection * 2));
+    }
     x_ = bf(c.hidden_size);
     y_ = bf(c.hidden_size);
     fused_ = bf(shape_.fused_width());
@@ -93,10 +101,29 @@ size_t MimoDecoderLayer::workspace_bytes(const MimoTextConfig& c, int layer, int
                  aligned(size_t(rows) * c.num_attention_heads / world * 128 * 2);
   bytes += c.moe(layer) ? aligned(size_t(rows) * c.hidden_size * 4)
                         : 3 * aligned(size_t(rows) * c.intermediate_size / world * 2);
+  if (mimo_fp8_dense_prefill_bf16_enabled() && rows > 64)
+    bytes +=
+        aligned(2 * std::max(size_t(c.qkv_rows(layer) / world) * c.hidden_size,
+                             c.moe(layer) ? size_t(0)
+                                          : size_t(c.intermediate_size / world) * c.hidden_size));
   return bytes;
 }
 void MimoDecoderLayer::project(const uint16_t* x, const uint16_t* w, uint16_t* y, int n, int k,
-                               cudaStream_t stream, int tokens, const MimoFp8Resident& fp8) {
+                               cudaStream_t stream, int tokens, const MimoFp8Resident& fp8,
+                               bool bridge) {
+  if (fp8.payload && bridge) {
+    // Also guard the actual stream state if a caller omitted capture=true.
+    cudaStreamCaptureStatus status;
+    DGPP_CUDA_OK(cudaStreamIsCapturing(stream, &status));
+    bridge = status == cudaStreamCaptureStatusNone;
+  }
+  if (fp8.payload && bridge) {
+    if (!projection_bf16_) throw std::logic_error("MiMo FP8 prefill bridge missing scratch");
+    launch_fp8_dequant_grid(fp8.payload, fp8.scales, projection_bf16_, n, k, 6, stream);
+    gemm_.matmul(x, projection_bf16_, y, tokens, n, k, DType::BF16, GemmOut::BF16, k, gemm_ws_,
+                 gemm_ws_bytes_, stream);
+    return;
+  }
   if (fp8.payload) {
     launch_scale_gemm_grid_bf16(x, k, fp8.payload, fp8.scales, y, tokens, n, k, stream, 0, 6, 6,
                                 tokens > dense_gemv_rows());
@@ -121,10 +148,13 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
     throw std::invalid_argument("MiMo decoder: null buffer");
   if ((w_.q_heads != cfg_.num_attention_heads) != (boundary != nullptr))
     throw std::invalid_argument("MiMo decoder: TP slices require a boundary reducer");
+  const bool bridge =
+      mimo_fp8_dense_use_bridge(prefill_bridge_, tokens, capture, request_ids != nullptr, end_key);
   const auto n = int64_t(tokens) * cfg_.hidden_size;
   glm_rmsnorm_bf16(residual, w_.input_norm, x_, tokens, cfg_.hidden_size, cfg_.rms_norm_eps,
                    stream);
-  project(x_, w_.qkv, fused_, shape_.fused_width(), cfg_.hidden_size, stream, tokens, w_.qkv_fp8);
+  project(x_, w_.qkv, fused_, shape_.fused_width(), cfg_.hidden_size, stream, tokens, w_.qkv_fp8,
+          bridge);
   // Expanded rings retain the oldest window plus this entire chunk. All
   // queries can therefore execute concurrently with causal position bounds.
   auto chunk = shape_;
@@ -170,7 +200,8 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
     return result ? result : y_;
   };
   auto* partial = stage();
-  project(attn_, w_.output, partial, cfg_.hidden_size, shape_.q_heads * 128, stream, tokens, {});
+  project(attn_, w_.output, partial, cfg_.hidden_size, shape_.q_heads * 128, stream, tokens, {},
+          false);
   fold(partial, boundary, stream, tokens, capture);
   add_inplace_bf16(residual, partial, n, stream);
   glm_rmsnorm_bf16(residual, w_.post_norm, x_, tokens, cfg_.hidden_size, cfg_.rms_norm_eps, stream);
@@ -185,11 +216,13 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
       moe_->enqueue_prefill_f32(x_, moe_sum_, tokens, nullptr, stream);
     launch_moe_round_bf16(partial, moe_sum_, n, stream);
   } else {
-    project(x_, w_.gate, gate_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.gate_fp8);
-    project(x_, w_.up, up_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.up_fp8);
+    project(x_, w_.gate, gate_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.gate_fp8,
+            bridge);
+    project(x_, w_.up, up_, w_.dense_inter, cfg_.hidden_size, stream, tokens, w_.up_fp8, bridge);
     launch_moe_swiglu_clamp(gate_, up_, act_, int64_t(tokens) * w_.dense_inter,
                             std::numeric_limits<float>::infinity(), stream);
-    project(act_, w_.down, partial, cfg_.hidden_size, w_.dense_inter, stream, tokens, w_.down_fp8);
+    project(act_, w_.down, partial, cfg_.hidden_size, w_.dense_inter, stream, tokens, w_.down_fp8,
+            bridge);
   }
   fold(partial, boundary, stream, tokens, capture);
   add_inplace_bf16(residual, partial, n, stream);

@@ -9,6 +9,11 @@
 #include "models/mimo/config.hpp"
 
 namespace dgpp {
+// Explicit execution-kind guard: CUDA graph capture and decode never bridge.
+inline bool mimo_fp8_dense_use_bridge(bool enabled, int rows, bool capture, bool has_request_ids,
+                                      int end_key) {
+  return enabled && rows > 64 && !capture && !has_request_ids && end_key > 0;
+}
 
 // Source checkpoint chunks are [Q0,K0,V0,Q1,K1,V1,...] at TP4.
 // A serving rank consumes [its Q heads, its K heads, its V heads].

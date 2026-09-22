@@ -47,6 +47,15 @@ bool mimo_fp8_dense_enabled() {
     throw std::invalid_argument("DGPP_MIMO_FP8_DENSE must be 0 or 1");
   return mode && std::string(mode) == "1";
 }
+bool mimo_fp8_dense_prefill_bf16_enabled() {
+  const char* mode = std::getenv("DGPP_MIMO_FP8_DENSE_PREFILL_BF16");
+  if (mode && std::string(mode) != "0" && std::string(mode) != "1")
+    throw std::invalid_argument("DGPP_MIMO_FP8_DENSE_PREFILL_BF16 must be 0 or 1");
+  const bool enabled = mode && std::string(mode) == "1";
+  if (enabled && !mimo_fp8_dense_enabled())
+    throw std::invalid_argument("DGPP_MIMO_FP8_DENSE_PREFILL_BF16 requires DGPP_MIMO_FP8_DENSE=1");
+  return enabled;
+}
 MimoDeviceLoader::MimoDeviceLoader(const std::string& checkpoint, int rank, int world)
     : reader_(checkpoint), rank_(rank), world_(world) {
   fp8_dense_ = mimo_fp8_dense_enabled();

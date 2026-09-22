@@ -45,7 +45,7 @@ class MimoDecoderLayer {
  private:
   friend struct MimoLayerProbe;
   void project(const uint16_t* x, const uint16_t* w, uint16_t* y, int n, int k, cudaStream_t stream,
-               int tokens, const MimoFp8Resident& fp8);
+               int tokens, const MimoFp8Resident& fp8, bool bridge);
   void fold(uint16_t* partial, BoundaryReducer* boundary, cudaStream_t stream, int tokens,
             bool capture);
   const MimoLayerResident& w_;
@@ -63,5 +63,7 @@ class MimoDecoderLayer {
   std::unique_ptr<GlmMoeLayer> owned_moe_;
   GlmMoeLayer* moe_ = nullptr;
   int graph_slot_ = 0;
+  bool prefill_bridge_ = false;
+  uint16_t* projection_bf16_ = nullptr;
 };
 }  // namespace dgpp

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "common/dtypes.hpp"
+#include "kernels/fp8_dequant.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "models/mimo/weights.hpp"
@@ -34,7 +35,6 @@ int main(int argc, char** argv) {
     dgpp::CublasLtGemm gemm;
     cudaStream_t stream;
     ok(cudaStreamCreate(&stream));
-    Buffer workspace(32u << 20);
     for (int layer : {0, 1})
       for (const std::string site : {"qkv", "gate", "up", "down"}) {
         if (layer == 1 && site != "qkv") continue;
@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
         w.put(packed.payload);
         scales.put(packed.scales);
         bf.put(ref.values);
+        Buffer transient(ref.values.size() * 2);
         for (int m : {1, 4, 8, 32, 128, 512}) {
           std::vector<uint16_t> x(size_t(m) * k);
           for (size_t i = 0; i < x.size(); ++i)
@@ -71,7 +72,7 @@ int main(int argc, char** argv) {
           };
           run();
           gemm.matmul(act.p, bf.p, baseline.p, m, n, k, dgpp::DType::BF16, dgpp::GemmOut::BF16, k,
-                      workspace.p, 32u << 20, stream);
+                      nullptr, 0, stream);
           ok(cudaStreamSynchronize(stream));
           std::vector<uint16_t> y(size_t(m) * n), z(y.size());
           ok(cudaMemcpy(y.data(), out.p, y.size() * 2, cudaMemcpyDeviceToHost));
@@ -125,7 +126,7 @@ int main(int argc, char** argv) {
           cudaGraph_t bf_graph;
           ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
           gemm.matmul(act.p, bf.p, baseline.p, m, n, k, dgpp::DType::BF16, dgpp::GemmOut::BF16, k,
-                      workspace.p, 32u << 20, stream);
+                      nullptr, 0, stream);
           ok(cudaStreamEndCapture(stream, &bf_graph));
           cudaGraphExec_t bf_exec;
           ok(cudaGraphInstantiate(&bf_exec, bf_graph, nullptr, nullptr, 0));
@@ -139,6 +140,47 @@ int main(int argc, char** argv) {
           std::cout << "rank=" << rank << " layer=" << layer << " site=" << site << " m=" << m
                     << " rel_rms=" << rel << " max_abs=" << maxerr << " kernel_nodes=" << count
                     << " fp8_us=" << ms * 100 << " bf16_us=" << bf_ms * 100 << "\n";
+          // Include fresh dequantization on EVERY timed invocation. No cached
+          // BF16 shadow: the same bounded buffer is overwritten each time.
+          if (m > 64) {
+            auto hybrid = [&] {
+              dgpp::launch_fp8_dequant_grid(w.as<uint8_t>(), scales.as<float>(),
+                                            transient.as<uint16_t>(), n, k, 6, stream);
+              gemm.matmul(act.p, transient.p, out.p, m, n, k, dgpp::DType::BF16,
+                          dgpp::GemmOut::BF16, k, nullptr, 0, stream);
+            };
+            hybrid();
+            ok(cudaStreamSynchronize(stream));
+            std::vector<uint16_t> restored(ref.values.size());
+            ok(cudaMemcpy(restored.data(), transient.p, restored.size() * 2,
+                          cudaMemcpyDeviceToHost));
+            if (restored != ref.values) throw std::runtime_error("GPU bridge dequant mismatch");
+            ok(cudaMemcpy(replay.data(), out.p, replay.size() * 2, cudaMemcpyDeviceToHost));
+            // Compare to the SAME zero-workspace GEMM as the serving model.
+            gemm.matmul(act.p, bf.p, baseline.p, m, n, k, dgpp::DType::BF16, dgpp::GemmOut::BF16, k,
+                        nullptr, 0, stream);
+            ok(cudaStreamSynchronize(stream));
+            ok(cudaMemcpy(z.data(), baseline.p, z.size() * 2, cudaMemcpyDeviceToHost));
+            if (replay != z) throw std::runtime_error("hybrid BF16 baseline mismatch");
+            ok(cudaEventRecord(a, stream));
+            for (int i = 0; i < 10; ++i) hybrid();
+            ok(cudaEventRecord(b, stream));
+            ok(cudaEventSynchronize(b));
+            float hybrid_ms;
+            ok(cudaEventElapsedTime(&hybrid_ms, a, b));
+            ok(cudaEventRecord(a, stream));
+            for (int i = 0; i < 10; ++i)
+              gemm.matmul(act.p, bf.p, baseline.p, m, n, k, dgpp::DType::BF16, dgpp::GemmOut::BF16,
+                          k, nullptr, 0, stream);
+            ok(cudaEventRecord(b, stream));
+            ok(cudaEventSynchronize(b));
+            float eager_bf_ms;
+            ok(cudaEventElapsedTime(&eager_bf_ms, a, b));
+            std::cout << "hybrid rank=" << rank << " layer=" << layer << " site=" << site
+                      << " m=" << m << " dequant_plus_gemm_us=" << hybrid_ms * 100
+                      << " eager_bf16_us=" << eager_bf_ms * 100
+                      << " scratch_bytes=" << ref.values.size() * 2 << "\n";
+          }
           cudaGraphExecDestroy(bf_exec);
           cudaGraphDestroy(bf_graph);
           cudaEventDestroy(a);
