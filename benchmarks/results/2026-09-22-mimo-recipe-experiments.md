@@ -85,7 +85,23 @@ passed all 11 requests, including C2 graph replay, four-slot prefix reuse,
 cancellation and recovery. Actual DFlash startup exposed two integration bugs:
 a stale TP reducer and the device picker's six-slot bound. Both are fixed;
 the eight-slot picker regression passed eager and graph execution on both Sparks.
-Repaired DFlash TP2 startup and service validation remain in progress.
+Repaired DFlash TP2 startup and all 11 lifecycle checks passed. All 19 timing
+requests completed with no failures: C1 decode code +9.9%, JSON -10.4%, prose
++96.5%, math +19.5%; C2 code +2.4%, JSON -25.8%; 67K TTFT +0.8%, cached
+67K decode +24.4%. Four serial acceptance probes yielded 4.204/6.486/0.969/
+4.313 accepted draft tokens per round for code/JSON/prose/math. Exact 31K
+retrieval and all three actual-harness replay cases passed.
+
+Initial DFlash serial, prefix and recovery outputs matched target-only, while
+C2 differed. Audit found the target BF16 GEMV cutoff at eight rows: DFlash C2
+verifies 16 rows and selects cuBLASLt. Opt-in target graph GEMV (`41fd8a7`)
+restored exact agreement across all 20 comparisons in the 11-request panel,
+including C2. This establishes agreement on this panel, not general numerical
+identity. Corrected C2 timing over two pairs was code 12.009 s / JSON 9.506 s,
+versus baseline approximately 10.9 / 10.0 s. DFlash therefore remains an
+optional workload-dependent experiment, not a general default speed win.
+Both ranks shut down cleanly with identical operation streams
+`40ca2e25f0ccf678a363188472976009` after the full DFlash panel.
 
 ## Snapshot budget
 
