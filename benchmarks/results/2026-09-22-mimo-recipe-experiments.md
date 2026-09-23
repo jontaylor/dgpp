@@ -44,33 +44,63 @@ or unrelated workloads. Run individual candidates first, then compatible
 combinations; preserve neutral/regressed results. Keep source and deployment
 opt-ins explicit. Never report kernel-only gain as whole-service gain.
 
-Status: baseline19-request suite, category acceptance, and retrieval at30,921,
-67,437 and125,491 tokens completed successfully. All three retrievals returned
-exact JSON with all three planted values. Both-rank original GPU probes passed;
-FP8, snapshots and DFlash-window memchecks report zero errors. The real-weight
-DFlash CPU/GPU oracle passed (maxabs0.25, RMS0.0263843, mincosine0.99991715).
+## Completed hardware evidence (2026-09-23)
 
-Initial attention kernel measurements at64K: oldwide89.357ms, previous
-fused82.376ms, bounded391.531ms, online182.222ms. The original memory-saving
-paths regress global attention; onlineSWA improves (~.24ms vs~.325ms). These
-are kernel timings, not service results. Split-key followup is implemented and
-awaiting hardware validation.
+Baseline source `7ca896f`: all 19 timing requests, four category acceptance
+probes and exact three-key retrieval at 30,921, 67,437 and 125,491 tokens passed.
 
-Original FP8 dense real-weight probe favors small-row decode but regresses
-512-row prefill. That probe used32MiB cuBLAS workspace whereas service uses
-zero, so its ratios are not directly representative of service. A transient
-BF16 prefill bridge adds64MiB shared scratch and a revised matched-workspace
-probe. Both await hardware validation. Original FP8-dense live19-request timing
-suite is in progress; preserve partial evidence underraw/fp8-dense.
+Original FP8 dense: all 19 timing requests, four acceptance probes and 31K
+retrieval passed. C1 decode time changed -11.6% code, -8.7% JSON, -4.0% prose,
+-8.9% math; C2 code/JSON -11.4%/-13.8%. Cold TTFT regressed 7.7% at 7K,
+4.8% at 31K and 2.3% at 67K. Saved approximately 1.79 GiB per rank.
+Some generated text differs; this panel does not establish quality equivalence.
 
-All traffic is explicitly paused by the user. Parent holds both ranks exclusively.
-No new source has been copied back into the original dirty checkout.
+Original FP8 cache: all 19 timing requests and four acceptance probes passed.
+Live backbone KV fell from 6.39 to 3.19 GiB; four snapshots fell from 11.54 to
+5.89 GiB, saving 8.842 GiB per rank. Short decode was about 1–3% slower;
+67K cold TTFT was 414.284 versus baseline 230.398 seconds. Exact three-key
+retrieval passed at 31K and 67K. The 125K probe was explicitly skipped because
+its predicted 1394.7-second request exceeded the bounded experiment budget.
+The actual orchestration harness passed all three replay cases, including the
+original failing request, with complete arguments. Generated tools were not executed.
 
-## FP8 snapshot budget calculation (hardware verification pending)
+Attention alternatives are capacity tradeoffs, not demonstrated speed wins.
+At 64K the previous fused kernel took about 82 ms, bounded about 389 ms,
+online about 182 ms, and split-key about 143 ms. Compact materialized tiles
+16/32/64/128 used 0.75/1.5/3/6 GiB at 256K; BF16 kernel times were
+169.65/120.77/94.44/83.89 ms. Keep tile 128 for performance. Both-rank parity,
+64 mapped rows, graph replay and sanitizer gates passed; memory/race tools
+reported no errors/hazards. Do not equate these kernel timings with service rates.
+
+Two follow-ups await service measurement. The dense prefill bridge uses 64 MiB
+transient BF16 scratch only for eager prefill at least 512 rows. Real-weight
+2048-row QKV improved from direct FP8 4.578 ms to bridge 2.045 ms; BF16 was
+1.617 ms. Exact FP8 loading, compile-time default off, reduced same-source 64K
+FP8 attention from 167.022 to 94.076 ms. All 256 E4M3 codes passed GPU equality
+on both ranks under both builds. Neither result is yet an end-to-end speed claim.
+
+DFlash real-weight CPU/GPU oracle passed (maximum absolute error 0.25,
+RMS 0.0263843, minimum cosine 0.99991715). The target-only TP2 service control
+passed all 11 requests, including C2 graph replay, four-slot prefix reuse,
+cancellation and recovery. Actual DFlash startup exposed two integration bugs:
+a stale TP reducer and the device picker's six-slot bound. Both are fixed;
+the eight-slot picker regression passed eager and graph execution on both Sparks.
+Repaired DFlash TP2 startup and service validation remain in progress.
+
+## Snapshot budget
 
 At TP2/context262144/forward_rows2048 (ring4096), native MTP3 snapshot:
 BF16 base3032678400 + nativeMTP/hidden65019904 = 3097698304 bytes/slot.
 FP8 base1516339200 + unchanged65019904 = 1581359104 bytes/slot.
-Four FP8 slots require6325436416 bytes =5.891021728515625GiB.
-Use this reduced budget for matched four-slot tests; leaving the old11.5398GiB
-budget would silently increase retention instead of showing memory savings.
+Four FP8 slots require6325436416 bytes =5.891021728515625 GiB.
+Both live ranks confirmed exactly four slots. DFlash configurations use their
+own four-slot budgets because draft-state size differs.
+
+## Remaining work
+
+DFlash service correctness and timing; dense bridge and exact-FP8-load service
+measurements; current-source native-MTP control; separate real-activation FP8
+audit; combined timing/quality/harness/tool-cap/lifecycle validation; final
+selection and healthy restoration. Preserve rejected and failed candidates.
+All traffic is explicitly paused by the user. Parent holds both ranks exclusively.
+No new source has been copied into the original dirty checkout. No PR is requested.
