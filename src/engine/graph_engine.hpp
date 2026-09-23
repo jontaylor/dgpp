@@ -1650,13 +1650,19 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       // ~110 MB and fourteen of them 1.5 GiB — the largest item the memory
       // plan did not name.
       size_t free_before = 0, free_after = 0, total = 0;
-      (void)cudaMemGetInfo(&free_before, &total);
+      const bool memory_before_valid = cudaMemGetInfo(&free_before, &total) == cudaSuccess;
       DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
       cudaGraphDestroy(graph);
-      (void)cudaMemGetInfo(&free_after, &total);
-      DGPP_LOG_INFO("rank {}: graph variant {} instantiated — {:.1f} MiB of device memory ({:.1f} GiB free)", rank_,
-                    variant, static_cast<double>(free_before - free_after) / (1024.0 * 1024.0),
-                    static_cast<double>(free_after) / (1024.0 * 1024.0 * 1024.0));
+      const bool memory_after_valid = cudaMemGetInfo(&free_after, &total) == cudaSuccess;
+      if (memory_before_valid && memory_after_valid) {
+        // Reclamation can increase free memory during capture. This is an
+        // observed free-memory delta, not the graph's isolated allocation.
+        DGPP_LOG_INFO("rank {}: graph variant {} instantiated — device-free delta {:+.1f} MiB ({:.1f} GiB free)", rank_,
+                      variant, (static_cast<double>(free_after) - static_cast<double>(free_before)) / (1024.0 * 1024.0),
+                      static_cast<double>(free_after) / (1024.0 * 1024.0 * 1024.0));
+      } else {
+        DGPP_LOG_INFO("rank {}: graph variant {} instantiated — device-free delta unavailable", rank_, variant);
+      }
       return exec;
     } catch (...) {
       if (capture_open) {
