@@ -346,11 +346,11 @@ bool shared_snapshots_enabled() {
 }
 }
 size_t MimoModel::prefix_arena_storage_bytes() const {
-  return shared_snapshots_enabled() ? session_snapshot_bytes() - snapshot_state_bytes() + 8
+  return shared_snapshots_enabled() ? MimoSharedSnapshots::slot_storage_bytes(session_snapshot_bytes() - snapshot_state_bytes())
                                     : session_snapshot_bytes();
 }
 size_t MimoModel::snapshot_state_storage_bytes(const void* dst) const {
-  return shared_snapshots_ && shared_snapshots_->contains(dst) ? 8 : snapshot_state_bytes();
+  return shared_snapshots_ && shared_snapshots_->contains(dst) ? MimoSharedSnapshots::header_bytes : snapshot_state_bytes();
 }
 void MimoModel::register_state_snapshot(const void* dst) {
   snapshot_history_.register_destination(dst);

@@ -20,6 +20,13 @@ class MimoSharedSnapshots {
   using Write = std::function<void(uint8_t*, int64_t, int64_t)>;
   using Read = std::function<void(const uint8_t*, int64_t, int64_t)>;
   static constexpr int64_t block_tokens = 256;
+  // Draft snapshots use glm_device_copy, which requires 16-byte pointers.
+  // Keep both the payload offset and every arena slot base aligned, even
+  // when a family's trailing hidden row is not a multiple of 16 bytes.
+  static constexpr size_t header_bytes = 16;
+  static constexpr size_t slot_storage_bytes(size_t suffix_bytes) {
+    return (header_bytes + suffix_bytes + 15) & ~size_t(15);
+  }
   MimoSharedSnapshots(size_t bytes_per_token, size_t private_bytes, Allocate allocate)
       : token_bytes_(bytes_per_token), private_bytes_(private_bytes),
         allocate_([allocate = std::move(allocate), owned = owned_](size_t bytes) {

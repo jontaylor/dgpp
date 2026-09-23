@@ -97,3 +97,15 @@ The CPU FP64 oracle computes dot products and value sums independently while
 retaining the model's BF16 score/difference/probability rounding points.
 Its numerical mode is diagnostic; bitwise mode remains the default gate.
 All service comparisons must retain native MTP3 and use the same frozen source.
+
+### Shared snapshot payload alignment gate
+
+Shared arena slots reserve a 16-byte header and round the complete private
+payload stride up to 16 bytes. Both are required by the native MTP/DFlash
+`glm_device_copy` contract; an 8-byte header fails on the first snapshot.
+`mimo_snapshot_test` now runs actual `SessionModel` snapshot/attach through four
+`PrefixArena` slots with shared global/private state, segmented draft state,
+hidden rows, hop snapshots and slot reuse. A deliberately unaligned old-layout
+negative control must raise the copy alignment error. A non-multiple-of-16 hidden
+width also checks stride padding independently of the header. This checkpoint-free
+gate supplements, rather than replaces, the real-model native-MTP lifecycle gate.

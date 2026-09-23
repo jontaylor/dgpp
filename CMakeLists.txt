@@ -1436,7 +1436,7 @@ endif()
 # Checkpoint-free exact-copy gate for MiMo rolling prefix snapshots.
 add_executable(mimo_snapshot_test tests/cuda/mimo_snapshot_test.cpp)
 target_include_directories(mimo_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(mimo_snapshot_test PRIVATE CUDA::cudart)
+target_link_libraries(mimo_snapshot_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mimo_snapshot_test)
 add_test(NAME mimo_snapshot_test COMMAND mimo_snapshot_test)
 set_tests_properties(mimo_snapshot_test PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE)

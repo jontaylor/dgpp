@@ -92,3 +92,14 @@ DGPP_TEST(mimo_shared_snapshot_metrics_concurrent_read) {
   stop.store(true, std::memory_order_relaxed); reader.join();
   require(!invalid.load() && store.unique_bytes() == 0, "concurrent metric accounting");
 }
+
+DGPP_TEST(mimo_shared_snapshot_slot_alignment) {
+  using Layout = dgpp::MimoSharedSnapshots;
+  require(Layout::header_bytes % 16 == 0, "draft payload offset alignment");
+  for (size_t suffix = 0; suffix < 1024; ++suffix) {
+    const size_t stride = Layout::slot_storage_bytes(suffix);
+    require(stride % 16 == 0, "arena slot stride alignment");
+    require(stride >= Layout::header_bytes + suffix, "arena slot truncates payload");
+    require(stride - Layout::header_bytes - suffix < 16, "excess arena padding");
+  }
+}

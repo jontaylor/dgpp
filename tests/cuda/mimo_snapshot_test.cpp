@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "engine/prefix_arena.hpp"
+#include "engine/paged_blocks.hpp"
+#include "engine/session_model.hpp"
 #include "models/mimo/snapshot.hpp"
 #include "models/mimo/shared_snapshot.hpp"
 #include "models/mimo/snapshot_copy.hpp"
@@ -197,6 +199,145 @@ void run() {
   m.verify(arena.slot_data(0), 500);
   std::cout << "PASS: exact rolling/hop snapshots, wraps, rollback, restore, four-slot reuse; copied=" << m.copied << " bytes\n";
 }
+// A checkpoint-free family supplies only its state copies; snapshot metadata,
+// pointer advancement, hidden-row preservation and attach are SessionModel's.
+struct SharedMtpModel : dgpp::SessionModel<SharedMtpModel> {
+  using Layout = dgpp::MimoSharedSnapshots;
+  static constexpr size_t draft_bytes = 96;
+  static constexpr int width = 9;  // deliberately exercises slot tail padding
+  bool old_layout;
+  Buffer live{1024 + 16}, draft{draft_bytes};
+  std::unique_ptr<Layout> store;
+  struct UnusedPool : dgpp::PagedBlockTable {
+    void copy_block_contents(int32_t, int32_t, cudaStream_t) {
+      throw std::logic_error("test has no paged pool");
+    }
+  } unused;
+  explicit SharedMtpModel(bool old = false) : old_layout(old) {
+    dgpp::SessionParams p;
+    p.max_tokens = 16; p.max_cache_tokens = 1024; p.max_position_embeddings = 1024;
+    p.max_requests = 2; p.mtp = true; p.hidden = width; p.draft_width = width;
+    p.vocab_size = 16; p.lm_vocab_count = 16;
+    init_session(p);
+    store = std::make_unique<Layout>(1, 16, [this](size_t n) {
+      uint8_t* ptr = nullptr;
+      DGPP_CUDA_OK(cudaMallocAsync(&ptr, n, stream_));
+      return Layout::Storage(ptr, [stream = stream_](uint8_t* v) { cudaFreeAsync(v, stream); });
+    });
+  }
+  ~SharedMtpModel() {
+    store.reset();
+    cudaStreamSynchronize(stream_);
+  }
+  static constexpr int prefill_chunk_tokens() { return 16; }
+  bool has_pool() const { return false; }
+  UnusedPool& pool() { return unused; }
+  size_t snapshot_state_bytes() const { return 1040; }
+  size_t draft_state_bytes() const { return draft_bytes; }
+  size_t prefix_arena_storage_bytes() const {
+    const auto suffix = session_snapshot_bytes() - snapshot_state_bytes();
+    return old_layout ? suffix + 8 : Layout::slot_storage_bytes(suffix);
+  }
+  size_t snapshot_state_storage_bytes(const void* dst) const {
+    check(store->contains(dst), "unregistered shared slot");
+    return old_layout ? 8 : Layout::header_bytes;
+  }
+  void register_state_snapshot(const void* d) { store->register_slot(d); }
+  void unregister_state_snapshot(const void* d) { store->unregister_slot(d); }
+  void invalidate_state_snapshot(const void* d) { store->release(d); }
+  void reset_slot_state(int req) { store->rewind(req); }
+  void write_state_snapshot(int req, uint8_t* dst, int row) {
+    const auto pos = session_pos_[req] - (row < 0 ? 0 : rows_after_for_snapshot_);
+    store->write(req, dst, pos,
+      [&](uint8_t* out, int64_t first, int64_t n) {
+        DGPP_CUDA_OK(cudaMemcpyAsync(out, live.p + first, n, cudaMemcpyDeviceToDevice, stream_));
+      }, [&](uint8_t* out, int64_t, int64_t) {
+        dgpp::glm_device_copy(out, live.p + 1024, 16, stream_);
+      });
+  }
+  void read_state_snapshot(int req, const uint8_t* src, int64_t pos) {
+    store->read(req, src, pos,
+      [&](const uint8_t* in, int64_t first, int64_t n) {
+        DGPP_CUDA_OK(cudaMemcpyAsync(live.p + first, in, n, cudaMemcpyDeviceToDevice, stream_));
+      }, [&](const uint8_t* in, int64_t, int64_t) {
+        dgpp::glm_device_copy(live.p + 1024, in, 16, stream_);
+      });
+  }
+  void write_draft_snapshot(int, uint8_t* dst, bool, int64_t) {
+    // Multiple aligned segments model native heads' independent state planes.
+    for (size_t offset = 0; offset < draft_bytes; offset += 32)
+      dgpp::glm_device_copy(dst + offset, draft.p + offset, 32, stream_);
+  }
+  void read_draft_snapshot(int, const uint8_t* src) {
+    for (size_t offset = 0; offset < draft_bytes; offset += 32)
+      dgpp::glm_device_copy(draft.p + offset, src + offset, 32, stream_);
+  }
+  void seed(int64_t pos, int salt, bool hop = false) {
+    reset_slot_state(0);
+    session_pos_[0] = pos + (hop ? 1 : 0);
+    mtp_pos_[0] = hop ? pos - 1 : pos;
+    DGPP_CUDA_OK(cudaMemsetAsync(live.p, salt, 1040, stream_));
+    std::array<uint8_t, draft_bytes> values;
+    for (size_t i = 0; i < values.size(); ++i) values[i] = uint8_t(salt + 7 * i);
+    DGPP_CUDA_OK(cudaMemcpyAsync(draft.p, values.data(), values.size(), cudaMemcpyHostToDevice, stream_));
+    DGPP_CUDA_OK(cudaMemsetAsync(mtp_window(0), salt + 1, max_decode_rows_ * width * 2, stream_));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  }
+  void poison() {
+    DGPP_CUDA_OK(cudaMemsetAsync(live.p, 0, 1040, stream_));
+    DGPP_CUDA_OK(cudaMemsetAsync(draft.p, 0, draft_bytes, stream_));
+    DGPP_CUDA_OK(cudaMemsetAsync(mtp_window(1), 0, max_decode_rows_ * width * 2, stream_));
+  }
+  void verify(int64_t pos, int salt, bool hop) {
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    check(session_position(1) == pos && mtp_pos_[1] == pos - (hop ? 1 : 0), "session/draft position restore");
+    std::vector<uint8_t> cache(1040), got(draft_bytes), hidden(width * 2);
+    DGPP_CUDA_OK(cudaMemcpy(cache.data(), live.p, cache.size(), cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), draft.p, got.size(), cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(hidden.data(), mtp_window(1) + ((pos - 1) % max_decode_rows_) * width,
+                           hidden.size(), cudaMemcpyDeviceToHost));
+    for (int64_t i = 0; i < pos; ++i) check(cache[i] == salt, "shared global restore");
+    for (int i = 1024; i < 1040; ++i) check(cache[i] == salt, "shared private restore");
+    for (size_t i = 0; i < got.size(); ++i) check(got[i] == uint8_t(salt + 7 * i), "MTP payload restore");
+    for (auto v : hidden) check(v == salt + 1, "MTP hidden row restore");
+  }
+};
+void shared_session_mtp() {
+  {
+    SharedMtpModel broken(true);
+    dgpp::PrefixArena<SharedMtpModel> arena(&broken, 4);
+    broken.seed(300, 17);
+    bool rejected = false;
+    try { arena.snapshot(0, 0, 300); }
+    catch (const std::invalid_argument& e) {
+      rejected = std::string(e.what()) == "glm_device_copy: alignment/size";
+    }
+    check(rejected, "negative control did not catch the old +8 payload layout");
+  }
+  SharedMtpModel m;
+  dgpp::PrefixArena<SharedMtpModel> arena(&m, 4);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int slot = 0; slot < 4; ++slot) {
+      const int64_t pos = 300 + 7 * slot + 100 * pass;
+      const int salt = 17 + slot + 31 * pass;
+      const bool hop = slot % 2;
+      check(reinterpret_cast<uintptr_t>(arena.slot_data(slot)) % 16 == 0, "arena slot alignment");
+      m.seed(pos, salt, hop);
+      if (hop) arena.snapshot_post_row0(0, slot, pos, 0, 1);
+      else arena.snapshot(0, slot, pos);
+    }
+    for (int slot = 0; slot < 4; ++slot) {
+      m.session_close(1);
+      m.poison();
+      arena.attach(1, slot);
+      m.verify(300 + 7 * slot + 100 * pass, 17 + slot + 31 * pass, slot % 2);
+    }
+  }
+  for (int slot = 0; slot < 4; ++slot) arena.release(slot);
+  check(m.store->unique_bytes() == 0, "session shared storage leaked after release");
+  std::cout << "PASS: real SessionModel MTP snapshots/attach, four slots, hop/reuse, +8 negative control\n";
+}
+
 void shared_gpu_storage() {
   cudaStream_t stream;
   DGPP_CUDA_OK(cudaStreamCreate(&stream));
@@ -250,6 +391,7 @@ int main() {
     run<uint16_t>();
     run<uint8_t>();
     shared_gpu_storage();
+    shared_session_mtp();
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
