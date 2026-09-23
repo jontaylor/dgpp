@@ -10,6 +10,7 @@
 #include "kernels/mimo_attn.hpp"
 
 namespace dgpp {
+bool mimo_fp8_fast_load_build() { return DGPP_MIMO_FP8_KV_FAST_LOAD != 0; }
 namespace {
 // Keep short-context trajectories on the established scalar path; the
 // coalesced/split path pays off as history grows. This is a device-side

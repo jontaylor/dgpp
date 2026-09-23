@@ -131,6 +131,9 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   globals_ = loader.load_globals();
   DGPP_LOG_INFO("MiMo rank {}: base K/V and prefix snapshots use {}", rank,
                 mimo_fp8_cache_enabled() ? "unit-scale E4M3 FP8" : "BF16");
+  DGPP_LOG_INFO("MiMo rank {}: FP8 cache load build={} (DGPP_MIMO_FP8_KV_FAST_LOAD={})", rank,
+                mimo_fp8_fast_load_build() ? "exact-finite-truncation" : "original-RNE",
+                mimo_fp8_fast_load_build() ? 1 : 0);
   cache_.init(requests * cache_bytes(c, context, world, sp.max_tokens));
   DGPP_CUDA_OK(cudaMemsetAsync(cache_.base, 0, cache_.capacity, stream_));
   const int rows = sp.max_tokens;
