@@ -27,7 +27,9 @@ not been loosened. Target-hardware quality and performance remain separate gates
 
 ## Workspace and capture
 
-Production prefill processes at most 32 query rows at once. Workspace is exactly
+Production prefill and mapped decode process at most 32 query rows at once.
+Wide DFlash verification (up to64 rows) reuses the same partial allocation across
+32-row mapped slices, preserving absolute cache-plane indices. Workspace is exactly
 `rows * local_q_heads * splits * 130 * sizeof(float)` bytes, reusable across
 layers and tiles on the model stream. `splits=min(256,ceil(capacity/target_keys))`;
 actual partition span is rounded to a multiple of 16 and covers the entire

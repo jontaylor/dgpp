@@ -171,8 +171,8 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
           attention_scores_, stream, true);
     }
   } else if (mimo_split_online_attention_enabled() && (request_ids || tokens == 1)) {
-    mimo_attention_split_online(chunk, q_, k_cache, v_cache, positions, w_.sinks,
-                                 attn_, attention_scores_, stream, false, request_ids);
+    mimo_attention_split_online_decode(chunk, q_, k_cache, v_cache, positions, w_.sinks,
+                                        attn_, attention_scores_, stream, request_ids);
   } else if (mimo_bounded_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
     mimo_attention_bounded_prefill(chunk, q_, k_cache, v_cache, positions, w_.sinks,
                                    attn_, end_key, stream, mimo_online_attention_enabled());

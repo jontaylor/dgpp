@@ -952,7 +952,7 @@ DGPP_TEST(mimo_cuda_split_online_partition_sink_padding_and_workspace_guards) {
   // Distinct physical V rows/planes expose missing, duplicate and mis-mapped keys.
   for (bool mapped : {false, true}) {
     for (int capacity : {3, 1025, 2051, 8193}) {
-      Fixture f({17, 4, 2, capacity, 0}, !mapped);
+      Fixture f({mapped ? 64 : 17, 4, 2, capacity, 0}, !mapped);
       std::fill(f.q.begin(), f.q.end(), 0);
       std::fill(f.k.begin(), f.k.end(), 0);
       const int planes = mapped ? f.shape.requests : 1;
@@ -968,7 +968,9 @@ DGPP_TEST(mimo_cuda_split_online_partition_sink_padding_and_workspace_guards) {
       std::vector<int32_t> mapping(f.shape.requests);
       for (int r = 0; r < f.shape.requests; ++r) mapping[r] = f.shape.requests - 1 - r;
       ids.upload(mapping.data(), mapping.size() * 4);
-      const size_t bytes = dgpp::mimo_online_partial_bytes(f.shape.requests, f.shape.q_heads, capacity);
+      const size_t bytes = dgpp::mimo_online_partial_bytes(
+          mapped ? std::min(f.shape.requests, dgpp::mimo_split_tile_rows) : f.shape.requests,
+          f.shape.q_heads, capacity);
       DevBuf parts(bytes + 256);
       for (bool sink : {false, true}) {
         for (int h = 0; h < f.shape.q_heads; ++h)
@@ -977,10 +979,14 @@ DGPP_TEST(mimo_cuda_split_online_partition_sink_padding_and_workspace_guards) {
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
-        dgpp::mimo_attention_split_online(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
-            f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
-            f.dout.as<uint16_t>(), parts.as<float>(), f.stream, !mapped,
-            mapped ? ids.as<int32_t>() : nullptr);
+        if (mapped)
+          dgpp::mimo_attention_split_online_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+              f.dout.as<uint16_t>(), parts.as<float>(), f.stream, ids.as<int32_t>());
+        else
+          dgpp::mimo_attention_split_online(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+              f.dout.as<uint16_t>(), parts.as<float>(), f.stream, true);
         DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
         DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {

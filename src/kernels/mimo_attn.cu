@@ -820,6 +820,24 @@ void mimo_attention_split_online(const MimoAttentionShape& s, const uint16_t* q,
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+void mimo_attention_split_online_decode(const MimoAttentionShape& s, const uint16_t* q,
+    const void* kc, const void* vc, const int64_t* positions, const uint16_t* sinks,
+    uint16_t* out, float* partials, cudaStream_t stream, const int32_t* request_ids) {
+  s.validate();
+  if (!q || !kc || !vc || !positions || !out || !partials)
+    throw std::invalid_argument("MiMo split decode: null buffer");
+  // Without an explicit map, slicing would reset implicit cache-plane indices.
+  if (s.requests > mimo_split_tile_rows && !request_ids)
+    throw std::invalid_argument("MiMo split decode: wide rows require explicit request mapping");
+  for (int first = 0; first < s.requests; first += mimo_split_tile_rows) {
+    auto tile = s;
+    tile.requests = std::min(mimo_split_tile_rows, s.requests - first);
+    mimo_attention_split_online(tile, q + size_t(first) * s.q_width(), kc, vc,
+        positions + first, sinks, out + size_t(first) * s.q_heads * 128, partials,
+        stream, false, request_ids ? request_ids + first : nullptr);
+  }
+}
+
 void mimo_attention_online_decode(const MimoAttentionShape& s, const uint16_t* q,
     const void* kc, const void* vc, const int64_t* positions,
     const uint16_t* sinks, uint16_t* out, cudaStream_t stream, const int32_t* request_ids) {

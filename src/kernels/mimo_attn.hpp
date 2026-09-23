@@ -80,6 +80,11 @@ void mimo_attention_split_online(const MimoAttentionShape& shape, const uint16_t
     const void* k_cache, const void* v_cache, const int64_t* positions, const uint16_t* sinks,
     uint16_t* out, float* partials, cudaStream_t stream, bool shared_cache = false,
     const int32_t* request_ids = nullptr);
+// Mapped decode microbatches into at most mimo_split_tile_rows, matching the
+// model/probe partial allocation. Cache plane indices remain absolute.
+void mimo_attention_split_online_decode(const MimoAttentionShape& shape, const uint16_t* q,
+    const void* k_cache, const void* v_cache, const int64_t* positions, const uint16_t* sinks,
+    uint16_t* out, float* partials, cudaStream_t stream, const int32_t* request_ids);
 // Experimental online decode, including mapped requests and padding.
 // Uses tensor-core QK and online softmax: differs from scalar decode numerics.
 void mimo_attention_online_decode(const MimoAttentionShape& shape, const uint16_t* q,
