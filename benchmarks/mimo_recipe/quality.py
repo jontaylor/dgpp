@@ -14,7 +14,7 @@ def main(tag,counts):
  dest=out/'quality.json';assert not dest.exists(),'Preserve previous quality evidence'
  before=metrics();assert before['scheduler']['active']==before['scheduler']['queued']==0
  rows=[];skipped=[];started=time.monotonic();previous_n=None
- for n in counts:
+ for index,n in enumerate(counts):
   if rows and previous_n:
    estimate=rows[-1]['ttft']*(n/previous_n)**2
    if estimate>1050 or time.monotonic()-started+estimate+30>1750:
@@ -30,8 +30,13 @@ def main(tag,counts):
   previous_n=n
   rows.append(r);dest.write_text(json.dumps(rows,indent=2))
   print('QUALITY',n,'exact JSON',r['exact_answer'],'values',r['values_found'],flush=True)
+  if not r['exact_answer']:
+   skipped.extend(dict(records=later,reason='Not executed after an earlier exact retrieval failure') for later in counts[index+1:])
+   if skipped:(out/'quality-skipped.json').write_text(json.dumps(skipped,indent=2))
+   break
  after=metrics();assert after['service']['requests_total']-before['service']['requests_total']==len(rows),'external traffic'
  assert after['service']['requests_failed']==before['service']['requests_failed'] and not after['service']['engine_failed']
  (out/'quality-metrics.json').write_text(json.dumps(dict(before=before,after=after,requested_counts=counts,skipped=skipped,complete=not skipped),indent=2))
  print('QUALITY SUMMARY',sum(r['exact_answer'] for r in rows),'/',len(rows),'exact;',len(skipped),'skipped; this is fixed retrieval evidence, not broad quality equivalence',flush=True)
+ if any(not r['exact_answer'] for r in rows):raise SystemExit(1)
 if __name__=='__main__':main(sys.argv[1],[int(x) for x in sys.argv[2:]] or [6000,11000])
