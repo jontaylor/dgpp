@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
         scales.put(packed.scales);
         bf.put(ref.values);
         Buffer transient(ref.values.size() * 2);
-        for (int m : {1, 4, 8, 32, 128, 512}) {
+        for (int m : {1, 4, 8, 32, 128, 256, 512, 2048}) {
           std::vector<uint16_t> x(size_t(m) * k);
           for (size_t i = 0; i < x.size(); ++i)
             x[i] = dgpp::float_to_bf16_bits(std::sin(float(i % 10007) * .017f));
@@ -177,7 +177,9 @@ int main(int argc, char** argv) {
             float eager_bf_ms;
             ok(cudaEventElapsedTime(&eager_bf_ms, a, b));
             std::cout << "hybrid rank=" << rank << " layer=" << layer << " site=" << site
-                      << " m=" << m << " dequant_plus_gemm_us=" << hybrid_ms * 100
+                      << " m=" << m << " service_bridge="
+                      << dgpp::mimo_fp8_dense_use_bridge(true, m, false, false, m)
+                      << " dequant_plus_gemm_us=" << hybrid_ms * 100
                       << " eager_bf16_us=" << eager_bf_ms * 100
                       << " scratch_bytes=" << ref.values.size() * 2 << "\n";
           }

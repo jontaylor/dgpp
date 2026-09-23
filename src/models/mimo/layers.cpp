@@ -37,7 +37,7 @@ MimoDecoderLayer::MimoDecoderLayer(const MimoLayerResident& w, const MimoTextCon
     auto bf = [&](size_t cols) {
       return static_cast<uint16_t*>(buffer.alloc(size_t(max_tokens_) * cols * 2));
     };
-    if (prefill_bridge_ && max_tokens_ > 64) {
+    if (prefill_bridge_ && max_tokens_ >= kMimoFp8DenseBridgeMinRows) {
       const size_t max_projection =
           std::max(size_t(shape_.fused_width()) * c.hidden_size,
                    c.moe(w.layer) ? size_t(0) : size_t(w.dense_inter) * c.hidden_size);
@@ -101,7 +101,7 @@ size_t MimoDecoderLayer::workspace_bytes(const MimoTextConfig& c, int layer, int
                  aligned(size_t(rows) * c.num_attention_heads / world * 128 * 2);
   bytes += c.moe(layer) ? aligned(size_t(rows) * c.hidden_size * 4)
                         : 3 * aligned(size_t(rows) * c.intermediate_size / world * 2);
-  if (mimo_fp8_dense_prefill_bf16_enabled() && rows > 64)
+  if (mimo_fp8_dense_prefill_bf16_enabled() && rows >= kMimoFp8DenseBridgeMinRows)
     bytes +=
         aligned(2 * std::max(size_t(c.qkv_rows(layer) / world) * c.hidden_size,
                              c.moe(layer) ? size_t(0)

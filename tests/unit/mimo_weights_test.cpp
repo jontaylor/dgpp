@@ -430,13 +430,13 @@ DGPP_TEST(mimo_fp8_resident_preserves_ordinary_tp_column_offsets) {
 
 DGPP_TEST(mimo_fp8_prefill_bridge_excludes_decode_and_every_capture) {
   for (bool enabled : {false, true})
-    for (int rows : {1, 4, 8, 32, 64, 65, 128, 512})
+    for (int rows : {1, 4, 8, 32, 64, 65, 128, 256, 511, 512, 513, 2048})
       for (bool capture : {false, true})
         for (bool decode : {false, true})
           for (int end_key : {0, 1024}) {
             const bool actual =
                 dgpp::mimo_fp8_dense_use_bridge(enabled, rows, capture, decode, end_key);
-            check(actual == (enabled && rows >= 65 && !capture && !decode && end_key == 1024),
+            check(actual == (enabled && rows >= 512 && !capture && !decode && end_key == 1024),
                   "incorrect prefill bridge execution kind");
           }
 }
