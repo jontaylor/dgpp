@@ -44,12 +44,27 @@ or unrelated workloads. Run individual candidates first, then compatible
 combinations; preserve neutral/regressed results. Keep source and deployment
 opt-ins explicit. Never report kernel-only gain as whole-service gain.
 
-Status: all five implementations are merged and cross-built in the isolated
-integration branch. Combined host suites pass (47 service, 52 scheduler).
-Fresh 19-request baseline performance suite passed with no external overlap.
-Baseline retrieval passes at 30,921 and 67,437 tokens; 125,491-token retrieval
-is currently running. New candidate GPU correctness/performance/quality gates
-remain outstanding. No new candidate performance win is claimed.
+Status: baseline19-request suite, category acceptance, and retrieval at30,921,
+67,437 and125,491 tokens completed successfully. All three retrievals returned
+exact JSON with all three planted values. Both-rank original GPU probes passed;
+FP8, snapshots and DFlash-window memchecks report zero errors. The real-weight
+DFlash CPU/GPU oracle passed (maxabs0.25, RMS0.0263843, mincosine0.99991715).
+
+Initial attention kernel measurements at64K: oldwide89.357ms, previous
+fused82.376ms, bounded391.531ms, online182.222ms. The original memory-saving
+paths regress global attention; onlineSWA improves (~.24ms vs~.325ms). These
+are kernel timings, not service results. Split-key followup is implemented and
+awaiting hardware validation.
+
+Original FP8 dense real-weight probe favors small-row decode but regresses
+512-row prefill. That probe used32MiB cuBLAS workspace whereas service uses
+zero, so its ratios are not directly representative of service. A transient
+BF16 prefill bridge adds64MiB shared scratch and a revised matched-workspace
+probe. Both await hardware validation. Original FP8-dense live19-request timing
+suite is in progress; preserve partial evidence underraw/fp8-dense.
+
+All traffic is explicitly paused by the user. Parent holds both ranks exclusively.
+No new source has been copied back into the original dirty checkout.
 
 ## FP8 snapshot budget calculation (hardware verification pending)
 
