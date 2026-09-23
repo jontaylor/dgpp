@@ -2,6 +2,8 @@
 """Parent-run, bounded TP2 DFlash correctness evidence. No deployment actions.
 
 Capture once with target-only mtp=false, once with DFlash7, then compare offline.
+The native capture mode runs the lifecycle panel with native MTP3; it is not a
+DFlash comparison arm.
 Text equality is a scoped observation: row-shape rounding can change near ties.
 """
 import argparse
@@ -171,7 +173,9 @@ class Capture:
             raise ValueError('Control deployment must explicitly set engine.mtp=false')
         if args.mode == 'dflash' and not (engine.get('mtp') is True and engine.get('mtp_depth') == 7):
             raise ValueError('DFlash deployment must set mtp=true, mtp_depth=7')
-        manifest = {'protocol': 'mimo-dflash-service-v1', 'mode': args.mode, 'pair_id': args.pair_id, 'started_unix_seconds': time.time(),
+        if args.mode == 'native' and not (engine.get('mtp') is True and engine.get('mtp_depth') == 3):
+            raise ValueError('Native deployment must set mtp=true, mtp_depth=3')
+        manifest = {'protocol': 'mimo-native-mtp3-service-v1' if args.mode == 'native' else 'mimo-dflash-service-v1', 'mode': args.mode, 'pair_id': args.pair_id, 'started_unix_seconds': time.time(),
                     'model': args.model, 'url': args.url, 'runtime_label': args.runtime_label,
                     'deployment_sha256': hashlib.sha256(config_bytes).hexdigest(), 'engine': engine,
                     'budget_seconds': args.budget_seconds, 'expected_requests': EXPECTED,
@@ -214,7 +218,7 @@ class Capture:
                       'no_server_failures': after['service']['requests_failed'] == before['service']['requests_failed'] and not after['service']['engine_failed'],
                       'cancel_observed': cancelled == 1,
                       'cache_hit_observed': warm > 0,
-                      'mode_metrics': drafts == 0 if args.mode == 'control' else drafts > 0 and spec['depth'] == 7,
+                      'mode_metrics': drafts == 0 if args.mode == 'control' else drafts > 0 and spec['depth'] == (3 if args.mode == 'native' else 7),
                       'c2_client_overlap': max(r['start_elapsed'] for r in records) < min(r['end_elapsed'] for r in records)}
             c2_replays = {key: value-self.metric_records['after-c1']['scheduler']['decode_batch']['replays_by_slots'].get(key, 0)
                           for key, value in self.metric_records['after-c2']['scheduler']['decode_batch']['replays_by_slots'].items()}
@@ -333,7 +337,7 @@ def main():
     sub = p.add_subparsers(dest='command', required=True)
     c = sub.add_parser('capture')
     for name in ['url', 'mode', 'out', 'deployment', 'pair-id', 'runtime-label']:
-        c.add_argument('--'+name, required=True, **({'choices': ['control', 'dflash']} if name == 'mode' else {}))
+        c.add_argument('--'+name, required=True, **({'choices': ['control', 'dflash', 'native']} if name == 'mode' else {}))
     c.add_argument('--model', default='XiaomiMiMo/MiMo-V2.6-Flash-RL')
     c.add_argument('--budget-seconds', type=float, default=300)
     c.add_argument('--request-timeout', type=float, default=45)
