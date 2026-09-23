@@ -184,7 +184,7 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   if (dflash)
     dflash_ = std::make_unique<MimoDFlash>(checkpoint + "/dflash", rows, requests,
                                            globals_.vocab_count, globals_.embed, globals_.head,
-                                           stream_, rank, world, boundary_);
+                                           stream_, rank, world);
   if (mtp && !dflash) {
     draft_weights_.reserve(c.mtp_blocks);
     for (int d = 0; d < c.mtp_blocks; ++d) {
@@ -441,7 +441,7 @@ void MimoModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
         features = dflash_->gather();
       }
       dflash_->context(features, pos, ids, T, stream_);
-      if (head_rows) dflash_->propose(tokens, pos, ids, groups, T / groups, stream_, capture);
+      if (head_rows) dflash_->propose(tokens, pos, ids, groups, T / groups, stream_, capture, boundary_);
     }
     if (!head_rows) return;
     dflash_->select(logits_, groups, head_rows / groups, draft_block_, stream_);

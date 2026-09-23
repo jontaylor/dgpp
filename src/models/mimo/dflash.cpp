@@ -12,6 +12,7 @@
 #include "kernels/glm_spec.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/mimo_dflash.hpp"
+#include "models/mimo/dflash_boundary.hpp"
 namespace dgpp {
 bool mimo_dflash_enabled() {
   const char* p = std::getenv("DGPP_MIMO_DFLASH");
@@ -130,18 +131,16 @@ size_t MimoDFlash::memory_bytes(int rows, int requests, int vocab, int world) {
 }
 MimoDFlash::MimoDFlash(const std::string& dir, int rows, int requests, int vocab,
                        const uint16_t* embedding, const uint16_t* head, cudaStream_t stream,
-                       int rank, int world, BoundaryReducer* boundary)
+                       int rank, int world)
     : rows_(rows),
       requests_(requests),
       vocab_(vocab),
       capacity_(std::bit_ceil(unsigned(1024 + rows))),
       world_(world),
-      boundary_(boundary),
       embedding_(embedding),
       head_(head) {
-  if ((world != 1 && world != 2 && world != 4 && world != 8) || rank < 0 || rank >= world ||
-      ((world > 1) != (boundary != nullptr)))
-    throw std::invalid_argument("DFlash TP geometry/reducer");
+  if ((world != 1 && world != 2 && world != 4 && world != 8) || rank < 0 || rank >= world)
+    throw std::invalid_argument("DFlash TP geometry");
   validate_config(dir);
   auto file = SafetensorsFile::open(dir + "/dflash_draft_model.safetensors");
   auto axis = [](const std::string& name) {
@@ -258,7 +257,8 @@ void MimoDFlash::context(const uint16_t* features, const int64_t* pos, const int
   }
 }
 void MimoDFlash::propose(const int64_t* tokens, const int64_t* pos, const int32_t* req, int groups,
-                         int rpg, cudaStream_t stream, bool capture) {
+                         int rpg, cudaStream_t stream, bool capture,
+                         BoundaryReducer* current_boundary) {
   const int n = groups * 8;
   if (n > rows_ || groups > requests_) throw std::invalid_argument("DFlash block exceeds capacity");
   dsv41_dspark_block_rows(pos, tokens, req, groups, rpg, 8, 151675, pos_, tokens_, req_, spans_,
@@ -276,14 +276,13 @@ void MimoDFlash::propose(const int64_t* tokens, const int64_t* pos, const int32_
     dflash_attention(q_, k_, v_, keys_[i], values_[i], l.sink, pos_, req_, attn_, groups, capacity_,
                      64 / world_, 8 / world_, stream);
     auto fold = [&](const uint16_t* input, const uint16_t* weight, int in) {
-      auto* partial = boundary_ ? boundary_->stage(n, 4096) : y_;
-      if (!partial) throw std::runtime_error("DFlash boundary staging missing");
-      project(input, weight, partial, 4096, in, n, stream);
-      if (boundary_) {
-        if (!capture && !boundary_->stream_ordered()) DGPP_CUDA_OK(cudaStreamSynchronize(stream));
-        boundary_->reduce(partial, n, 4096);
-      }
-      add_inplace_bf16(residual_, partial, size_t(n) * 4096, stream);
+      mimo_dflash_fold(
+          current_boundary, world_, y_, n, 4096, capture,
+          [&](uint16_t* partial) { project(input, weight, partial, 4096, in, n, stream); },
+          [&]() { DGPP_CUDA_OK(cudaStreamSynchronize(stream)); },
+          [&](uint16_t* partial) {
+            add_inplace_bf16(residual_, partial, size_t(n) * 4096, stream);
+          });
     };
     fold(attn_, l.o, 8192 / world_);
     glm_rmsnorm_bf16(residual_, l.post, x_, n, 4096, 1e-6f, stream);

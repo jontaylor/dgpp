@@ -16,7 +16,7 @@ class MimoDFlash {
   static constexpr std::array<int, 5> target_layers{0, 11, 23, 35, 47};
   MimoDFlash(const std::string& directory, int rows, int requests, int vocab,
              const uint16_t* embedding, const uint16_t* head, cudaStream_t stream, int rank = 0,
-             int world = 1, BoundaryReducer* boundary = nullptr);
+             int world = 1);
   static size_t state_bytes(int rows, int world = 1);
   static size_t memory_bytes(int rows, int requests, int vocab, int world = 1);
   const uint16_t* output_hidden() const { return x_; }
@@ -24,10 +24,13 @@ class MimoDFlash {
   uint16_t* features() { return features_; }
   uint16_t* gather() { return gather_; }
   const uint16_t* dummy_hidden() const { return dummy_; }
+  // Context FC/norm is replicated and context K/V projections are local shards;
+  // this path has no all-reduce and retains no reducer pointer.
   void context(const uint16_t* features, const int64_t* pos, const int32_t* req, int rows,
                cudaStream_t stream);
   void propose(const int64_t* tokens, const int64_t* pos, const int32_t* req, int groups,
-               int rows_per_group, cudaStream_t stream, bool capture = false);
+               int rows_per_group, cudaStream_t stream, bool capture = false,
+               BoundaryReducer* current_boundary = nullptr);
   void select(float* logits, int groups, int rows_out, int index, cudaStream_t stream);
   void snapshot(int req, uint8_t* out, cudaStream_t stream);
   void restore(int req, const uint8_t* in, cudaStream_t stream);
@@ -41,7 +44,6 @@ class MimoDFlash {
     const uint16_t *input, *post, *q, *k, *v, *o, *qn, *kn, *sink, *gate, *up, *down;
   };
   int rows_, requests_, vocab_, capacity_, world_;
-  BoundaryReducer* boundary_;
   CublasLtGemm gemm_;
   LayerBump weights_, scratch_, cache_;
   std::array<Layer, 5> layers_;

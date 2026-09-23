@@ -641,6 +641,7 @@ add_executable(unit_tests
   tests/unit/net_test.cpp
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
+  tests/unit/mimo_dflash_boundary_test.cpp
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_cache_format_test.cpp
   tests/unit/mimo_weights_test.cpp
