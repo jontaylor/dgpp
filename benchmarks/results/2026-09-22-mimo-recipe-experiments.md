@@ -72,12 +72,26 @@ online about 182 ms, and split-key about 143 ms. Compact materialized tiles
 64 mapped rows, graph replay and sanitizer gates passed; memory/race tools
 reported no errors/hazards. Do not equate these kernel timings with service rates.
 
-Two follow-ups await service measurement. The dense prefill bridge uses 64 MiB
+The dense prefill bridge uses 64 MiB
 transient BF16 scratch only for eager prefill at least 512 rows. Real-weight
 2048-row QKV improved from direct FP8 4.578 ms to bridge 2.045 ms; BF16 was
 1.617 ms. Exact FP8 loading, compile-time default off, reduced same-source 64K
 FP8 attention from 167.022 to 94.076 ms. All 256 E4M3 codes passed GPU equality
-on both ranks under both builds. Neither result is yet an end-to-end speed claim.
+on both ranks under both builds. The same-source control and dense-bridge service panels are now complete (19
+requests plus four acceptance probes each). The control matched all 19 old
+baseline outputs; median decode-time ratio was 1.00094. Its 67K TTFT was
+232.248 seconds versus old baseline 230.398; cached decode remained 4.56 s.
+Against that control, dense bridge reduced C1 decode time by 11.69% code,
+9.21% JSON, 4.25% prose and 9.81% math; C2 code/JSON by 13.55%/14.01%.
+Cold TTFT changed -0.26% at 7K, +0.29% at 31K, +0.30% at 67K; cached
+67K decode fell 6.07%. Total planned allocation is 106.22 GiB, approximately
+1.73 GiB below control per rank, including bridge scratch. Some output text
+differs. Fast-FP8-cache service measurement also completed all 19 requests and four
+acceptance probes. All 19 outputs matched the original FP8-cache run exactly.
+At 67K, TTFT fell from 414.284 to 258.160 seconds (-37.69%), but remains
+11.16% above same-source BF16 cache. At 31K it averaged 64.405 seconds
+versus BF16 56.672. The memory saving remains 8.842 GiB per rank; this is
+an optional capacity tradeoff, not a prefill speed win over BF16.
 
 DFlash real-weight CPU/GPU oracle passed (maximum absolute error 0.25,
 RMS 0.0263843, minimum cosine 0.99991715). The target-only TP2 service control
@@ -114,9 +128,7 @@ own four-slot budgets because draft-state size differs.
 
 ## Remaining work
 
-DFlash service correctness and timing; dense bridge and exact-FP8-load service
-measurements; current-source native-MTP control; separate real-activation FP8
-audit; combined timing/quality/harness/tool-cap/lifecycle validation; final
+Separate real-activation FP8 audit; combined timing/quality/harness/tool-cap/lifecycle validation; final
 selection and healthy restoration. Preserve rejected and failed candidates.
 All traffic is explicitly paused by the user. Parent holds both ranks exclusively.
 No new source has been copied into the original dirty checkout. No PR is requested.
