@@ -6,7 +6,9 @@ environment and cleared external traffic. The preparation agent did not make
 network requests or access either Spark.
 
 Use the same checkpoint, target precision, context, maximum concurrency,
-prefix budget and other engine settings in both modes. Target-only control
+four-slot prefix retention and other engine settings in both modes. Snapshot byte
+budgets may differ because draft state changes each slot size; the comparator
+permits that difference only when live metrics confirm four slots in both modes. Target-only control
 must explicitly set `engine.mtp=false`; DFlash must set `mtp=true`,
 `mtp_depth=7`, and the parent must verify `DGPP_MIMO_DFLASH=1` on both ranks.
 The supplied deployment configuration is saved as engine fields plus a SHA256;

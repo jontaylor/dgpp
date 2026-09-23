@@ -244,9 +244,19 @@ def compare(args):
               'capture_valid': all(s['status'] == 'ok' for s in summaries) and all(set(EXPECTED) <= r.keys() for r in runs), 'comparisons': []}
     e0, e1 = (m['engine'] for m in manifests)
     report['engine_differences'] = {k: [e0.get(k), e1.get(k)] for k in e0.keys() | e1.keys() if e0.get(k) != e1.get(k)}
+    slots = []
+    for directory in dirs:
+        path = directory/'before.metrics.json'
+        slots.append(json.loads(path.read_text())[-1]['metrics']['prefix_cache']['slots'] if path.exists() else None)
+    report['prefix_snapshot_slots'] = slots
+    # Draft state changes the byte size of a snapshot. Preserve four live slots,
+    # rather than silently reducing retention to match a nominal byte budget.
+    allowed = {'mtp', 'mtp_depth'}
+    if slots == [4, 4]:
+        allowed.add('prefix_cache_gib')
     report['configuration_matched'] = (manifests[0]['mode'] == 'control' and manifests[1]['mode'] == 'dflash' and
         manifests[0]['pair_id'] == manifests[1]['pair_id'] and manifests[0]['model'] == manifests[1]['model'] and
-        set(report['engine_differences']) <= {'mtp', 'mtp_depth'})
+        set(report['engine_differences']) <= allowed)
 
     def check(label, left, right, compare_request=True):
         differences = {field: first_difference(left.get(field, ''), right.get(field, '')) for field in ['content', 'reasoning']}

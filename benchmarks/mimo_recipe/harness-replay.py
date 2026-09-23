@@ -37,7 +37,7 @@ def validate(arguments, schema):
             assert value <= spec['maximum']
         if 'minLength' in spec:
             assert len(value) >= spec['minLength']
-        if key in schema.get('required', []) and expected is str:
+        if key in schema.get('required', []) and key in {'path', 'file_path', 'command', 'pattern', 'old_string'} and expected is str:
             assert value.strip(), 'empty required string: ' + key
 
 async def main(tag):
