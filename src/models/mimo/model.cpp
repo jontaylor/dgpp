@@ -7,8 +7,28 @@
 #include "models/mimo/head.hpp"
 #include "models/mimo/snapshot_copy.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace dgpp {
 namespace {
+bool target_decode_gemv_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_TARGET_DECODE_GEMV");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+// The lowering is chosen while enqueuing/capturing, not during GPU replay.
+// Restore the shared target GEMM before any prefill or native draft call.
+struct ScopedTargetDecodeRows {
+  CublasLtGemm& gemm;
+  int previous;
+  ScopedTargetDecodeRows(CublasLtGemm& g, int rows) : gemm(g), previous(g.decode_rows()) {
+    gemm.set_decode_rows(rows);
+  }
+  ~ScopedTargetDecodeRows() { gemm.set_decode_rows(previous); }
+};
 size_t align256(size_t n) {
   return (n + 255) & ~size_t(255);
 }
@@ -259,6 +279,10 @@ MimoModel::Outputs MimoModel::run_rows(const RowRun& run) {
                                                 : 1))))
     throw std::invalid_argument(
         "MiMo requires single-sequence prefill or at most four decode rows per request");
+  const ScopedTargetDecodeRows decode_lowering(
+      gemm_, target_decode_gemv_enabled() && run.decode && run.capture
+                 ? max_decode_rows_
+                 : gemm_.decode_rows());
   const auto in = begin_run(run);
   embed_gather_bf16(globals_.embed, in.tokens, residual_, run.T, cfg_.hidden_size, stream_);
   Outputs out;
