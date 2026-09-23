@@ -12,11 +12,12 @@ DGPP_HD inline uint16_t mimo_fp8_expanded_to_bf16(float value) {
       ? static_cast<uint16_t>((top & 0x8000u) | 0x7fc0u) : top;
 }
 // Direct E4M3-to-BF16 expansion: every finite input is exact, including
-// subnormals and signed zero. Keep the signed canonical quiet-NaN contract.
+// subnormals and signed zero. CUDA E4M3 expansion canonicalizes either NaN
+// encoding to positive quiet NaN (unlike arbitrary FP32 NaN conversion).
 DGPP_HD inline uint16_t mimo_fp8_bits_to_bf16(uint8_t code) {
   const uint16_t sign = uint16_t(code & 128u) << 8;
   const unsigned magnitude = code & 127u;
-  if (magnitude == 127u) return sign | 0x7fc0u;
+  if (magnitude == 127u) return 0x7fc0u;
   if (magnitude >= 8u) return sign | uint16_t((magnitude << 4) + 0x3c00u);
   // Eight-entry subnormal table expressed as branches to avoid device storage.
   const uint16_t low = magnitude == 0 ? 0 : magnitude == 1 ? 0x3b00 :

@@ -1141,11 +1141,15 @@ DGPP_TEST(mimo_cuda_compact_materialized_bitwise_and_mapped64_graph) {
 // Compare the staged fused PV path against independently materialized BF16
 // probabilities, including FP8 loads, partial tiles, ring wrap and graph replay.
 DGPP_TEST(mimo_cuda_staged_pv_bf16_fp8_bitwise) {
+  const std::string qk_choice = std::getenv("DGPP_MIMO_QK_KEY_TILE") ? std::getenv("DGPP_MIMO_QK_KEY_TILE") : "16";
+  const std::string swa_choice = std::getenv("DGPP_MIMO_SWA_QK_KEY_TILE") ? std::getenv("DGPP_MIMO_SWA_QK_KEY_TILE") : "16";
+  const std::string gemm_choice = std::getenv("DGPP_MIMO_QK_GEMM") ? std::getenv("DGPP_MIMO_QK_GEMM") : "0";
   for (bool fp8 : {false, true}) {
     for (int window : {0, 128}) {
-      Fixture f({17, 4, 2, window ? 263 : 515, window, fp8}, true);
+      for (int rows : {17, 128}) {
+      Fixture f({rows, 8, 2, window ? 263 : 515, window, fp8}, true);
       const int end = window ? 800 : 515;
-      DevBuf scores(size_t(17) * 4 * f.shape.capacity * 6);
+      DevBuf scores(size_t(rows) * 8 * f.shape.capacity * 6);
       uint32_t rng = 7919;
       auto upload = [&](std::vector<uint16_t>& data, DevBuf& device, bool quantized) {
         std::vector<uint8_t> packed(data.size());
@@ -1154,19 +1158,23 @@ DGPP_TEST(mimo_cuda_staged_pv_bf16_fp8_bitwise) {
           const float value = float(int(rng >> 16) - 32768) / 16384.f;
           data[i] = dgpp::float_to_bf16_bits(value);
           packed[i] = dgpp::float_to_fp8_e4m3_bits(value);
+          if (quantized) data[i] = dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(packed[i]));
         }
         if (quantized) device.upload(packed.data(), packed.size());
         else device.upload(data.data(), data.size() * 2);
       };
       upload(f.q, f.dq, false);
       upload(f.k, f.dk, fp8);
-      for (int i = 0; i < 17; ++i) f.positions[i] = end - 17 + i;
-      f.dpos.upload(f.positions.data(), 17 * 8);
+      for (int i = 0; i < rows; ++i) f.positions[i] = end - rows + i;
+      f.dpos.upload(f.positions.data(), rows * 8);
       auto run = [&](bool fused) {
         dgpp::mimo_attention_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
             f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
             f.dout.as<uint16_t>(), scores.as<float>(), end, f.stream, true, true, fused);
       };
+      upload(f.v, f.dv, fp8);
+      run(true);
+      DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
       cudaGraph_t graph;
       cudaGraphExec_t executable;
       DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
@@ -1175,17 +1183,77 @@ DGPP_TEST(mimo_cuda_staged_pv_bf16_fp8_bitwise) {
       DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
       for (int replay = 0; replay < 2; ++replay) {
         upload(f.v, f.dv, fp8);
+        setenv("DGPP_MIMO_QK_KEY_TILE", "16", 1);
+        setenv("DGPP_MIMO_SWA_QK_KEY_TILE", "16", 1);
+        setenv("DGPP_MIMO_QK_GEMM", "0", 1);
         run(false);
+        setenv("DGPP_MIMO_QK_KEY_TILE", qk_choice.c_str(), 1);
+        setenv("DGPP_MIMO_SWA_QK_KEY_TILE", swa_choice.c_str(), 1);
+        setenv("DGPP_MIMO_QK_GEMM", gemm_choice.c_str(), 1);
         DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
         std::vector<uint16_t> expected(f.output.size()), actual(f.output.size());
         f.dout.download(expected.data(), expected.size() * 2);
         DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
         DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
         f.dout.download(actual.data(), actual.size() * 2);
-        if (expected != actual) throw std::runtime_error("staged PV changed output bits");
+        if (expected != actual) {
+          double error = 0, norm = 0, max_error = 0; size_t mismatches = 0, outside = 0;
+          for (size_t i = 0; i < actual.size(); ++i) {
+            const double a = dgpp::bf16_bits_to_float(actual[i]);
+            const double b = dgpp::bf16_bits_to_float(expected[i]);
+            if (!std::isfinite(a)) throw std::runtime_error("nonfinite GEMM attention");
+            error += (a-b)*(a-b); norm += b*b; max_error = std::max(max_error, std::abs(a-b));
+            mismatches += actual[i] != expected[i];
+            outside += std::abs(a-b) > std::max(1e-4, std::abs(b) / 128.0);
+          }
+          std::cout << "attention difference fp8=" << fp8 << " window=" << window << " rows=" << rows
+                    << " mismatches=" << mismatches << " rel_l2=" << std::sqrt(error / norm)
+                    << " outside=" << outside << " max_abs=" << max_error << '\n';
+          const bool numerical = gemm_choice == "1" && std::getenv("DGPP_MIMO_ATTN_GEMM_NUMERICAL");
+          if (!numerical) throw std::runtime_error("staged PV changed output bits");
+          // Independent FP64 dot products and PV sums retain the model's
+          // BF16 score/difference/probability rounding points. Compare both
+          // implementations to this oracle, not just to each other.
+          auto rb = [](double x) { return dgpp::bf16_bits_to_float(dgpp::float_to_bf16_bits(float(x))); };
+          double oracle_error = 0, oracle_norm = 0, baseline_error = 0;
+          size_t oracle_outside = 0, baseline_outside = 0;
+          for (int row = 0; row < rows; ++row) for (int head = 0; head < 8; ++head) {
+            const int kh = head / 4, pos = int(f.positions[row]);
+            const int first = window ? std::max(0, pos - window + 1) : 0;
+            std::vector<double> probability(pos - first + 1);
+            double maximum = dgpp::bf16_bits_to_float(f.sinks[head]);
+            for (int key = first; key <= pos; ++key) {
+              double dot = 0;
+              for (int d = 0; d < 192; ++d)
+                dot += double(dgpp::bf16_bits_to_float(f.q[(row * 8 + head) * 192 + d])) *
+                    dgpp::bf16_bits_to_float(f.k[((key % f.shape.capacity) * 2 + kh) * 192 + d]);
+              probability[key - first] = rb(rb(dot) * 0.07216878364870322f);
+              maximum = std::max(maximum, probability[key - first]);
+            }
+            double denominator = std::exp(rb(dgpp::bf16_bits_to_float(f.sinks[head]) - maximum));
+            for (auto& x : probability) { x = std::exp(rb(x - maximum)); denominator += x; }
+            for (auto& x : probability) x = rb(x / denominator);
+            for (int d = 0; d < 128; ++d) {
+              double sum = 0;
+              for (int key = first; key <= pos; ++key)
+                sum += probability[key-first] * dgpp::bf16_bits_to_float(f.v[((key % f.shape.capacity) * 2 + kh) * 128 + d]);
+              const double ref = rb(sum), tolerance = std::max(1e-4, std::abs(ref) / 128.0);
+              const size_t i = (row * 8 + head) * 128 + d;
+              const double av = dgpp::bf16_bits_to_float(actual[i]), bv = dgpp::bf16_bits_to_float(expected[i]);
+              oracle_norm += ref * ref; oracle_error += (av-ref)*(av-ref); baseline_error += (bv-ref)*(bv-ref);
+              oracle_outside += std::abs(av-ref) > tolerance; baseline_outside += std::abs(bv-ref) > tolerance;
+            }
+          }
+          std::cout << "FP64 oracle candidate_l2=" << std::sqrt(oracle_error/oracle_norm)
+                    << " candidate_outside=" << oracle_outside << " baseline_l2=" << std::sqrt(baseline_error/oracle_norm)
+                    << " baseline_outside=" << baseline_outside << '\n';
+          if (oracle_outside || std::sqrt(oracle_error/oracle_norm) > 0.002)
+            throw std::runtime_error("GEMM failed independent FP64 oracle");
+        }
       }
       DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
       DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
     }
   }
 }

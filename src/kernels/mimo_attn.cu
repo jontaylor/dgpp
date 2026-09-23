@@ -2,6 +2,7 @@
 #include <mma.h>
 #include <stdexcept>
 #include <cstdlib>
+#include <cublasLt.h>
 
 #include <cuda_bf16.h>
 #include "kernels/mimo_cache.cuh"
@@ -141,7 +142,21 @@ __device__ float score(MimoAttentionShape s, const uint16_t* q, const void* kc, 
 
 // One warp computes a 16-query by 16-key QK tile with BF16 tensor cores.
 // Absolute positions retain the same causal/ring mapping as the scalar path.
-__global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const void* kc,
+__global__ void expand_prefill_cache(const uint8_t* kc, const uint8_t* vc,
+                                     uint16_t* kb, uint16_t* vb, int64_t nk, int64_t nv) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < nk) {
+    __nv_fp8_e4m3 x; x.__x = kc[i];
+    kb[i] = mimo_fp8_expanded_to_bf16(static_cast<float>(x));
+  }
+  if (i < nv) {
+    __nv_fp8_e4m3 x; x.__x = vc[i];
+    vb[i] = mimo_fp8_expanded_to_bf16(static_cast<float>(x));
+  }
+}
+
+template <bool repair = false>
+__global__ void score_tiles_baseline(MimoAttentionShape s, const uint16_t* q, const void* kc,
                             const int64_t* positions, float* scores, int first_key, int end_key) {
   using namespace nvcuda;
   const int row0 = blockIdx.y * 16, head = blockIdx.z;
@@ -154,6 +169,18 @@ __global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const void*
   __shared__ __align__(32) __nv_bfloat16 a[16 * 192], b[16 * 192];
   __shared__ __align__(32) float c[16 * 16];
   const int kh = head / (s.q_heads / s.kv_heads);
+  if constexpr (repair) {
+    bool near_tie = false;
+    for (int i = lane; i < 256; i += 32) {
+      const int row = row0 + i / 16, key = key0 + i % 16;
+      if (row < s.requests && key < end_key && key <= positions[row]) {
+        const float dot = scores[(int64_t(row) * s.q_heads + head) * s.capacity + key];
+        const unsigned fraction = __float_as_uint(dot) & 65535u;
+        near_tie |= fraction >= 32768u - 32u && fraction <= 32768u + 32u;
+      }
+    }
+    if (!__any_sync(0xffffffffu, near_tie)) return;
+  }
   for (int i = lane; i < 16 * 192; i += 32) {
     const int row = row0 + i / 192, dim = i % 192;
     const int key = key0 + i / 192;
@@ -180,7 +207,113 @@ __global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const void*
       const int64_t p = positions[row];
       if (key <= p && (!s.window || key >= p - s.window + 1))
         scores[(int64_t(row) * s.q_heads + head) * s.capacity + cache_slot(s, key)] =
-            rb(__fmul_rn(rb(c[i]), 0.07216878364870322f));
+            repair ? c[i] : rb(__fmul_rn(rb(c[i]), 0.07216878364870322f));
+    }
+  }
+}
+
+
+// Eager/graph-safe after the handle is initialized: grouped strided GEMM
+// shares K within each GQA group and writes the existing interleaved scores.
+void score_gemm(MimoAttentionShape s, const uint16_t* q, const uint16_t* kc,
+                float* scores, int end_key, cudaStream_t stream) {
+  struct Handle {
+    cublasLtHandle_t value{};
+    Handle() { DGPP_CUBLAS_OK(cublasLtCreate(&value), "MiMo attention handle"); }
+    ~Handle() { cublasLtDestroy(value); }
+  };
+  static thread_local Handle handle;
+  struct Descriptors {
+    cublasLtMatmulDesc_t op{};
+    cublasLtMatrixLayout_t a{}, b{}, c{};
+    cublasLtMatmulPreference_t pref{};
+    ~Descriptors() {
+      if (pref) cublasLtMatmulPreferenceDestroy(pref);
+      if (c) cublasLtMatrixLayoutDestroy(c);
+      if (b) cublasLtMatrixLayoutDestroy(b);
+      if (a) cublasLtMatrixLayoutDestroy(a);
+      if (op) cublasLtMatmulDescDestroy(op);
+    }
+  } d;
+  DGPP_CUBLAS_OK(cublasLtMatmulDescCreate(&d.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "MiMo QK op");
+  const cublasOperation_t trans = CUBLAS_OP_T;
+  DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)), "MiMo QK transpose");
+  DGPP_CUBLAS_OK(cublasLtMatrixLayoutCreate(&d.a, CUDA_R_16BF, 192, end_key, s.k_width()), "MiMo QK K layout");
+  DGPP_CUBLAS_OK(cublasLtMatrixLayoutCreate(&d.b, CUDA_R_16BF, 192, s.requests, s.q_width()), "MiMo QK Q layout");
+  DGPP_CUBLAS_OK(cublasLtMatrixLayoutCreate(&d.c, CUDA_R_32F, end_key, s.requests, int64_t(s.q_heads) * s.capacity), "MiMo QK output layout");
+  const int batch = s.q_heads / s.kv_heads;
+  const int64_t strides[3] = {0, 192, s.capacity};
+  const cublasLtMatrixLayout_t layouts[3] = {d.a, d.b, d.c};
+  for (int i = 0; i < 3; ++i) {
+    DGPP_CUBLAS_OK(cublasLtMatrixLayoutSetAttribute(layouts[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)), "MiMo QK batch");
+    DGPP_CUBLAS_OK(cublasLtMatrixLayoutSetAttribute(layouts[i], CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strides[i], sizeof(int64_t)), "MiMo QK stride");
+  }
+  DGPP_CUBLAS_OK(cublasLtMatmulPreferenceCreate(&d.pref), "MiMo QK preference");
+  cublasLtMatmulHeuristicResult_t algorithm{};
+  int count = 0;
+  DGPP_CUBLAS_OK(cublasLtMatmulAlgoGetHeuristic(handle.value, d.op, d.a, d.b, d.c, d.c, d.pref, 1, &algorithm, &count), "MiMo QK heuristic");
+  if (!count) throw std::runtime_error("MiMo QK GEMM has no zero-workspace algorithm");
+  const float alpha = 1, beta = 0;
+  for (int kh = 0; kh < s.kv_heads; ++kh) {
+    float* out = scores + int64_t(kh * batch) * s.capacity;
+    DGPP_CUBLAS_OK(cublasLtMatmul(handle.value, d.op, &alpha, kc + kh * 192, d.a,
+        q + kh * batch * 192, d.b, &beta, out, d.c, out, d.c,
+        &algorithm.algo, nullptr, 0, stream), "MiMo QK GEMM");
+  }
+}
+__global__ void round_gemm_scores(MimoAttentionShape s, float* scores, int end_key) {
+  const int key = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y, head = blockIdx.z;
+  if (key < end_key) {
+    auto& score = scores[(int64_t(row) * s.q_heads + head) * s.capacity + key];
+    score = rb(__fmul_rn(rb(score), 0.07216878364870322f));
+  }
+}
+
+template <int key_tiles = 1>
+__global__ void score_tiles(MimoAttentionShape s, const uint16_t* q, const void* kc,
+                            const int64_t* positions, float* scores, int first_key, int end_key) {
+  using namespace nvcuda;
+  const int row0 = blockIdx.y * 16, head = blockIdx.z;
+  const int key0 = first_key + blockIdx.x * (16 * key_tiles);
+  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+  const int last_row = min(row0 + 15, s.requests - 1);
+  const int64_t last = positions[last_row];
+  const int64_t first = positions[row0];
+  if (key0 > last || (s.window && key0 + 16 * key_tiles - 1 < first - s.window + 1)) return;
+  __shared__ __align__(32) __nv_bfloat16 a[16 * 192], b[key_tiles * 16 * 192];
+  __shared__ __align__(32) float c[key_tiles * 16 * 16];
+  const int kh = head / (s.q_heads / s.kv_heads);
+  for (int i = tid; i < 16 * 192; i += 32 * key_tiles) {
+    const int row = row0 + i / 192, dim = i % 192;
+    reinterpret_cast<uint16_t*>(a)[i] =
+        row < s.requests ? q[(int64_t(row) * s.q_heads + head) * 192 + dim] : 0;
+  }
+  for (int i = tid; i < key_tiles * 16 * 192; i += 32 * key_tiles) {
+    const int key = key0 + i / 192, dim = i % 192;
+    reinterpret_cast<uint16_t*>(b)[i] =
+        key < end_key ? mimo_cache_load(kc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 192 + dim, s.fp8_cache) : 0;
+  }
+  if constexpr (key_tiles == 1) __syncwarp();
+  else __syncthreads();
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+  wmma::fill_fragment(cf, 0.0f);
+  for (int k = 0; k < 192; k += 16) {
+    wmma::load_matrix_sync(af, a + k, 192);
+    wmma::load_matrix_sync(bf, b + warp * 16 * 192 + k, 192);
+    wmma::mma_sync(cf, af, bf, cf);
+  }
+  wmma::store_matrix_sync(c + warp * 256, cf, 16, wmma::mem_row_major);
+  __syncwarp();
+  for (int i = lane; i < 256; i += 32) {
+    const int row = row0 + i / 16, key = key0 + warp * 16 + i % 16;
+    if (row < s.requests && key < end_key) {
+      const int64_t p = positions[row];
+      if (key <= p && (!s.window || key >= p - s.window + 1))
+        scores[(int64_t(row) * s.q_heads + head) * s.capacity + cache_slot(s, key)] =
+            rb(__fmul_rn(rb(c[warp * 256 + i]), 0.07216878364870322f));
     }
   }
 }
@@ -885,25 +1018,60 @@ void mimo_attention_bounded_prefill(const MimoAttentionShape& s, const uint16_t*
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
-void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, const void* kc,
+void mimo_attention_prefill(const MimoAttentionShape& input_shape, const uint16_t* q, const void* kc,
                             const void* vc, const int64_t* positions, const uint16_t* sinks,
                             uint16_t* out, float* scores, int end_key, cudaStream_t stream,
                             bool parallel_softmax, bool wide_values, bool fused_probabilities) {
+  auto s = input_shape;
   s.validate();
   if (!q || !kc || !vc || !positions || !out || !scores || end_key < s.requests ||
       end_key > 1048576 || (!s.window && end_key > s.capacity) ||
       (s.window && s.capacity < s.window + s.requests - 1))
     throw std::invalid_argument("MiMo tensor-core prefill: invalid buffers or chunk bounds");
   const int first = s.window ? std::max(0, end_key - s.requests - s.window + 1) : 0;
-  score_tiles<<<dim3((end_key - first + 15) / 16, (s.requests + 15) / 16, s.q_heads), 32, 0,
-                stream>>>(s, q, kc, positions, scores, first, end_key);
-  DGPP_CUDA_OK(cudaGetLastError());
   auto* probabilities =
       reinterpret_cast<uint16_t*>(scores + int64_t(s.requests) * s.q_heads * s.capacity);
-  // Reuse the probability region for two FP32 normalizers per query/head.
-  // Tiny capacities retain the baseline because its region is too small.
   const bool fused = fused_probabilities && wide_values && s.capacity >= 4;
   auto* normalizers = fused ? reinterpret_cast<float*>(probabilities) : nullptr;
+  static const bool bridge = [] {
+    const char* v = std::getenv("DGPP_MIMO_FP8_PREFILL_BRIDGE");
+    return v && std::string_view(v) == "1";
+  }();
+  // Fused PV leaves most of the probability region unused. Only use it when
+  // the complete expanded planes fit, including normalizers and alignment.
+  const size_t normalizer_bytes = (size_t(s.requests) * s.q_heads * 8 + 255) & ~size_t(255);
+  const size_t nk = size_t(end_key) * s.k_width(), nv = size_t(end_key) * s.v_width();
+  const size_t available = size_t(s.requests) * s.q_heads * s.capacity * 2;
+  if (bridge && fused && s.fp8_cache && !s.window && normalizer_bytes + (nk + nv) * 2 <= available) {
+    auto* kb = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(probabilities) + normalizer_bytes);
+    auto* vb = kb + nk;
+    expand_prefill_cache<<<(nk + 255) / 256, 256, 0, stream>>>(
+        static_cast<const uint8_t*>(kc), static_cast<const uint8_t*>(vc), kb, vb, nk, nv);
+    DGPP_CUDA_OK(cudaGetLastError());
+    kc = kb; vc = vb; s.fp8_cache = false;
+  }
+  const int qk_tile = [&] {
+    const char* v = std::getenv(s.window ? "DGPP_MIMO_SWA_QK_KEY_TILE" : "DGPP_MIMO_QK_KEY_TILE");
+    const int n = v ? std::atoi(v) : 16;
+    if (n != 16 && n != 32 && n != 64) throw std::invalid_argument("DGPP_MIMO_QK_KEY_TILE must be 16, 32 or 64");
+    return n;
+  }();
+  const dim3 grid((end_key - first + qk_tile - 1) / qk_tile, (s.requests + 15) / 16, s.q_heads);
+  const char* gemm_option = std::getenv("DGPP_MIMO_QK_GEMM");
+  if (gemm_option && std::string_view(gemm_option) == "1" && !s.window && !s.fp8_cache) {
+    score_gemm(s, q, static_cast<const uint16_t*>(kc), scores, end_key, stream);
+    // Repair tiles containing dot products close to a BF16 halfway point with
+    // the established MMA reduction, before applying the two BF16 roundings.
+    score_tiles_baseline<true><<<dim3((end_key + 15) / 16, (s.requests + 15) / 16, s.q_heads),
+        32, 0, stream>>>(s, q, kc, positions, scores, first, end_key);
+    round_gemm_scores<<<dim3((end_key + 255) / 256, s.requests, s.q_heads), 256, 0, stream>>>(s, scores, end_key);
+  } else if (qk_tile == 64)
+    score_tiles<4><<<grid, 128, 0, stream>>>(s, q, kc, positions, scores, first, end_key);
+  else if (qk_tile == 32)
+    score_tiles<2><<<grid, 64, 0, stream>>>(s, q, kc, positions, scores, first, end_key);
+  else
+    score_tiles_baseline<false><<<grid, 32, 0, stream>>>(s, q, kc, positions, scores, first, end_key);
+  DGPP_CUDA_OK(cudaGetLastError());
   attention_kernel<<<dim3(s.q_heads, s.requests), 128, 0, stream>>>(
       s, q, kc, vc, positions, sinks, out, true, scores, true, probabilities, nullptr,
       parallel_softmax, false, normalizers);
