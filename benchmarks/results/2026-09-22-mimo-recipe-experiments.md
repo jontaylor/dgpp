@@ -143,11 +143,35 @@ Cold 31K/67K TTFT changed +13.95%/+11.55%; 67K took 259.075 seconds.
 Planned memory is 98.30 GiB per rank, approximately 9.65 GiB below control,
 with exactly four prefix snapshots. This combination is not the general-purpose
 performance default. Exact three-key retrieval passed at 31K and 67K;
-125K and remaining harness/tool-cap/lifecycle checks are in progress.
+125K also passed all three exact values (125,491 tokens, 967.852 s TTFT,
+6.088 s decode). All three actual-harness cases passed, including the original
+empty-argument failure. Default eight-call generation and caps one/two passed
+streaming/non-streaming parity with complete arguments. All 11 lifecycle
+requests passed, including C2 graph replay, prefix seed/warm/recompute,
+cancellation and recovery (35.67 s; 4,078 warm cached tokens; one cancellation).
+Generated tools were not executed. These are fixed checks, not broad agent
+quality or full 256K simultaneous-load validation.
 
 Small fixed panels are not broad quality evidence. Short first-request TTFT
 also includes initialization effects; the main prefill comparison uses the
 later fixed 7K/31K/67K requests. Raw outputs and counters preserve differences.
+
+## Real-activation FP8 audit
+
+Separate from timing, source `2b966f9` ran native MTP3 with dense bridge, FP8
+KV and audit counters. A 7K exact retrieval and all three actual-harness cases
+passed, followed by clean shutdown with identical two-rank operation streams.
+Across 192 layer/type/rank records: 1,213,601,280 executed conversions, zero
+clipped and zero non-finite values. Aggregate relative L2 conversion error was
+2.6467%. The largest layer/type error was layer-zero V: 10.9443% on rank zero
+and 9.5913% on rank one. Small-magnitude V values make unit-scale quantization
+relatively coarse; the aggregate alone would hide that. These counts include
+warm capture and replayed/rejected writes, not unique prompt tokens. No broad
+quality-equivalence claim follows from retrieval passing. BF16 KV remains the
+selected general-purpose configuration.
+
+The same build verified the signed device-free graph-instantiation log on real
+hardware, replacing the previous unsigned-underflow allocation report.
 
 ## Snapshot budget
 
@@ -158,9 +182,32 @@ Four FP8 slots require6325436416 bytes =5.891021728515625 GiB.
 Both live ranks confirmed exactly four slots. DFlash configurations use their
 own four-slot budgets because draft-state size differs.
 
-## Remaining work
+## Final selection and validation
 
-Separate real-activation FP8 audit; combined timing/quality/harness/tool-cap/lifecycle validation; final
-selection and healthy restoration. Preserve rejected and failed candidates.
-All traffic is explicitly paused by the user. Parent holds both ranks exclusively.
-No new source has been copied into the original dirty checkout. No PR is requested.
+The selected service uses native MTP3 with `DGPP_MIMO_FUSED_PREFILL=1`,
+`DGPP_MIMO_FP8_DENSE=1` and `DGPP_MIMO_FP8_DENSE_PREFILL_BF16=1`. KV remains
+BF16. Context is 262,144 tokens per request, concurrency two, four prefix
+snapshots (11.539825439453125 GiB budget), API port 30001. DFlash, FP8 KV and
+compact/online attention remain opt-in experiments; they are not enabled in
+the final general-purpose configuration.
+
+Both ranks run the final source `2b966f9` binary, compiled with the exact-FP8-load
+option on (unused while BF16 KV is selected), SHA256
+`badebd501e7a8252621bd31631493f06001236298ba376bb869d471d32ebdd50`.
+The difference from measured source `41fd8a7` is the signed memory-log fix.
+Later commits change only validation tooling and documentation. Frozen binaries
+and per-binary manifests preserve this distinction.
+
+Final deployment passed 31K exact retrieval (56.816 s TTFT), all three actual
+harness cases, five default/capped streaming/non-streaming tool cases and all
+11 native-MTP lifecycle requests (29.54 s; 4,079 warm cached tokens; one
+cancellation). A separate mixed-load check started a cold 7K retrieval after
+another request began decoding: all three retrieved values were exact, the
+other request completed 1,024 tokens, and 20 two-slot graph replays occurred.
+That smoke test establishes this concurrent journey's correctness/liveness;
+it is not a matched mixed-load performance comparison.
+
+The original dirty checkout is integrated by a baseline-checked patch after
+archiving its existing changes. No pull request or publication is part of this
+experiment. Raw evidence, including rejected/failed candidates and explicitly
+skipped earlier 125K FP8 probes, remains in the experiment directory.
