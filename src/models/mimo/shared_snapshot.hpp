@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,7 +21,18 @@ class MimoSharedSnapshots {
   using Read = std::function<void(const uint8_t*, int64_t, int64_t)>;
   static constexpr int64_t block_tokens = 256;
   MimoSharedSnapshots(size_t bytes_per_token, size_t private_bytes, Allocate allocate)
-      : token_bytes_(bytes_per_token), private_bytes_(private_bytes), allocate_(std::move(allocate)) {}
+      : token_bytes_(bytes_per_token), private_bytes_(private_bytes),
+        allocate_([allocate = std::move(allocate), owned = owned_](size_t bytes) {
+          auto storage = allocate(bytes);
+          auto* pointer = storage.get();
+          owned->fetch_add(bytes, std::memory_order_relaxed);
+          // The wrapper counts unique allocations, not snapshot references.
+          // Its counter can outlive the store if a copy is unwinding.
+          return Storage(pointer, [storage = std::move(storage), owned, bytes](uint8_t*) mutable {
+            storage.reset();
+            owned->fetch_sub(bytes, std::memory_order_relaxed);
+          });
+        }) {}
   void register_slot(const void* slot) { slots_.try_emplace(slot); }
   bool contains(const void* slot) const { return slots_.contains(slot); }
   void release(const void* slot) { if (contains(slot)) slots_.at(slot) = {}; }
@@ -73,16 +85,10 @@ class MimoSharedSnapshots {
     read_private(snap.private_data.get(), 0, position);
     seed(req, snap);
   }
-  size_t unique_bytes() const {
-    std::unordered_map<const uint8_t*, size_t> allocations;
-    for (const auto& [slot, snap] : slots_) {
-      for (const auto& b : snap.blocks) allocations[b.data.get()] = size_t(b.tokens) * token_bytes_;
-      if (snap.private_data) allocations[snap.private_data.get()] = private_bytes_;
-    }
-    size_t total = 0;
-    for (const auto& [ptr, bytes] : allocations) total += bytes;
-    return total;
-  }
+  // HTTP metrics may run concurrently with the model owner. Never traverse
+  // mutable snapshot maps from that thread.
+  size_t unique_bytes() const { return owned_->load(std::memory_order_relaxed); }
+
  private:
   struct Block { Storage data; int64_t tokens; };
   struct Snapshot {
@@ -96,6 +102,7 @@ class MimoSharedSnapshots {
     for (const auto& block : snap.blocks)
       if (block.tokens == block_tokens) history.push_back(block.data);
   }
+  std::shared_ptr<std::atomic<size_t>> owned_ = std::make_shared<std::atomic<size_t>>(0);
   size_t token_bytes_, private_bytes_;
   Allocate allocate_;
   std::unordered_map<const void*, Snapshot> slots_;

@@ -1,6 +1,7 @@
 #include "common/test.hpp"
 #include "models/mimo/shared_snapshot.hpp"
 #include <cstring>
+#include <thread>
 
 namespace {
 void require(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
@@ -71,4 +72,23 @@ DGPP_TEST(mimo_shared_snapshot_replace_and_copy_failure) {
   require(store.write(0, &slot, 700, fill, one) == 701, "failure published stale provenance");
   store.unregister_slot(&slot);
   require(owned == 0, "unregister leaked storage");
+}
+
+DGPP_TEST(mimo_shared_snapshot_metrics_concurrent_read) {
+  dgpp::MimoSharedSnapshots store(1, 4, [](size_t n) {
+    return dgpp::MimoSharedSnapshots::Storage(new uint8_t[n], std::default_delete<uint8_t[]>());
+  });
+  int slot; store.register_slot(&slot);
+  std::atomic<bool> stop{false}, invalid{false};
+  std::thread reader([&] {
+    while (!stop.load(std::memory_order_relaxed))
+      if (store.unique_bytes() > 1028) invalid.store(true, std::memory_order_relaxed);
+  });
+  for (int i = 0; i < 1000; ++i) {
+    store.rewind(0);
+    store.write(0, &slot, 512, [](uint8_t*, int64_t, int64_t) {}, [](uint8_t*, int64_t, int64_t) {});
+    store.release(&slot);
+  }
+  stop.store(true, std::memory_order_relaxed); reader.join();
+  require(!invalid.load() && store.unique_bytes() == 0, "concurrent metric accounting");
 }
