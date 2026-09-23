@@ -167,3 +167,17 @@ DGPP_TEST(mimo_attention_rows_pause_reset_and_reject_invalid_positions) {
   rejects([&] { dgpp::MimoAttentionShape{1, 2, 1, 127, 128}.validate(); }, "window");
   rejects([&] { dgpp::MimoAttentionShape{0, 2, 1, 128, 128}.validate(); }, "requests");
 }
+
+DGPP_TEST(mimo_compact_workspace_keeps_swa_floor_and_decode_slices) {
+  // 256K / TP2, 512 forward rows: retain exact global row-tile accounting.
+  for (int tile : {16, 32, 64, 128})
+    check(dgpp::mimo_materialized_workspace_bytes(512, 32, 262144, 1024, tile) ==
+              size_t(tile) * (48u << 20), "compact global workspace accounting");
+  // Small global context, expanded SWA ring: global-only accounting is unsafe.
+  check(dgpp::mimo_materialized_workspace_bytes(512, 32, 128, 1024, 16) == (24u << 20),
+        "compact allocation must retain full 128-row SWA workspace");
+  check(dgpp::mimo_materialized_workspace_bytes(8, 32, 262144, 256, 16) == (384u << 20),
+        "short forward geometry must still hold all eight decode rows");
+  check(dgpp::mimo_materialized_workspace_bytes(64, 32, 262144, 256, 16) == (768u << 20),
+        "DFlash64 uses sixteen-row decode slices rather than full-row scratch");
+}

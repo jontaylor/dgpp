@@ -10,6 +10,28 @@
 
 namespace dgpp {
 
+inline bool mimo_materialized_tile_enabled() {
+  static const bool enabled = std::getenv("DGPP_MIMO_ATTN_TILE_ROWS") != nullptr;
+  return enabled;
+}
+inline int mimo_materialized_tile_rows() {
+  static const int rows = [] {
+    const char* value = std::getenv("DGPP_MIMO_ATTN_TILE_ROWS");
+    if (!value || !std::strcmp(value, "128")) return 128;
+    if (!std::strcmp(value, "16")) return 16;
+    if (!std::strcmp(value, "32")) return 32;
+    if (!std::strcmp(value, "64")) return 64;
+    throw std::invalid_argument("MiMo attention tile rows: expected 16, 32, 64 or 128");
+  }();
+  return rows;
+}
+inline size_t mimo_materialized_workspace_bytes(int rows, int heads, int global_capacity,
+                                                int ring_capacity, int tile_rows) {
+  // SWA keeps its original 128-row tiling/arithmetic even at tiny contexts.
+  return std::max(size_t(std::min(rows, tile_rows)) * global_capacity,
+                  size_t(std::min(rows, 128)) * ring_capacity) * heads * 6;
+}
+
 inline bool mimo_split_online_attention_enabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("DGPP_MIMO_SPLIT_ONLINE_ATTN");

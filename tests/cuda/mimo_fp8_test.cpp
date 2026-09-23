@@ -131,12 +131,18 @@ DGPP_TEST(mimo_fp8_bounded_online_same_algorithm_graph_and_mapping) {
           }
         };
         DevBuf partials(dgpp::mimo_online_partial_bytes(rows, shape.q_heads, capacity));
+        DevBuf materialized(size_t(rows) * shape.q_heads * capacity * 6);
         const int end_key = window ? capacity * 3 + 17 : capacity;
-        for (int online : {0, 1, 2}) {
+        for (int online : {0, 1, 2, 3, 4, 5, 6}) {
           for (bool with_sink : {false, true}) {
             auto launch = [&](auto s, void* keys, void* values, DevBuf& output) {
               const auto* sink = with_sink ? sinks.as<uint16_t>() : nullptr;
-              if (online == 2)
+              if (online >= 3)
+                dgpp::mimo_attention_compact(s, q.as<uint16_t>(), keys, values,
+                    positions.as<int64_t>(), sink, output.as<uint16_t>(), materialized.as<float>(),
+                    mapped ? 0 : end_key, stream, !mapped, mapped ? mapping.as<int32_t>() : nullptr,
+                    16 << (online - 3), true);
+              else if (online == 2)
                 dgpp::mimo_attention_split_online(s, q.as<uint16_t>(), keys, values,
                     positions.as<int64_t>(), sink, output.as<uint16_t>(), partials.as<float>(),
                     stream, !mapped, mapped ? mapping.as<int32_t>() : nullptr);

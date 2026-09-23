@@ -41,7 +41,10 @@ int main(int argc, char** argv) {
       gemm.set_decode_rows(std::stoi(rows));
     if (std::getenv("DGPP_MIMO_LAYER_MMA")) gemm.set_decode_mma(true, 8);
     dgpp::LayerBump attention_scores;
-    if (dgpp::mimo_split_online_attention_enabled())
+    if (dgpp::mimo_materialized_tile_enabled())
+      attention_scores.init(dgpp::mimo_materialized_workspace_bytes(chunk, w.q_heads,
+          tokens, dgpp::mimo_ring_capacity(chunk), dgpp::mimo_materialized_tile_rows()));
+    else if (dgpp::mimo_split_online_attention_enabled())
       attention_scores.init(dgpp::mimo_online_partial_bytes(std::min(chunk, dgpp::mimo_split_tile_rows),
                              w.q_heads, tokens));
     else if (!dgpp::mimo_bounded_attention_enabled())

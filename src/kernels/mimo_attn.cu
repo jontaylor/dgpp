@@ -900,6 +900,45 @@ void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, cons
         s, probabilities, vc, positions, out, first, end_key);
   DGPP_CUDA_OK(cudaGetLastError());
 }
+void mimo_attention_compact(const MimoAttentionShape& s, const uint16_t* q,
+    const void* kc, const void* vc, const int64_t* positions, const uint16_t* sinks,
+    uint16_t* out, float* scores, int end_key, cudaStream_t stream, bool shared_cache,
+    const int32_t* request_ids, int tile_rows, bool fused_probabilities) {
+  s.validate();
+  if (!q || !kc || !vc || !positions || !out || !scores ||
+      (tile_rows != 16 && tile_rows != 32 && tile_rows != 64 && tile_rows != 128))
+    throw std::invalid_argument("MiMo compact attention: invalid buffers or tile rows");
+  if (shared_cache && s.window && s.capacity < s.window + s.requests - 1)
+    throw std::invalid_argument("MiMo compact prefill: insufficient retained ring history");
+  if (shared_cache && s.requests > 1 && end_key > 0 &&
+      (end_key < s.requests || end_key > 1048576 || (!s.window && end_key > s.capacity)))
+    throw std::invalid_argument("MiMo compact prefill: invalid chunk bounds");
+  const int limit = s.window ? 128 : tile_rows;
+  if (!shared_cache && s.requests > limit && !request_ids)
+    throw std::invalid_argument("MiMo compact decode: wide rows require explicit request mapping");
+  if (shared_cache && (s.requests == 1 || end_key <= 0)) {
+    // Preserve the baseline scalar single-token/unknown-prefix path. One row
+    // fits the allocation; unknown-prefix wider rows avoid using score scratch.
+    mimo_attention(s, q, kc, vc, positions, sinks, out, stream, true,
+                    s.requests <= limit ? scores : nullptr);
+    return;
+  }
+  for (int first = 0; first < s.requests; first += limit) {
+    auto tile = s;
+    tile.requests = std::min(limit, s.requests - first);
+    const auto* tq = q + size_t(first) * s.q_width();
+    auto* to = out + size_t(first) * s.q_heads * 128;
+    const auto* ids = request_ids ? request_ids + first : nullptr;
+    if (shared_cache)
+      mimo_attention_prefill(tile, tq, kc, vc, positions + first, sinks, to, scores,
+          end_key - s.requests + first + tile.requests, stream, true, true, fused_probabilities);
+    else if (!s.window)
+      mimo_attention_decode(tile, tq, kc, vc, positions + first, sinks, to, scores, stream, ids);
+    else
+      mimo_attention(tile, tq, kc, vc, positions + first, sinks, to, stream, false, scores, ids);
+  }
+}
+
 namespace {
 __global__ void mtp_history_gather(const uint16_t* history, uint16_t* hidden,
                                    const int64_t* positions, int64_t* translated,

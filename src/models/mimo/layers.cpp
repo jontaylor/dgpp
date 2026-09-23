@@ -162,7 +162,15 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
   mimo_qkv_append(chunk, fused_, freq_, positions, q_, k_cache, v_cache, status, stream,
                   request_ids == nullptr, request_ids, fp8_audit_);
   if (cache_only) return;
-  if (mimo_split_online_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
+  static const bool fused_prefill = [] {
+    const char* value = std::getenv("DGPP_MIMO_FUSED_PREFILL");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  if (mimo_materialized_tile_enabled()) {
+    mimo_attention_compact(chunk, q_, k_cache, v_cache, positions, w_.sinks, attn_,
+        attention_scores_, end_key, stream, request_ids == nullptr, request_ids,
+        mimo_materialized_tile_rows(), fused_prefill);
+  } else if (mimo_split_online_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
     for (int first = 0; first < tokens; first += mimo_split_tile_rows) {
       auto tile = chunk;
       tile.requests = std::min(mimo_split_tile_rows, tokens - first);
@@ -184,10 +192,6 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
     // matrix stays bounded. The expanded ring preserves the whole chunk.
     // Read once outside the captured kernel path; explicit opt-in until
     // real-weight and whole-service validation establishes a benefit.
-    static const bool fused_prefill = [] {
-      const char* value = std::getenv("DGPP_MIMO_FUSED_PREFILL");
-      return value && std::strcmp(value, "1") == 0;
-    }();
     for (int first = 0; first < tokens; first += attention_tile_rows) {
       auto tile = chunk;
       tile.requests = std::min(attention_tile_rows, tokens - first);

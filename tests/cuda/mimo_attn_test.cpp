@@ -643,23 +643,34 @@ void benchmark() {
   if (context < 128 || context > 1048576) throw std::invalid_argument("benchmark context");
   const int first_mode = std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")
       ? std::stoi(std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")) : 3;
-  if (first_mode < 0 || first_mode > 7) throw std::invalid_argument("benchmark first mode");
+  if (first_mode < 0 || first_mode > 11) throw std::invalid_argument("benchmark first mode");
+  const int last_mode = std::getenv("DGPP_MIMO_ATTN_BENCH_LAST_MODE")
+      ? std::stoi(std::getenv("DGPP_MIMO_ATTN_BENCH_LAST_MODE")) : 11;
+  if (last_mode < first_mode || last_mode > 11) throw std::invalid_argument("benchmark last mode");
   for (int window : {0, 128}) {
     Fixture f({128, 32, window ? 4 : 2, window ? 256 : context, window}, true);
     DevBuf scores(first_mode <= 4 ? size_t(128) * 32 * f.shape.capacity * 6 : 1);
-    DevBuf partials(dgpp::mimo_online_partial_bytes(32, 32, f.shape.capacity));
+    DevBuf partials(first_mode <= 7 ? dgpp::mimo_online_partial_bytes(32, 32, f.shape.capacity) : 1);
     benchmark_cache(f);
     for (int t = 0; t < 128; ++t) f.positions[t] = context - 128 + t;
     f.prepare();
     dgpp::mimo_qkv_append(f.shape, f.df.as<uint16_t>(), f.dfreq.as<float>(), f.dpos.as<int64_t>(),
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream, true);
-    for (int tensor = first_mode; tensor < 8; ++tensor) {
+    for (int tensor = first_mode; tensor <= last_mode; ++tensor) {
+      const int compact_rows = tensor >= 8 ? 16 << (tensor - 8) : 128;
+      const size_t compact_bytes = size_t(window ? 128 : compact_rows) * 32 * f.shape.capacity * 6;
+      DevBuf compact(first_mode > 4 && tensor >= 8 ? compact_bytes : 1);
       cudaEvent_t start, end;
       DGPP_CUDA_OK(cudaEventCreate(&start));
       DGPP_CUDA_OK(cudaEventCreate(&end));
       auto run = [&] {
-        if (tensor == 7) {
+        if (tensor >= 8)
+          dgpp::mimo_attention_compact(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), window ? f.dsinks.as<uint16_t>() : nullptr,
+              f.dout.as<uint16_t>(), first_mode <= 4 ? scores.as<float>() : compact.as<float>(),
+              context, f.stream, true, nullptr, compact_rows, true);
+        else if (tensor == 7) {
           for (int first = 0; first < f.shape.requests; first += dgpp::mimo_split_tile_rows) {
             auto tile = f.shape;
             tile.requests = std::min(dgpp::mimo_split_tile_rows, f.shape.requests - first);
@@ -1030,6 +1041,98 @@ DGPP_TEST(mimo_cuda_split_online_partition_sink_padding_and_workspace_guards) {
         }
         DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
         DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
+    }
+  }
+}
+
+DGPP_TEST(mimo_cuda_compact_materialized_bitwise_and_mapped64_graph) {
+  for (int window : {0, 128}) {
+    for (bool mapped : {false, true}) {
+      const int rows = mapped ? 64 : 129;
+      const int capacity = window ? 263 : 2051;
+      Fixture f({rows, 4, 2, capacity, window}, !mapped);
+      uint32_t rng = 91;
+      for (auto* data : {&f.q, &f.k, &f.v})
+        for (auto& x : *data) {
+          rng = rng * 1664525u + 1013904223u;
+          x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+        }
+      f.dq.upload(f.q.data(), f.q.size() * 2);
+      f.dk.upload(f.k.data(), f.k.size() * 2);
+      f.dv.upload(f.v.data(), f.v.size() * 2);
+      DevBuf ids(rows * sizeof(int32_t));
+      std::vector<int32_t> mapping(rows);
+      for (int r = 0; r < rows; ++r) mapping[r] = rows - 1 - r;
+      ids.upload(mapping.data(), mapping.size() * 4);
+      DevBuf baseline(size_t(rows) * f.shape.q_heads * capacity * 6);
+      for (bool fused : {false, true}) {
+        for (int tile_rows : {16, 32, 64, 128}) {
+          const size_t bytes = size_t(std::min(rows, window ? 128 : tile_rows)) * f.shape.q_heads * capacity * 6;
+          DevBuf compact(bytes + 256);
+          cudaGraph_t graph;
+          cudaGraphExec_t executable;
+          const int end = window ? 800 : capacity;
+          DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+          dgpp::mimo_attention_compact(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+              f.dout.as<uint16_t>(), compact.as<float>(), mapped ? 0 : end, f.stream,
+              !mapped, mapped ? ids.as<int32_t>() : nullptr, tile_rows, fused);
+          DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+          size_t node_count = 0;
+          DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &node_count));
+          std::vector<cudaGraphNode_t> nodes(node_count);
+          DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &node_count));
+          for (auto node : nodes) {
+            cudaGraphNodeType type;
+            DGPP_CUDA_OK(cudaGraphNodeGetType(node, &type));
+            if (type != cudaGraphNodeTypeKernel) throw std::runtime_error("compact graph non-kernel node");
+          }
+          DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+          for (int replay = 0; replay < 2; ++replay) {
+            for (int r = 0; r < rows; ++r)
+              f.positions[r] = mapped ? ((r + replay) % 7 == 0 ? -1 :
+                  ((r + replay) % 11 == 0 ? 1048576 : (window ? 800 : capacity - 1) - r)) : end - rows + r;
+            f.dpos.upload(f.positions.data(), rows * 8);
+            if (mapped) {
+              if (window)
+                dgpp::mimo_attention(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+                    f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+                    f.dout.as<uint16_t>(), f.stream, false, baseline.as<float>(), ids.as<int32_t>());
+              else
+                dgpp::mimo_attention_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+                    f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+                    f.dout.as<uint16_t>(), baseline.as<float>(), f.stream, ids.as<int32_t>());
+            } else {
+              for (int first = 0; first < rows; first += 128) {
+                auto slice = f.shape; slice.requests = std::min(128, rows - first);
+                dgpp::mimo_attention_prefill(slice, f.dq.as<uint16_t>() + size_t(first) * slice.q_width(),
+                    f.dk.as<uint16_t>(), f.dv.as<uint16_t>(), f.dpos.as<int64_t>() + first,
+                    f.dsinks.as<uint16_t>(), f.dout.as<uint16_t>() + size_t(first) * slice.q_heads * 128,
+                    baseline.as<float>(), end - rows + first + slice.requests, f.stream, true, true, fused);
+              }
+            }
+            DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+            std::vector<uint16_t> expected(f.output.size()), actual(expected.size());
+            f.dout.download(expected.data(), expected.size() * 2);
+            DGPP_CUDA_OK(cudaMemsetAsync(compact.as<uint8_t>(), 0xff, bytes, f.stream));
+            DGPP_CUDA_OK(cudaMemsetAsync(compact.as<uint8_t>() + bytes, 0xa5, 256, f.stream));
+            DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+            DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+            f.dout.download(actual.data(), actual.size() * 2);
+            if (actual != expected)
+              throw std::runtime_error("compact materialized output changed from original algorithm");
+            std::vector<uint8_t> guard(256);
+            DGPP_CUDA_OK(cudaMemcpy(guard.data(), compact.as<uint8_t>() + bytes, 256, cudaMemcpyDeviceToHost));
+            if (!std::all_of(guard.begin(), guard.end(), [](auto x) { return x == 0xa5; }))
+              throw std::runtime_error("compact workspace overflow");
+          }
+          DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+          DGPP_CUDA_OK(cudaGraphDestroy(graph));
+          std::cout << "compact bitwise window=" << window << " mapped=" << mapped
+                    << " rows=" << rows << " tile=" << tile_rows << " fused=" << fused
+                    << " scratch_bytes=" << bytes << '\n';
+        }
       }
     }
   }

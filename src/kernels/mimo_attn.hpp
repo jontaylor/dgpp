@@ -85,6 +85,15 @@ void mimo_attention_split_online(const MimoAttentionShape& shape, const uint16_t
 void mimo_attention_split_online_decode(const MimoAttentionShape& shape, const uint16_t* q,
     const void* k_cache, const void* v_cache, const int64_t* positions, const uint16_t* sinks,
     uint16_t* out, float* partials, cudaStream_t stream, const int32_t* request_ids);
+// Workspace-bounded scheduling of the ORIGINAL materialized algorithms.
+// Global prefill/decode slices at tile_rows (16/32/64/128); SWA prefill stays128
+// and mapped SWA decode keeps scalar arithmetic. Scratch must cover the largest
+// slice: min(rows,tile_rows)*heads*capacity*6 global, min(rows,128)*heads*capacity*6
+// SWA. Mapped rows wider than the slice require explicit request_ids.
+void mimo_attention_compact(const MimoAttentionShape& shape, const uint16_t* q,
+    const void* k_cache, const void* v_cache, const int64_t* positions, const uint16_t* sinks,
+    uint16_t* out, float* scores, int end_key, cudaStream_t stream, bool shared_cache,
+    const int32_t* request_ids, int tile_rows, bool fused_probabilities);
 // Experimental online decode, including mapped requests and padding.
 // Uses tensor-core QK and online softmax: differs from scalar decode numerics.
 void mimo_attention_online_decode(const MimoAttentionShape& shape, const uint16_t* q,
