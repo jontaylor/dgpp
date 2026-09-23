@@ -3,9 +3,11 @@
 Baseline source: `149bc6f`. Experiments and build logs:
 `/mnt/benchmarks/dgpp-mimo-attention-20260923`.
 
-These candidates are not enabled by default and have no measured Spark speedup
-at this stage. Retain native MTP3, C2, 262144 context/request and four prefix
-slots. Do not enable DFlash as part of this work.
+New experimental paths remain disabled by default. The selected serving configuration
+uses SWA QK tile32, repaired full-attention QK GEMM and shared snapshots, with
+BF16 live KV. Native MTP3, C2, 262144 context/request and four prefix slots are
+retained. DFlash remains disabled. Measured results are in
+`benchmarks/results/2026-09-23-mimo-attention-shared-snapshots.md`.
 
 ## Staged PV tiles
 
@@ -96,7 +98,8 @@ Additional opt-in paths:
 The CPU FP64 oracle computes dot products and value sums independently while
 retaining the model's BF16 score/difference/probability rounding points.
 Its numerical mode is diagnostic; bitwise mode remains the default gate.
-All service comparisons must retain native MTP3 and use the same frozen source.
+All service comparisons retain native MTP3 and record exact source/binary hashes.
+Snapshot-only fixes after bd48198 did not change inference kernels.
 
 ### Shared snapshot payload alignment gate
 
@@ -109,3 +112,18 @@ hidden rows, hop snapshots and slot reuse. A deliberately unaligned old-layout
 negative control must raise the copy alignment error. A non-multiple-of-16 hidden
 width also checks stride padding independently of the header. This checkpoint-free
 gate supplements, rather than replaces, the real-model native-MTP lifecycle gate.
+
+## Native MTP snapshot alignment gate
+
+The compact header and each slot stride are16-byte aligned. An8-byte header
+was rejected by the native draft state's glm_device_copy path; the initial
+shared serving panel was interrupted and retained as incomplete evidence.
+The regression uses the actual SessionModel and PrefixArena through all four
+slots, including a non-aligned hidden suffix, hop snapshots, reuse/restore and
+a negative control for the old layout. Both Sparks pass it under memcheck.
+
+Shared snapshots are immutable256-token global blocks, not paged live KV.
+Owned storage after the selected67K benchmark is about1.05GiB per rank versus
+11.54GiB fixed allocation. Unique-prefix occupancy can increase this amount.
+The optional FP8 bridge removes most FP8 prefill overhead, but FP8 KV remains
+off in the selected configuration because measured long decode regressed.
