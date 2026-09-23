@@ -6,6 +6,14 @@ The serving API already requires graph mode for speculation; the model's eager
 session draft interface and the standalone drafter probe remain available.
 No deployment is performed by this branch.
 
+For the validated TP2/C2 comparison, also set
+`DGPP_MIMO_TARGET_DECODE_GEMV=1`. DFlash C2 verifies 16 target rows, crossing
+the usual eight-row BF16 GEMV cutoff. Keeping target graph execution on GEMV
+restored exact decoded-text agreement across the fixed serial, concurrent,
+prefix and recovery panel. This can cost throughput and does not make FP8
+target arithmetic identical to BF16. See the experiment results for the
+separate original and corrected-path measurements.
+
 This loads the actual release's five-layer BF16 Qwen3 drafter from
 `CHECKPOINT/dflash/dflash_draft_model.safetensors`. It captures target outputs
 from layers 0/11/23/35/47 before the backbone's final norm, concatenates them,

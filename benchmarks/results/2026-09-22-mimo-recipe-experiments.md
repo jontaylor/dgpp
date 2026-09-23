@@ -3,7 +3,12 @@
 Baseline source: 7ca896f (previous three optimizations combined).
 Recipe source: 13621bb3cc6fd30a94d53609320599d1f1134686.
 Parent exclusively performs Spark hardware work; Astra Medium agents implement
-in isolated worktrees. Current original dirty source is preserved.
+in isolated worktrees. Full local evidence is retained under
+`/mnt/benchmarks/dgpp-mimo-recipe-20260922`: per-deployment raw requests, SSE,
+metrics, both-rank hashes/configurations/logs, frozen binaries, GPU/sanitizer
+logs, failed attempts, and old/same-source summaries. Current original dirty
+source is preserved; `original-before-integration` archives its 86 dirty files
+and records the exact pre-application checks.
 
 ## Candidates
 
@@ -116,6 +121,33 @@ versus baseline approximately 10.9 / 10.0 s. DFlash therefore remains an
 optional workload-dependent experiment, not a general default speed win.
 Both ranks shut down cleanly with identical operation streams
 `40ca2e25f0ccf678a363188472976009` after the full DFlash panel.
+
+## Combined service measurement
+
+Source `41fd8a7`, the same frozen fast-load binary as the current native,
+dense-bridge and cache-fast controls. DFlash7 plus target graph GEMV, FP8 dense
+bridge and FP8 KV completed all 19 timing requests and four acceptance probes
+without failures. Relative to same-source native MTP3/BF16:
+
+| Workload | Decode time change |
+| --- | ---: |
+| C1 code | -2.15% |
+| C1 JSON | -16.40% |
+| C1 prose | +77.31% |
+| C1 arithmetic | +6.10% |
+| C2 code | -5.24% |
+| C2 JSON | -13.72% |
+| Cached 67K | +21.44% |
+
+Cold 31K/67K TTFT changed +13.95%/+11.55%; 67K took 259.075 seconds.
+Planned memory is 98.30 GiB per rank, approximately 9.65 GiB below control,
+with exactly four prefix snapshots. This combination is not the general-purpose
+performance default. Exact three-key retrieval passed at 31K and 67K;
+125K and remaining harness/tool-cap/lifecycle checks are in progress.
+
+Small fixed panels are not broad quality evidence. Short first-request TTFT
+also includes initialization effects; the main prefill comparison uses the
+later fixed 7K/31K/67K requests. Raw outputs and counters preserve differences.
 
 ## Snapshot budget
 
