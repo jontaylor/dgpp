@@ -15,3 +15,13 @@ DGPP_TEST(mimo_fp8_exact_expansion_all_codes_and_signed_nan_payloads) {
       throw std::runtime_error("FP8 exact expansion changed signed NaN canonicalization");
   }
 }
+
+DGPP_TEST(mimo_fp8_integer_expansion_all_codes) {
+  for (int code = 0; code < 256; ++code) {
+    const uint16_t got = dgpp::mimo_fp8_bits_to_bf16(static_cast<uint8_t>(code));
+    const uint16_t expected = (code & 127) == 127
+        ? uint16_t(((code & 128) << 8) | 0x7fc0)
+        : dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(static_cast<uint8_t>(code)));
+    if (got != expected) throw std::runtime_error("integer E4M3 expansion differs at " + std::to_string(code));
+  }
+}

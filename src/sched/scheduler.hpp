@@ -277,7 +277,8 @@ class SchedulerEngine {
     double snapshot_ms = 0;  // their summed device time, where measured
     int64_t attaches = 0;
     double attach_ms = 0;
-    int64_t snapshot_bytes = 0;  // one slot's state bytes
+    int64_t snapshot_storage_bytes = 0;  // owned bytes across all slots, excluding allocator reserve
+    int64_t snapshot_bytes = 0;  // one slot's worst-case state budget
   };
   virtual PrefixEngineStats prefix_engine_stats() const { return {}; }
 };

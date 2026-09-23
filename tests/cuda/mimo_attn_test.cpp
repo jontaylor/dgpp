@@ -1137,3 +1137,55 @@ DGPP_TEST(mimo_cuda_compact_materialized_bitwise_and_mapped64_graph) {
     }
   }
 }
+
+// Compare the staged fused PV path against independently materialized BF16
+// probabilities, including FP8 loads, partial tiles, ring wrap and graph replay.
+DGPP_TEST(mimo_cuda_staged_pv_bf16_fp8_bitwise) {
+  for (bool fp8 : {false, true}) {
+    for (int window : {0, 128}) {
+      Fixture f({17, 4, 2, window ? 263 : 515, window, fp8}, true);
+      const int end = window ? 800 : 515;
+      DevBuf scores(size_t(17) * 4 * f.shape.capacity * 6);
+      uint32_t rng = 7919;
+      auto upload = [&](std::vector<uint16_t>& data, DevBuf& device, bool quantized) {
+        std::vector<uint8_t> packed(data.size());
+        for (size_t i = 0; i < data.size(); ++i) {
+          rng = rng * 1664525u + 1013904223u;
+          const float value = float(int(rng >> 16) - 32768) / 16384.f;
+          data[i] = dgpp::float_to_bf16_bits(value);
+          packed[i] = dgpp::float_to_fp8_e4m3_bits(value);
+        }
+        if (quantized) device.upload(packed.data(), packed.size());
+        else device.upload(data.data(), data.size() * 2);
+      };
+      upload(f.q, f.dq, false);
+      upload(f.k, f.dk, fp8);
+      for (int i = 0; i < 17; ++i) f.positions[i] = end - 17 + i;
+      f.dpos.upload(f.positions.data(), 17 * 8);
+      auto run = [&](bool fused) {
+        dgpp::mimo_attention_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+            f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), f.dsinks.as<uint16_t>(),
+            f.dout.as<uint16_t>(), scores.as<float>(), end, f.stream, true, true, fused);
+      };
+      cudaGraph_t graph;
+      cudaGraphExec_t executable;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+      run(true);
+      DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+      for (int replay = 0; replay < 2; ++replay) {
+        upload(f.v, f.dv, fp8);
+        run(false);
+        DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+        std::vector<uint16_t> expected(f.output.size()), actual(f.output.size());
+        f.dout.download(expected.data(), expected.size() * 2);
+        DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+        f.dout.download(actual.data(), actual.size() * 2);
+        if (expected != actual) throw std::runtime_error("staged PV changed output bits");
+      }
+      DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+  }
+}

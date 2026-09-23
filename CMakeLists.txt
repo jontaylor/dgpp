@@ -34,6 +34,7 @@ endif()
 enable_language(CUDA)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+option(DGPP_MIMO_FP8_KV_INTEGER_LOAD "Expand E4M3 cache bytes directly to BF16 bits" OFF)
 option(DGPP_MIMO_FP8_KV_FAST_LOAD "Use exact E4M3 expansion without redundant BF16 rounding" OFF)
 option(DGPP_WERROR "Treat compiler warnings as errors" OFF)
 set(DGPP_SANITIZE "" CACHE STRING "Host sanitizer (address or undefined)")
@@ -173,7 +174,8 @@ add_library(dgpp_kernels STATIC
   src/kernels/mimo_attn.cu
   src/kernels/mimo_dflash.cu)
 set_property(SOURCE src/kernels/mimo_attn.cu APPEND PROPERTY COMPILE_DEFINITIONS
-  DGPP_MIMO_FP8_KV_FAST_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_FAST_LOAD}>)
+  DGPP_MIMO_FP8_KV_FAST_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_FAST_LOAD}>
+  DGPP_MIMO_FP8_KV_INTEGER_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_INTEGER_LOAD}>)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt dgpp_core)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
@@ -622,6 +624,7 @@ endif()
 
 enable_testing()
 add_executable(unit_tests
+  tests/unit/mimo_shared_snapshot_test.cpp
   tests/unit/log_test.cpp
   tests/unit/minijson_test.cpp
   tests/unit/arena_test.cpp
@@ -1473,7 +1476,8 @@ set_tests_properties(mimo_fp8_test PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE
 add_executable(mimo_fp8_load_test tests/cuda/mimo_fp8_load_test.cu)
 target_include_directories(mimo_fp8_load_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(mimo_fp8_load_test PRIVATE
-  DGPP_MIMO_FP8_KV_FAST_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_FAST_LOAD}>)
+  DGPP_MIMO_FP8_KV_FAST_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_FAST_LOAD}>
+  DGPP_MIMO_FP8_KV_INTEGER_LOAD=$<BOOL:${DGPP_MIMO_FP8_KV_INTEGER_LOAD}>)
 target_link_libraries(mimo_fp8_load_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(mimo_fp8_load_test)
 add_test(NAME mimo_fp8_load_test COMMAND mimo_fp8_load_test)

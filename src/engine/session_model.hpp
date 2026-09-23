@@ -1172,7 +1172,10 @@ template <class D>
 void SessionModel<D>::write_snapshot(int req, void* dst, int spec_row) {
   uint8_t* d = static_cast<uint8_t*>(dst);
   derived().write_state_snapshot(req, d, spec_row);
-  d += derived().snapshot_state_bytes();
+  if constexpr (requires { derived().snapshot_state_storage_bytes(d); })
+    d += derived().snapshot_state_storage_bytes(d);
+  else
+    d += derived().snapshot_state_bytes();
   if (mtp_) {
     const bool live = spec_row < 0;
     const int64_t pos = live ? session_pos_[static_cast<size_t>(req)]
@@ -1275,7 +1278,10 @@ void SessionModel<D>::session_attach(int req, const void* src, const SessionSnap
     derived().read_state_snapshot(req, d, meta.position);
   else
     derived().read_state_snapshot(req, d);
-  d += derived().snapshot_state_bytes();
+  if constexpr (requires { derived().snapshot_state_storage_bytes(d); })
+    d += derived().snapshot_state_storage_bytes(d);
+  else
+    d += derived().snapshot_state_bytes();
   if (mtp_) {
     derived().read_draft_snapshot(req, d);
     d += derived().draft_state_bytes();

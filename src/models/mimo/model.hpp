@@ -6,6 +6,7 @@
 #include "models/mimo/dflash.hpp"
 #include "models/mimo/layers.hpp"
 #include "models/mimo/snapshot.hpp"
+#include "models/mimo/shared_snapshot.hpp"
 
 namespace dgpp {
 // Independent flat-cache sessions with chunked projections, grouped MoE,
@@ -43,11 +44,15 @@ class MimoModel : public SessionModel<MimoModel> {
   }
   size_t draft_state_bytes() const;
   void write_state_snapshot(int req, uint8_t* dst, int spec_row);
-  void register_state_snapshot(const void* dst) { snapshot_history_.register_destination(dst); }
-  void unregister_state_snapshot(const void* dst) { snapshot_history_.unregister_destination(dst); }
-  void invalidate_state_snapshot(const void* dst) { snapshot_history_.release(dst); }
+  size_t prefix_arena_storage_bytes() const;
+  size_t snapshot_state_storage_bytes(const void* dst) const;
+  size_t shared_snapshot_bytes() const { return shared_snapshots_ ? shared_snapshots_->unique_bytes() : 0; }
+  void register_state_snapshot(const void* dst);
+  void unregister_state_snapshot(const void* dst);
+  void invalidate_state_snapshot(const void* dst);
   void rollback_state_snapshots(int req, int64_t position) {
     snapshot_history_.rewind(req, position);
+    if (shared_snapshots_) shared_snapshots_->rewind(req, position);
   }
   // Base K/V only: draft/MTP snapshot bytes are unchanged and excluded.
   uint64_t snapshot_copied_bytes() const { return snapshot_copied_bytes_; }
@@ -87,6 +92,7 @@ class MimoModel : public SessionModel<MimoModel> {
  private:
   std::unique_ptr<MimoDFlash> dflash_;
   MimoSnapshotHistory snapshot_history_;
+  std::unique_ptr<MimoSharedSnapshots> shared_snapshots_;
   uint64_t snapshot_copied_bytes_ = 0, snapshot_saved_bytes_ = 0;
   MimoTextConfig cfg_;
   std::vector<MimoLayerResident> draft_weights_;

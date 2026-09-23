@@ -179,6 +179,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     st.attaches = arena_.attaches();
     st.attach_ms = arena_.attach_ms();
     st.snapshot_bytes = static_cast<int64_t>(arena_.bytes());
+    st.snapshot_storage_bytes = static_cast<int64_t>(arena_.allocated_bytes());
     return st;
   }
   void reserve(int req, int64_t tokens) override {

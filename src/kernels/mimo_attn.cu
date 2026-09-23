@@ -1,6 +1,7 @@
 #include <math_constants.h>
 #include <mma.h>
 #include <stdexcept>
+#include <cstdlib>
 
 #include <cuda_bf16.h>
 #include "kernels/mimo_cache.cuh"
@@ -11,6 +12,7 @@
 
 namespace dgpp {
 bool mimo_fp8_fast_load_build() { return DGPP_MIMO_FP8_KV_FAST_LOAD != 0; }
+bool mimo_fp8_integer_load_build() { return DGPP_MIMO_FP8_KV_INTEGER_LOAD != 0; }
 namespace {
 // Keep short-context trajectories on the established scalar path; the
 // coalesced/split path pays off as history grows. This is a device-side
@@ -376,7 +378,7 @@ __global__ void value_tiles(MimoAttentionShape s, const uint16_t* probabilities,
 }
 // Four warps share one probability tile across all 128 value columns.
 // Each output fragment retains the same ordered MMA chain as value_tiles.
-template <bool fused = false>
+template <bool fused = false, int key_tile = 16>
 __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabilities,
                                  const void* vc, const int64_t* positions, uint16_t* out,
                                  int first_key, int end_key, const float* scores = nullptr,
@@ -387,16 +389,16 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
   const int last_row = min(row0 + 15, s.requests - 1);
   const int begin = s.window ? max(first_key, int(positions[row0]) - s.window + 1) : 0;
   const int end = min(end_key, int(positions[last_row]) + 1);
-  __shared__ __align__(32) __nv_bfloat16 a[256], b[16 * 128];
+  __shared__ __align__(32) __nv_bfloat16 a[16 * key_tile], b[key_tile * 128];
   __shared__ __align__(32) float c[16 * 128];
   wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
   wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf[2];
 #pragma unroll
   for (int tile = 0; tile < 2; ++tile) wmma::fill_fragment(cf[tile], 0.0f);
-  for (int key0 = begin; key0 < end; key0 += 16) {
-    for (int i = tid; i < 256; i += 128) {
-      const int row = row0 + i / 16, key = key0 + i % 16;
+  for (int key0 = begin; key0 < end; key0 += key_tile) {
+    for (int i = tid; i < 16 * key_tile; i += 128) {
+      const int row = row0 + i / key_tile, key = key0 + i % key_tile;
       uint16_t probability = 0;
       if (row < s.requests && key < end) {
         const int64_t pos = positions[row];
@@ -415,17 +417,33 @@ __global__ void value_tiles_wide(MimoAttentionShape s, const uint16_t* probabili
       }
       reinterpret_cast<uint16_t*>(a)[i] = probability;
     }
-    for (int i = tid; i < 16 * 128; i += 128) {
-      const int key = key0 + i / 128, dim = i % 128;
-      reinterpret_cast<uint16_t*>(b)[i] =
-          key < end ? mimo_cache_load(vc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 128 + dim, s.fp8_cache) : 0;
+    if constexpr (key_tile > 16) {
+      for (int pair = tid; pair < key_tile * 64; pair += 128) {
+        const int key = key0 + pair / 64, dim = (pair % 64) * 2;
+        reinterpret_cast<uint32_t*>(b)[pair] = key < end ?
+            mimo_cache_load_pair(vc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 128 + dim,
+                                 s.fp8_cache) : 0;
+      }
+    } else {
+      for (int i = tid; i < key_tile * 128; i += 128) {
+        const int key = key0 + i / 128, dim = i % 128;
+        reinterpret_cast<uint16_t*>(b)[i] =
+            key < end ? mimo_cache_load(vc, (int64_t(cache_slot(s, key)) * s.kv_heads + kh) * 128 + dim, s.fp8_cache) : 0;
+      }
     }
     __syncthreads();
-    wmma::load_matrix_sync(af, a, 16);
+    // Each output keeps exactly the original ascending 16-key MMA chain.
+    // Larger staging tiles amortize barriers and coalesce score reads.
 #pragma unroll
-    for (int tile = 0; tile < 2; ++tile) {
-      wmma::load_matrix_sync(bf, b + (warp * 2 + tile) * 16, 128);
-      wmma::mma_sync(cf[tile], af, bf, cf[tile]);
+    for (int sub = 0; sub < key_tile; sub += 16) {
+      if (key0 + sub < end) {
+        wmma::load_matrix_sync(af, a + sub, key_tile);
+#pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+          wmma::load_matrix_sync(bf, b + sub * 128 + (warp * 2 + tile) * 16, 128);
+          wmma::mma_sync(cf[tile], af, bf, cf[tile]);
+        }
+      }
     }
     __syncthreads();
   }
@@ -890,7 +908,21 @@ void mimo_attention_prefill(const MimoAttentionShape& s, const uint16_t* q, cons
       s, q, kc, vc, positions, sinks, out, true, scores, true, probabilities, nullptr,
       parallel_softmax, false, normalizers);
   DGPP_CUDA_OK(cudaGetLastError());
-  if (fused)
+  // Resolve once before graph capture; retain the established default for A/B.
+  static const int key_tile = [] {
+    const char* value = std::getenv("DGPP_MIMO_PV_KEY_TILE");
+    const int n = value ? std::atoi(value) : 16;
+    if (n != 16 && n != 32 && n != 64)
+      throw std::invalid_argument("DGPP_MIMO_PV_KEY_TILE must be 16, 32 or 64");
+    return n;
+  }();
+  if (fused && key_tile == 64)
+    value_tiles_wide<true, 64><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+        s, nullptr, vc, positions, out, first, end_key, scores, normalizers);
+  else if (fused && key_tile == 32)
+    value_tiles_wide<true, 32><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
+        s, nullptr, vc, positions, out, first, end_key, scores, normalizers);
+  else if (fused)
     value_tiles_wide<true><<<dim3((s.requests + 15) / 16, s.q_heads), 128, 0, stream>>>(
         s, nullptr, vc, positions, out, first, end_key, scores, normalizers);
   else if (wide_values)

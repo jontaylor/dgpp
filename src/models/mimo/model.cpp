@@ -333,7 +333,56 @@ void MimoModel::graph_prepare() {
 void MimoModel::reset_slot_state(int req) {
   check_req(req, "MiMo reset");
   snapshot_history_.rewind(req);
+  if (shared_snapshots_) shared_snapshots_->rewind(req);
   // Position zero hides old global/ring tails; no full-cache memset per request.
+}
+namespace {
+bool shared_snapshots_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_SHARED_SNAPSHOTS");
+    return value && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+}
+size_t MimoModel::prefix_arena_storage_bytes() const {
+  return shared_snapshots_enabled() ? session_snapshot_bytes() - snapshot_state_bytes() + 8
+                                    : session_snapshot_bytes();
+}
+size_t MimoModel::snapshot_state_storage_bytes(const void* dst) const {
+  return shared_snapshots_ && shared_snapshots_->contains(dst) ? 8 : snapshot_state_bytes();
+}
+void MimoModel::register_state_snapshot(const void* dst) {
+  snapshot_history_.register_destination(dst);
+  if (!shared_snapshots_enabled()) return;
+  if (!shared_snapshots_) {
+    size_t token_bytes = 0, private_bytes = 0;
+    for (const auto& layer : layers_) {
+      const auto& s = layer->shape();
+      const size_t width = (s.k_width() + s.v_width()) * s.cache_element_bytes();
+      if (s.window) private_bytes += s.window * width;
+      else token_bytes += width;
+    }
+    const auto stream = stream_;
+    shared_snapshots_ = std::make_unique<MimoSharedSnapshots>(token_bytes, private_bytes,
+        [stream](size_t bytes) {
+          uint8_t* ptr = nullptr;
+          DGPP_CUDA_OK(cudaMallocAsync(&ptr, bytes, stream));
+          return MimoSharedSnapshots::Storage(ptr, [stream](uint8_t* p) {
+            // Destruction is ordered after snapshot/restore copies on this stream.
+            cudaFreeAsync(p, stream);
+          });
+        });
+  }
+  shared_snapshots_->register_slot(dst);
+}
+void MimoModel::unregister_state_snapshot(const void* dst) {
+  snapshot_history_.unregister_destination(dst);
+  if (shared_snapshots_) shared_snapshots_->unregister_slot(dst);
+}
+void MimoModel::invalidate_state_snapshot(const void* dst) {
+  snapshot_history_.release(dst);
+  if (shared_snapshots_) shared_snapshots_->release(dst);
 }
 void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
   check_req(req, "MiMo snapshot");
@@ -341,6 +390,32 @@ void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
   // by position; packing the earlier prefix does not need a full cache copy.
   const int64_t position =
       session_pos_[static_cast<size_t>(req)] - (spec_row >= 0 ? rows_after_for_snapshot_ : 0);
+  if (shared_snapshots_ && shared_snapshots_->contains(dst)) {
+    const size_t copied = shared_snapshots_->write(req, dst, position,
+        [&](uint8_t* out, int64_t first, int64_t count) {
+          for (size_t l = 0; l < layers_.size(); ++l) {
+            const auto& s = layers_[l]->shape();
+            if (s.window) continue;
+            for (bool values : {false, true}) {
+              const size_t width = (values ? s.v_width() : s.k_width()) * s.cache_element_bytes();
+              const auto* src = values ? values_[l] + req * value_plane_[l] : keys_[l] + req * key_plane_[l];
+              DGPP_CUDA_OK(cudaMemcpyAsync(out, src + size_t(first) * width, size_t(count) * width,
+                                          cudaMemcpyDeviceToDevice, stream_));
+              out += size_t(count) * width;
+            }
+          }
+        }, [&](uint8_t* out, int64_t, int64_t pos) {
+          for (size_t l = 0; l < layers_.size(); ++l) {
+            const auto& s = layers_[l]->shape();
+            if (!s.window) continue;
+            mimo_write_snapshot_layer(s, pos, 0, keys_[l] + req * key_plane_[l],
+                                      values_[l] + req * value_plane_[l], out, stream_);
+            out += s.window * (s.k_width() + s.v_width()) * s.cache_element_bytes();
+          }
+        });
+    snapshot_copied_bytes_ += copied;
+    return;
+  }
   uint8_t* const base = dst;
   const int64_t previous = snapshot_history_.begin(req, base, position);
   for (size_t l = 0; l < layers_.size(); ++l) {
@@ -358,6 +433,32 @@ void MimoModel::write_state_snapshot(int req, uint8_t* dst, int spec_row) {
 void MimoModel::read_state_snapshot(int req, const uint8_t* src, int64_t position) {
   check_req(req, "MiMo restore");
   snapshot_history_.rewind(req);
+  if (shared_snapshots_) shared_snapshots_->rewind(req);
+  if (shared_snapshots_ && shared_snapshots_->contains(src)) {
+    shared_snapshots_->read(req, src, position,
+        [&](const uint8_t* in, int64_t first, int64_t count) {
+          for (size_t l = 0; l < layers_.size(); ++l) {
+            const auto& s = layers_[l]->shape();
+            if (s.window) continue;
+            for (bool values : {false, true}) {
+              const size_t width = (values ? s.v_width() : s.k_width()) * s.cache_element_bytes();
+              auto* dst = values ? values_[l] + req * value_plane_[l] : keys_[l] + req * key_plane_[l];
+              DGPP_CUDA_OK(cudaMemcpyAsync(dst + size_t(first) * width, in, size_t(count) * width,
+                                          cudaMemcpyDeviceToDevice, stream_));
+              in += size_t(count) * width;
+            }
+          }
+        }, [&](const uint8_t* in, int64_t, int64_t pos) {
+          for (size_t l = 0; l < layers_.size(); ++l) {
+            const auto& s = layers_[l]->shape();
+            if (!s.window) continue;
+            mimo_read_snapshot_layer(s, pos, in, keys_[l] + req * key_plane_[l],
+                                     values_[l] + req * value_plane_[l], stream_);
+            in += s.window * (s.k_width() + s.v_width()) * s.cache_element_bytes();
+          }
+        });
+    return;
+  }
   for (size_t l = 0; l < layers_.size(); ++l) {
     const auto& shape = layers_[l]->shape();
     const size_t slots = shape.window ? shape.window : shape.capacity;

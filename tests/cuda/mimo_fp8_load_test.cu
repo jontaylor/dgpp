@@ -23,6 +23,10 @@ __global__ void fp8_load_selected(const uint8_t* input, const uint16_t* bf16, ui
   const int i = threadIdx.x;
   output[i] = dgpp::mimo_cache_load(input, i, true);
   output[256 + i] = dgpp::mimo_cache_load(bf16, i, false);
+  if (i < 128) {
+    reinterpret_cast<uint32_t*>(output + 512)[i] = dgpp::mimo_cache_load_pair(input, i * 2, true);
+    reinterpret_cast<uint32_t*>(output + 768)[i] = dgpp::mimo_cache_load_pair(bf16, i * 2, false);
+  }
 }
 int main() {
   int devices = 0;
@@ -30,8 +34,10 @@ int main() {
   try {
     if (dgpp::mimo_fp8_fast_load_build() != bool(DGPP_MIMO_FP8_KV_FAST_LOAD))
       throw std::runtime_error("probe and linked attention library have different fast-load builds");
+    if (dgpp::mimo_fp8_integer_load_build() != bool(DGPP_MIMO_FP8_KV_INTEGER_LOAD))
+      throw std::runtime_error("probe and attention library have different integer-load builds");
     std::vector<uint8_t> input(256);
-    std::vector<uint16_t> bf16(256), output(1024);
+    std::vector<uint16_t> bf16(256), output(1536);
     for (int code = 0; code < 256; ++code) {
       input[code] = uint8_t(code);
       bf16[code] = uint16_t(code * 257);  // includes signed-zero/NaN payload passthrough
@@ -43,7 +49,7 @@ int main() {
     uint16_t *bf, *dest;
     DGPP_CUDA_OK(cudaMalloc(&source, 256));
     DGPP_CUDA_OK(cudaMalloc(&bf, 512));
-    DGPP_CUDA_OK(cudaMalloc(&dest, 2048));
+    DGPP_CUDA_OK(cudaMalloc(&dest, 3072));
     DGPP_CUDA_OK(cudaMemcpy(source, input.data(), 256, cudaMemcpyHostToDevice));
     DGPP_CUDA_OK(cudaMemcpy(bf, bf16.data(), 512, cudaMemcpyHostToDevice));
     cudaStream_t stream;
@@ -64,10 +70,12 @@ int main() {
       }
       DGPP_CUDA_OK(cudaGraphLaunch(executable, stream));
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
-      DGPP_CUDA_OK(cudaMemcpy(output.data(), dest, 2048, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(output.data(), dest, 3072, cudaMemcpyDeviceToHost));
       for (int i = 0; i < 256; ++i) {
         if (output[i] != output[256 + i] || output[i] != output[512 + i])
           throw std::runtime_error("GPU load differs at E4M3 code " + std::to_string(input[i]));
+        if (output[i] != output[1024 + i]) throw std::runtime_error("FP8 paired load changed");
+        if (output[1280 + i] != bf16[i]) throw std::runtime_error("BF16 paired load changed");
         if (output[768 + i] != bf16[i]) throw std::runtime_error("BF16 passthrough changed");
         if ((input[i] & 127) != 127) {
           const auto expected = dgpp::float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(input[i]));
@@ -84,7 +92,7 @@ int main() {
     DGPP_CUDA_OK(cudaFree(bf));
     DGPP_CUDA_OK(cudaFree(source));
     std::cout << "PASS all256 E4M3 codes, NaN-sign parity, signed zero, BF16 passthrough, graph replay; fast_load="
-              << DGPP_MIMO_FP8_KV_FAST_LOAD << '\n';
+              << DGPP_MIMO_FP8_KV_FAST_LOAD << " integer_load=" << DGPP_MIMO_FP8_KV_INTEGER_LOAD << '\n';
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -27,11 +27,14 @@ class PrefixArena {
     if (model_ == nullptr) throw std::invalid_argument("PrefixArena: null model");
     if (slots_ < 0) throw std::invalid_argument("PrefixArena: negative slots");
     bytes_ = model_->session_snapshot_bytes();
+    storage_bytes_ = bytes_;
+    if constexpr (requires { model_->prefix_arena_storage_bytes(); })
+      storage_bytes_ = model_->prefix_arena_storage_bytes();
     if (slots_ > 0) {
       if (bytes_ == 0)
         throw std::invalid_argument(
             "PrefixArena: the model has no session state to snapshot");
-      DGPP_CUDA_OK(cudaMalloc(&base_, bytes_ * static_cast<size_t>(slots_)));
+      DGPP_CUDA_OK(cudaMalloc(&base_, storage_bytes_ * static_cast<size_t>(slots_)));
       metas_.resize(static_cast<size_t>(slots_));
       filled_.assign(static_cast<size_t>(slots_), false);
       if constexpr (requires { model_->register_state_snapshot(ptr(0)); })
@@ -63,7 +66,12 @@ class PrefixArena {
   PrefixArena& operator=(const PrefixArena&) = delete;
 
   int slots() const { return slots_; }
-  size_t bytes() const { return bytes_; }
+  size_t bytes() const { return bytes_; }  // worst-case budget per slot
+  size_t allocated_bytes() const {
+    size_t n = storage_bytes_ * static_cast<size_t>(slots_);
+    if constexpr (requires { model_->shared_snapshot_bytes(); }) n += model_->shared_snapshot_bytes();
+    return n;
+  }
   bool filled(int slot) const { return filled_.at(static_cast<size_t>(slot)); }
   int64_t position(int slot) const {
     check(slot);
@@ -164,6 +172,7 @@ class PrefixArena {
   double attach_ms() const { harvest(); return attach_ms_; }
 
  private:
+  size_t storage_bytes_ = 0;
   void invalidate(int slot) {
     if constexpr (requires { model_->invalidate_state_snapshot(ptr(slot)); })
       model_->invalidate_state_snapshot(ptr(slot));
@@ -187,7 +196,7 @@ class PrefixArena {
                               " outside [0, " + std::to_string(slots_) + ")");
   }
   void* ptr(int slot) const {
-    return static_cast<uint8_t*>(base_) + bytes_ * static_cast<size_t>(slot);
+    return static_cast<uint8_t*>(base_) + storage_bytes_ * static_cast<size_t>(slot);
   }
   // A ring of event pairs: the oldest armed one is harvested (or waited
   // for, if still in flight — four ops later it never is) before reuse.

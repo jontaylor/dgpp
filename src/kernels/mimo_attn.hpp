@@ -8,6 +8,7 @@
 namespace dgpp {
 // Reports the linked attention kernel build, not a host-header assumption.
 bool mimo_fp8_fast_load_build();
+bool mimo_fp8_integer_load_build();
 // Native MTP head d consumes backbone hidden at absolute row p-d.
 // Attention positions are translated by -d so each layer's populated history
 // starts at zero. Padding never reads or writes a history plane.

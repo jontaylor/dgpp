@@ -1955,6 +1955,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {
   append_json_int(&out, m.prefix_blocks_pinned);
   out.append(",\"snapshot_bytes\":");
   append_json_int(&out, pe.snapshot_bytes);
+  out.append(",\"snapshot_storage_bytes\":");
+  append_json_int(&out, pe.snapshot_storage_bytes);
   out.append(",\"arena_snapshots\":");
   append_json_int(&out, pe.snapshots);
   append_ms("snapshot_ms_avg", avg(pe.snapshot_ms, pe.snapshots));

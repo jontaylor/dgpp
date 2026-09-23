@@ -9,6 +9,7 @@
 
 #include "engine/prefix_arena.hpp"
 #include "models/mimo/snapshot.hpp"
+#include "models/mimo/shared_snapshot.hpp"
 #include "models/mimo/snapshot_copy.hpp"
 
 namespace {
@@ -196,6 +197,51 @@ void run() {
   m.verify(arena.slot_data(0), 500);
   std::cout << "PASS: exact rolling/hop snapshots, wraps, rollback, restore, four-slot reuse; copied=" << m.copied << " bytes\n";
 }
+void shared_gpu_storage() {
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  {
+    Buffer live(1024), restored(1024);
+    dgpp::MimoSharedSnapshots store(1, 4, [stream](size_t n) {
+      uint8_t* ptr = nullptr;
+      DGPP_CUDA_OK(cudaMallocAsync(&ptr, n, stream));
+      return dgpp::MimoSharedSnapshots::Storage(ptr, [stream](uint8_t* p) { cudaFreeAsync(p, stream); });
+    });
+    int a, b;
+    store.register_slot(&a); store.register_slot(&b);
+    DGPP_CUDA_OK(cudaMemsetAsync(live.p, 17, 1024, stream));
+    auto write = [&](void* dst, int64_t pos) {
+      return store.write(0, dst, pos,
+          [&](uint8_t* out, int64_t first, int64_t count) {
+            DGPP_CUDA_OK(cudaMemcpyAsync(out, live.p + first, count, cudaMemcpyDeviceToDevice, stream));
+          }, [&](uint8_t* out, int64_t, int64_t) {
+            DGPP_CUDA_OK(cudaMemcpyAsync(out, live.p, 4, cudaMemcpyDeviceToDevice, stream));
+          });
+    };
+    check(write(&a, 300) == 304, "shared GPU first copy");
+    check(write(&b, 600) == 348, "shared GPU block reuse");
+    check(store.unique_bytes() == 652, "shared GPU owned storage");
+    DGPP_CUDA_OK(cudaMemsetAsync(live.p, 29, 1024, stream));
+    store.rewind(0);
+    write(&a, 300);  // old A must not corrupt B's shared block
+    store.read(1, &b, 600,
+        [&](const uint8_t* in, int64_t first, int64_t count) {
+          DGPP_CUDA_OK(cudaMemcpyAsync(restored.p + first, in, count, cudaMemcpyDeviceToDevice, stream));
+        }, [&](const uint8_t* in, int64_t, int64_t) {
+          DGPP_CUDA_OK(cudaMemcpyAsync(restored.p + 600, in, 4, cudaMemcpyDeviceToDevice, stream));
+        });
+    store.release(&b);  // stream-ordered free must follow restore copies
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<uint8_t> got(604);
+    DGPP_CUDA_OK(cudaMemcpy(got.data(), restored.p, got.size(), cudaMemcpyDeviceToHost));
+    check(std::all_of(got.begin(), got.end(), [](uint8_t x) { return x == 17; }), "shared GPU restore changed bytes");
+    store.unregister_slot(&a); store.unregister_slot(&b);
+    check(store.unique_bytes() == 0, "shared GPU eviction leaked ownership");
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  std::cout << "PASS: shared GPU snapshots, async allocation/free ordering, branch and eviction\n";
+}
 }  // namespace
 int main() {
   int count = 0;
@@ -203,6 +249,7 @@ int main() {
   try {
     run<uint16_t>();
     run<uint8_t>();
+    shared_gpu_storage();
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

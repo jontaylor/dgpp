@@ -11,4 +11,17 @@ DGPP_HD inline uint16_t mimo_fp8_expanded_to_bf16(float value) {
   return (bits & 0x7fffffffu) > 0x7f800000u
       ? static_cast<uint16_t>((top & 0x8000u) | 0x7fc0u) : top;
 }
+// Direct E4M3-to-BF16 expansion: every finite input is exact, including
+// subnormals and signed zero. Keep the signed canonical quiet-NaN contract.
+DGPP_HD inline uint16_t mimo_fp8_bits_to_bf16(uint8_t code) {
+  const uint16_t sign = uint16_t(code & 128u) << 8;
+  const unsigned magnitude = code & 127u;
+  if (magnitude == 127u) return sign | 0x7fc0u;
+  if (magnitude >= 8u) return sign | uint16_t((magnitude << 4) + 0x3c00u);
+  // Eight-entry subnormal table expressed as branches to avoid device storage.
+  const uint16_t low = magnitude == 0 ? 0 : magnitude == 1 ? 0x3b00 :
+      magnitude < 4 ? uint16_t(0x3b80 + (magnitude - 2) * 0x40) :
+      uint16_t(0x3c00 + (magnitude - 4) * 0x20);
+  return sign | low;
+}
 }  // namespace dgpp
