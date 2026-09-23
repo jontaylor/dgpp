@@ -1,4 +1,5 @@
 #pragma once
+#include "common/spec_limits.hpp"
 // Composition interface (M5 deliverable 3): adapts BoundaryReducer to the
 // CollectiveBus one-shot all-reduce. Header-only so the ungated models
 // library never links ibverbs — only consumers that already link the bus
@@ -1049,8 +1050,8 @@ inline sample::SpecPrefixDecision bus_spec_accept(
 class DevicePicker {
  public:
   // The verify's pick and one per draft position (kSpecRows - 1 chained
-  // drafts at most, 2026-09-06; 6 since the DSpark block, 2026-09-13).
-  static constexpr int kSlots = 6;
+  // drafts at most). This also sizes pinned/device mirrors, locals and outcomes.
+  static constexpr int kSlots = kSpeculationRows;
 
   // `sampling_candidates` > 0 arms the SAMPLING pick (kernels/
   // glm_sample_pick.hpp): a wider table (k candidates + the slice lse per

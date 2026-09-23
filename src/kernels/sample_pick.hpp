@@ -1,4 +1,5 @@
 #pragma once
+#include "common/spec_limits.hpp"
 // The on-device SAMPLING pick (DESIGN §10, the device path): the greedy
 // pick's two kernels (glm_pick.hpp) generalized from top-1 to top-k per
 // rank plus each slice's temperature-scaled log-sum-exp, and a verdict that
@@ -86,7 +87,7 @@ constexpr int kSampleMaxTopLogprobs = 20;
 // up to kSampleVerdictRows - 1 drafts — the families' kSpecRows (6 since
 // the DeepSeek-V4.1 DSpark block of five drafts, 2026-09-14; the kernel's
 // per-row tables moved to dynamic shared memory for it).
-constexpr int kSampleVerdictRows = 8;
+constexpr int kSampleVerdictRows = kSpeculationRows;
 
 // The sampling verdict's outcome per request, beside the PickVerdict the
 // device consumers (commit, token feeds) keep reading.

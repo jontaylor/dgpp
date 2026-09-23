@@ -1,4 +1,5 @@
 #pragma once
+#include "common/spec_limits.hpp"
 // The speculative step's DEVICE-SIDE control (DESIGN §9, the on-device
 // step, phase B): what the host used to do between a verify and the next
 // step — read the verdict, roll the rejected rows' state back, advance the
@@ -212,7 +213,7 @@ void glm_spec_chain_rows_batched(const PickVerdict* verify_verdicts,
 // The next replay's fed tokens, written at the end of this one (phase D):
 // tokens[0] = *next (the verify's), tokens[1 + c] = drafts.v[c]->next (the
 // block's guesses for the tokens after it, one per draft position).
-constexpr int kSpecMaxDrafts = 7;  // kSpecRows - 1 (engine/decode_outputs.hpp)
+constexpr int kSpecMaxDrafts = kSpeculationMaxDrafts;  // kSpecRows - 1 (engine/decode_outputs.hpp)
 struct GlmSpecDrafts {
   const PickVerdict* v[kSpecMaxDrafts] = {};
   int count = 0;

@@ -6363,3 +6363,109 @@ int main() {
   }
   return dgpp::test::run_all();
 }
+
+// Regression for DFlash7: verification at picker slot 0 followed by seven
+// independent draft picks needs slots 0..7. Exercise real allocation/access,
+// eager collectives and graph replay at C2 with sixteen verification rows.
+DGPP_TEST(device_picker_dflash7_all_slots_eager_and_graph_loopback) {
+  constexpr int world = 2, requests = 2, rows = requests * dgpp::kSpecRows, vocab = 32;
+  static_assert(dgpp::DevicePicker::kSlots == dgpp::kSpecRows && dgpp::kSpecRows == 8);
+  auto buses = start_world(world, 29949);
+  require(!buses.empty(), "picker-slot bus startup");
+  std::vector<std::string> errors(world);
+  ConstructBarrier barrier(world);
+  std::vector<std::thread> workers;
+  for (int rank = 0; rank < world; ++rank) {
+    workers.emplace_back([&, rank] {
+      bool arrived = false;
+      auto arrive = [&] { if (!arrived) { arrived = true; barrier.arrive_and_wait(); } };
+      float* logits = nullptr;
+      int64_t* fed = nullptr;
+      cudaStream_t stream = nullptr;
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t exec = nullptr;
+      try {
+        auto& bus = *buses[rank];
+        DGPP_CUDA_OK(cudaStreamCreate(&stream));
+        DGPP_CUDA_OK(cudaMallocManaged(&logits, sizeof(float) * rows * vocab * dgpp::DevicePicker::kSlots));
+        DGPP_CUDA_OK(cudaMallocManaged(&fed, sizeof(int64_t) * rows));
+        for (int row = 0; row < rows; ++row) fed[row] = row % dgpp::kSpecRows ? 2 + row : 0;
+        for (int slot = 0; slot < dgpp::DevicePicker::kSlots; ++slot) {
+          for (int row = 0; row < rows; ++row) {
+            const int winner = slot == 0 ? 3 + row : 3 + slot * 2 + row;
+            for (int v = 0; v < vocab; ++v)
+              logits[(slot * rows + row) * vocab + v] = rank == 0 && v == winner ? 10.f : -10.f;
+          }
+        }
+        // Sampling allocations are armed too, even though this synthetic
+        // deterministic test runs the greedy path. Upper outcome slots must
+        // be addressable and distinct, just like device/pinned verdicts.
+        dgpp::DevicePicker picker(bus, rank, world, test_wait_timeout_ms(), 32, rows);
+        arrive();
+        auto input = [&](int slot) {
+          dgpp::DevicePicker::Inputs in;
+          in.logits = logits + slot * rows * vocab;
+          in.rows = slot == 0 ? rows : requests;
+          in.requests = requests;
+          in.rows_per_request = slot == 0 ? dgpp::kSpecRows : 1;
+          in.vocab_count = vocab;
+          in.vocab_begin = rank * vocab;
+          in.fed = fed;
+          in.slot = slot;
+          return in;
+        };
+        auto check = [&] {
+          for (int slot = 0; slot < dgpp::DevicePicker::kSlots; ++slot) {
+            for (int req = 0; req < requests; ++req) {
+              const auto& verdict = picker.verdict(slot, req);
+              const int want = slot == 0 ? 3 + req * dgpp::kSpecRows + dgpp::kSpecRows - 1
+                                        : 3 + slot * 2 + req;
+              require(verdict.accepted == (slot == 0 ? dgpp::kSpecRows : 1) && verdict.next == want,
+                      "upper picker slot verdict overwritten or wrong");
+            }
+            require(picker.local(0, slot).best_id == (rank == 0 ? 3 + slot * 2 : vocab),
+                    "slot-local pick mirror not retained");
+            (void)picker.outcome(slot, requests - 1);
+            if (slot) {
+              require(picker.device_verdict(slot) != picker.device_verdict(slot - 1), "device slots alias");
+              require(&picker.outcome(slot) != &picker.outcome(slot - 1), "outcome slots alias");
+            }
+          }
+        };
+        for (int slot = 0; slot < dgpp::DevicePicker::kSlots; ++slot) picker.run(stream, input(slot));
+        check();
+        for (int bad : {-1, dgpp::DevicePicker::kSlots}) {
+          bool refused = false;
+          try { (void)picker.device_verdict(bad); } catch (const std::out_of_range&) { refused = true; }
+          require(refused, "picker must retain strict slot bounds");
+        }
+        std::string error;
+        require(bus.graph_record_begin(&error), error);
+        DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        for (int slot = 0; slot < dgpp::DevicePicker::kSlots; ++slot) picker.record(stream, input(slot));
+        DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+        require(bus.graph_record_end(&error), error);
+        dgpp::glm_check_decode_graph(graph, rank, "DFlash7 picker slots");
+        DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+          require(bus.graph_replay_arm(&error), error);
+          DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          require(bus.graph_replay_finish(test_wait_timeout_ms(), &error), error);
+          check();
+        }
+      } catch (const std::exception& error) {
+        errors[rank] = error.what();
+        arrive();
+      }
+      if (exec) cudaGraphExecDestroy(exec);
+      if (graph) cudaGraphDestroy(graph);
+      if (stream) cudaStreamDestroy(stream);
+      if (logits) cudaFree(logits);
+      if (fed) cudaFree(fed);
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  for (int rank = 0; rank < world; ++rank)
+    require(errors[rank].empty(), "DFlash7 picker rank " + std::to_string(rank) + ": " + errors[rank]);
+}

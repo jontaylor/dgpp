@@ -1,4 +1,5 @@
 #pragma once
+#include "common/spec_limits.hpp"
 // Types and model interface used by the eager and graph engines, prefix
 // arena and speculators. The adapters are templates over a model type;
 // this header defines shared row limits, output buffers and pick callbacks.
@@ -44,7 +45,7 @@ namespace dgpp {
 // it).
 constexpr int kDecodeRows = 8;
 constexpr int kDecodeRowsMax = 64;
-constexpr int kSpecRows = 8;  // DFlash: seven drafts + the pending token
+constexpr int kSpecRows = kSpeculationRows;  // DFlash: seven drafts + the pending token
 
 // One forward's rows as the engines read them.
 struct DecodeOutputs {

@@ -39,6 +39,10 @@
 
 namespace dgpp {
 
+static_assert(DevicePicker::kSlots == kSpecRows && kSpecRows == kSpecMaxDrafts + 1 &&
+              kSpecRows == kSampleVerdictRows,
+              "graph verification rows, draft picks and outcome slots must agree");
+
 // Pins the process's current pages BEFORE the model is constructed — the
 // decode loop's host state (tokenizer tables, the bus, this binary) once
 // had to survive a load phase that drove every box to its memory
