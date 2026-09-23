@@ -570,18 +570,43 @@ DGPP_TEST(mimo_cuda_partial_snapshot_restores_causal_chunk_after_poison_and_wrap
   }
 }
 
+void benchmark_cache(Fixture& f) {
+  const char* option = std::getenv("DGPP_MIMO_ATTN_BENCH_FP8");
+  f.shape.fp8_cache = option && std::string(option) == "1";
+  uint32_t rng = 37;
+  for (auto item : {std::pair{&f.k, &f.dk}, std::pair{&f.v, &f.dv}}) {
+    auto& values = *item.first;
+    for (auto& x : values) {
+      rng = rng * 1664525u + 1013904223u;
+      x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
+    }
+    if (f.shape.fp8_cache) {
+      std::vector<uint8_t> packed(values.size());
+      for (size_t i = 0; i < values.size(); ++i)
+        packed[i] = dgpp::float_to_fp8_e4m3_bits(dgpp::bf16_bits_to_float(values[i]));
+      item.second->upload(packed.data(), packed.size());
+    } else item.second->upload(values.data(), values.size() * 2);
+  }
+}
+
 void benchmark_decode() {
   for (int context : {128, 512, 2048, 8192, 65536}) {
     Fixture f({1, 32, 2, 65536, 0});
+    benchmark_cache(f);
     f.positions[0] = context - 1;
     f.prepare();
     dgpp::mimo_qkv_append(f.shape, f.df.as<uint16_t>(), f.dfreq.as<float>(), f.dpos.as<int64_t>(),
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream);
     DevBuf scores(size_t(32) * 65536 * 6);
-    for (int tensor : {0, 1, 2, 3}) {
+    DevBuf partials(dgpp::mimo_online_partial_bytes(1, 32, f.shape.capacity));
+    for (int tensor : {0, 1, 2, 3, 4}) {
       auto run = [&] {
-        if (tensor == 3)
+        if (tensor == 4)
+          dgpp::mimo_attention_split_online(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), nullptr, f.dout.as<uint16_t>(),
+              partials.as<float>(), f.stream);
+        else if (tensor == 3)
           dgpp::mimo_attention_online_decode(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
               f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), nullptr, f.dout.as<uint16_t>(), f.stream);
         else if (tensor == 1)
@@ -603,7 +628,8 @@ void benchmark_decode() {
       DGPP_CUDA_OK(cudaEventSynchronize(end));
       float ms = 0;
       DGPP_CUDA_OK(cudaEventElapsedTime(&ms, start, end));
-      std::cout << "decode context=" << context << " tensor=" << tensor << " ms=" << ms / 5 << '\n';
+      std::cout << "decode context=" << context << " fp8=" << f.shape.fp8_cache << " split_keys=" << dgpp::mimo_online_split_keys()
+                << " tensor=" << tensor << " ms=" << ms / 5 << '\n';
       DGPP_CUDA_OK(cudaEventDestroy(start));
       DGPP_CUDA_OK(cudaEventDestroy(end));
     }
@@ -617,30 +643,33 @@ void benchmark() {
   if (context < 128 || context > 1048576) throw std::invalid_argument("benchmark context");
   const int first_mode = std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")
       ? std::stoi(std::getenv("DGPP_MIMO_ATTN_BENCH_FIRST_MODE")) : 3;
-  if (first_mode < 0 || first_mode > 6) throw std::invalid_argument("benchmark first mode");
+  if (first_mode < 0 || first_mode > 7) throw std::invalid_argument("benchmark first mode");
   for (int window : {0, 128}) {
     Fixture f({128, 32, window ? 4 : 2, window ? 256 : context, window}, true);
     DevBuf scores(first_mode <= 4 ? size_t(128) * 32 * f.shape.capacity * 6 : 1);
-    uint32_t rng = 37;
-    for (auto* cache : {&f.k, &f.v}) {
-      for (auto& x : *cache) {
-        rng = rng * 1664525u + 1013904223u;
-        x = dgpp::float_to_bf16_bits(float(int(rng >> 16) - 32768) / 16384.f);
-      }
-    }
-    f.dk.upload(f.k.data(), f.k.size() * 2);
-    f.dv.upload(f.v.data(), f.v.size() * 2);
+    DevBuf partials(dgpp::mimo_online_partial_bytes(32, 32, f.shape.capacity));
+    benchmark_cache(f);
     for (int t = 0; t < 128; ++t) f.positions[t] = context - 128 + t;
     f.prepare();
     dgpp::mimo_qkv_append(f.shape, f.df.as<uint16_t>(), f.dfreq.as<float>(), f.dpos.as<int64_t>(),
                           f.dq.as<uint16_t>(), f.dk.as<uint16_t>(), f.dv.as<uint16_t>(),
                           f.dstatus.as<int32_t>(), f.stream, true);
-    for (int tensor = first_mode; tensor < 7; ++tensor) {
+    for (int tensor = first_mode; tensor < 8; ++tensor) {
       cudaEvent_t start, end;
       DGPP_CUDA_OK(cudaEventCreate(&start));
       DGPP_CUDA_OK(cudaEventCreate(&end));
       auto run = [&] {
-        if (tensor >= 5)
+        if (tensor == 7) {
+          for (int first = 0; first < f.shape.requests; first += dgpp::mimo_split_tile_rows) {
+            auto tile = f.shape;
+            tile.requests = std::min(dgpp::mimo_split_tile_rows, f.shape.requests - first);
+            dgpp::mimo_attention_split_online(tile, f.dq.as<uint16_t>() + size_t(first) * tile.q_width(),
+                f.dk.as<uint16_t>(), f.dv.as<uint16_t>(), f.dpos.as<int64_t>() + first,
+                window ? f.dsinks.as<uint16_t>() : nullptr,
+                f.dout.as<uint16_t>() + size_t(first) * tile.q_heads * 128,
+                partials.as<float>(), f.stream, true);
+          }
+        } else if (tensor >= 5)
           dgpp::mimo_attention_bounded_prefill(f.shape, f.dq.as<uint16_t>(),
               f.dk.as<uint16_t>(), f.dv.as<uint16_t>(), f.dpos.as<int64_t>(),
               window ? f.dsinks.as<uint16_t>() : nullptr, f.dout.as<uint16_t>(),
@@ -664,7 +693,8 @@ void benchmark() {
       DGPP_CUDA_OK(cudaEventSynchronize(end));
       float ms = 0;
       DGPP_CUDA_OK(cudaEventElapsedTime(&ms, start, end));
-      std::cout << "window=" << window << " tensor=" << tensor << " ms=" << ms / 5 << '\n';
+      std::cout << "window=" << window << " fp8=" << f.shape.fp8_cache << " split_keys=" << dgpp::mimo_online_split_keys()
+                << " tensor=" << tensor << " ms=" << ms / 5 << '\n';
       DGPP_CUDA_OK(cudaEventDestroy(start));
       DGPP_CUDA_OK(cudaEventDestroy(end));
     }
@@ -873,17 +903,22 @@ DGPP_TEST(mimo_cuda_bounded_random_serial_parallel_oracles) {
         DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
         f.dout.download((par ? parallel : serial).data(), serial.size() * 2);
       }
-      for (bool online : {false, true}) {
+      for (int online : {0, 1, 2}) {
+        DevBuf partials(dgpp::mimo_online_partial_bytes(f.shape.requests, f.shape.q_heads, capacity));
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
-        dgpp::mimo_attention_bounded_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+        if (online == 2)
+          dgpp::mimo_attention_split_online(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+              f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+              f.dout.as<uint16_t>(), partials.as<float>(), f.stream, true);
+        else dgpp::mimo_attention_bounded_prefill(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
             f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
             f.dout.as<uint16_t>(), end, f.stream, online);
         DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
         size_t nodes = 0;
         DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &nodes));
-        if (nodes != 1) throw std::runtime_error("bounded prefill must capture one kernel");
+        if (nodes != (online == 2 && !window ? 2 : 1)) throw std::runtime_error("bounded prefill must capture one kernel");
         DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
         DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
@@ -904,6 +939,88 @@ DGPP_TEST(mimo_cuda_bounded_random_serial_parallel_oracles) {
                     << " sink=" << sink << " online=" << online << " parallel_ref=" << par
                     << " rel_l2=" << rel << " maxabs=" << maxabs << " changed=" << changed << '\n';
           if (rel > (online ? 0.025 : 0.005)) throw std::runtime_error("bounded random L2 gate");
+        }
+        DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+        DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
+    }
+  }
+}
+
+DGPP_TEST(mimo_cuda_split_online_partition_sink_padding_and_workspace_guards) {
+  // Independent analytic oracle: zero Q/K makes every real key weight one.
+  // Distinct physical V rows/planes expose missing, duplicate and mis-mapped keys.
+  for (bool mapped : {false, true}) {
+    for (int capacity : {3, 1025, 2051, 8193}) {
+      Fixture f({17, 4, 2, capacity, 0}, !mapped);
+      std::fill(f.q.begin(), f.q.end(), 0);
+      std::fill(f.k.begin(), f.k.end(), 0);
+      const int planes = mapped ? f.shape.requests : 1;
+      for (int r = 0; r < planes; ++r)
+        for (int t = 0; t < capacity; ++t)
+          for (int d = 0; d < f.shape.v_width(); ++d)
+            f.v[(size_t(r) * capacity + t) * f.shape.v_width() + d] =
+                dgpp::float_to_bf16_bits(float((t * 7 + d + r * 3) % 29) / 8.f);
+      f.dq.upload(f.q.data(), f.q.size() * 2);
+      f.dk.upload(f.k.data(), f.k.size() * 2);
+      f.dv.upload(f.v.data(), f.v.size() * 2);
+      DevBuf ids(f.shape.requests * sizeof(int32_t));
+      std::vector<int32_t> mapping(f.shape.requests);
+      for (int r = 0; r < f.shape.requests; ++r) mapping[r] = f.shape.requests - 1 - r;
+      ids.upload(mapping.data(), mapping.size() * 4);
+      const size_t bytes = dgpp::mimo_online_partial_bytes(f.shape.requests, f.shape.q_heads, capacity);
+      DevBuf parts(bytes + 256);
+      for (bool sink : {false, true}) {
+        for (int h = 0; h < f.shape.q_heads; ++h)
+          f.sinks[h] = dgpp::float_to_bf16_bits(h % 2 ? 12.f : 0.f);
+        f.dsinks.upload(f.sinks.data(), f.sinks.size() * 2);
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        DGPP_CUDA_OK(cudaStreamBeginCapture(f.stream, cudaStreamCaptureModeGlobal));
+        dgpp::mimo_attention_split_online(f.shape, f.dq.as<uint16_t>(), f.dk.as<uint16_t>(),
+            f.dv.as<uint16_t>(), f.dpos.as<int64_t>(), sink ? f.dsinks.as<uint16_t>() : nullptr,
+            f.dout.as<uint16_t>(), parts.as<float>(), f.stream, !mapped,
+            mapped ? ids.as<int32_t>() : nullptr);
+        DGPP_CUDA_OK(cudaStreamEndCapture(f.stream, &graph));
+        DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+          for (int r = 0; r < f.shape.requests; ++r) {
+            const int splits = dgpp::mimo_online_splits(capacity);
+            const int span = ((capacity + splits - 1) / splits + 15) / 16 * 16;
+            const int64_t cases[] = {0, capacity - 1, std::min(span - 1, capacity - 1),
+                std::min(span, capacity - 1), -1, capacity, std::min(2 * span, capacity - 1)};
+            f.positions[r] = cases[(r + replay) % 7];
+          }
+          f.dpos.upload(f.positions.data(), f.positions.size() * 8);
+          DGPP_CUDA_OK(cudaMemsetAsync(parts.as<uint8_t>(), 0xff, bytes, f.stream));
+          DGPP_CUDA_OK(cudaMemsetAsync(parts.as<uint8_t>() + bytes, 0xa5, 256, f.stream));
+          DGPP_CUDA_OK(cudaGraphLaunch(executable, f.stream));
+          DGPP_CUDA_OK(cudaStreamSynchronize(f.stream));
+          std::vector<uint16_t> got(f.output.size());
+          f.dout.download(got.data(), got.size() * 2);
+          for (int r = 0; r < f.shape.requests; ++r) {
+            const int64_t pos = f.positions[r];
+            for (int h = 0; h < f.shape.q_heads; ++h) {
+              const int kh = h / (f.shape.q_heads / f.shape.kv_heads);
+              for (int d = 0; d < 128; ++d) {
+                double sum = 0;
+                const bool valid = pos >= 0 && pos < capacity;
+                if (valid)
+                  for (int t = 0; t <= pos; ++t)
+                    sum += dgpp::bf16_bits_to_float(f.v[(size_t(mapped ? mapping[r] : 0) * capacity + t) * f.shape.v_width() + kh * 128 + d]);
+                const double mass = sink ? std::exp(dgpp::bf16_bits_to_float(f.sinks[h])) : 0;
+                const float ref = valid ? float(sum / (pos + 1 + mass)) : 0;
+                const float actual = dgpp::bf16_bits_to_float(got[(r * f.shape.q_heads + h) * 128 + d]);
+                if (!std::isfinite(actual) || (!valid && actual != 0) ||
+                    std::abs(actual - ref) > std::max(1e-6f, std::abs(ref) / 128))
+                  throw std::runtime_error("split online analytic partition/sink/mapping oracle failed");
+              }
+            }
+          }
+          std::vector<uint8_t> guard(256);
+          DGPP_CUDA_OK(cudaMemcpy(guard.data(), parts.as<uint8_t>() + bytes, 256, cudaMemcpyDeviceToHost));
+          if (!std::all_of(guard.begin(), guard.end(), [](auto x) { return x == 0xa5; }))
+            throw std::runtime_error("split partial workspace overflow");
         }
         DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
         DGPP_CUDA_OK(cudaGraphDestroy(graph));

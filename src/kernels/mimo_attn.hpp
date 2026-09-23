@@ -72,6 +72,14 @@ void mimo_attention_prefill(const MimoAttentionShape& shape, const uint16_t* q,
                             float* scores, int end_key, cudaStream_t stream,
                             bool parallel_softmax = true, bool wide_values = true,
                             bool fused_probabilities = false);
+// Split-key online attention. Workspace: mimo_online_partial_bytes(rows, heads,
+// capacity). Reusable on one stream; allocation/capture safe. Global queries
+// may include padding/invalid positions; shared-cache valid rows are causal.
+// SWA delegates to unsplit online, retaining its consecutive-prefill contract.
+void mimo_attention_split_online(const MimoAttentionShape& shape, const uint16_t* q,
+    const void* k_cache, const void* v_cache, const int64_t* positions, const uint16_t* sinks,
+    uint16_t* out, float* partials, cudaStream_t stream, bool shared_cache = false,
+    const int32_t* request_ids = nullptr);
 // Experimental online decode, including mapped requests and padding.
 // Uses tensor-core QK and online softmax: differs from scalar decode numerics.
 void mimo_attention_online_decode(const MimoAttentionShape& shape, const uint16_t* q,

@@ -162,7 +162,18 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
   mimo_qkv_append(chunk, fused_, freq_, positions, q_, k_cache, v_cache, status, stream,
                   request_ids == nullptr, request_ids, fp8_audit_);
   if (cache_only) return;
-  if (mimo_bounded_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
+  if (mimo_split_online_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
+    for (int first = 0; first < tokens; first += mimo_split_tile_rows) {
+      auto tile = chunk;
+      tile.requests = std::min(mimo_split_tile_rows, tokens - first);
+      mimo_attention_split_online(tile, q_ + size_t(first) * shape_.q_width(), k_cache, v_cache,
+          positions + first, w_.sinks, attn_ + size_t(first) * shape_.q_heads * 128,
+          attention_scores_, stream, true);
+    }
+  } else if (mimo_split_online_attention_enabled() && (request_ids || tokens == 1)) {
+    mimo_attention_split_online(chunk, q_, k_cache, v_cache, positions, w_.sinks,
+                                 attn_, attention_scores_, stream, false, request_ids);
+  } else if (mimo_bounded_attention_enabled() && !request_ids && tokens > 1 && end_key > 0) {
     mimo_attention_bounded_prefill(chunk, q_, k_cache, v_cache, positions, w_.sinks,
                                    attn_, end_key, stream, mimo_online_attention_enabled());
   } else if (mimo_online_attention_enabled() && (request_ids || tokens == 1)) {
@@ -191,7 +202,7 @@ void MimoDecoderLayer::enqueue(uint16_t* residual, const int64_t* positions, voi
                           attention_scores_, stream, request_ids);
   } else {
     mimo_attention(chunk, q_, k_cache, v_cache, positions, w_.sinks, attn_, stream,
-                   request_ids == nullptr, attention_scores_, request_ids);
+                   request_ids == nullptr, mimo_bounded_attention_enabled() ? nullptr : attention_scores_, request_ids);
   }
   auto stage = [&]() {
     uint16_t* result = boundary ? boundary->stage(tokens, cfg_.hidden_size) : nullptr;

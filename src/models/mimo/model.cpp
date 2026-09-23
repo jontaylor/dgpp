@@ -69,7 +69,9 @@ MemoryPlan MimoModel::plan_memory(const MimoTextConfig& c, int forward_rows, int
   plan.add("MiMo session core",
            device + align256(rows * c.hidden_size * 2) + align256(rows * c.num_hidden_layers * 4),
            pinned);
-  plan.add("MiMo shared attention scores",
+  plan.add(mimo_split_online_attention_enabled() ? "MiMo split online partials" : "MiMo shared attention scores",
+           mimo_split_online_attention_enabled() ?
+           mimo_online_partial_bytes(std::min(rows, mimo_split_tile_rows), c.num_attention_heads / world, global_capacity(context)) :
            mimo_bounded_attention_enabled() ? 0 :
            size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) * c.num_attention_heads /
                world * std::max<int64_t>(global_capacity(context), mimo_ring_capacity(rows)) *
@@ -132,7 +134,10 @@ MimoModel::MimoModel(const MimoTextConfig& c, const std::string& checkpoint, int
   scratch_.init(align256(rows * c.hidden_size * 2) + align256(rows * c.num_hidden_layers * 4));
   residual_ = static_cast<uint16_t*>(scratch_.alloc(rows * c.hidden_size * 2));
   status_ = static_cast<int32_t*>(scratch_.alloc(rows * c.num_hidden_layers * 4));
-  if (!mimo_bounded_attention_enabled())
+  if (mimo_split_online_attention_enabled())
+    attention_scores_.init(mimo_online_partial_bytes(std::min(rows, mimo_split_tile_rows),
+                          c.num_attention_heads / world, global_capacity(context)));
+  else if (!mimo_bounded_attention_enabled())
     attention_scores_.init(size_t(std::min(rows, MimoDecoderLayer::attention_tile_rows)) *
                          c.num_attention_heads / world *
                          std::max<int64_t>(global_capacity(context), mimo_ring_capacity(rows)) *

@@ -10,6 +10,32 @@
 
 namespace dgpp {
 
+inline bool mimo_split_online_attention_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MIMO_SPLIT_ONLINE_ATTN");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+inline int mimo_online_split_keys() {
+  static const int keys = [] {
+    const char* value = std::getenv("DGPP_MIMO_ONLINE_SPLIT_KEYS");
+    if (!value) return 1024;
+    if (!std::strcmp(value, "512")) return 512;
+    if (!std::strcmp(value, "1024")) return 1024;
+    if (!std::strcmp(value, "2048")) return 2048;
+    throw std::invalid_argument("MiMo split keys: expected 512, 1024 or 2048");
+  }();
+  return keys;
+}
+constexpr int mimo_split_tile_rows = 32;
+inline int mimo_online_splits(int capacity) {
+  return std::min(256, (capacity + mimo_online_split_keys() - 1) / mimo_online_split_keys());
+}
+inline size_t mimo_online_partial_bytes(int rows, int heads, int capacity) {
+  return size_t(rows) * heads * mimo_online_splits(capacity) * 130 * sizeof(float);
+}
+
 inline bool mimo_online_attention_enabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("DGPP_MIMO_ONLINE_ATTN");
@@ -24,7 +50,7 @@ inline bool mimo_bounded_attention_enabled() {
     const char* value = std::getenv("DGPP_MIMO_BOUNDED_ATTN");
     return value && std::strcmp(value, "1") == 0;
   }();
-  return enabled || mimo_online_attention_enabled();
+  return enabled || mimo_online_attention_enabled() || mimo_split_online_attention_enabled();
 }
 
 // One token per request/slot per invocation. SWA uses a bounded ring;
