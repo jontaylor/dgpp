@@ -355,6 +355,8 @@ DGPP_TEST(expert_cache_grouped_native_preparation_is_stable_and_retires_with_one
   ExpertCache cache(f.store, cfg, host(f, control));
   cache.initialize();
   const std::array<size_t, 2> routed{0, 1};
+  const auto initial_revision = cache.prepared_revision();
+  require(!cache.prepared_address(0), "unprepared experts have no GPU binding");
   require(!cache.prepare_resident(routed) && cache.stats().native_packs == 0,
           "partial routed set does not convert layouts speculatively");
   for (const auto e : routed) {
@@ -362,6 +364,9 @@ DGPP_TEST(expert_cache_grouped_native_preparation_is_stable_and_retires_with_one
     auto lease = cache.acquire(e); check_bytes(lease, f, e);
   }
   require(cache.prepare_resident(routed) && cache.stats().native_packs == 2, "all hot experts pack inside the shared slab");
+  const auto revision = cache.prepared_revision();
+  require(revision > initial_revision && cache.prepared_address(0) && cache.prepared_address(1),
+          "native packing publishes addresses with a new revision");
   const auto packed = cache.stats();
   for (int repeat = 0; repeat < 4; ++repeat) {
     require(cache.prepare_resident(routed), "stable routed set remains prepared");
@@ -373,6 +378,12 @@ DGPP_TEST(expert_cache_grouped_native_preparation_is_stable_and_retires_with_one
                 cache.stats().active_native_leases == 0, "one fence retires every grouped reader");
   }
   const auto after = cache.stats();
+  require(cache.prepared_revision() == revision, "native hit execution leaves binding revision stable");
+  const auto observations = cache.observations();
+  cache.record_native_hits(std::array<size_t, 3>{0, 1, 0});
+  require(cache.stats().requests == after.requests + 2 && cache.stats().native_hits == after.native_hits + 2 &&
+          cache.observations() == observations + 3,
+          "GPU hit accounting preserves unique executions and repeated route observations");
   require(after.native_packs == packed.native_packs && after.native_unpacks == packed.native_unpacks &&
               after.native_layout_copy_bytes == packed.native_layout_copy_bytes,
           "neighboring hot experts do not repeatedly unpack or relocate one another");

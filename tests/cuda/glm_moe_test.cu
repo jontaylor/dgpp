@@ -38,6 +38,8 @@
 #include "kernels/packq_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "kernels/sm12x_moe.hpp"
+#include "kernels/expert_demand.hpp"
+#include "kernels/moe_fp4_pack.hpp"
 #include "models/glm/moe.hpp"
 #include "models/glm/moe_layer.hpp"
 #include "models/glm/moe_reference.hpp"
@@ -3389,6 +3391,85 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
     require(hot.telemetry().file.calls == before.file.calls &&
               hot.stats().native_packs == before.cache.native_packs,
             "b12x warm graph performs no expert reads or repacking");
+    {
+      // GPU route grouping and miss-only host service, using the SAME graph
+      // for resident hits, an injected miss, and changed routing.
+      dgpp::ExpertDemand* demand = nullptr;
+      uint64_t* table = nullptr;
+      cudaStream_t service = nullptr;
+      cudaEvent_t done = nullptr;
+      DGPP_CUDA_OK(cudaHostAlloc(&demand,sizeof(*demand),cudaHostAllocMapped));
+      DGPP_CUDA_OK(cudaMalloc(&table,E*6*sizeof(uint64_t)));
+      DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service,cudaStreamNonBlocking));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));
+      auto cold = std::make_unique<ExpertCache>(store,config(2,4),cuda_cache_storage(identity,service,true));
+      cold->initialize();
+      std::vector<uint64_t> bindings(E*6);
+      auto publish = [&] {
+        std::fill(bindings.begin(),bindings.end(),0);
+        for (int e=0;e<E;++e) {
+          auto* address=hot.prepared_address(e);
+          if (!address) continue;
+          const auto v=dgpp::moe_fp4_packed_view(const_cast<uint8_t*>(address),H,I);
+          bindings[e*3]=reinterpret_cast<uintptr_t>(v.w13);
+          bindings[e*3+1]=reinterpret_cast<uintptr_t>(v.s13);
+          bindings[e*3+2]=reinterpret_cast<uintptr_t>(v.g13);
+          bindings[E*3+e*3]=reinterpret_cast<uintptr_t>(v.w2);
+          bindings[E*3+e*3+1]=reinterpret_cast<uintptr_t>(v.s2);
+          bindings[E*3+e*3+2]=reinterpret_cast<uintptr_t>(v.g2);
+        }
+        DGPP_CUDA_OK(cudaMemcpyAsync(table,bindings.data(),bindings.size()*8,cudaMemcpyHostToDevice,service));
+        DGPP_CUDA_OK(cudaStreamSynchronize(service));
+      };
+      publish();
+      *demand={};
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+      layer.enqueue_paged_device(c.d_hidden,c.d_out,6,table,demand,stream);
+      cudaGraph_t graph=nullptr;
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream,&graph));
+      cudaGraphExec_t exec=nullptr;
+      DGPP_CUDA_OK(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+      for (int pass=0;pass<4;++pass) {
+        if (pass==3) {
+          for (int j=0;j<6*H;++j) c.d_hidden[j]=float_to_bf16_bits(-bf16_bits_to_float(c.d_hidden[j]));
+          layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          std::memcpy(expected.data(),c.d_out,expected.size()*2);
+          publish();
+        }
+        *demand={};
+        if (pass==1) DGPP_CUDA_OK(cudaMemsetAsync(table,0,E*6*sizeof(uint64_t),stream));
+        hot.set_execution_context(service);
+        DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
+        DGPP_CUDA_OK(cudaEventRecord(done,stream));
+        for (;;) {
+          if (__atomic_load_n(&demand->request,__ATOMIC_ACQUIRE)==1) {
+            auto& selected_cache = pass==1 ? *cold : hot;
+            layer.enqueue_paged(c.d_hidden,c.d_out,6,selected_cache,mapping,service);
+            DGPP_CUDA_OK(cudaStreamSynchronize(service));
+            publish();
+            __atomic_store_n(&demand->request,2u,__ATOMIC_RELEASE);
+          }
+          const auto status=cudaEventQuery(done);
+          if (status==cudaSuccess) break;
+          if (status!=cudaErrorNotReady) DGPP_CUDA_OK(status);
+        }
+        hot.set_execution_context(stream);
+        std::memcpy(got.data(),c.d_out,got.size()*2);
+        require(got==expected,"GPU resident/miss graph and CPU path are bitwise identical");
+        if (pass==0 || pass==2) require(!demand->serviced,"resident graph needs no host service");
+        if (pass==1) require(demand->serviced,"missing binding takes the exact service path");
+        if (pass==1) require(cold->telemetry().file.calls > 0,"GPU demand service performs actual cold reads");
+      }
+      // Restore the fixture's original inputs and reference for later cases.
+      for (int j=0;j<6*H;++j) c.d_hidden[j]=float_to_bf16_bits(-bf16_bits_to_float(c.d_hidden[j]));
+      layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      std::memcpy(expected.data(),c.d_out,expected.size()*2);
+      cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);cudaEventDestroy(done);
+      cold.reset();
+      cudaStreamDestroy(service);cudaFree(table);cudaFreeHost(demand);
+    }
     ExpertCache pressure(store,config(2),cuda_cache_storage(identity,stream,true)); pressure.initialize();
     layer.enqueue_paged(c.d_hidden,c.d_out,6,pressure,mapping,stream);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));

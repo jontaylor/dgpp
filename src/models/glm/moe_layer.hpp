@@ -31,6 +31,7 @@
 
 namespace dgpp {
 class Sm12xMoe;
+struct ExpertDemand;
 namespace expert { class ExpertCache; }
 
 // Caller-owned PINNED staging for enqueue_decode's async route copies:
@@ -122,6 +123,10 @@ class GlmMoeLayer {
                      expert::ExpertCache& cache, std::span<const size_t> cache_experts,
                      cudaStream_t stream, MoeExpertKernel kernel = MoeExpertKernel::kGemv,
                      MoeTraceStaging* trace = nullptr);
+  // Capturable resident path. A missing binding publishes a demand mailbox;
+  // the engine services it on a separate stream before the GPU continues.
+  void enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
+                            const uint64_t* table, ExpertDemand* demand, cudaStream_t stream);
   // The host path with the fp32 chain handed back UNROUNDED (out
   // [tokens, hidden] f32) — the Qwen MoE continues it with its BF16 shared
   // expert and rounds once after (models/qwen/moe_layer.hpp).

@@ -6,6 +6,7 @@
 #include <span>
 
 namespace dgpp {
+struct ExpertDemand;
 // Optional b12x W4A16 specialization for the TP2 NVFP4 target. All preparation
 // precedes graph capture; execution has no Python or JIT dependency.
 bool sm12x_moe_enabled(int hidden, int intermediate, int experts, int top_k);
@@ -27,6 +28,8 @@ class Sm12xMoe {
   // Unweighted FP32 output [rows,top_k+1,H]; shared slots are untouched.
   void run(const uint16_t* input, const int32_t* ids, const float* weights,
            float* slots, int rows, cudaStream_t stream);
+  void prepare_device(const uint64_t* table, const int32_t* ids,
+                      const ExpertDemand* demand, int rows, cudaStream_t stream);
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

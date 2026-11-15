@@ -1,5 +1,7 @@
 #include "models/dsv41/model.hpp"
 #include "kernels/sm12x_moe.hpp"
+#include "kernels/expert_demand.hpp"
+#include "kernels/moe_fp4_pack.hpp"
 
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/exl3_gemv.hpp"
@@ -11,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <numeric>
+#include <map>
+#include <thread>
 #include <stdexcept>
 #include <string>
 
@@ -23,6 +27,65 @@
 namespace dgpp {
 using session_detail::dev_alloc;
 using session_detail::pinned_alloc;
+
+struct Dsv41Model::PagedGraphs {
+  static constexpr int experts = 384, words = experts * 6;
+  struct Graph {
+    cudaGraphExec_t exec = nullptr;
+    int variant = 0;
+    uint16_t *cur = nullptr, *next = nullptr;
+    float *pre = nullptr, *pre_next = nullptr;
+    std::vector<const uint16_t*> inputs;
+    std::vector<uint16_t*> outputs;
+  };
+  std::map<std::array<uint64_t, 7>, Graph> graphs;
+  cudaStream_t service = nullptr;
+  cudaEvent_t done = nullptr;
+  ExpertDemand* demands = nullptr;
+  uint64_t *tables = nullptr, *host_tables = nullptr;
+  int layers;
+  Graph* capturing = nullptr;
+  uint64_t passes = 0, misses = 0;
+  uint64_t published_revision = 0;
+  explicit PagedGraphs(int n) : layers(n) {
+    prepare_moe_fp4_pack();
+    DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
+    DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    DGPP_CUDA_OK(cudaHostAlloc(&demands, n * sizeof(ExpertDemand), cudaHostAllocMapped));
+    DGPP_CUDA_OK(cudaHostAlloc(&host_tables, n * words * sizeof(uint64_t), cudaHostAllocDefault));
+    DGPP_CUDA_OK(cudaMalloc(&tables, n * words * sizeof(uint64_t)));
+  }
+  ~PagedGraphs() {
+    if (service) (void)cudaStreamSynchronize(service);
+    for (auto& [key,g] : graphs) if (g.exec) (void)cudaGraphExecDestroy(g.exec);
+    if (tables) (void)cudaFree(tables);
+    if (host_tables) (void)cudaFreeHost(host_tables);
+    if (demands) (void)cudaFreeHost(demands);
+    if (done) (void)cudaEventDestroy(done);
+    if (service) (void)cudaStreamDestroy(service);
+  }
+  void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
+               int hidden, int inter) {
+    if (published_revision == cache.prepared_revision()) return;
+    std::fill_n(host_tables, layers * words, uint64_t{0});
+    for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
+      const auto* address = cache.prepared_address(mapping[l][e]);
+      if (!address) continue;
+      const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
+      auto* table = host_tables + l * words;
+      table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
+      table[e*3+1] = reinterpret_cast<uintptr_t>(p.s13);
+      table[e*3+2] = reinterpret_cast<uintptr_t>(p.g13);
+      table[experts*3+e*3] = reinterpret_cast<uintptr_t>(p.w2);
+      table[experts*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
+      table[experts*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
+    }
+    DGPP_CUDA_OK(cudaMemcpyAsync(tables, host_tables, layers * words * sizeof(uint64_t),
+                                cudaMemcpyHostToDevice, service));
+    DGPP_CUDA_OK(cudaStreamSynchronize(service));
+    published_revision = cache.prepared_revision();
+  }
+};
 
 namespace {
 expert::StoreIdentity paging_identity(const Dsv41TextConfig& cfg, int rank, int world,
@@ -462,6 +525,8 @@ HeadMatrix Dsv41Model::draft_head_matrix() const {
 
 
 Dsv41Model::~Dsv41Model() {
+  if (stream_) (void)cudaStreamSynchronize(stream_);
+  paged_graphs_.reset();
   cudaStreamSynchronize(stream_);
   expert_cache_.reset();
   for (cudaEvent_t e : ov_ev_)
@@ -843,7 +908,9 @@ Dsv41Model::Outputs Dsv41Model::session_draft_batch(
     if (std::find(reqs.begin(), reqs.begin() + q, req) != reqs.begin() + q ||
         tokens[q].empty() || tokens[q].size() > kSpecRows ||
         session_pos_[req] <= 0 || mtp_pos_[req] + static_cast<int64_t>(tokens[q].size()) != session_pos_[req])
-      throw std::invalid_argument("DSpark draft batch: invalid request rows");
+      throw std::invalid_argument("DSpark draft batch: invalid request rows: slot=" + std::to_string(req) +
+          " rows=" + std::to_string(tokens[q].size()) + " draft=" + std::to_string(mtp_pos_[req]) +
+          " target=" + std::to_string(session_pos_[req]));
     for (int64_t token : tokens[q])
       if (token < 0 || token >= vocab_size_) throw std::invalid_argument("DSpark draft batch: invalid token");
     width = std::max(width, static_cast<int>(tokens[q].size()));
@@ -1432,7 +1499,7 @@ void Dsv41Model::enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, i
   Dsv41EngramLayerWeights ew;
   uint16_t* engram_kv = engram_kv_;
   if (r.engram.present) {
-    engram_->embed(r.engram.table_index, T, stream_);
+    engram_->embed(r.engram.table_index, T, stream_, paged_graph_capture_);
     prestage_after_embed(r.engram.table_index);
     ew = engram_view(r.engram);
     const int W = (cfg_.hc_mult + 1) * H;
@@ -1575,7 +1642,7 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   // Engram: the hashed rows (staged at the walk's start) gate the streams
   // before this layer's coefficients read them.
   if (r.engram.present) {
-    engram_->embed(r.engram.table_index, T, stream_);
+    engram_->embed(r.engram.table_index, T, stream_, paged_graph_capture_);
     prestage_after_embed(r.engram.table_index);
     const Dsv41EngramLayerWeights ew = engram_view(r.engram);
     uint16_t* kv = stage(engram_kv_, T, 5 * H, rows.capture);
@@ -1651,7 +1718,13 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   mhc_site(cur_, fw, r.ffn_norm, T, rows.decode, decode_prefix);
   if (debug_capture_) cap.x_ffn = grab(x_, static_cast<size_t>(T) * H);
   uint16_t* ffn_out = stage(y_, T, H, rows.capture);
-  if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
+  if (paged_graph_capture_ && !draft) {
+    auto& p = *paged_graphs_;
+    p.capturing->inputs[layer] = x_;
+    p.capturing->outputs[layer] = ffn_out;
+    moe_->enqueue_paged_device(x_, ffn_out, T, p.tables + layer * PagedGraphs::words,
+                              p.demands + layer, stream_);
+  } else if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
     if (rows.capture) throw std::logic_error("Dsv41Model: expert paging cannot execute in a captured walk");
     auto& moe = draft ? *draft_moe_ : *moe_;
     const auto& mapping = expert_cache_map_[static_cast<size_t>(layer)];
@@ -1693,11 +1766,120 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);
   stream_update(ffn_out, T);
-  if (expert_cache_ && expert_cache_->observations() - expert_last_adapt_ >= expert_adapt_every_routes_) {
+  if (!paged_graph_capture_ && expert_cache_ && expert_cache_->observations() - expert_last_adapt_ >= expert_adapt_every_routes_) {
     expert_cache_->adapt();
     expert_last_adapt_ = expert_cache_->observations();
   }
   if (debug_capture_) debug_sites_.push_back(std::move(cap));
+}
+
+bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
+  if (!paged_graphs_) paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers);
+  auto& p = *paged_graphs_;
+  const std::array<uint64_t,7> key{static_cast<uint64_t>(T), static_cast<uint64_t>(rows.num_requests),
+      static_cast<uint64_t>(rows.snapshots), reinterpret_cast<uintptr_t>(rows.req_ids),
+      reinterpret_cast<uintptr_t>(rows.pos), reinterpret_cast<uintptr_t>(rows.spans), 0};
+  auto it = p.graphs.find(key);
+  // Bound graph executable memory. Uncached uncommon shapes retain the
+  // ordinary eager path; live request IDs/positions remain device inputs.
+  if (it == p.graphs.end() && p.graphs.size() >= 8) return false;
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  if (boundary_) boundary_->settle();
+  if (it == p.graphs.end()) {
+    // All plan creation and allocations precede capture. Decode uses device
+    // request/position arrays, so advancing context does not bake a position.
+    for (int l = 0; l < p.layers; ++l) {
+      build_layer_objects(loader_.load_layer(l));
+      if (!csa2_->prepare(T)) throw std::runtime_error("GPU paging: CSA2 plans unavailable");
+    }
+    auto& g = p.graphs[key];
+    g.variant = static_cast<int>(p.graphs.size()) - 1;
+    g.inputs.resize(p.layers); g.outputs.resize(p.layers);
+    cudaGraph_t graph = nullptr;
+    bool recording = false, capturing = false;
+    try {
+      if (boundary_) { boundary_->graph_segment_begin(g.variant); recording = true; }
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+      capturing = true; paged_graph_capture_ = true; p.capturing = &g;
+      for (int l = 0; l < p.layers; ++l) enqueue_layer(loader_.load_layer(l), l, T, rows);
+      join_comb();
+      paged_graph_capture_ = false; p.capturing = nullptr;
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
+      if (boundary_) { boundary_->graph_segment_end(); recording = false; }
+      DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
+      g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
+      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}", g.variant, T, rows.num_requests);
+    } catch (...) {
+      paged_graph_capture_ = false; p.capturing = nullptr;
+      if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
+      if (graph) (void)cudaGraphDestroy(graph);
+      if (recording) { try { boundary_->graph_segment_end(); } catch (...) {} }
+      throw;
+    }
+    it = p.graphs.find(key);
+  }
+  auto& g = it->second;
+  cur_ = g.cur; nxt_ = g.next; pre_cur_ = g.pre; pre_nxt_ = g.pre_next;
+  std::fill_n(p.demands, p.layers, ExpertDemand{});
+  p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
+  // Cache changes occur only in the engine thread while a demand gate
+  // holds the main stream. Its independent service stream must never wait
+  // on that paused stream. Before release, service kernels are completed.
+  expert_cache_->set_execution_context(p.service);
+  int accounted = 0;
+  auto account = [&](int end) {
+    for (; accounted < end; ++accounted) {
+      if (p.demands[accounted].serviced) continue;
+      std::vector<size_t> selected;
+      for (int j = 0; j < T * cfg_.num_experts_per_tok; ++j)
+        selected.push_back(expert_cache_map_[accounted].at(p.demands[accounted].ids[j]));
+      expert_cache_->record_native_hits(selected);
+    }
+  };
+  bool launched = false;
+  try {
+    if (boundary_) boundary_->graph_segment_arm(g.variant);
+    DGPP_CUDA_OK(cudaGraphLaunch(g.exec, stream_)); launched = true;
+    DGPP_CUDA_OK(cudaEventRecord(p.done, stream_));
+    for (;;) {
+      for (int l = accounted; l < p.layers; ++l) {
+        auto& demand = p.demands[l];
+        if (__atomic_load_n(&demand.request, __ATOMIC_ACQUIRE) != 1) continue;
+        account(l);
+        // Reuse the existing exact miss path, including bounded waves,
+        // admissions and shared-expert overlap. The paused GPU skips its
+        // own expert output when this service has supplied it.
+        moe_->rebind(moe_view(loader_.load_layer(l).moe));
+        moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
+                            p.service, MoeExpertKernel::kGemv);
+        DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
+        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
+        ++p.misses; accounted = l + 1;
+        __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
+        break;
+      }
+      const auto status = cudaEventQuery(p.done);
+      if (status == cudaSuccess) break;
+      if (status != cudaErrorNotReady) DGPP_CUDA_OK(status);
+      std::this_thread::yield();
+    }
+    if (boundary_) boundary_->graph_segment_finish();
+    account(p.layers);
+    expert_cache_->set_execution_context(stream_);
+    if (expert_cache_->observations() - expert_last_adapt_ >= expert_adapt_every_routes_) {
+      expert_cache_->adapt(); expert_last_adapt_ = expert_cache_->observations();
+    }
+    ++p.passes;
+    if (p.passes == 1 || p.passes % 100 == 0)
+      DGPP_LOG_INFO("dsv41 GPU paging: {} target replays, {} serviced layer misses", p.passes, p.misses);
+  } catch (...) {
+    for (int l = 0; l < p.layers; ++l) __atomic_store_n(&p.demands[l].request, 3u, __ATOMIC_RELEASE);
+    if (launched) (void)cudaStreamSynchronize(stream_);
+    try { expert_cache_->set_execution_context(stream_); } catch (...) {}
+    throw;
+  }
+  return true;
 }
 
 bool Dsv41Model::prefill_batch_fits(const RowRun& run) const {
@@ -1876,7 +2058,16 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   const bool overlap_walk = !expert_cache_ && fold_overlap_ && !run.decode && !run.capture && !capture_layers &&
                             debug_teacher_ == nullptr && !traces &&
                             (boundary_ != nullptr || fold_overlap_without_reducer_);
-  for (int layer = 0; layer < last_layer; ++layer) {
+  const char* gpu_paging = std::getenv("DGPP_EXPERT_GPU_PAGING");
+  // Multi-request verification retains the eager path: its draft/rollback
+  // state contract has not been qualified for these target graph captures.
+  const bool paged_candidate = gpu_paging && gpu_paging[0] == '1' && expert_cache_ &&
+      expert_cache_->packed_nvfp4() && run.decode && !run.capture && !capture_layers &&
+      !debug_teacher_ && !debug_capture_ && !traces && rows.num_requests == 1 &&
+      last_layer == cfg_.num_hidden_layers && T <= 16 &&
+      (!boundary_ || boundary_->supports_graph_segments());
+  const bool paged_graph = paged_candidate && enqueue_paged_graph(T, rows);
+  for (int layer = 0; !paged_graph && layer < last_layer; ++layer) {
     const Dsv41LayerResident& r = loader_.load_layer(layer);
     if (debug_teacher_ && layer > 0) teach(layer - 1);
     if (bounded && layer == dec0) {

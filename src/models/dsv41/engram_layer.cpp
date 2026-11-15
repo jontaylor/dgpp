@@ -310,12 +310,12 @@ void Dsv41EngramLayer::context_rows(const int64_t* tokens, int rows, const int32
                             ctx, ctx_rows, stream);
 }
 
-void Dsv41EngramLayer::embed(int table_index, int rows, cudaStream_t stream) {
+void Dsv41EngramLayer::embed(int table_index, int rows, cudaStream_t stream, bool external_stage) {
   if (rows <= 0) return;
   if (table_index < 0 || table_index >= layers_) throw std::invalid_argument("Dsv41EngramLayer: table index");
   if (staged_rows_ != rows) throw std::logic_error("Dsv41EngramLayer: embed() without a matching stage()");
   if (use_pre_) {
-    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, pre_join_, 0));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, pre_join_, external_stage ? cudaEventWaitExternal : 0));
   } else if (table_index + 1 < layers_) {
     // An earlier table's rows: the wait kernel bumps the device's count of
     // stagings consumed for the table and spins until the host published
@@ -324,7 +324,7 @@ void Dsv41EngramLayer::embed(int table_index, int rows, cudaStream_t stream) {
   } else {
     // The last table's consumer joins the staging's side stream (its
     // gather is the callback's last work; a capture needs the fork joined).
-    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, join_, 0));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, join_, external_stage ? cudaEventWaitExternal : 0));
   }
   uint8_t* d_staged = nullptr;
   DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_staged), use_pre_ ? pre_staged_ : staged_, 0));

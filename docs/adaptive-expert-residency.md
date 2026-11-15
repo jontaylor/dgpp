@@ -2779,7 +2779,8 @@ bounded scratch and use the existing kernels, provided its reconstruction
 overhead is measured. Step 4 describes later execution optimizations, not an
 extra prerequisite for that permitted initial delivery. The initial baseline excluded serving MTP and whole-model CUDA Graph execution.
 Current eager DSpark and expert-only graph replay are described above;
-whole-model graph execution remains unsupported with paging.
+The optional NVFP4 target-layer graph path is described below; other paged
+execution retains the eager path.
 
 Initial completion requires both policies integrated into the shared serving
 engine, correct MXFP4/NVFP4 packing and scaling, bounded and separately accounted
@@ -2789,3 +2790,63 @@ reported alongside inference costs. A policy library, synthetic benchmark or
 configuration flag alone is partial work. Unavailable physical DRAM counters
 remain an explicit measurement gap; cache-copy volumes and L2 rates must not be
 substituted for that requested measurement.
+
+## GPU decisions and target-layer replay (NVFP4)
+
+Set `DGPP_EXPERT_GPU_PAGING=1` alongside `DGPP_MOE_B12X=1` to enable
+the DSV4.1 target-layer graph path. It currently covers decode/verification
+for one request, with at most 16 rows and the prepared b12x experts and FP8
+shared lane. Concurrent verification batches retain the eager path: the
+initial multi-request graph prototype failed its draft-position contract.
+Prefill, draft execution, unsupported shapes and diagnostic traces keep their
+existing paths. Up to eight target graph shapes are retained.
+
+Each layer has a device table of prepared expert addresses. GPU routing checks
+the selected entries and builds b12x's grouped route packet without a CPU
+readback. A fully resident target pass replays all target layers, including
+shared-expert overlap and tensor-parallel collectives, without a host decision
+at each MoE site. Token positions and request IDs remain device inputs;
+Engram staging remains outside capture.
+
+On a missing binding, a mapped mailbox pauses the GPU at that layer. The
+engine services the existing exact paging/MoE path on an independent stream,
+publishes updated addresses after any relocation or eviction, and releases the
+gate. The captured expert accumulation skips the output already supplied by
+the service path. Cache observations are accounted at miss boundaries or at
+the end of the pass; adaptation occurs after the graph has completed.
+
+Packing/unpacking kernels are explicitly loaded before the first target graph.
+CUDA lazy loading during a miss otherwise deadlocked the initial full-model
+prototype: its kernel loading waited for the graph whose demand gate was waiting
+for that kernel. The gate has a 60-second failure timeout; a device failure is
+fatal to the serving process. Disabling the environment flag restores the
+ordinary paged execution path.
+
+Validation includes host cache accounting tests and a GPU fixture comparing
+resident hits, actual cold reads, changed routes and subsequent resident replay
+bit-for-bit with the existing executor. Serving measurements below use two
+GB10 nodes, NVFP4, whole-expert caching and fixed speculation depth three.
+
+
+A 24,128-token tool-enabled prompt produced identical 149-token responses
+(including reasoning and tool arguments, excluding generated call IDs) with
+replay enabled and disabled. Both used 45 verification passes and accepted
+2.31 predictions per pass. The final warmed repeats measured:
+
+| Target execution | Decode tokens/s | Decode time | Expert reads, reconstruction, repacking |
+| --- | ---: | ---: | --- |
+| Existing eager layer decisions | 44.0 | 3.362 s | zero on both ranks |
+| GPU decisions and target graph | 45.7 | 3.239 s | zero on both ranks |
+
+Both final repeats also recorded zero process disk reads and major faults on
+both ranks. This is a modest approximately 4% improvement on one matched
+workload, not a broad throughput guarantee. First-use runs included different
+cache histories and are not a controlled prefill comparison. The graph change
+does not optimize prefill or draft execution. The earlier eager measurement
+of 42.7 tokens/s is superseded by the fresh 44.0 tokens/s control for this
+comparison.
+
+The deployed guard keeps multi-request verification eager. A two-request
+serving check with different output limits completed successfully, including
+the remaining request switching to target graph replay after its peer
+finished. Captured multi-request verification remains unsupported.

@@ -84,6 +84,7 @@ struct ExpertCacheState {
   std::vector<bool> execution_busy;
   std::map<size_t, std::shared_ptr<ReadTicket>> prefetched;
   CacheStats counters;
+  uint64_t prepared_revision = 1;
   bool observed_for_adaptation = false;
   bool all_observed_full = true;
   ResourcePressureSampler resource_sampler;
@@ -185,6 +186,7 @@ struct ExpertCacheState {
       storage->unpack_native_chunk(scratch, store->records()[r], slots[r]);
     storage->finish();
     native_start[expert] = absent;
+    ++prepared_revision;
     ++counters.native_unpacks;
     counters.native_layout_copy_bytes += full.allocation_bytes;
     for (const auto r : experts[expert].records)
@@ -270,6 +272,7 @@ struct ExpertCacheState {
     }
     for (const size_t slot : native_holes) add_free_slot(slot);
     native_start[expert] = first;
+    ++prepared_revision;
     ++counters.native_packs;
     counters.native_layout_copy_bytes += full.allocation_bytes;
     for (const auto r : records) counters.native_layout_copy_bytes += store->records()[r].layout.useful_bytes;
@@ -279,6 +282,7 @@ struct ExpertCacheState {
     counters.native_layout_wall_ns += wall > nested ? wall - nested : 0;
   }
   void evict(const ResidencyPlan& plan, size_t scratch = 0) {
+    ++prepared_revision;
     const auto& previous = planner->current().chunks;
     for (size_t e = 0; e < experts.size(); ++e) {
       if (plan.chunks[e] < previous[e] && native_start[e] != absent) {
@@ -428,6 +432,31 @@ void ExpertCache::adapt() {
   } catch (...) { s.counters.poisoned = true; throw; }
 }
 bool ExpertCache::packed_nvfp4() const { return state_->config.packed_nvfp4; }
+const uint8_t* ExpertCache::prepared_address(size_t expert) const {
+  const auto& s = *state_;
+  s.check(); s.expert_index(expert);
+  return s.native_start[expert] == absent ? nullptr : s.storage->cache_data(s.native_start[expert]);
+}
+uint64_t ExpertCache::prepared_revision() const { state_->check(); return state_->prepared_revision; }
+void ExpertCache::set_execution_context(void* context) {
+  auto& s = *state_; s.check();
+  if (s.counters.active_execution_slots || s.counters.active_native_leases)
+    throw std::logic_error("expert cache: stream handoff with live leases");
+  s.storage->set_execution_context(context);
+}
+void ExpertCache::record_native_hits(std::span<const size_t> selected) {
+  auto& s = *state_; s.check();
+  observe(selected);
+  std::vector<size_t> unique(selected.begin(), selected.end());
+  std::sort(unique.begin(), unique.end());
+  unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+  for (auto e : unique) {
+    s.expert_index(e);
+    ++s.counters.requests; ++s.counters.full_hits; ++s.counters.native_hits;
+    s.counters.chunk_lookups += s.experts[e].records.size();
+    s.counters.chunk_hits += s.experts[e].records.size();
+  }
+}
 ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
   auto& s = *state_;
   s.check();

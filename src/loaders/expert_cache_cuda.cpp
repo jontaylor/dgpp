@@ -131,9 +131,16 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void move_cache_slot(size_t dest, size_t source) override {
     check_cache(dest);
     check_cache(source);
-    DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + dest * memory_.cache_slot_bytes,
-        cache_ + source * memory_.cache_slot_bytes, memory_.cache_slot_bytes,
-        cudaMemcpyDeviceToDevice, stream_));
+    if (gpu_scatter_) {
+      const auto bytes = memory_.cache_slot_bytes;
+      const ScatterCopy copy{0, 0, bytes, 1, bytes, bytes};
+      const auto plan = expert_chunk_copy_plan(std::span(&copy, 1));
+      launch_expert_chunk_scatter(cache_ + dest * bytes, cache_ + source * bytes, plan, stream_);
+    } else {
+      DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + dest * memory_.cache_slot_bytes,
+          cache_ + source * memory_.cache_slot_bytes, memory_.cache_slot_bytes,
+          cudaMemcpyDeviceToDevice, stream_));
+    }
   }
   void native_to_execution(size_t execution_slot, size_t first) override {
     check_native(execution_slot, first);
@@ -190,6 +197,10 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void retire_native() override {}
   void finish() override { DGPP_CUDA_OK(cudaStreamSynchronize(stream_)); }
   bool accepts_execution_context(const void* context) const override { return context == stream_; }
+  void set_execution_context(void* context) override {
+    if (!context) throw std::invalid_argument("expert cache: null execution stream");
+    stream_ = static_cast<cudaStream_t>(context);
+  }
  private:
   size_t staging_index(const uint8_t* source) const {
     size_t index = 0;

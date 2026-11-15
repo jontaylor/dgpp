@@ -213,6 +213,26 @@ class BusStreamReducer final : public BoundaryReducer {
   BusStreamReducer& operator=(const BusStreamReducer&) = delete;
 
   bool stream_ordered() const override { return stream_ != nullptr; }
+  bool supports_graph_segments() const override { return stream_ != nullptr; }
+  void graph_segment_begin(int variant) override {
+    settle();
+    std::string err;
+    if (!bus_.graph_record_begin(&err, variant)) throw std::runtime_error("segment record: " + err);
+    recording_segment_ = true;
+  }
+  void graph_segment_end() override {
+    recording_segment_ = false;
+    std::string err;
+    if (!bus_.graph_record_end(&err)) throw std::runtime_error("segment record end: " + err);
+  }
+  void graph_segment_arm(int variant) override {
+    std::string err;
+    if (!bus_.graph_replay_arm(&err, variant)) throw std::runtime_error("segment arm: " + err);
+  }
+  void graph_segment_finish() override {
+    std::string err;
+    if (!bus_.graph_replay_finish(timeout_ms_, &err)) throw std::runtime_error("segment finish: " + err);
+  }
   void bind_stream(void* stream) override { stream_ = static_cast<cudaStream_t>(stream); }
 
   void probe(int rows, int cols) override {
@@ -233,6 +253,11 @@ class BusStreamReducer final : public BoundaryReducer {
     if (hidden <= 0 || hidden % 2 != 0)
       throw std::invalid_argument("boundary reduce: hidden must be even");
     const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(hidden);
+    if (recording_segment_) {
+      for (size_t at = 0; at < total; at += max_elems_)
+        issue(partial + at, std::min(max_elems_, total - at));
+      return;
+    }
     if (stream_ == nullptr) {
       // Unbound (no model stream yet): the host-driven one-shot / bulk.
       host_driven(partial, total);
@@ -310,8 +335,14 @@ class BusStreamReducer final : public BoundaryReducer {
 
  private:
   uint64_t async_id_ = 0;
+  bool recording_segment_ = false;
   void issue(uint16_t* at, size_t elems) {
     std::string err;
+    if (recording_segment_) {
+      if (!bus_.allreduce_record(stream_, at, at, elems, &err))
+        throw std::runtime_error("segment collective: " + err);
+      return;
+    }
     if (bus_.allreduce_stream(stream_, at, at, elems, &err) == 0)
       throw std::runtime_error("boundary reduce: stream collective rejected: " + err);
   }

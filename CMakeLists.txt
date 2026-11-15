@@ -155,7 +155,7 @@ add_library(dgpp_expert_residency STATIC
 target_link_libraries(dgpp_expert_residency PUBLIC Threads::Threads)
 dgpp_set_common(dgpp_expert_residency)
 
-add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu)
+add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu src/kernels/expert_demand.cu)
 target_link_libraries(dgpp_moe_fp4_pack PUBLIC CUDA::cudart)
 dgpp_set_common(dgpp_moe_fp4_pack)
 

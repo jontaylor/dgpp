@@ -52,6 +52,10 @@ struct Fp4PackedExpert {
 size_t moe_fp4_packed_bytes(int hidden, int intermediate);
 Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate);
 
+// Resolve lazily loaded packing kernels before a persistent demand gate can
+// wait for them. CUDA module loading may otherwise synchronize the device.
+void prepare_moe_fp4_pack();
+
 // Source and destination must be disjoint. All allocations belong to the
 // caller; the launchers allocate nothing and are CUDA-graph capturable.
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,

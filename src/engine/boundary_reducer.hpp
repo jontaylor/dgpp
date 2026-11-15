@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <stdexcept>
 
 namespace dgpp {
 
@@ -48,6 +49,12 @@ struct BoundaryReducer {
   virtual bool stream_ordered() const { return false; }
   virtual void bind_stream(void* /*cudaStream_t*/) {}
   virtual void settle() {}
+  // Local graph segments inside an eager model, folding in place.
+  virtual bool supports_graph_segments() const { return false; }
+  virtual void graph_segment_begin(int) { throw std::logic_error("graph segments unsupported"); }
+  virtual void graph_segment_end() { throw std::logic_error("graph segments unsupported"); }
+  virtual void graph_segment_arm(int) { throw std::logic_error("graph segments unsupported"); }
+  virtual void graph_segment_finish() { throw std::logic_error("graph segments unsupported"); }
 
   // The asynchronous form of a prefill-class fold (2026-09-19, the fold
   // overlap): begin_async() submits the fold of partial[rows, hidden] and

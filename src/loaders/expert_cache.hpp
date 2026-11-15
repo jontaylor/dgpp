@@ -71,6 +71,9 @@ class ExpertCacheStorage {
   virtual void execution_to_native(size_t, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual void unpack_native_chunk(size_t, const StoreRecord&, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual bool accepts_execution_context(const void*) const { return false; }
+  // Caller must quiesce all payload readers before switching. A paused GPU
+  // demand gate is quiescent: it reads metadata only, never expert payloads.
+  virtual void set_execution_context(void*) { throw std::logic_error("cache stream switching unsupported"); }
   // Retire native readers. A backend with one ordered execution/transfer
   // stream may release host leases without draining it: all future writes
   // are ordered after these readers. Other backends retain the full fence.
@@ -161,6 +164,14 @@ class ExpertCache {
   // Demand reads wait for completion, using queued prefetch tickets if present.
   ExpertExecutionLease acquire(size_t expert, bool canonical = false);
   bool packed_nvfp4() const;
+  // Borrowed metadata, not a lease. Only usable by a quiescent engine-owned
+  // walk that stops payload readers before any cache mutation. A revision
+  // change invalidates the published table; null means not prepared.
+  const uint8_t* prepared_address(size_t expert) const;
+  uint64_t prepared_revision() const;
+  void set_execution_context(void* context);
+  // Account for GPU-executed native hits after the walk has completed.
+  void record_native_hits(std::span<const size_t> selected);
   // Prepare a complete routed set before pinning any members. Returns false
   // without changing residency when a member is partial or backend is compact-only.
   bool prepare_resident(std::span<const size_t> experts);

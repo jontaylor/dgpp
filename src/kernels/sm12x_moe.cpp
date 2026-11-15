@@ -7,6 +7,7 @@
 #include <vector>
 #include "common/cuda_check.hpp"
 #include "kernels/moe_fp4_pack.hpp"
+#include "kernels/expert_demand.hpp"
 #ifdef DGPP_HAVE_B12X_AOT
 #define CUTE_DSL_CUDA_ERROR_CHECK(err) DGPP_CUDA_OK(err)
 #include "dgpp_b12x_raw_fp32.h"
@@ -64,6 +65,11 @@ struct Sm12xMoe::Impl {
 };
 Sm12xMoe::Sm12xMoe() : impl_(std::make_unique<Impl>()) { impl_->initialize(); }
 Sm12xMoe::~Sm12xMoe() = default;
+void Sm12xMoe::prepare_device(const uint64_t* table, const int32_t* ids,
+                            const ExpertDemand* demand, int rows, cudaStream_t stream) {
+  if (rows < 1 || rows > M) throw std::invalid_argument("b12x device route row count");
+  launch_expert_route_packet(impl_->packet, table, ids, demand, rows, stream);
+}
 void Sm12xMoe::prepare(std::span<const int32_t> ids,
     std::span<const uint8_t* const> addresses, int rows, cudaStream_t stream,
     std::span<const int> execute_experts) {
@@ -139,6 +145,9 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
 }
 #else
 struct Sm12xMoe::Impl {};
+void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, const ExpertDemand*, int, cudaStream_t) {
+  throw std::logic_error("b12x AOT is unavailable");
+}
 Sm12xMoe::Sm12xMoe() { throw std::logic_error("b12x AOT is unavailable"); }
 Sm12xMoe::~Sm12xMoe() = default;
 void Sm12xMoe::prepare(std::span<const int32_t>, std::span<const uint8_t* const>, int, cudaStream_t,

@@ -85,7 +85,7 @@ class Dsv41EngramLayer {
   // Joins the gather and converts layer `table_index`'s staged rows into
   // e (bf16 [rows, rows_local * head_dim]); any layer, any number of
   // times, until the next stage().
-  void embed(int table_index, int rows, cudaStream_t stream);
+  void embed(int table_index, int rows, cudaStream_t stream, bool external_stage = false);
   // kv_dst [rows, (hc + 1) * hidden] = e x wkv^T (this rank's partial;
   // null: the internal kv_partial()).
   // `r0`: the first row (the overlap walk projects a row block at a time:

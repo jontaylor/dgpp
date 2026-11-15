@@ -672,8 +672,9 @@ __global__ void moe_slot_gate_up_swiglu_kernel(
 // is exactly a + y), round to bf16 once.
 __global__ void moe_slot_accum_kernel(
     uint16_t* __restrict__ out, const float* __restrict__ contrib,
-    const float* __restrict__ weights, int64_t n, int hidden, int top_k) {
+    const float* __restrict__ weights, int64_t n, int hidden, int top_k, const uint32_t* skip) {
   dgpp_pdl_wait();
+  if (skip && *skip) return;
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x +
                     threadIdx.x;
   if (i >= n) return;
@@ -2010,14 +2011,14 @@ void launch_moe_slot_accum_routed_f32(float* out, const float* contrib,
 
 void launch_moe_slot_accum(uint16_t* out, const float* contrib,
                            const float* weights, int tokens, int hidden,
-                           int top_k, cudaStream_t stream) {
+                           int top_k, cudaStream_t stream, const uint32_t* skip) {
   if (tokens <= 0) return;
   if (!out || !contrib || !weights)
     throw std::invalid_argument("moe_slot_accum: null pointer");
   const int64_t n = static_cast<int64_t>(tokens) * hidden;
   const int64_t blocks = (n + kElemThreads - 1) / kElemThreads;
   moe_slot_accum_kernel<<<static_cast<int>(blocks), kElemThreads, 0, stream>>>(
-      out, contrib, weights, n, hidden, top_k);
+      out, contrib, weights, n, hidden, top_k, skip);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

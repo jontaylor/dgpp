@@ -19,6 +19,7 @@
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "kernels/sm12x_moe.hpp"
+#include "kernels/expert_demand.hpp"
 #include "models/glm/step_timing.hpp"
 #include "loaders/expert_cache_cuda.hpp"
 
@@ -992,6 +993,33 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   //    rounding onto the wire buffer — or the chain unrounded, for a
   //    caller that continues it.
   accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
+}
+
+void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
+    const uint64_t* table, ExpertDemand* demand, cudaStream_t stream) {
+  if (!sm12x_moe_ || tokens > decode_slots_ || !shared_lane_takes(true, tokens) ||
+      shared_aside_takes(true, tokens) || !has_shared() || w_.shared_nvfp4())
+    throw std::logic_error("GPU paging requires prepared b12x and the FP8 shared lane");
+  const int K = cfg_.top_k, H = cfg_.hidden, I = cfg_.inter;
+  route(hidden, tokens, stream, d_router_counters_);
+  launch_expert_demand(d_ids_, table, demand, tokens, stream);
+  sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream);
+  const auto& g = w_.shared[0]; const auto& u = w_.shared[1]; const auto& d = w_.shared[2];
+  const auto shift = [](int block) { int n = 0; while ((1 << n) < block) ++n; return n; };
+  const int run = moe_shared_run_rows(tokens, H);
+  DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
+  DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
+  auto* act = d_slot_act_ + K*I;
+  launch_moe_shared_run_gate_up_swiglu(hidden, H, g.payload, g.scales, u.payload, u.scales,
+      act, static_cast<size_t>(K+1)*I, tokens, static_cast<int>(g.rows), H, cfg_.swiglu_limit,
+      run, sh_lane_blocks_, sh_lane_, shift(g.scale_block_rows), shift(g.scale_block_cols));
+  launch_moe_shared_run_down(act, static_cast<size_t>(K+1)*I, d.payload, d.scales,
+      d_slot_down_ + K*H, static_cast<size_t>(K+1)*H, tokens, H, static_cast<int>(g.rows),
+      run, sh_lane_blocks_, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
+  DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
+  sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream);
+  DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
+  launch_moe_slot_accum(out, d_slot_down_, d_weights_, tokens, H, K, stream, &demand->serviced);
 }
 
 void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,

@@ -9,6 +9,13 @@ namespace dgpp {
 namespace {
 constexpr int kThreads = 256;
 
+// Three scalar scales belong to the compute dependency chain. Avoid a
+// copy-engine operation between packing and its consumer.
+__global__ void copy_globals(float* d0, float* d1, float* d2,
+                             const float* s0, const float* s1, const float* s2) {
+  if (threadIdx.x == 0) { *d0 = *s0; *d1 = *s1; *d2 = *s2; }
+}
+
 __global__ void scatter_expert_chunk(uint8_t* destination, const uint8_t* source,
                                      ExpertChunkCopyPlan plan) {
   for (uint32_t m = 0; m < plan.count; ++m) {
@@ -177,6 +184,20 @@ Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate)
   return {data, s13, reinterpret_cast<float*>(g13), w2, s2, reinterpret_cast<float*>(g2)};
 }
 
+void prepare_moe_fp4_pack() {
+  cudaFuncAttributes attributes{};
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunk));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, copy_globals));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_payload<true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_payload<false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, unpack_payload<true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, unpack_payload<false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<true, false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<false, false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<true, true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<false, true>));
+}
+
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
                          int hidden, int intermediate, cudaStream_t stream) {
   check_geometry(hidden, intermediate);
@@ -193,9 +214,9 @@ void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
   move_scales<false, false><<<blocks(hidden * (intermediate / 16)), kThreads, 0, stream>>>(
       nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate);
   DGPP_CUDA_OK(cudaGetLastError());
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.g13, src.globals[0], sizeof(float), cudaMemcpyDeviceToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.g13 + 1, src.globals[1], sizeof(float), cudaMemcpyDeviceToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.g2, src.globals[2], sizeof(float), cudaMemcpyDeviceToDevice, stream));
+  copy_globals<<<1, 32, 0, stream>>>(dst.g13, dst.g13 + 1, dst.g2,
+                                    src.globals[0], src.globals[1], src.globals[2]);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 
 void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
@@ -214,8 +235,8 @@ void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
   move_scales<false, true><<<blocks(hidden * (intermediate / 16)), kThreads, 0, stream>>>(
       dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate);
   DGPP_CUDA_OK(cudaGetLastError());
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.globals[0], src.g13, sizeof(float), cudaMemcpyDeviceToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.globals[1], src.g13 + 1, sizeof(float), cudaMemcpyDeviceToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(dst.globals[2], src.g2, sizeof(float), cudaMemcpyDeviceToDevice, stream));
+  copy_globals<<<1, 32, 0, stream>>>(dst.globals[0], dst.globals[1], dst.globals[2],
+                                    src.g13, src.g13 + 1, src.g2);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace dgpp

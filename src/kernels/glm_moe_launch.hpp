@@ -272,7 +272,7 @@ void launch_moe_slot_down(const uint16_t* act, size_t act_stride,
 // per segment, then launch_moe_round_bf16).
 void launch_moe_slot_accum(uint16_t* out, const float* contrib,
                            const float* weights, int tokens, int hidden,
-                           int top_k, cudaStream_t stream);
+                           int top_k, cudaStream_t stream, const uint32_t* skip = nullptr);
 // The routed slots' chain alone, UNROUNDED fp32 (out [tokens, hidden]) —
 // the slot layout keeps its (unused) shared slot; the Qwen decode
 // continues the chain with its BF16 shared expert. The slot kernels above

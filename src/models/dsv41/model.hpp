@@ -333,6 +333,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   int cache_ordinal(int layer) const;
   // The layer over the streams (cur -> next, swapped), the two folds.
   void enqueue_layer(const Dsv41LayerResident& r, int layer, int T, const WalkRows& rows);
+  struct PagedGraphs;
+  std::unique_ptr<PagedGraphs> paged_graphs_;
+  bool paged_graph_capture_ = false;
+  bool enqueue_paged_graph(int T, const WalkRows& rows);
   void mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode,
                 int decode_prefix = 0);
   void stream_update(const uint16_t* sublayer_out, int T);
