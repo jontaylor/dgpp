@@ -217,6 +217,7 @@ ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> ex
                                *cfg.initial_fraction < cfg.minimum_fraction)) ||
       !std::isfinite(cfg.decay_routes) || cfg.decay_routes <= 0 ||
       !std::isfinite(cfg.horizon_routes) || cfg.horizon_routes <= 0 ||
+      !std::isfinite(cfg.prefill_route_weight) || cfg.prefill_route_weight < 1.0 / 1024 || cfg.prefill_route_weight > 1 ||
       !std::isfinite(cfg.promotion_margin) || cfg.promotion_margin < 0)
     throw std::invalid_argument("expert residency: invalid budget, fraction or adaptation setting");
   std::map<uint64_t, size_t> groups;
@@ -289,22 +290,24 @@ size_t ResidencyPlanner::minimum_chunks(size_t expert) const {
 }
 double ResidencyPlanner::frequency(size_t expert) const {
   const History& h = history_[expert];
-  const auto clock = config_.layer_local_history ? group_epochs_[history_groups_[expert]] : epoch_;
+  const auto clock = config_.layer_local_history ? group_epochs_[history_groups_[expert]] : history_epoch_;
   const double scale = config_.layer_local_history ? static_cast<double>(group_epochs_.size()) : 1.0;
   return h.accesses * std::exp2(-static_cast<double>(clock - h.updated) * scale / config_.decay_routes);
 }
 
-void ResidencyPlanner::observe(std::span<const size_t> selected) {
+void ResidencyPlanner::observe(std::span<const size_t> selected, bool prefill) {
+  const double weight = prefill ? config_.prefill_route_weight : 1.0;
   if (selected.size() > std::numeric_limits<uint64_t>::max() - epoch_)
     throw std::overflow_error("expert residency: observation clock overflow");
   for (size_t e : selected)
     if (e >= experts_.size()) throw std::out_of_range("expert residency: invalid observed expert");
   for (size_t e : selected) {
     ++epoch_;
-    if (config_.layer_local_history) ++group_epochs_[history_groups_[e]];
+    history_epoch_ += weight;
+    if (config_.layer_local_history) group_epochs_[history_groups_[e]] += weight;
     auto& h = history_[e];
-    h.accesses = frequency(e) + 1;
-    h.updated = config_.layer_local_history ? group_epochs_[history_groups_[e]] : epoch_;
+    h.accesses = frequency(e) + weight;
+    h.updated = config_.layer_local_history ? group_epochs_[history_groups_[e]] : history_epoch_;
   }
 }
 void ResidencyPlanner::observe_load(size_t expert, double ms) {

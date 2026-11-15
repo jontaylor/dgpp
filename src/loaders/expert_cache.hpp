@@ -184,7 +184,7 @@ class ExpertCache {
   const std::vector<CachedExpert>& experts() const;
   // Completes mandatory fractional population before making any expert usable.
   void initialize();
-  void observe(std::span<const size_t> selected);
+  void observe(std::span<const size_t> selected, bool prefill = false);
   // Transitions outside running kernels. A failed transition poisons the cache;
   // a partially loaded/evicted population can never be executed or committed.
   void adapt();

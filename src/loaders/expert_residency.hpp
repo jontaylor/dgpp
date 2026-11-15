@@ -86,6 +86,7 @@ struct PlannerConfig {
   std::optional<double> initial_fraction;
   double decay_routes = 1024;  // exponential half-life in routed selections
   double horizon_routes = 8192;
+  double prefill_route_weight = 1.0;  // weight in both popularity and ageing clock
   bool layer_local_history = false;  // experimental; scale local clocks by group count
   bool learn_load_cost = true;  // false retains each expert's initial cost estimate
   double promotion_margin = 0.25;
@@ -111,7 +112,7 @@ class ResidencyPlanner {
   uint64_t observations() const { return epoch_; }
   // Each element is a selected expert index, including repeated selections
   // across concurrent rows. Invalid input leaves the estimator unchanged.
-  void observe(std::span<const size_t> selected);
+  void observe(std::span<const size_t> selected, bool prefill = false);
   void observe_load(size_t expert, double full_expert_ms);
   // leased is a per-expert prefix lower bound supplied by the cache manager.
   // In-flight/GPU readers cannot be demoted by a desired-residency change.
@@ -129,7 +130,8 @@ class ResidencyPlanner {
  private:
   struct History {
     double accesses = 0;
-    uint64_t updated = 0, changed = 0;
+    double updated = 0;
+    uint64_t changed = 0;
     bool has_changed = false;
   };
   uint64_t prefix_bytes(size_t expert, size_t chunks) const;
@@ -144,7 +146,8 @@ class ResidencyPlanner {
   std::vector<std::vector<uint64_t>> prefix_;
   std::vector<History> history_;
   std::vector<size_t> history_groups_;
-  std::vector<uint64_t> group_epochs_;
+  std::vector<double> group_epochs_;
+  double history_epoch_ = 0;
   ResidencyPlan current_;
   uint64_t epoch_ = 0;
   uint64_t generation_ = 0;

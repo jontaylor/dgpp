@@ -771,7 +771,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     selected.reserve(demand_history ? active_experts.size() : tk);
     const auto& observations = demand_history ? active_experts : h_ids_;
     for (const auto id : observations) selected.push_back(cache_experts[static_cast<size_t>(id)]);
-    cache->observe(selected);
+    cache->observe(selected, kernel == MoeExpertKernel::kMma);
     if (cache->packed_nvfp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
         (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
       enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts);

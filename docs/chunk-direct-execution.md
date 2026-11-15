@@ -678,3 +678,22 @@ cache state, without replaying the completed loop. Layer-local history remains
 disabled and the global-clock deployment is restored. This experiment does not
 reject phase-aware admission or other layer-aware estimators; it rejects this
 clock substitution as the serving choice for the tested workload.
+
+## Weighted prefill history candidate
+
+`engine.expert_streaming.prefill_route_weight` defaults to 1.0 and accepts
+values from 1/1024 through 1. The candidate uses 1/16. Each prefill selection
+contributes that weight to both its expert's popularity and the frequency
+estimator's elapsed clock. Decode/verification contributes one. This retains
+relative token popularity within prefill while reducing how far a long scan
+ages earlier decode evidence. It is a shared weighted history, not independent
+prefill/decode histories or a reserved decode cache. The raw observation count,
+adaptation interval, cooldown, admission rules and memory budget are unchanged.
+
+The DSV4.1 execution path marks MMA observations as prefill; GEMV and native
+graph-hit observations retain unit decode weight. The earlier deduplicated
+prefill experiment and layer-local clocks remain disabled for this comparison.
+Tests cover preservation of recent decode evidence through a short weighted
+scan, eventual learning of a repeated new prefill distribution, unchanged raw
+observation count, invalid-input atomicity, configuration bounds/serialization,
+and the default phase-independent behavior.

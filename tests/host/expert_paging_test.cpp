@@ -31,9 +31,10 @@ DGPP_TEST(expert_paging_configuration_roundtrips_every_effective_setting) {
   const auto configured = parse(R"({"policy":"adaptive_fractional_cache","budget_bytes":1073741824,
     "image_directory":"/ssd/experts","io_mode":"buffered","chunk_intermediate":128,
     "execution_slots":3,"io_buffers":4,"io_workers":2,"queue_depth":7,"prefetch_bytes":4096,
-    "minimum_fraction":0.125,"initial_fraction":0.375,"decay_routes":32,"horizon_routes":64,"learn_load_cost":false,"layer_local_history":true,
+    "minimum_fraction":0.125,"initial_fraction":0.375,"decay_routes":32,"horizon_routes":64,"learn_load_cost":false,"layer_local_history":true,"prefill_route_weight":0.0625,
     "promotion_margin":0.5,"cooldown_routes":17,"adaptation_bytes":1024,"adapt_every_routes":8})");
   require(parse(expert_paging_json(configured)) == configured, "nondefault settings preserved exactly");
+  require(configured.cache.planner.prefill_route_weight == 0.0625, "prefill weight parsed explicitly");
   require(configured.cache.planner.layer_local_history, "layer history parsed explicitly");
   require(!configured.cache.planner.learn_load_cost, "fixed-cost mode parsed explicitly");
   auto different = configured;
@@ -51,7 +52,7 @@ DGPP_TEST(expert_paging_configuration_refuses_unknown_inert_and_unbounded_settin
   for (const auto* suffix : {R"(,"unknown":1})", R"(,"budget_bytes":0})", R"(,"initial_fraction":0.5})",
        R"(,"io_mode":"automatic"})", R"(,"chunk_intermediate":17})", R"(,"minimum_fraction":-0.1})",
        R"(,"io_buffers":1,"io_workers":2})", R"(,"io_buffers":9,"queue_depth":3})",
-       R"(,"execution_slots":0})", R"(,"adapt_every_routes":0})", R"(,"budget_bytes":1.5})", R"(,"layer_local_history":1})", R"(,"learn_load_cost":1})"})
+       R"(,"execution_slots":0})", R"(,"adapt_every_routes":0})", R"(,"budget_bytes":1.5})", R"(,"prefill_route_weight":0})", R"(,"prefill_route_weight":2})", R"(,"layer_local_history":1})", R"(,"learn_load_cost":1})"})
     refuses([&] { (void)parse(prefix + suffix); });
   refuses([&] { (void)parse("{}"); });
   refuses([&] { (void)parse(R"({"policy":"fractional","budget_bytes":1,"image_directory":"x"})"); });

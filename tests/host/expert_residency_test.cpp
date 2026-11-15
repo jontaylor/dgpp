@@ -466,4 +466,41 @@ DGPP_TEST(expert_planner_single_group_local_history_matches_global) {
   }
 }
 
+DGPP_TEST(expert_planner_prefill_weight_preserves_decode_history_and_popularity) {
+  auto c = config(Policy::kWholeExpert, 400);
+  c.prefill_route_weight = 1.0 / 16;
+  ResidencyPlanner weighted(c, equal_experts(3, 4));
+  c.prefill_route_weight = 1;
+  ResidencyPlanner control(c, equal_experts(3, 4));
+  hot(weighted, 0, 128); hot(control, 0, 128);
+  std::vector<size_t> scan;
+  for (int i = 0; i < 64; ++i) scan.push_back(i % 4 ? 1 : 2);
+  weighted.observe(scan, true); control.observe(scan, true);
+  require(weighted.propose().chunks[0] == 4, "weighted scan preserves recent decode popularity");
+  require(control.propose().chunks[1] == 4, "unweighted scan supplants decode history");
+  require(weighted.observations() == control.observations(), "weight does not alter admission or adaptation clock");
+  for (int i = 0; i < 32; ++i) weighted.observe(scan, true);
+  require(weighted.propose().chunks[1] == 4, "repeated prefill learns relative popularity");
+  const auto before = weighted.propose().chunks;
+  refuses([&] { weighted.observe(std::vector<size_t>{0, 999}, true); });
+  require(weighted.propose().chunks == before, "invalid weighted batch is atomic");
+}
+
+DGPP_TEST(expert_planner_weight_one_preserves_phase_independent_behavior) {
+  auto c = config(Policy::kWholeExpert, 800);
+  ResidencyPlanner decode(c, equal_experts(4, 4)), prefill(c, equal_experts(4, 4));
+  std::mt19937 rng(173);
+  for (int step = 0; step < 200; ++step) {
+    const std::vector<size_t> routes{rng() % 4, rng() % 4, rng() % 4};
+    decode.observe(routes); prefill.observe(routes, true);
+    auto a = decode.propose(), b = prefill.propose();
+    require(a.chunks == b.chunks, "default weighting is phase independent");
+    decode.commit(a); prefill.commit(b);
+  }
+  for (double w : {0., 2., std::numeric_limits<double>::quiet_NaN()}) {
+    c.prefill_route_weight = w;
+    refuses([&] { ResidencyPlanner invalid(c, equal_experts(4, 4)); });
+  }
+}
+
 int main() { return dgpp::test::run_all(); }

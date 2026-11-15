@@ -440,10 +440,10 @@ void ExpertCache::initialize() {
     s.counters.initialized = true;
   } catch (...) { s.counters.poisoned = true; throw; }
 }
-void ExpertCache::observe(std::span<const size_t> selected) {
+void ExpertCache::observe(std::span<const size_t> selected, bool prefill) {
   auto& s = *state_;
   s.check();
-  s.planner->observe(selected);
+  s.planner->observe(selected, prefill);
   s.observed_for_adaptation |= !selected.empty();
   for (const auto e : selected)
     s.all_observed_full &= s.planner->current().chunks[e] == s.experts[e].records.size();

@@ -66,6 +66,7 @@ expert::PagingOptions parse_expert_paging(const minijson::Value& v, const std::s
     else if (key == "initial_fraction") p.initial_fraction = number(x, what, key, std::numeric_limits<double>::min(), 1);
     else if (key == "decay_routes") p.decay_routes = number(x, what, key, 1, 1e15);
     else if (key == "horizon_routes") p.horizon_routes = number(x, what, key, 1, 1e15);
+    else if (key == "prefill_route_weight") p.prefill_route_weight = number(x, what, key, 1.0 / 1024, 1);
     else if (key == "layer_local_history") {
       if (!x.is_bool()) bad(what, key, "expected true or false");
       p.layer_local_history = x.as_bool();
@@ -104,6 +105,7 @@ std::string expert_paging_json(const expert::PagingOptions& o) {
       << ",\"prefetch_bytes\":" << r.prefetch_bytes << ",\"io_mode\":" << json_string(o.io_mode == IoMode::kDirect ? "direct" : "buffered")
       << ",\"minimum_fraction\":" << p.minimum_fraction << ",\"decay_routes\":" << p.decay_routes
       << ",\"horizon_routes\":" << p.horizon_routes << ",\"promotion_margin\":" << p.promotion_margin
+      << ",\"prefill_route_weight\":" << p.prefill_route_weight
       << ",\"layer_local_history\":" << (p.layer_local_history ? "true" : "false")
       << ",\"learn_load_cost\":" << (p.learn_load_cost ? "true" : "false")
       << ",\"cooldown_routes\":" << p.cooldown_routes;
