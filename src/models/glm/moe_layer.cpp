@@ -1019,6 +1019,12 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       return demand_lookahead ? cache->lookahead_demand(expert) : cache->prefetch(expert);
     };
     const bool resident_first = direct_prefill && resident_first_enabled;
+    static const bool ready_groups_enabled = [] {
+      const char* value = std::getenv("DGPP_EXPERT_READY_GROUPS");
+      return value && std::atoi(value) != 0;
+    }();
+    const bool ready_groups = ready_groups_enabled && resident_first && chunk_direct_prefill;
+    std::vector<MoeSegment> original_segments(ready_groups ? E : 0);
     size_t resident_count = 0;
     if (resident_first) {
       const auto boundary = std::stable_partition(active_experts.begin(), active_experts.end(), [&](int e) {
@@ -1046,7 +1052,15 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       if (shared) for (int t = 0; t < tokens; ++t) h_seg_rows_[tk+t] = t;
       DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total*sizeof(int), cudaMemcpyHostToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk*sizeof(int), cudaMemcpyHostToDevice, stream));
-      DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
+      if (ready_groups) {
+        for (size_t j = 0; j < active_experts.size(); ++j)
+          original_segments[active_experts[j]] = h_segs_[j];
+        // Each routed staging slice is uploaded once, after its wave is chosen.
+        // Never rewrite pinned descriptors still being consumed by a copy.
+        DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_ + E, h_segs_ + E, sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
+      } else {
+        DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
+      }
       for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + static_cast<size_t>(lookahead_experts)); ++j)
         (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
     } else {
@@ -1061,6 +1075,24 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       int end = resident_first && wave == 0 && resident_count
           ? static_cast<int>(resident_count)
           : wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      if (ready_groups) {
+        if (!(wave == 0 && resident_count)) {
+          const int scan_end = std::min(n_segs, first + static_cast<int>(2*wave_capacity));
+          for (int j = first; j < scan_end; ++j)
+            (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
+          const auto ready_end = std::stable_partition(active_experts.begin() + first,
+              active_experts.begin() + scan_end, [&](int e) {
+                return cache->demand_ready(cache_experts[static_cast<size_t>(e)]);
+              });
+          const size_t ready = static_cast<size_t>(ready_end - (active_experts.begin() + first));
+          // If none are ready, wait for the earliest queued expert. Otherwise
+          // launch a useful bounded group without waiting for its successors.
+          end = first + static_cast<int>(std::min(wave_capacity, std::max<size_t>(1, ready)));
+        }
+        for (int j = first; j < end; ++j) h_segs_[j] = original_segments[active_experts[j]];
+        DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_ + first, h_segs_ + first,
+            static_cast<size_t>(end-first)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
+      }
       // Full resident chunks need only one conversion to the direct layout.
       // Do it before this wave owns any scratch/native leases: preparation
       // relocates cache slots and uses the existing reconstruction reservation.
@@ -1125,7 +1157,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           // the next SSD read. Keep segment/accumulation order unchanged and
           // preserve the existing lookahead and staging-reader retirement.
           // Native-only groups retain their larger grouping above.
-          if (ready_prefill && chunk_direct_prefill && direct_prefill && j+1 < end &&
+          if (ready_prefill && !ready_groups && chunk_direct_prefill && direct_prefill && j+1 < end &&
               !cache->demand_ready(cache_experts[static_cast<size_t>(active_experts[j+1])]))
             end = j+1;
         }
@@ -1163,7 +1195,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
           grouped_decode ? tk : rows_total, stream,
-          nullptr, nullptr, 0, end == n_segs, activation_row, wave_rows);
+          nullptr, nullptr, 0, end == n_segs, ready_groups ? -1 : activation_row, wave_rows);
       activation_row += wave_rows;
       cache->release_native_leases(native_leases);
       native_leases.clear();
@@ -2041,9 +2073,14 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     if (local_activation) {
       // Segment outputs retain their absolute gathered-row positions.
       // Only rows whose gate/up projections ran in this wave are consumed.
-      const size_t offset = static_cast<size_t>(activation_row) * I_max;
-      launch_moe_swiglu_clamp(d_gate_ + offset, d_up_ + offset, d_act_ + offset,
-          static_cast<int64_t>(activation_rows) * I_max, cfg_.swiglu_limit, stream);
+      if (activation_row < 0) {
+        launch_moe_swiglu_segments(d_gate_, d_up_, d_act_, segs, n_segs, max_rows,
+            static_cast<int>(I_max), cfg_.swiglu_limit, stream);
+      } else {
+        const size_t offset = static_cast<size_t>(activation_row) * I_max;
+        launch_moe_swiglu_clamp(d_gate_ + offset, d_up_ + offset, d_act_ + offset,
+            static_cast<int64_t>(activation_rows) * I_max, cfg_.swiglu_limit, stream);
+      }
       if (shared_seg && execute_shared) {
         const size_t shared_offset = static_cast<size_t>(tokens) * cfg_.top_k * I_max;
         launch_moe_swiglu_clamp(d_gate_ + shared_offset, d_up_ + shared_offset, d_act_ + shared_offset,

@@ -776,3 +776,26 @@ acceptance matched and both ranks stayed at zero swap. The temporary six-window
 override is removed and default two-expert lookahead is restored. Arbitrary
 ready-expert execution remains unimplemented; this test changes submission
 lead only and neither proves nor rules out a benefit from readiness scheduling.
+
+## Ready-group prefill candidate
+
+`DGPP_EXPERT_READY_GROUPS=1` enables an experimental ready-group scheduler for
+resident-first, chunk-direct NVFP4 prefill. After the resident group, each wave
+offers a bounded window of known demand to the existing read queue and stably
+selects ready experts. If none are ready it waits for the first queued expert;
+it does not busy-spin or reserve extra staging. Group size remains bounded by
+the existing wave capacity and the queue retains its half-pool reservation cap.
+This candidate changes both submission lead and completion-based selection.
+
+Gathered rows and final route-slot mapping stay fixed. Each expert retains its
+original absolute row interval; only the wave's segment descriptors are
+permuted. A segmented BF16 SwiGLU launcher handles noncontiguous row intervals
+with the same two BF16 roundings as the ordinary activation kernel. It leaves
+other rows untouched and keeps activation work proportional to selected rows.
+Pinned wave descriptors are uploaded once per slice, then left unchanged until
+the forward finishes. Shared-expert placement and final ordered accumulation
+remain intact. The earlier ready-prefix control does not truncate these waves.
+
+The candidate is opt-in and is not selected for deployment without serving
+evidence. The isolated activation test covers nonmonotonic uneven segments,
+zero-length segments, untouched gaps and bitwise arithmetic parity.

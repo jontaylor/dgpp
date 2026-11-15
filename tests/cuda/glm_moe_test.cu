@@ -1553,6 +1553,35 @@ DGPP_TEST(moe_router_ties_break_to_lower_expert_id) {
   std::printf("[ OK ] router ties: experts 0..7, uniform weights\n");
 }
 
+DGPP_TEST(moe_swiglu_segments_preserve_gaps_and_match_contiguous_arithmetic) {
+  constexpr int rows = 19, stride = 320, n = rows*stride;
+  uint16_t *gate, *up, *expected, *got;
+  dgpp::MoeSegment* segments;
+  DGPP_CUDA_OK(cudaMallocManaged(&gate, n*2));
+  DGPP_CUDA_OK(cudaMallocManaged(&up, n*2));
+  DGPP_CUDA_OK(cudaMallocManaged(&expected, n*2));
+  DGPP_CUDA_OK(cudaMallocManaged(&got, n*2));
+  DGPP_CUDA_OK(cudaMallocManaged(&segments, 4*sizeof(dgpp::MoeSegment)));
+  for (int i = 0; i < n; ++i) {
+    gate[i] = float_to_bf16_bits((i % 137 - 68)*0.5f);
+    up[i] = float_to_bf16_bits((i % 79 - 39)*0.5f);
+    got[i] = 0x7fc1;
+  }
+  segments[0] = {12, 5, 7}; segments[1] = {2, 3, 1};
+  segments[2] = {8, 0, 5}; segments[3] = {7, 2, 2};
+  dgpp::launch_moe_swiglu_clamp(gate, up, expected, n, 10.f, nullptr);
+  dgpp::launch_moe_swiglu_segments(gate, up, got, segments, 4, 5, stride, 10.f, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  bool matches = true;
+  for (int i = 0; i < n; ++i) {
+    const int row = i/stride;
+    const bool selected = (row >= 12 && row < 17) || (row >= 2 && row < 5) || (row >= 7 && row < 9);
+    matches &= got[i] == (selected ? expected[i] : 0x7fc1);
+  }
+  cudaFree(gate); cudaFree(up); cudaFree(expected); cudaFree(got); cudaFree(segments);
+  require(matches, "nonmonotonic uneven segments match BF16 arithmetic and leave gaps untouched");
+}
+
 DGPP_TEST(moe_swiglu_clamp_edge_semantics) {
   // gate clamps only the max; up clamps both; exactly-at-limit values pass.
   const float limit = 10.0f;

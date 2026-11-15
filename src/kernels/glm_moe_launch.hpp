@@ -69,6 +69,10 @@ struct MoeSegment {
   int32_t rows = 0;    // rows in the segment
   int32_t expert = 0;  // view-table expert index (the shared expert last)
 };
+// Apply exactly the ordinary BF16 SwiGLU arithmetic to disjoint row ranges.
+void launch_moe_swiglu_segments(const uint16_t* gate, const uint16_t* up,
+    uint16_t* out, const MoeSegment* segments, int count, int max_rows,
+    int stride, float limit, cudaStream_t stream);
 // `max_rows` is the longest segment's row count; `rows_per_block` (0 = no
 // split) splits every segment across blocks along z in pieces of that many
 // rows — for a launch whose segments are long and even (the shared

@@ -347,6 +347,21 @@ __global__ void moe_swiglu_clamp_kernel(const uint16_t* __restrict__ gate,
       float_to_bf16_bits(bf16_bits_to_float(t) * u);  // rounding 2 (product)
 }
 
+__global__ void moe_swiglu_segments_kernel(const uint16_t* gate, const uint16_t* up,
+    uint16_t* out, const MoeSegment* segments, int stride, float limit) {
+  dgpp_pdl_wait();
+  const auto segment = segments[blockIdx.y];
+  const int64_t local = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (local >= static_cast<int64_t>(segment.rows) * stride) return;
+  const int64_t i = static_cast<int64_t>(segment.row0) * stride + local;
+  float g = bf16_bits_to_float(gate[i]);
+  float u = bf16_bits_to_float(up[i]);
+  if (g > limit) g = limit;
+  u = fminf(fmaxf(u, -limit), limit);
+  const uint16_t t = float_to_bf16_bits(g * sigmoidf_acc(g));
+  out[i] = float_to_bf16_bits(bf16_bits_to_float(t) * u);
+}
+
 __global__ void moe_gather_rows_kernel(const uint16_t* __restrict__ src,
                                        const int32_t* __restrict__ rows,
                                        uint16_t* __restrict__ dst, int64_t n,
@@ -975,6 +990,19 @@ void launch_moe_swiglu_clamp(const uint16_t* gate, const uint16_t* up,
   const int64_t blocks = (n + kElemThreads - 1) / kElemThreads;
   moe_swiglu_clamp_kernel<<<static_cast<int>(blocks), kElemThreads, 0,
                             stream>>>(gate, up, out, n, limit);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void launch_moe_swiglu_segments(const uint16_t* gate, const uint16_t* up,
+    uint16_t* out, const MoeSegment* segments, int count, int max_rows,
+    int stride, float limit, cudaStream_t stream) {
+  if (count <= 0 || max_rows <= 0) return;
+  if (!gate || !up || !out || !segments || stride <= 0)
+    throw std::invalid_argument("moe_swiglu_segments: invalid input");
+  constexpr int threads = 256;
+  const auto blocks = (static_cast<int64_t>(max_rows) * stride + threads - 1) / threads;
+  moe_swiglu_segments_kernel<<<dim3(static_cast<unsigned>(blocks), count), threads, 0, stream>>>(
+      gate, up, out, segments, stride, limit);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
