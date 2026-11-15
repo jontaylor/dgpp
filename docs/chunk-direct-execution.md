@@ -750,3 +750,29 @@ The six-expert GPU paging fixture passed for both whole and fractional cache
 policies under constrained staging, with bitwise agreement with the resident
 chain. Full serving comparison is required to determine whether earlier
 submission helps rather than merely increasing outstanding demand.
+
+### Read-ahead serving screen: retain two
+
+Implementation `627f9316` was compared using binary SHA-256
+`0eccf37889336b8f822507ca3a0d3f8f36d8f949f5f74deabf9dc825c71e7254`
+on both ranks (built before commit, stamped with parent `46185841`). The
+existing two-expert window ran first, then six, each restarting before the
+four-request prefix-enabled tool loop and three small recomputations. Cache
+capacity, eight workers, history settings and fixed depth three were unchanged.
+The GPU paging fixture passed before serving. This is a focused diagnostic,
+not a campaign throughput row.
+
+Cold prefill was 38.601 versus 38.579 seconds. Three continuations took 40.265
+versus 40.798 seconds wall, with summed prefill 5.274 versus 5.385 seconds and
+engine decode 34.856 versus 35.286 seconds. Expert reads were identical at
+47.009 GiB per rank. Small-repeat prefills were 7.851, 2.859 and 1.604 seconds
+for two, versus 7.806, 2.827 and 1.597 seconds for six. Both reached zero expert
+reads on the third repeat; decode then measured 52.12 versus 51.56 tokens/s.
+There is no meaningful demonstrated benefit from the larger window in this
+screen, and the small timing differences do not establish a causal regression.
+
+All seven normalized outputs, usage and expert read volumes matched; tool-loop
+acceptance matched and both ranks stayed at zero swap. The temporary six-window
+override is removed and default two-expert lookahead is restored. Arbitrary
+ready-expert execution remains unimplemented; this test changes submission
+lead only and neither proves nor rules out a benefit from readiness scheduling.
