@@ -632,12 +632,14 @@ not measurements from the live Sparks or instructions to implement every idea.
   implemented. Larger decay helped recomputed prefill but hurt prefix-enabled
   continuations; the proportional-horizon control also failed to improve serving.
   Decay 65536 with horizon 8192 remains selected.
-- **Four blocking readers: verified mechanism, benefit unproven.** Each worker
+- **Blocking-reader concurrency: verified and tested.** Each worker
   calls the blocking store reader before taking another job. Queue capacity
   256 is not 256 concurrent expert read calls, and the queue's active count
-  includes staging acquisition. The current deployment still uses four workers.
-  Eight and sixteen workers are inexpensive next candidates with the same
-  staging pool and cache capacity. No asynchronous I/O backend is justified yet.
+  includes staging acquisition. Eight workers reduced the prefix-enabled
+  continuation sequence's elapsed time by 14.9% versus four; sixteen improved
+  cold prefill slightly further but was slower on the continuations than eight.
+  Eight is now deployed with the same staging pool and cache capacity. No
+  asynchronous I/O backend has been implemented or separately justified.
 - **Adjacent-range coalescing: verified gap, deferred.** Current coalescing
   deduplicates one record; it does not combine neighboring records. Preserve
   alignment, per-chunk views and GPU reader lifetimes if physical coalescing
@@ -652,7 +654,8 @@ not measurements from the live Sparks or instructions to implement every idea.
   opt-in ready-prefix experiment was correct but did not improve the matched
   serving sequence, and is disabled. It preserves order and does not run
   arbitrary later-ready experts. Full readiness-based grouping remains open;
-  reader concurrency should be tested before another scheduler rewrite.
+  the reader-count comparison subsequently selected eight workers before
+  attempting another scheduler rewrite.
 - **Normal tool continuations and demand replay: remaining coverage gaps.**
   The original comparisons disabled prefix reuse and used short forced tool
   calls. A new direct-DGPP continuation comparison enables prefix reuse and

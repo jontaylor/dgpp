@@ -321,3 +321,44 @@ do not yet prove a particular replacement policy. Production is restored to
 The next cheap configuration test is reader concurrency, before adding I/O or
 scheduling machinery. Exact normal-client tool loops, uncapped task completion,
 phase-aware histories and a future-aware traffic bound remain untested.
+
+## Reader-count follow-up
+
+The deployment now retains **eight expert read workers**, up from four, with
+256 staging buffers/queue entries, twelve execution slots and the same expert
+memory reservation. Decay remains 65536 and horizon remains 8192; ready-prefix
+is disabled. No model, precision, context, Engram or prefix-cache setting changed.
+
+The direct-DGPP prefix-enabled continuation sequence above was replayed on fresh
+processes with eight and sixteen workers. The four-worker control is the preceding
+`loop65536` sequence, with the same binary
+`ecb2bc043318e04da6c075e0dcad5d82f562ecdb33d06bbe9709b111249bad84`
+on both ranks. These are focused configuration diagnostics, not benchmark
+campaign rows or a measurement of physical NVMe command depth.
+
+Cold initial-request prefill was 43.051 seconds with four workers, 39.377 with
+eight and 38.384 with sixteen. Across the three prefix-reusing continuations,
+summed prefill was 6.689 / 5.233 / 5.373 seconds for four/eight/sixteen workers;
+summed engine decode was 41.057 / 35.401 / 37.521 seconds. Per-request engine
+decode rates were 15.10/19.05/23.64 tokens/s with four, 18.17/22.14/25.90 with
+eight, and 17.08/20.77/24.73 with sixteen. Service-level elapsed time totaled
+47.878 / 40.766 / 43.033 seconds. Eight workers reduced that continuation
+sequence's elapsed time by 14.9% relative to four; sixteen was better on the
+cold prefill but did not improve the continuation sequence further.
+
+Average per-rank expert reads across continuations were nearly unchanged:
+55.60 / 55.72 / 55.34 GiB. All normalized outputs, token usage, prefix hits and
+speculative acceptance matched. Both ranks remained at zero swap. Answers were
+still capped at 256 tokens, so the comparison establishes bounded serving
+performance, not completed-task quality. No actual overlapping-read trace or
+CPU attribution was collected; these results select a useful worker setting,
+not a precise explanation of the sixteen-worker slowdown. Cache allocation
+was held fixed; additional thread overhead was not subtracted from the budget.
+
+After retaining eight workers, the short recomputation anchor settled at
+1.437/1.421 seconds prefill and 52.81/52.77 decode tokens/s, with zero expert
+reads on both ranks. This preserves the previous fully warm performance. Its
+initial process-cold 2,209-token prefill took 21.463 seconds; that is an anchor,
+not a new paired short-cold comparison. Serving remains running with eight
+workers. GPU binding-publication timing, phase-aware cache admission, physical
+read coalescing and exact normal-client traffic remain open.
