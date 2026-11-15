@@ -920,3 +920,29 @@ single-run improvement has not established a worthwhile trade for reducing
 headroom at the configured million-token context. The original budget and
 serving configuration were restored. A larger cache may still help another
 working set; no capacity sweep or long-context qualification was performed.
+
+## Zero versus 25% promotion margin
+
+A focused configuration screen compared the default 0.25 promotion margin to
+zero on the same binary `e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`
+(implementation `e5d19f1e`, stamped with parent `f3d217f0`). The margin affects
+both demand admission replacement and the periodic planner's promotion cost;
+this is not an isolated test of either. The default ran first, each arm
+restarted before the same four-request prefix-enabled tool loop and three
+2209-token recomputations. This is a single focused diagnostic, not a campaign
+or evidence about concurrent or long-context workloads.
+
+Cold prefill was 38.650 versus 38.656 seconds. Three continuations took 40.619
+versus 41.231 seconds wall, with summed prefill 5.281 versus 5.528 seconds and
+engine decode 35.209 versus 35.554 seconds. Expert reads were 47.009 GiB per
+rank in both arms. The timing difference in this single ordering is not proof
+of a causal slowdown. On the third small recomputation both ranks had zero
+expert reads; prefill was 1.603 versus 1.641 seconds and decode 50.60 versus
+52.64 tokens/s. All seven normalized outputs, usage and per-request read
+volumes matched, as did tool-loop speculative acceptance; both server
+processes remained at zero swap at the recorded boundaries.
+
+Zero margin showed no meaningful benefit in this workload, so the default 0.25
+was restored. Equal aggregate reads do not prove that the internal residency
+or eviction decisions were identical. Other margins, workload switches and
+phase-specific admission remain untested by this screen.
