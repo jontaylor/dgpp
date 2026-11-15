@@ -697,3 +697,36 @@ Tests cover preservation of recent decode evidence through a short weighted
 scan, eventual learning of a repeated new prefill distribution, unchanged raw
 observation count, invalid-input atomicity, configuration bounds/serialization,
 and the default phase-independent behavior.
+
+### Weighted-history serving screen: not selected
+
+Implementation `ceb19b0f` was tested with the same binary on both ranks,
+SHA-256 `1de43683a2673e464473c49cc9c01d243fd1dd75d5b4f5b61c877d209c222109`
+(built before commit, stamped with parent `7e303b4d`). Unit-weight control ran
+first, then prefill weight 1/16, each restarted before the same four-request
+prefix-enabled tool loop and three small recomputations. Other retained
+settings were unchanged. This is a focused diagnostic, not a campaign row.
+All 21 planner, 28 cache and three paging configuration tests passed on Spark-1.
+
+Cold prefill was 38.979 versus 38.507 seconds, with initial-request expert reads
+109.950 versus 110.772 GiB per rank. Across the three continuations, service wall
+time increased from 40.342 to 41.882 seconds (3.8%) and expert reads rose from
+47.009 to 56.572 GiB per rank (20.3%). Summed prefill was 5.403 versus 6.330
+seconds; engine decode was 34.820 versus 35.426 seconds. The final repeated
+continuation improved from 10.514 to 9.181 seconds wall, but the first two
+continuations lost more than that saved.
+
+Small-request recomputation prefills were 7.829, 2.862 and 1.604 seconds for
+control, versus 5.966, 4.054 and 3.498 seconds for the candidate. Control reached
+zero reads on the third repeat; candidate still read 14.353 GiB per rank. Decode
+on that repeat was 51.87 versus 52.35 tokens/s, so the candidate could warm the
+decode working set while remaining worse at recomputing the prompt. A fully
+resident prefill anchor was not established for the candidate. No further
+convergence sweep was justified by the continuation and repeat-prefill losses.
+
+All seven normalized outputs and usage records matched, as did tool-loop
+speculative acceptance. Both ranks stayed at zero swap. The default unit
+weight is restored in serving; 1/16 is not selected. The result argues against
+further tuning this scalar without new evidence. It does not establish that
+separate phase histories or scan-resistant admission cannot help, but those
+remain unimplemented rather than demonstrated optimization opportunities.
