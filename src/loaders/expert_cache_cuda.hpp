@@ -5,9 +5,10 @@
 #include "models/quant_matrix.hpp"
 
 namespace dgpp::expert {
-// Engine-owned stream only: this backend creates no streams or worker CUDA
-// contexts. Construct/register at boot, before fabric collective execution.
-// Keep the stream/context alive until all cache/execution leases are gone.
+// Consumers use the engine-owned stream; transfers use a backend-owned
+// nonblocking stream with storage lifetime fences. No worker CUDA contexts.
+// Construct/register at boot, before fabric collective execution, and keep
+// the engine stream/context alive until all cache/execution leases are gone.
 CacheStorageFactory cuda_cache_storage(const StoreIdentity&, cudaStream_t, bool packed_nvfp4 = false);
 
 // Converts a complete reconstruction into the exact existing kernel views.
