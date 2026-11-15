@@ -47,7 +47,12 @@ struct Dsv41Model::PagedGraphs {
   Graph* capturing = nullptr;
   uint64_t passes = 0, misses = 0;
   uint64_t published_revision = 0;
+  bool profile_publish = false;
+  uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
+  uint64_t publish_bytes = 0, profiled_walk_ns = 0;
   explicit PagedGraphs(int n) : layers(n) {
+    const char* profile = std::getenv("DGPP_EXPERT_PROFILE_PUBLISH");
+    profile_publish = profile && std::atoi(profile) != 0;
     prepare_moe_fp4_pack();
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
@@ -67,6 +72,8 @@ struct Dsv41Model::PagedGraphs {
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
                int hidden, int inter) {
     if (published_revision == cache.prepared_revision()) return;
+    const auto started = profile_publish ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
     std::fill_n(host_tables, layers * words, uint64_t{0});
     for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
       const auto* address = cache.prepared_address(mapping[l][e]);
@@ -80,9 +87,18 @@ struct Dsv41Model::PagedGraphs {
       table[experts*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
       table[experts*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
     }
+    const auto built = profile_publish ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
     DGPP_CUDA_OK(cudaMemcpyAsync(tables, host_tables, layers * words * sizeof(uint64_t),
                                 cudaMemcpyHostToDevice, service));
     DGPP_CUDA_OK(cudaStreamSynchronize(service));
+    if (profile_publish) {
+      ++publish_calls;
+      publish_build_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(built-started).count();
+      publish_transfer_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now()-built).count();
+      publish_bytes += layers * words * sizeof(uint64_t);
+    }
     published_revision = cache.prepared_revision();
   }
 };
@@ -1848,6 +1864,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   // holds the main stream. Its independent service stream must never wait
   // on that paused stream. Before release, service kernels are completed.
   expert_cache_->set_execution_context(p.service);
+  const auto profile_started = p.profile_publish ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
   p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
   int accounted = 0;
   auto account = [&](int end) {
@@ -1893,6 +1911,16 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       expert_cache_->adapt(); expert_last_adapt_ = expert_cache_->observations();
     }
     ++p.passes;
+    if (p.profile_publish) {
+      p.profiled_walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now()-profile_started).count();
+      // Cumulative host wall clocks, not GPU kernel timings. Publication is
+      // nested in walk time; never add them together. Keep this diagnostic
+      // opt-in so normal serving does not pay clock or per-pass logging cost.
+      DGPP_LOG_INFO("dsv41 publish profile: passes={} rows={} misses={} calls={} build_ns={} transfer_wait_ns={} bytes={} walk_ns={}",
+          p.passes, T, p.misses, p.publish_calls, p.publish_build_ns,
+          p.publish_transfer_wait_ns, p.publish_bytes, p.profiled_walk_ns);
+    }
     if (p.passes == 1 || p.passes % 100 == 0)
       DGPP_LOG_INFO("dsv41 GPU paging: {} target replays, {} serviced layer misses", p.passes, p.misses);
   } catch (...) {
