@@ -56,4 +56,87 @@ SSD throughput limit for this deployment. Exact drive-bandwidth characterization
 is outside this pass, consistent with the user's instruction that exact
 bandwidth numbers are unnecessary.
 
-Serving validation and proxy/direct request accounting are pending.
+## Serving validation
+
+The two-Spark NVFP4 deployment ran source `bff4edaf`, binary SHA-256
+`0195a9cd19aa37e3dc54d779df19b82a4807ce9262fdc3487b0cb0ff6e341407`.
+It retained whole-expert caching, the 100 GiB per-rank reservation including
+draft weights, 24 canonical execution slots, four I/O workers, 16 staging
+buffers, direct I/O, fixed speculation depth three, and target-layer graphs.
+The serving endpoint and authentication configuration were unchanged.
+Both live Engram mappings and expert-image directories resolved to the local
+NVMe ext4 filesystem on each rank.
+
+The existing 24,128-token greedy tool-enabled diagnostic was replayed once from
+a freshly started server and twice warm. This is a focused regression comparison,
+not a new standard serving-campaign row set or a replay of a historical user
+conversation. Against the recorded fresh-server `ba60af73` diagnostic:
+
+- Cold engine prefill fell from 93.704 s to 66.329 s (29.2% less time);
+  prompt processing rose from 257.5 to 363.8 tokens/s.
+- Expert-image reads stayed approximately 118.8 GiB per rank across the complete
+  first request. These are logical expert-file bytes, not physical NVMe counters
+  and not decode-only traffic.
+- First-request wall time fell from 103.657 s to 76.541 s. Cold decode was
+  14.5 tokens/s versus 14.9 previously; this patch targets prefill.
+- The final warm repeat stayed at 45.7 decode tokens/s, with zero expert reads,
+  reconstruction, native preparation and canonical unpacking on both ranks.
+- All three outputs matched the earlier transcript, including reasoning and tool
+  arguments, excluding generated call IDs. Each generated 149 tokens in
+  45 verification passes, accepting 2.31 predictions per pass.
+- Both ranks reported zero process swap. The allocated target expert subsystem
+  remained 103,764,177,664 bytes within its 103,764,459,520-byte budget.
+
+The timing improvement measures the combined activation and wave-grouping
+changes; it does not isolate their individual contributions. It still does not
+establish that the remaining latency is entirely storage-bound.
+
+## Normal agent-path check
+
+A Codex subagent using the `spark-primary` model override exercised the normal
+OpenCodex → Combo → DGPP path. Its transcript records exactly one
+`ls -la` execution in `/home/jon/dgpp`, exit status zero, followed by a
+successful final answer. The task took 75.372 s:
+
+- Initial request: 24,138 prompt tokens, no cached prefix, 54.799 s engine
+  prefill, 90 generated tokens, 62.4 s server request duration.
+- Tool-result continuation: 25,162 prompt tokens, 24,064 cached tokens,
+  9.377 s engine prefill, 30 generated tokens, 11.5 s server request duration.
+- Combined server durations were approximately 73.9 s, leaving approximately
+  1.5 s for tool execution, proxy/client handling and other time outside the
+  recorded server requests. This is not an isolated proxy microbenchmark.
+- Both requests logged speculation eligible, temperature zero, depth three
+  and active tool grammar. A separate tool-enabled temperature-0.7 control
+  logged `reason=temperature` and generated four tokens with zero draft passes,
+  confirming fallback without changing the requested sampling behavior.
+- Across the complete two-request sequence, ranks read 78.919/78.881 GiB
+  of expert-image bytes and recorded 49,709/49,722 native-to-canonical unpacks.
+  Logical canonical output volume was about 494.8/494.9 GB. These unpack counts
+  are now distinct from 23,570/23,571 direct native executions. All these
+  counters include both prefill and decode; none is a decode-only bandwidth.
+- Both ranks remained at zero process swap.
+
+This actual agent sequence is different from the earlier direct diagnostic;
+their throughputs are not an apples-to-apples proxy comparison. The server's
+own durations do establish that most of this agent's wall time was inside DGPP.
+The new telemetry demonstrates remaining conversion work and substantial
+expert reads despite approximately 92% full-resident acquisitions. The changes
+do not make the deployment fully resident or eliminate its capacity penalty.
+
+## Review disposition
+
+Findings 1–3 are addressed by segment-local activation, bounded grouped
+canonical prefill and explicit conversion/wait counters. Finding 5 is addressed
+by effective-eligibility logging and the sampled/greedy serving checks.
+Finding 4's synchronous readiness boundary remains explicit; its recommendation
+to fix prefill first has been followed, without reviving the discarded
+transfer-stream prototype. Findings 6–8 are reflected in the interpretation
+above: distinguish historical warm results, differing reference quantization,
+local Engram placement, prefix reuse and actual server timing from UI rates.
+
+The bounded plan in finding 9 has produced focused numerical/work-count checks,
+a full-model regression comparison and a real proxy-mediated tool turn.
+No drive-limit claim or open-ended cache/prefetch campaign is made. Further
+large-prefill optimization can target direct prepared-weight execution to
+remove the newly visible unpack volume, with separate numerical qualification
+if it changes the GEMM recipe.

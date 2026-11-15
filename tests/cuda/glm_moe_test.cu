@@ -3608,7 +3608,7 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
           }
           for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
             CacheConfig cfg;
-            cfg.execution_slots = tokens > 64 ? 4 : 1;  // bounded single- and multi-expert waves
+            cfg.execution_slots = tokens >= 64 ? 4 : 1;  // includes uneven segments straddling the 16-row MMA tile boundary
             cfg.reads.buffers = 8;
             cfg.reads.workers = 4;
             cfg.reads.max_pending = 16;

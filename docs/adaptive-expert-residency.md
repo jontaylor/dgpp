@@ -1398,8 +1398,11 @@ native eager batching, rollback, prefix reuse and draft-chain verification.
 The historical conservative baseline reconstructs every selected expert,
 including full cache hits, into bounded scratch. The newer native-layout path
 above avoids rebuilding stable full hits. In the historical path, routing IDs
-and weights are copied to the host, and one expert segment executes per wave. Waves currently repeat
-whole-row gather/activation work. Whole misses execute from scratch and can
+and weights were copied to the host, with one expert segment per wave and
+repeated whole-row activation work. The BF16-activation FP4 path now uses
+bounded multi-expert canonical waves and segment-local activation; see the
+[external review response](expert-streaming-review-response.md). Prepared
+NVFP4 hits still unpack when the large-prefill recipe requires canonical weights. Whole misses execute from scratch and can
 populate persistent residency directly from the same staged bytes. Periodic
 adaptation remains available for workload-driven speculative allocation.
 Prefetch overlaps file work with existing kernel work; direct fractional
