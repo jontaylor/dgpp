@@ -281,7 +281,7 @@ class GlmMoeLayer {
   // waiting first, only if the host is kViewRing uploads ahead of the
   // stream, for that entry's previous upload to have executed.
   void upload_expert_views(MoeExpertView* d_dst, bool with_shared,
-                           cudaStream_t stream);
+                           cudaStream_t stream, const MoeExpertView* routed = nullptr);
   // The grouped chain shared by enqueue() and enqueue_prefill(): gather,
   // gate/up over the routed segments and the shared segment, swiglu, the
   // down projection — on the chosen kernel. accumulate_grouped consumes the

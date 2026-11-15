@@ -125,18 +125,38 @@ do not make the deployment fully resident or eliminate its capacity penalty.
 
 ## Review disposition
 
-Findings 1–3 are addressed by segment-local activation, bounded grouped
-canonical prefill and explicit conversion/wait counters. Finding 5 is addressed
-by effective-eligibility logging and the sampled/greedy serving checks.
-Finding 4's synchronous readiness boundary remains explicit; its recommendation
-to fix prefill first has been followed, without reviving the discarded
-transfer-stream prototype. Findings 6–8 are reflected in the interpretation
-above: distinguish historical warm results, differing reference quantization,
-local Engram placement, prefix reuse and actual server timing from UI rates.
+The review remains open. Segment-local activation, bounded canonical grouping,
+conversion counters and effective speculation eligibility are implemented and
+validated above. They do not close the following gaps:
 
-The bounded plan in finding 9 has produced focused numerical/work-count checks,
-a full-model regression comparison and a real proxy-mediated tool turn.
-No drive-limit claim or open-ended cache/prefetch campaign is made. Further
-large-prefill optimization can target direct prepared-weight execution to
-remove the newly visible unpack volume, with separate numerical qualification
-if it changes the GEMM recipe.
+- Prepared-weight large prefill still needs a measured direct execution path.
+- The remaining prefill cost needs GPU attribution; enqueue and synchronization
+  wall counters cannot isolate unpack, expert, dense and communication time.
+- The proxy check and direct check above used different requests. A matched
+  tool-request sequence is still required to compare the paths.
+- Miss groups still wait for synchronous acquisitions. Independent readiness
+  requires follow-through after profiling the corrected prefill path.
+
+No drive-limit claim is made. Exact drive-bandwidth characterization remains
+outside scope at the user's request.
+
+## Direct prepared prefill implementation
+
+The W4A16 prefill tile can now consume the prepared NVFP4 code and scale
+layout directly. It gathers only the current weight tile into shared memory,
+then retains the canonical BF16 decode, MMA order and output rounding. Packing,
+unpacking and prefill share the same layout-index functions.
+
+The host executes contiguous prepared runs directly and reconstructs other
+runs within the existing execution-slot budget. It retires native leases before
+miss admission can relocate cache storage. Source descriptors may remain
+metadata-only. W4A4 and GEMV keep their canonical fallback; small b12x batches
+and graph replay are unchanged. `DGPP_MOE_PREPARED_PREFILL=0` retains the previous
+large-prefill binding for comparisons.
+
+The checkpoint-geometry fixture (H=5120, I=1152, top-6) passes bitwise comparisons
+against canonical MMA at 65, 129 and 256 rows, including metadata-only source
+descriptors, prepared hits, residency pressure and subsequent verification.
+Prepared hits add no canonical unpack operations and leave no live native
+leases. The 24 host cache tests and both-format paged-wave regression pass.
+Serving latency validation remains pending.

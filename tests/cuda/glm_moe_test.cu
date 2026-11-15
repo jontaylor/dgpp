@@ -3294,7 +3294,7 @@ DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
 DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
   using namespace dgpp::expert;
   if (!dgpp::sm12x_moe_enabled(5120, 1152, 384, 6)) dgpp::test::skip("optional b12x AOT path disabled");
-  constexpr int H = 5120, I = 1152, E = 384, live = 12, M = dgpp::Sm12xMoe::kCapacity+1;
+  constexpr int H = 5120, I = 1152, E = 384, live = 12, M = 256;
   auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true);
   c.cfg.shared_run_lane_min_rows = 1;
   c.alloc();
@@ -3518,9 +3518,33 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
     layer.enqueue_paged(c.d_hidden,c.d_out,43,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     require(std::equal(prefill.begin(),prefill.end(),c.d_out),"prepared prefill replays with its own bounded scratch");
-    // Canonical larger-prefill fallback must safely read and demote prepared
-    // experts; the next verification pass returns to identical arithmetic.
-    layer.enqueue_paged(c.d_hidden,c.d_out,M,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
+    // Large prefills read the prepared layout in the canonical MMA recipe.
+    // Compare complete output, including merged gate/up row offsets, down,
+    // uneven tiles and the shared expert. Pressure exercises native/miss runs.
+    auto metadata = c.expert_mats_fp4;
+    for (auto& m : metadata) { m.payload = nullptr; m.scales = nullptr; m.global_scale = nullptr; }
+    auto paged_weights = c.dev_w;
+    paged_weights.experts_fp4 = metadata.data();
+    for (const int rows : {65, 129, M}) {
+      layer.enqueue(c.d_hidden,c.d_out,rows,stream,dgpp::MoeExpertKernel::kMma);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      const std::vector<uint16_t> canonical(c.d_out,c.d_out+rows*H);
+      const auto prior = hot.stats();
+      layer.rebind(paged_weights);
+      layer.enqueue_paged(c.d_hidden,c.d_out,rows,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      require(std::equal(canonical.begin(),canonical.end(),c.d_out),
+              "direct prepared prefill is bitwise canonical MMA at checkpoint geometry");
+      require(hot.stats().canonical_unpacks == prior.canonical_unpacks &&
+                  hot.stats().direct_native_hits > prior.direct_native_hits &&
+                  hot.stats().active_native_leases == 0,
+              "prepared prefill executes without unpacking and retires all native leases");
+      layer.enqueue_paged(c.d_hidden,c.d_out,rows,pressure,mapping,stream,dgpp::MoeExpertKernel::kMma);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      require(std::equal(canonical.begin(),canonical.end(),c.d_out),
+              "mixed prepared and reconstructed prefill preserves canonical arithmetic");
+      layer.rebind(c.dev_w);
+    }
     layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     std::memcpy(got.data(),c.d_out,got.size()*2);

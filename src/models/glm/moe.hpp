@@ -283,6 +283,10 @@ struct MoeExpertView {
   // The fp4 scale group (2026-09-13): 16 = NVFP4 (e4m3 scales + the global),
   // 32 = MXFP4 (e8m0 scales, no global — fp4_global stays null).
   int fp4_group = 16;
+  // Nonzero only for prepared NVFP4 consumed by the W4A16 prefill tile.
+  // Gate/up share a 2I-row allocation; up starts at row I.
+  int fp4_packed_rows = 0;
+  int fp4_packed_row0 = 0;
   // The packed-int interpretation: payload = the I32 words [n, k*bits/32]
   // as bytes, packed_scales = the group scales (bf16 per 64 or f16 per 128
   // by packed_scale_fmt, quant_matrix.hpp), bits = 4 or 8 (0: not packed).

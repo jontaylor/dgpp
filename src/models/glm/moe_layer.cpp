@@ -16,6 +16,7 @@
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/hadamard32.hpp"
 #include "kernels/moe_w4a4.hpp"
+#include "kernels/moe_fp4_pack.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "kernels/sm12x_moe.hpp"
@@ -24,6 +25,8 @@
 #include "loaders/expert_cache_cuda.hpp"
 
 namespace dgpp {
+
+static bool moe_w4a4_eligible(int hidden, int inter, size_t rows);
 
 namespace {
 // The routed tables' per-matrix view (the per-projection form reads each
@@ -957,29 +960,64 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const size_t wave_capacity = cache->memory().execution_slots;
     std::vector<expert::ExpertExecutionLease> leases;
     leases.reserve(std::min(wave_capacity, static_cast<size_t>(n_segs)));
+    // A prepared run uses native leases and the same prefill MMA arithmetic.
+    // End the run before a miss: native leases prevent cache relocation and
+    // admission, so they must retire before reconstructing the next run.
+    static const bool prepared_prefill = [] {
+      const char* e = std::getenv("DGPP_MOE_PREPARED_PREFILL");
+      return e == nullptr || e[0] != '0';
+    }();
+    const bool direct_prefill = prepared_prefill && cache->packed_nvfp4() &&
+        kernel == MoeExpertKernel::kMma &&
+        (w_.weight_only_fp4 || !moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total));
+    std::vector<MoeExpertView> prepared_views(static_cast<size_t>(E)*3);
     int activation_row = 0;
     for (int wave = 0; wave < n_segs;) {
       const int first = wave;
-      const int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      const bool native = direct_prefill &&
+          cache->prepared_address(cache_experts[static_cast<size_t>(active_experts[wave])]);
+      int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      if (direct_prefill)
+        for (int j = wave + 1; j < end; ++j)
+          if (bool(cache->prepared_address(cache_experts[static_cast<size_t>(active_experts[j])])) != native) {
+            end = j;
+            break;
+          }
       int wave_rows = 0, wave_max_rows = 0;
       for (; wave < end; ++wave) {
         const int e = active_experts[wave];
-        auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/true);
+        auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/!native);
         if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
         if (wave + 1 < n_segs)
           (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[wave + 1])]);
-        const auto matrices = expert::execution_matrices(lease, full, format);
-        if (leases.empty())
-          for (int entry = 0; entry < E; ++entry)
-            std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
-        std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e) * 3);
+        if (native) {
+          const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(lease.data()),
+              static_cast<int>(cfg_.hidden), static_cast<int>(full.intermediate_size));
+          for (int m = 0; m < 3; ++m) {
+            auto& v = prepared_views[static_cast<size_t>(e)*3+m];
+            v = MoeExpertView{};
+            v.payload = m == 2 ? p.w2 : p.w13;
+            v.fp4_scales = m == 2 ? p.s2 : p.s13;
+            v.fp4_global = m == 2 ? p.g2 : p.g13 + m;
+            v.fp4_packed_rows = m == 2 ? cfg_.hidden : 2*full.intermediate_size;
+            v.fp4_packed_row0 = m == 1 ? full.intermediate_size : 0;
+          }
+        } else {
+          const auto matrices = expert::execution_matrices(lease, full, format);
+          if (leases.empty())
+            for (int entry = 0; entry < E; ++entry)
+              std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
+          std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e) * 3);
+        }
         wave_rows += h_counts_[e];
         wave_max_rows = std::max(wave_max_rows, h_counts_[e]);
         leases.push_back(std::move(lease));
       }
-      w_.experts_fp4 = views.data();
-      check_expert_geometry();
-      upload_expert_views(d_views_prefill_, shared, stream);
+      w_.experts_fp4 = native ? original.experts_fp4 : views.data();
+      // Paged source descriptors carry geometry only. Native device views
+      // above come from live cache leases, not those absent source pointers.
+      if (!native) check_expert_geometry();
+      upload_expert_views(d_views_prefill_, shared, stream, native ? prepared_views.data() : nullptr);
       const int first_expert = active_experts[first];
       const int expert_span = active_experts[end - 1] - first_expert + 1;
       grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
@@ -988,7 +1026,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           grouped_decode ? tk : rows_total, stream,
           nullptr, nullptr, 0, end == n_segs, activation_row, wave_rows);
       activation_row += wave_rows;
-      for (auto& lease : leases) lease.release();
+      if (native) cache->release_native_leases(leases);
+      else for (auto& lease : leases) lease.release();
       leases.clear();
     }
     if (grouped_decode) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
@@ -1209,7 +1248,7 @@ void GlmMoeLayer::accumulate_grouped(uint16_t* out_bf16, float* out_f32, int sha
 }
 
 void GlmMoeLayer::upload_expert_views(MoeExpertView* d_dst, bool with_shared,
-                                      cudaStream_t stream) {
+                                      cudaStream_t stream, const MoeExpertView* routed) {
   const int E = cfg_.n_experts;
   const int slot = view_ring_next_;
   view_ring_next_ = (view_ring_next_ + 1) % kViewRing;
@@ -1220,7 +1259,7 @@ void GlmMoeLayer::upload_expert_views(MoeExpertView* d_dst, bool with_shared,
     DGPP_CUDA_OK(cudaEventSynchronize(view_ring_event_[slot]));
   MoeExpertView* h = h_view_ring_ + static_cast<size_t>(slot) * view_table_entries_;
   for (size_t i = 0; i < static_cast<size_t>(E) * 3; ++i)
-    h[i] = routed_view(w_, i);
+    h[i] = routed ? routed[i] : routed_view(w_, i);
   size_t n = static_cast<size_t>(E) * 3;
   if (with_shared) {
     for (int w = 0; w < 3; ++w)
