@@ -367,3 +367,93 @@ configuration are active after the comparison. The tested optional path is
 retained for review, not presented as a performance improvement. Eliminating
 remaining miss fences or optimizing large-prefill readiness would be further
 implementation work, not a result established by this comparison.
+
+## Updated long-prefill attribution and read identity
+
+After review of `60d10b92`, one new two-rank capture replayed the exact translated
+initial request and tool-result continuation. Runtime source: `a3412b27`; binary
+SHA-256 `d1ab72063de4f3e50cb510ad993be1ba0319ebc26c1dd21d05342ba23fd626f1`.
+This includes all previous execution fixes and grouped misses. The only new
+runtime facility is optional read tracing. Nsight again used 262,144 KV tokens
+for profiler headroom; the request bodies, expert budgets, execution slots,
+worker/staging counts, sampling and speculation remained unchanged. These are
+instrumented attribution results, not production throughput measurements.
+
+The store can write successful-read completion records when
+`DGPP_EXPERT_READ_TRACE` is a filename prefix. Output is
+`<prefix>.r<rank>.p<pid>.bin`; it contains timestamps, expert/chunk identity,
+record bytes and file offsets, never weights or prompt text. Tracing is off by
+default. `scripts/expert_read_trace.py` aggregates these records per expert and
+accepts `--start-ns` / `--end-ns` Unix-nanosecond windows. It distinguishes:
+
+- First-fetch bytes: chunks not previously read anywhere in that trace.
+- Reread bytes: chunks already fetched earlier in the trace.
+- Repeats within the selected window: chunks fetched more than once inside it.
+
+Classification is by chunk before aggregation, so partially resident experts
+are not misclassified as wholly new or wholly repeated. Counts are successful
+logical record bytes, including alignment; they are not physical SSD traffic.
+Read-duration sums overlap between workers and must not be treated as wall time.
+
+The six store tests pass, including trace identity, byte counts and duplicate
+reads. Analyzer validation distinguishes earlier-window rereads from repeats
+inside the current window. Full-model outputs, tool arguments, prompt/cache
+counts and speculative acceptance match the uninstrumented grouped control:
+50/29 output tokens, 14/9 target passes and 38/21 accepted predictions. Both
+ranks remained at zero swap. Read totals agree with existing rank telemetry.
+
+### Read volume
+
+The phase boundary is the first target-graph demand kernel. Thus the prefill
+window includes a small amount of initial draft/graph setup; it is not an exact
+engine timer boundary. Both ranks produced identical prefill read counts:
+
+| Phase | Expert reads (GiB/rank) | First fetch (GiB/rank) | Previously fetched (GiB/rank) | Repeated within phase (GiB/rank) |
+|---|---:|---:|---:|---:|
+| Initial prefill through first target graph | 106.317 | 106.317 | 0 | 0 |
+| Continuation prefill through first target graph | 10.646 | 3.166 | 7.480 | 0 |
+
+The initial window fetched chunks belonging to 11,385 target experts. The
+continuation fetched 1,140 target experts; 801 had previously fetched chunks.
+Neither prefill window reread a chunk internally. Across complete requests,
+including decode, reads were 110.118 and 12.971 GiB per rank.
+
+This rules out repeated chunk reloads *within these prefill phases* as the
+explanation for their latency. It does not establish optimal eviction between
+requests: 7.480 GiB of continuation prefill had been fetched previously.
+Replacement changes alone cannot remove the initial first-touch reads while
+preserving the same required payload and initially cold cache.
+
+### Updated GPU/file-read overlap
+
+| Prefill window | Rank | Window (s) | No GPU activity (s) | No GPU activity while either rank reads (s) | No GPU activity and neither rank reads (s) |
+|---|---:|---:|---:|---:|---:|
+| Initial | 0 | 63.874 | 40.643 | 30.343 | 10.301 |
+| Initial | 1 | 63.872 | 41.116 | 30.886 | 10.230 |
+| Continuation | 0 | 7.090 | 3.917 | 3.491 | 0.426 |
+| Continuation | 1 | 7.095 | 4.622 | 4.077 | 0.545 |
+
+An active read means a successful store read's start-to-completion interval,
+not SSD utilization. Accounting for both ranks matters: checking only local
+reads would attribute approximately 14 seconds of initial GPU inactivity to
+non-I/O work, versus approximately 10.3 seconds with the peer included.
+These gaps can include host planning, synchronization, communication progress
+and instrumentation overhead; they are not automatically recoverable time.
+Overlap does not establish causation or prove ready resident work existed
+throughout each gap. Untraced Engram page faults are not expert-image reads.
+
+Initial routed-prefill kernel sums were approximately 7.79 / 7.72 s on ranks
+0 / 1; expert layout/scatter sums were 3.24 / 3.22 s. Continuation routed-prefill
+sums were 1.39 / 1.38 s. Kernel sums can overlap other activity and must not be
+added to the wall timeline categories. Engine prefill timers were 63.810 and
+7.053 s; instrumented decode timers were 3.000 and 1.890 s.
+
+The next supported direction is large-prefill scheduling and host coordination:
+submit demand reads while executing prepared resident work, and avoid limiting
+resident groups by reconstruction-slot capacity. Its lease/admission ordering
+still requires an implementation and a matched comparison. The current capture
+does not prove that reordering will win or that the remaining time is an
+irreducible SSD limit. No additional tuning of the optional decode readiness
+path was performed. Production was restored once after capture, retaining its
+million-token context, endpoint, credentials and grouped misses; diagnostic
+tracing/profiling is not enabled there.
