@@ -700,6 +700,31 @@ DGPP_TEST(expert_cache_resource_pressure_defers_only_background_work) {
             "background promotions resume after pressure clears");
   }
 }
+DGPP_TEST(expert_cache_readiness_observes_completed_reads_without_consuming_them) {
+  Fixture f;
+  auto cfg = f.config(Policy::kWholeExpert);
+  const auto record_bytes = cfg.reads.staging_budget_bytes / cfg.reads.buffers;
+  cfg.planner.budget_bytes += 5 * record_bytes;
+  cfg.reads.buffers = 8;
+  cfg.reads.max_pending = 8;
+  cfg.reads.staging_budget_bytes = 8 * record_bytes;
+  ExpertCache cache(f.store, cfg, host(f));
+  cache.initialize();
+  require(!cache.demand_ready(0), "missing unqueued expert is not ready");
+  require(cache.lookahead_demand(0) == 4, "queue every chunk of the expert");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!cache.demand_ready(0) && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  require(cache.demand_ready(0), "completed demand tickets make the expert ready");
+  require(!cache.demand_ready(1), "other unqueued experts remain unavailable");
+  require(cache.residency().chunks[0] == 0, "readiness does not admit staging bytes");
+  const auto calls = f.store->stats().calls;
+  { auto lease = cache.acquire(0); check_bytes(lease, f); }
+  require(f.store->stats().calls == calls, "acquisition reuses the observed ready tickets");
+  require(cache.demand_ready(0), "admitted resident expert stays ready");
+  refuses([&] { (void)cache.demand_ready(99); });
+}
+
 DGPP_TEST(expert_cache_demand_lookahead_is_bounded_under_pressure) {
   for (auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
     Fixture f;

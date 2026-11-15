@@ -972,6 +972,10 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
         cache->packed_nvfp4() && !full_batch_activation && chunk_layout.intermediate_size % 64 == 0 &&
         (chunk_layout.intermediate_size & (chunk_layout.intermediate_size-1)) == 0 &&
         full.intermediate_size % chunk_layout.intermediate_size == 0;
+    static const bool ready_prefill = [] {
+      const char* value = std::getenv("DGPP_EXPERT_READY_PREFILL");
+      return value && std::atoi(value) != 0;
+    }();
     const size_t staging_buffers = cache->memory().staging_bytes / chunk_layout.record_bytes;
     const size_t wave_capacity = std::min(std::max<size_t>(1, cache->memory().execution_slots / 2),
         chunk_direct_prefill ? std::max<size_t>(1, staging_buffers / (2*chunks_per_expert))
@@ -1036,7 +1040,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     int activation_row = 0;
     for (int wave = 0; wave < n_segs;) {
       const int first = wave;
-      const int end = resident_first && wave == 0 && resident_count
+      int end = resident_first && wave == 0 && resident_count
           ? static_cast<int>(resident_count)
           : wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
       // Full resident chunks need only one conversion to the direct layout.
@@ -1099,6 +1103,13 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           leases.push_back(std::move(lease));
           reconstructed[j-first] = true;
           progress = true;
+          // Submit the ready prefix instead of blocking this entire wave on
+          // the next SSD read. Keep segment/accumulation order unchanged and
+          // preserve the existing lookahead and staging-reader retirement.
+          // Native-only groups retain their larger grouping above.
+          if (ready_prefill && chunk_direct_prefill && direct_prefill && j+1 < end &&
+              !cache->demand_ready(cache_experts[static_cast<size_t>(active_experts[j+1])]))
+            end = j+1;
         }
       } while (direct_prefill && progress);
       int wave_rows = 0, wave_max_rows = 0;

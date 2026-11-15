@@ -886,6 +886,18 @@ size_t ExpertCache::prefetch(size_t expert) {
   }
   return accepted;
 }
+bool ExpertCache::demand_ready(size_t expert) const {
+  const auto& s = *state_;
+  s.check();
+  s.expert_index(expert);
+  if (s.native_start[expert] != absent) return true;
+  for (auto record : s.experts[expert].records) {
+    if (s.slots[record] != absent) continue;
+    const auto it = s.prefetched.find(record);
+    if (it == s.prefetched.end() || !it->second.ticket->ready()) return false;
+  }
+  return true;
+}
 size_t ExpertCache::lookahead_demand(size_t expert) {
   auto& s = *state_;
   s.check();

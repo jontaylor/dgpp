@@ -221,6 +221,10 @@ class ExpertCache {
   // Already-routed upcoming work, not speculative background traffic. Uses
   // at most half of the existing staging slots and never changes residency.
   size_t lookahead_demand(size_t expert);
+  // Nonblocking observation only: every missing chunk has a completed ticket.
+  // Read failures count as ready and are propagated by acquire(). Residency
+  // can change on subsequent admissions; this is a scheduling hint, not a lease.
+  bool demand_ready(size_t expert) const;
   CacheStats stats() const;
   ReadQueueStats read_stats() const;
   CacheTelemetry telemetry() const;
