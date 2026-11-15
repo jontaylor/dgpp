@@ -383,6 +383,21 @@ DGPP_TEST(expert_planner_cost_aware_admission_distinguishes_equal_frequency_expe
   require(p.propose().chunks[1] == 4, "expensive equally frequent miss is retained");
 }
 
+DGPP_TEST(expert_planner_fixed_cost_preserves_frequency_ranking_despite_load_samples) {
+  for (bool learn : {false, true}) {
+    auto c = config(Policy::kWholeExpert, 400);
+    c.learn_load_cost = learn;
+    ResidencyPlanner p(c, equal_experts(2, 4));
+    p.observe(std::vector<size_t>{0, 0, 0, 1});
+    p.observe_load(1, 100);
+    const auto plan = p.propose();
+    require(plan.chunks[learn ? 1 : 0] == 4,
+            "fixed costs preserve popularity; learned costs may prefer the expensive expert");
+    refuses([&] { p.observe_load(2, 1); });
+    refuses([&] { p.observe_load(0, 0); });
+  }
+}
+
 DGPP_TEST(expert_planner_random_workload_shift_maintains_budget_and_policy_invariants) {
   std::mt19937 rng(41);
   for (auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {

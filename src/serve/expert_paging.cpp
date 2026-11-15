@@ -66,6 +66,10 @@ expert::PagingOptions parse_expert_paging(const minijson::Value& v, const std::s
     else if (key == "initial_fraction") p.initial_fraction = number(x, what, key, std::numeric_limits<double>::min(), 1);
     else if (key == "decay_routes") p.decay_routes = number(x, what, key, 1, 1e15);
     else if (key == "horizon_routes") p.horizon_routes = number(x, what, key, 1, 1e15);
+    else if (key == "learn_load_cost") {
+      if (!x.is_bool()) bad(what, key, "expected true or false");
+      p.learn_load_cost = x.as_bool();
+    }
     else if (key == "promotion_margin") p.promotion_margin = number(x, what, key, 0, 1e6);
     else if (key == "cooldown_routes") p.cooldown_routes = integer(x, what, key);
     else if (key == "adaptation_bytes") p.adaptation_bytes = integer(x, what, key);
@@ -96,6 +100,7 @@ std::string expert_paging_json(const expert::PagingOptions& o) {
       << ",\"prefetch_bytes\":" << r.prefetch_bytes << ",\"io_mode\":" << json_string(o.io_mode == IoMode::kDirect ? "direct" : "buffered")
       << ",\"minimum_fraction\":" << p.minimum_fraction << ",\"decay_routes\":" << p.decay_routes
       << ",\"horizon_routes\":" << p.horizon_routes << ",\"promotion_margin\":" << p.promotion_margin
+      << ",\"learn_load_cost\":" << (p.learn_load_cost ? "true" : "false")
       << ",\"cooldown_routes\":" << p.cooldown_routes;
   if (p.initial_fraction) out << ",\"initial_fraction\":" << *p.initial_fraction;
   if (p.adaptation_bytes != UINT64_MAX) out << ",\"adaptation_bytes\":" << p.adaptation_bytes;

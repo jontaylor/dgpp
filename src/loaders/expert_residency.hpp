@@ -85,6 +85,7 @@ struct PlannerConfig {
   std::optional<double> initial_fraction;
   double decay_routes = 1024;  // exponential half-life in routed selections
   double horizon_routes = 8192;
+  bool learn_load_cost = true;  // false retains each expert's initial cost estimate
   double promotion_margin = 0.25;
   uint64_t cooldown_routes = 128;
   uint64_t adaptation_bytes = UINT64_MAX;  // newly retained bytes per plan

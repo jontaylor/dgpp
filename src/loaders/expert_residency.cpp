@@ -300,6 +300,7 @@ void ResidencyPlanner::observe(std::span<const size_t> selected) {
 void ResidencyPlanner::observe_load(size_t expert, double ms) {
   if (expert >= experts_.size() || !std::isfinite(ms) || ms <= 0)
     throw std::invalid_argument("expert residency: invalid measured load cost");
+  if (!config_.learn_load_cost) return;
   experts_[expert].estimated_load_ms = 0.75 * experts_[expert].estimated_load_ms + 0.25 * ms;
 }
 
