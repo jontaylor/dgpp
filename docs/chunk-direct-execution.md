@@ -799,3 +799,40 @@ remain intact. The earlier ready-prefix control does not truncate these waves.
 The candidate is opt-in and is not selected for deployment without serving
 evidence. The isolated activation test covers nonmonotonic uneven segments,
 zero-length segments, untouched gaps and bitwise arithmetic parity.
+
+### Ready-group serving screen: not selected
+
+Implementation `e5d19f1e` was built before commit, stamped with parent
+`f3d217f0`, and tested on both ranks with binary SHA-256
+`e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`.
+The segmented-activation parity test and checkpoint-shaped b12x paging test
+passed with ready groups, chunk-direct prefill and resident-first execution
+enabled. The latter covers whole/fractional policies, misses, hits, pressure,
+prepared prefill and graph paths. These tests do not constitute full-model
+quality evaluation.
+
+The first ordered run produced a different continuation stream from previous
+binaries: 39.113 seconds total continuation wall time and 44.376 GiB of reads
+per rank, with changed acceptance. The initial tool response matched. The
+ready-group run instead matched the earlier output stream. Therefore those
+two timings cannot support a same-output scheduler speedup/regression claim.
+A single repeated ordered run on this same binary returned to the earlier
+stream. The initial outlier and its unresolved cause are retained; neither
+correctness failure nor harmless numerical variation has been established.
+
+The ready-group candidate and repeated ordered control matched all seven
+normalized outputs, usage and read volumes, plus tool-loop acceptance. Cold
+prefill was 38.333 seconds ready versus 38.622 ordered. Three continuations
+were 41.165 versus 40.972 seconds wall, with summed prefill 5.395 versus 5.465
+seconds and engine decode 35.637 versus 35.351 seconds. Both read 47.009 GiB
+per rank over the continuations. These are focused diagnostics, not campaign
+rows or evidence of a meaningful speedup.
+
+Small-repeat prefills were 7.583, 2.970 and 1.614 seconds ready, versus 7.810,
+2.821 and 1.631 ordered. Both reached zero expert reads on the third repeat;
+decode then measured 51.60 versus 52.88 tokens/s. All runs stayed at zero swap.
+The default ordered path remains deployed, with the temporary ready-groups
+override removed. The last ordered repeat left serving ready. Arbitrary ready
+grouping is now implemented and fixture-tested, but this bounded candidate
+has no demonstrated serving advantage. No broader readiness-tuning sweep was
+performed.
