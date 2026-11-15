@@ -3694,6 +3694,7 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
               const auto reads_before = store->stats().calls;
               const auto counters_before = cache.stats();
               const auto activation_before = layer.activation_elements_processed();
+              const auto observations_before = cache.observations();
               DGPP_CUDA_OK(cudaMemsetAsync(c.d_out, 0x7F, count * 2, stream));
               layer.enqueue_paged(c.d_hidden, c.d_out, tokens, cache, mapping, stream, kernel);
               DGPP_CUDA_OK(cudaDeviceSynchronize());
@@ -3701,6 +3702,14 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
               require(layer.last_ids() == expected_ids && layer.last_weights() == expected_weights,
                       "paged GPU segmentation preserves routing getter semantics");
               require(got == expected, "paged waves must be bitwise the resident complete-expert chain");
+              auto observed_ids = expected_ids;
+              const char* demand_history = std::getenv("DGPP_EXPERT_PREFILL_DEMAND_HISTORY");
+              if (demand_history && std::atoi(demand_history) != 0 && kernel == dgpp::MoeExpertKernel::kMma) {
+                std::sort(observed_ids.begin(), observed_ids.end());
+                observed_ids.erase(std::unique(observed_ids.begin(), observed_ids.end()), observed_ids.end());
+              }
+              require(cache.observations() - observations_before == observed_ids.size(),
+                      "prefill demand history deduplicates experts while decode keeps token observations");
               require(layer.activation_elements_processed() - activation_before <=
                           static_cast<uint64_t>(tokens) * (c.cfg.top_k + 1) * c.cfg.inter,
                       "paged activation work must not multiply batch rows by active experts");

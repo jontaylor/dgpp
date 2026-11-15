@@ -757,10 +757,20 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
                                  cudaMemcpyHostToDevice, stream));
   }
   if (cache) {
-    // Repeated route IDs are observations of reuse, not a unique-expert set.
+    static const bool prefill_demand_history = [] {
+      const char* value = std::getenv("DGPP_EXPERT_PREFILL_DEMAND_HISTORY");
+      return value && std::atoi(value) != 0;
+    }();
+    // DSV4.1 supplies prefill readers as MMA and decode/verifier rows as
+    // GEMV, including mixed batches. The optional prefill policy counts one
+    // demand per expert in this invocation, rather than treating a thousand
+    // rows sharing its weights as a thousand independent fetch opportunities.
+    // It also bounds clock advancement; default and decode retain token counts.
+    const bool demand_history = prefill_demand_history && kernel == MoeExpertKernel::kMma;
     std::vector<size_t> selected;
-    selected.reserve(tk);
-    for (const auto id : h_ids_) selected.push_back(cache_experts[static_cast<size_t>(id)]);
+    selected.reserve(demand_history ? active_experts.size() : tk);
+    const auto& observations = demand_history ? active_experts : h_ids_;
+    for (const auto id : observations) selected.push_back(cache_experts[static_cast<size_t>(id)]);
     cache->observe(selected);
     if (cache->packed_nvfp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
         (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
