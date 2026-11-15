@@ -616,3 +616,54 @@ drain findings with per-buffer staging completion, scratch/native reader fences
 and rotating prefill scratch. Cold prefill improves about 4.8% in the focused
 comparison; steady warm performance is unchanged. Independent ready-expert
 launches, chunk-direct kernels and activation-precision qualification remain open.
+
+### Follow-up review of `c147652`: current disposition
+
+The external review "DGPP serving performance: next experiments" was checked
+against `bc330320`. Its source observations are hypotheses about performance,
+not measurements from the live Sparks or instructions to implement every idea.
+
+- **Global estimator clock: verified concern, partially addressed.** The clock
+  still advances for every selected token/expert across layers. The retained
+  65536 half-life reduced warmed prefill time by 27.8% in the focused tool
+  sequence; see [cache history results](chunk-direct-execution.md#cache-history-follow-up-2026-11-15).
+  The comparison held horizon at 8192, so periodic normalization changed too.
+  Layer-aware ageing, phase-aware histories and fetch-event statistics are not
+  implemented. Larger decay helped recomputed prefill but hurt prefix-enabled
+  continuations; the proportional-horizon control also failed to improve serving.
+  Decay 65536 with horizon 8192 remains selected.
+- **Four blocking readers: verified mechanism, benefit unproven.** Each worker
+  calls the blocking store reader before taking another job. Queue capacity
+  256 is not 256 concurrent expert read calls, and the queue's active count
+  includes staging acquisition. The current deployment still uses four workers.
+  Eight and sixteen workers are inexpensive next candidates with the same
+  staging pool and cache capacity. No asynchronous I/O backend is justified yet.
+- **Adjacent-range coalescing: verified gap, deferred.** Current coalescing
+  deduplicates one record; it does not combine neighboring records. Preserve
+  alignment, per-chunk views and GPU reader lifetimes if physical coalescing
+  proves useful. No image rebuild or chunk-width change has been made.
+- **Full GPU binding publication: verified mechanism, cost unmeasured.** A
+  prepared revision change still rebuilds every target layer's table, copies
+  all entries and synchronizes the service stream. An unchanged revision exits
+  immediately. Dirty publication is not implemented; timing that function
+  should precede the change. Any eventual dirty set must include removals and
+  relocations, not only admissions.
+- **Ready prefill groups: partially investigated, no serving win.** The newer
+  opt-in ready-prefix experiment was correct but did not improve the matched
+  serving sequence, and is disabled. It preserves order and does not run
+  arbitrary later-ready experts. Full readiness-based grouping remains open;
+  reader concurrency should be tested before another scheduler rewrite.
+- **Normal tool continuations and demand replay: remaining coverage gaps.**
+  The original comparisons disabled prefix reuse and used short forced tool
+  calls. A new direct-DGPP continuation comparison enables prefix reuse and
+  includes capped prose/code answers; it rejected the larger-history candidate.
+  Exact Combo-client traffic and uncapped task completion remain untested.
+  Successful-read traces cannot provide a complete alternative
+  policy replay: hits, grouped demand events and starting residency are also
+  required. No future-aware traffic bound has been measured.
+
+Existing resident-first execution, prepared layouts, Engram direct caching and
+transfer-stream ownership should not be reimplemented. W4A4 remains disabled
+because its earlier serving screen was slower and changed acceptance. The
+context and precision settings remain unchanged. These conclusions do not
+claim that cache policy or storage alone explains all remaining latency.

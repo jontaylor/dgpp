@@ -264,3 +264,60 @@ Validation passed: all 28 host cache tests, the generic paged-wave GPU fixture,
 and the checkpoint-sized B12x paging fixture with chunk-direct, ready-prefix,
 GPU scatter and resident-first enabled. The latter checks bitwise prefill
 agreement with canonical execution and confirms discontiguous chunk reads.
+
+## Longer history and proportional-horizon control
+
+A further configuration-only diagnostic at the same `9de2eef1` implementation
+and binary hash `ecb2bc043318e04da6c075e0dcad5d82f562ecdb33d06bbe9709b111249bad84`
+tested decay 1048576. Ready-prefix remained disabled and memory stayed fixed.
+The control is the preceding ready-prefix-off sequence (decay 65536, horizon
+8192); the same five requests were replayed after fresh process restarts.
+
+With horizon held at 8192, cold prefill was 40.717 seconds. Summed prefill for
+four warmed requests fell from the control's 63.246 to 54.238 seconds (14.2%),
+and average per-rank expert traffic fell from 92.02 to 51.82 GiB. Summed decode
+time rose from 11.383 to 12.831 seconds (12.7%); the per-request engine rates
+were 17.58/13.92/14.92/14.75 tokens/s. Service-level elapsed time fell from
+74.797 to 67.250 seconds (10.1%). This is a prefill/decode tradeoff, not a
+uniform improvement.
+
+The external review suggested preserving horizon/decay = 8. Holding decay at
+1048576 and raising horizon to 8388608 instead produced 40.831-second cold
+prefill, 60.169 seconds summed warmed prefill, 15.027 seconds summed decode,
+and 75.395 seconds service-level elapsed time. It did not beat the retained
+65536/8192 control. Both larger-decay arms matched all five normalized outputs,
+usage and speculative acceptance. Both ranks stayed at zero swap and each
+request recomputed its prompt with zero prefix-cached tokens.
+
+The fixed-horizon result cannot isolate ageing from normalized periodic
+adaptation benefit. The prefix-enabled continuation comparison below tests whether, once prompt
+reuse removes most prefill work, the decode penalty outweighs that saving. The proportional
+horizon setting is not selected merely because it preserves the default ratio.
+
+
+The subsequent direct-DGPP tool-continuation comparison **rejects decay
+1048576 for the deployment**. Each arm restarted, made the root-listing tool
+request with prefix reuse enabled, then supplied the same fixed representative
+tool result. Follow-ups requested a prose investigation plan, a Python cache
+helper review, and a repeat of the prose request. Tools remained enabled with
+auto choice, and each follow-up had a 256-token output cap. These are controlled
+representative continuations, not captured Combo-client traffic or a quality
+benchmark: all three textual outputs reached the cap.
+
+All normalized outputs, usage, acceptance and finish reasons matched. The first
+two follow-ups reused 24,192 tokens; the repeated prose reused 24,448. Against
+65536/8192, the 1048576/8192 candidate increased their summed service-level time
+from 47.878 to 63.866 seconds (33.4%), summed prefill from 6.689 to 8.311 seconds,
+and summed engine decode from 41.057 to 55.411 seconds. Per-request engine decode
+rates fell from 15.10/19.05/23.64 to 11.59/12.90/18.71 tokens/s. Average per-rank
+expert reads across the three continuations rose from 55.60 to 101.15 GiB.
+Both ranks remained at zero swap. The initial cold tool request took 43.051
+versus 42.471 seconds in prefill and about 46.2 seconds service-level in each arm.
+
+This reverses the result from recomputed long prompts. The data support testing
+phase-aware retention rather than simply lengthening one global history; they
+do not yet prove a particular replacement policy. Production is restored to
+**decay 65536, horizon 8192, four read workers**, with ready-prefix disabled.
+The next cheap configuration test is reader concurrency, before adding I/O or
+scheduling machinery. Exact normal-client tool loops, uncapped task completion,
+phase-aware histories and a future-aware traffic bound remain untested.
