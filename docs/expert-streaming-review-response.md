@@ -448,12 +448,70 @@ sums were 1.39 / 1.38 s. Kernel sums can overlap other activity and must not be
 added to the wall timeline categories. Engine prefill timers were 63.810 and
 7.053 s; instrumented decode timers were 3.000 and 1.890 s.
 
-The next supported direction is large-prefill scheduling and host coordination:
-submit demand reads while executing prepared resident work, and avoid limiting
-resident groups by reconstruction-slot capacity. Its lease/admission ordering
-still requires an implementation and a matched comparison. The current capture
-does not prove that reordering will win or that the remaining time is an
-irreducible SSD limit. No additional tuning of the optional decode readiness
+Process-level counters expose another contributor which the expert trace does
+not include: the initial request incurred 596,072 / 598,290 major page faults
+and 148.748 / 148.867 GiB of process reads on ranks 0 / 1. That is roughly
+38.6–38.7 GiB beyond expert-image reads. These counters include other mapped
+files and read amplification; they do not individually identify Engram traffic,
+but the mmap-backed Engram gather is a concrete source to investigate. Thus the
+10.3-second gap must not be labeled pure host overhead or non-storage time.
+
+Inspection found a specific Engram prefetch defect: `gather()` aligned
+`MADV_WILLNEED` addresses to 4 KiB, whereas both deployment hosts use 64 KiB
+pages. A direct syscall check on Spark confirmed that a 4 KiB-offset address
+returns `EINVAL`, while the host-page-aligned address succeeds. The constructor
+already uses `MADV_RANDOM`; simply adding that advice again is not a remedy.
+
+Large-prefill resident-first scheduling remains a supported hypothesis: submit
+demand reads while executing prepared resident work, and avoid limiting resident
+groups by reconstruction-slot capacity. Its lease/admission ordering still needs
+implementation and a matched comparison. The concrete Engram alignment defect
+takes priority over speculative overlap changes. The capture does not establish
+that reordering will win or that the remaining time is an irreducible SSD limit. No additional tuning of the optional decode readiness
 path was performed. Production was restored once after capture, retaining its
 million-token context, endpoint, credentials and grouped misses; diagnostic
 tracing/profiling is not enabled there.
+
+### Engram page-size correction and hint policy
+
+The Engram gather now derives alignment from `_SC_PAGESIZE`, and each hint
+covers the actual payload/scale row extent. Invalid ranges are reported instead
+of silently accepting `EINVAL`. Both FP8 and MXFP4 Engram GPU fixtures pass
+bitwise on the 64 KiB-page Spark, with hints enabled and disabled.
+
+The corrected-hint diagnostic (`fcffa57f`, production 1M context, profiling and
+read tracing off) did not demonstrate a speedup: initial prefill was 65.054 s,
+continuation prefill 6.936 s, and total pair wall time 77.044 s. The earlier
+grouped control recorded 63.262 / 6.680 s prefill and 74.850 s pair wall.
+Major faults dropped from 581,299 / 583,562 to 6,411 / 47,055 initially, but
+process reads remained 148.691 / 151.569 GiB. The hints moved work ahead of the
+demand faults without removing read volume; fewer major faults did not imply
+faster serving. These observations do not isolate all OS-cache/run variation.
+
+Explicit hints are now optional with `DGPP_ENGRAM_PREFETCH=1`; the alternative
+uses the existing parallel gather threads to fault demanded pages directly.
+This removes the per-row hint syscalls rather than preserving misaligned hints
+as an accidental optimization. Neither path changes gathered bytes or routing.
+
+The no-hint diagnostic used runtime source `5a516a9c`, binary SHA-256
+`7bf02101d8c628cb8ba3e702da7b816b4db0e5654b3e2067eee777076db95a32`.
+With production 1M context and no profiling/tracing:
+
+| Request | Prefill (s) | Decode (s) | Decode (tok/s) | Wall (s) |
+|---|---:|---:|---:|---:|
+| Initial | 63.153 | 2.885 | 16.99 | 66.077 |
+| Continuation | 6.467 | 1.863 | 15.03 | 8.382 |
+
+The pair took 74.459 s, versus 77.044 s with corrected explicit hints and
+74.850 s for the earlier grouped control. This supports leaving hints disabled;
+it does not establish a material prefill gain over the original control.
+All three arms matched outputs, tool arguments, usage and acceptance, with zero
+swap on both ranks. The no-hint binary is deployed with the existing endpoint,
+keys, 1M context and grouped expert misses. Aligned hints remain opt-in for
+workloads where a separate comparison establishes benefit.
+
+This pass adds current attribution and fixes a real page-size assumption; it
+does not claim to solve the remaining prefill latency. Future work should include
+Engram's mapped-file read amplification alongside resident-first prefill
+scheduling. A chunk identity trace alone cannot declare either subsystem the
+irreducible hardware bottleneck.
