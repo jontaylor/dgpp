@@ -336,6 +336,12 @@ DGPP_TEST(expert_cache_native_layouts_survive_repeated_random_admission_and_adap
             { auto lease = cache.acquire(e); check_bytes(lease, f, e); }
             { auto lease = cache.acquire(e); check_bytes(lease, f, e); }
             if (step % 17 == 0) cache.adapt();
+            const std::array<size_t, 4> indices{3, 1, 0, 2};
+            std::array<const uint8_t*, 4> addresses;
+            cache.prepared_addresses(indices, addresses);
+            for (size_t i = 0; i < indices.size(); ++i)
+              require(addresses[i] == cache.prepared_address(indices[i]),
+                      "bulk bindings match scalar bindings after packing, eviction and relocation");
             const auto& p = cache.residency();
             require(p.cache_bytes + p.reserved_bytes <= cfg.planner.budget_bytes, "native layout churn respects hard budget");
             for (size_t count : p.chunks)
@@ -357,6 +363,14 @@ DGPP_TEST(expert_cache_grouped_native_preparation_is_stable_and_retires_with_one
   ExpertCache cache(f.store, cfg, host(f, control));
   cache.initialize();
   const std::array<size_t, 2> routed{0, 1};
+  const uint8_t marker = 0;
+  std::array<const uint8_t*, 2> addresses{&marker, &marker};
+  refuses([&] { cache.prepared_addresses(std::array<size_t, 2>{0, 99}, addresses); });
+  require(addresses[0] == &marker && addresses[1] == &marker,
+          "invalid bulk index does not partially publish bindings");
+  refuses([&] { cache.prepared_addresses(routed, std::span(addresses).first(1)); });
+  cache.prepared_addresses(routed, addresses);
+  require(!addresses[0] && !addresses[1], "unprepared bulk entries are explicitly cleared");
   const auto initial_revision = cache.prepared_revision();
   require(!cache.prepared_address(0), "unprepared experts have no GPU binding");
   require(!cache.prepare_resident(routed) && cache.stats().native_packs == 0,
@@ -599,6 +613,8 @@ DGPP_TEST(expert_cache_thread_handoff_requires_quiescent_explicit_release_and_bi
     try {
       refuses([&] { cache.bind_execution_thread(); });
       refuses([&] { (void)cache.stats(); });
+      std::array<const uint8_t*, 1> addresses;
+      refuses([&] { cache.prepared_addresses(std::array<size_t, 1>{0}, addresses); });
     } catch (...) { failure = std::current_exception(); }
   });
   unauthorized.join();

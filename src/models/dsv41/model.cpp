@@ -48,11 +48,14 @@ struct Dsv41Model::PagedGraphs {
   uint64_t passes = 0, misses = 0;
   uint64_t published_revision = 0;
   bool profile_publish = false;
+  bool bulk_publish = true;
   uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
   uint64_t publish_bytes = 0, profiled_walk_ns = 0;
   explicit PagedGraphs(int n) : layers(n) {
     const char* profile = std::getenv("DGPP_EXPERT_PROFILE_PUBLISH");
     profile_publish = profile && std::atoi(profile) != 0;
+    const char* bulk = std::getenv("DGPP_EXPERT_BULK_BINDINGS");
+    bulk_publish = !bulk || std::atoi(bulk) != 0;
     prepare_moe_fp4_pack();
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
@@ -75,17 +78,21 @@ struct Dsv41Model::PagedGraphs {
     const auto started = profile_publish ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
     std::fill_n(host_tables, layers * words, uint64_t{0});
-    for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
-      const auto* address = cache.prepared_address(mapping[l][e]);
-      if (!address) continue;
-      const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
-      auto* table = host_tables + l * words;
-      table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
-      table[e*3+1] = reinterpret_cast<uintptr_t>(p.s13);
-      table[e*3+2] = reinterpret_cast<uintptr_t>(p.g13);
-      table[experts*3+e*3] = reinterpret_cast<uintptr_t>(p.w2);
-      table[experts*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
-      table[experts*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
+    std::array<const uint8_t*, experts> addresses;
+    for (int l = 0; l < layers; ++l) {
+      if (bulk_publish) cache.prepared_addresses(mapping[l], addresses);
+      for (int e = 0; e < experts; ++e) {
+        const auto* address = bulk_publish ? addresses[e] : cache.prepared_address(mapping[l][e]);
+        if (!address) continue;
+        const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
+        auto* table = host_tables + l * words;
+        table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
+        table[e*3+1] = reinterpret_cast<uintptr_t>(p.s13);
+        table[e*3+2] = reinterpret_cast<uintptr_t>(p.g13);
+        table[experts*3+e*3] = reinterpret_cast<uintptr_t>(p.w2);
+        table[experts*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
+        table[experts*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
+      }
     }
     const auto built = profile_publish ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};

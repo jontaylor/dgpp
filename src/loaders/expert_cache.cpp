@@ -485,6 +485,18 @@ const uint8_t* ExpertCache::prepared_address(size_t expert) const {
   return s.native_start[expert] == absent ? nullptr : s.storage->cache_data(s.native_start[expert]);
 }
 uint64_t ExpertCache::prepared_revision() const { state_->check(); return state_->prepared_revision; }
+void ExpertCache::prepared_addresses(std::span<const size_t> experts,
+                                    std::span<const uint8_t*> addresses) const {
+  const auto& s = *state_;
+  s.check();
+  if (experts.size() != addresses.size())
+    throw std::invalid_argument("expert cache: prepared address span sizes differ");
+  for (const auto e : experts) s.expert_index(e);
+  for (size_t i = 0; i < experts.size(); ++i) {
+    const auto slot = s.native_start[experts[i]];
+    addresses[i] = slot == absent ? nullptr : s.storage->cache_data(slot);
+  }
+}
 void ExpertCache::set_execution_context(void* context) {
   auto& s = *state_; s.check();
   if (s.counters.active_execution_slots || s.counters.active_native_leases)

@@ -206,6 +206,10 @@ class ExpertCache {
   // walk that stops payload readers before any cache mutation. A revision
   // change invalidates the published table; null means not prepared.
   const uint8_t* prepared_address(size_t expert) const;
+  // Same borrowed-pointer lifetime, with one ownership check for a whole
+  // table walk. Validates all indices before writing any output addresses.
+  void prepared_addresses(std::span<const size_t> experts,
+                          std::span<const uint8_t*> addresses) const;
   uint64_t prepared_revision() const;
   void set_execution_context(void* context);
   // Account for GPU-executed native hits after the walk has completed.
