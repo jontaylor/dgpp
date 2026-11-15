@@ -400,7 +400,8 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   for (const auto& e : s.experts) {
     if (std::find(e.records.begin(), e.records.end(), absent) != e.records.end())
       throw std::invalid_argument("expert cache: incomplete TP expert population");
-    specs.push_back({std::vector<uint64_t>(chunks.size(), m.cache_slot_bytes), 1.0});
+    specs.push_back({std::vector<uint64_t>(chunks.size(), m.cache_slot_bytes), 1.0,
+                     uint64_t{e.layer} * 2 + static_cast<uint64_t>(e.draft)});
     uint64_t bytes = 0;
     for (const auto r : e.records) bytes = add(bytes, s.store->records()[r].layout.record_bytes);
     s.expert_record_bytes.push_back(bytes);

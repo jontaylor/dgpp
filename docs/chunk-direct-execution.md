@@ -625,3 +625,21 @@ It must not hold a partial batch waiting for more free staging. Given the
 modest screen result and possible readiness delay, adjacent coalescing remains
 a lower-priority candidate than reducing avoidable demand traffic. No warm or
 cold serving improvement is claimed for this candidate.
+
+## Layer-local history candidate
+
+The opt-in `engine.expert_streaming.layer_local_history` setting replaces the
+frequency estimator's global ageing clock with one clock per `(draft, layer)`.
+Each selected expert still contributes one observation, including repeats.
+Local elapsed selections are multiplied by the number of groups before applying
+`decay_routes`, preserving approximately the global half-life over balanced
+model traversals. The global observation count, cooldown, adaptation cadence,
+load-cost setting, memory allocation and admission rules remain unchanged.
+One group's routes no longer age another group's popularity merely because it
+runs later in a prefill traversal. Groups that stop executing retain history;
+this is not phase-aware admission or separate prefill/decode histories.
+
+The default remains false pending serving evidence. Tests cover layer-order and
+observation-batching invariance of final ranking, preserved popularity,
+workload-switch adaptation, invalid-observation atomicity, exact single-group
+agreement with the existing estimator, and configuration serialization.

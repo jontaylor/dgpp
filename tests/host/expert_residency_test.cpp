@@ -422,4 +422,48 @@ DGPP_TEST(expert_planner_random_workload_shift_maintains_budget_and_policy_invar
   }
 }
 
+DGPP_TEST(expert_planner_layer_history_preserves_popularity_across_layer_order) {
+  auto c = config(Policy::kWholeExpert, 800);
+  c.layer_local_history = true;
+  auto specs = equal_experts(4, 4);
+  specs[2].history_group = specs[3].history_group = 999;
+  ResidencyPlanner forward(c, specs), reverse(c, specs), split(c, specs);
+  std::vector<size_t> a, b;
+  for (size_t i = 0; i < 128; ++i) {
+    a.push_back(i % 4 ? 0 : 1);
+    b.push_back(i % 4 ? 2 : 3);
+  }
+  forward.observe(a); forward.observe(b);
+  reverse.observe(b); reverse.observe(a);
+  for (size_t i = 0; i < a.size(); ++i) {
+    split.observe(std::span<const size_t>(&a[i], 1));
+    split.observe(std::span<const size_t>(&b[i], 1));
+  }
+  const auto plan = forward.propose();
+  require(plan.chunks == reverse.propose().chunks && plan.chunks == split.propose().chunks,
+          "cross-layer order and observe batching do not change local popularity");
+  require(plan.chunks == std::vector<size_t>({4, 0, 4, 0}), "popular expert from each layer retained");
+  refuses([&] { forward.observe(std::vector<size_t>{0, 999}); });
+  require(forward.observations() == 256 && forward.propose().chunks == plan.chunks,
+          "invalid observations leave both clocks unchanged");
+  hot(forward, 1, 256); hot(forward, 3, 256);
+  require(forward.propose().chunks == std::vector<size_t>({0, 4, 0, 4}), "local histories adapt to a workload switch");
+}
+
+DGPP_TEST(expert_planner_single_group_local_history_matches_global) {
+  auto c = config(Policy::kWholeExpert, 800);
+  auto specs = equal_experts(4, 4);
+  ResidencyPlanner global(c, specs);
+  c.layer_local_history = true;
+  ResidencyPlanner local(c, specs);
+  std::mt19937 rng(912);
+  for (int step = 0; step < 200; ++step) {
+    const std::vector<size_t> routes{rng() % 4, rng() % 4, rng() % 4};
+    global.observe(routes); local.observe(routes);
+    const auto a = global.propose(), b = local.propose();
+    require(a.chunks == b.chunks, "single-group estimator identical under churn");
+    global.commit(a); local.commit(b);
+  }
+}
+
 int main() { return dgpp::test::run_all(); }

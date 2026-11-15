@@ -73,6 +73,7 @@ struct ExpertSpec {
   // runtime resolves the vector index to its (model, layer, expert, rank) key.
   std::vector<uint64_t> chunk_bytes;
   double estimated_load_ms = 1.0;  // full expert, updated from measured reads
+  uint64_t history_group = 0;  // shared clock, normally one model/layer
 };
 
 struct PlannerConfig {
@@ -85,6 +86,7 @@ struct PlannerConfig {
   std::optional<double> initial_fraction;
   double decay_routes = 1024;  // exponential half-life in routed selections
   double horizon_routes = 8192;
+  bool layer_local_history = false;  // experimental; scale local clocks by group count
   bool learn_load_cost = true;  // false retains each expert's initial cost estimate
   double promotion_margin = 0.25;
   uint64_t cooldown_routes = 128;
@@ -141,6 +143,8 @@ class ResidencyPlanner {
   std::vector<ExpertSpec> experts_;
   std::vector<std::vector<uint64_t>> prefix_;
   std::vector<History> history_;
+  std::vector<size_t> history_groups_;
+  std::vector<uint64_t> group_epochs_;
   ResidencyPlan current_;
   uint64_t epoch_ = 0;
   uint64_t generation_ = 0;
