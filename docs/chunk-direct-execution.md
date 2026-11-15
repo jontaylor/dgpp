@@ -836,3 +836,27 @@ override removed. The last ordered repeat left serving ready. Arbitrary ready
 grouping is now implemented and fixture-tested, but this bounded candidate
 has no demonstrated serving advantage. No broader readiness-tuning sweep was
 performed.
+
+## Prefill quantum: 4096 versus 2048
+
+A focused configuration screen compared the deployed 4096-token initial,
+idle ceiling and idle-floor settings against 2048 for all three, on the same
+binary `e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`
+(implementation `e5d19f1e`, stamped with parent `f3d217f0`). Both ranks
+were restarted before the same four-request prefix-enabled tool sequence,
+followed by three 2209-token recomputations. The 4096 setting ran first; this
+is a single focused comparison, not a published campaign or a concurrency test.
+
+Cold initial prefill increased from 38.581 to 39.903 seconds at 2048. The three
+continuations increased from 38.209 to 39.893 seconds wall, with summed engine
+prefill 5.057 versus 5.334 seconds and decode 33.033 versus 34.405 seconds.
+Continuation expert reads fell from 47.009 to 45.898 GiB per rank. On the third
+small recomputation, both ranks had zero expert reads; prefill was 1.594 versus
+1.750 seconds and decode was 52.47 versus 52.05 tokens/s. All seven normalized
+outputs and usage records matched, as did tool-loop speculative acceptance;
+both ranks remained at zero swap.
+
+The 2048 setting is not selected for this workload. The 4096 values were
+restored and serving restarted. This screen does not establish the best setting
+for concurrent requests or larger chunks; it shows the smaller idle quantum
+hurt the tested cold, partially warm and fully warm cases.
