@@ -1572,6 +1572,12 @@ set(DSV41_EXL3_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/dsv41_exl3)
 file(MAKE_DIRECTORY ${DSV41_EXL3_WORKDIR})
 set(DSV41_EXL3_ENV ${CMAKE_COMMAND} -E env DGPP_DSV41_FIXTURE=exl3)
 
+add_executable(direct_row_cache_test tests/host/direct_row_cache_test.cpp)
+target_include_directories(direct_row_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(direct_row_cache_test PRIVATE Threads::Threads)
+dgpp_set_common(direct_row_cache_test)
+add_test(NAME direct_row_cache_test COMMAND direct_row_cache_test)
+
 add_executable(dsv41_engram_layer_test tests/cuda/dsv41_engram_layer_test.cpp)
 target_include_directories(dsv41_engram_layer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(dsv41_engram_layer_test PRIVATE dgpp_models_dsv41_layers CUDA::cudart Threads::Threads)

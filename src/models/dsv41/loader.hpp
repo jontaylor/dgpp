@@ -1,4 +1,5 @@
 #pragma once
+#include "loaders/direct_row_cache.hpp"
 // DeepSeek-V4.1-Flash weight loader using ResidentLayerStream (2026-09-13,
 // docs/deepseek_v41_flash_plan.md G3). The family supplies tensor
 // bindings, TP geometry and the builders for the release's own formats —
@@ -195,6 +196,7 @@ class Dsv41EngramTableMmap {
 
  private:
   int fd_ = -1;
+  std::unique_ptr<DirectRowCache> direct_rows_;
   uint8_t* base_ = nullptr;
   size_t len_ = 0;
   uint64_t payload_begin_ = 0;

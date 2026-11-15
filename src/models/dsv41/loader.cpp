@@ -966,6 +966,11 @@ Dsv41EngramTableMmap::Dsv41EngramTableMmap(const std::string& path, uint64_t pay
   base_ = static_cast<uint8_t*>(map);
   // Rows are read one at a time from anywhere in ~95 GB: no readahead.
   madvise(base_, len_, MADV_RANDOM);
+  try {
+    if (direct_engram_enabled())
+      direct_rows_ = std::make_unique<DirectRowCache>(path, payload_begin_, scale_begin_, rows_,
+                                                    payload_row_bytes(), head_dim_/32);
+  } catch (...) { munmap(base_, len_); ::close(fd_); throw; }
 }
 
 Dsv41EngramTableMmap::~Dsv41EngramTableMmap() {
@@ -988,6 +993,7 @@ const uint8_t* Dsv41EngramTableMmap::scale_row(int64_t row) const {
 void Dsv41EngramTableMmap::gather(const int32_t* ids, int64_t ids_stride, const int32_t* sel,
                                   int rows_local, int n, uint8_t* dst) const {
   if (n <= 0 || rows_local <= 0) return;
+  if (direct_rows_) { direct_rows_->gather(ids, ids_stride, sel, rows_local, n, dst); return; }
   const int64_t total = static_cast<int64_t>(n) * rows_local;
   const size_t rb = static_cast<size_t>(row_bytes());
   const size_t sb = static_cast<size_t>(head_dim_ / 32);

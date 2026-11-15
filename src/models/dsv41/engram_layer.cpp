@@ -57,7 +57,9 @@ size_t Dsv41EngramLayer::staging_bytes(const Dsv41TextConfig& cfg, int world, in
   const size_t row_bytes = static_cast<size_t>(cfg.engram_head_dim / (cfg.engram_mxfp4 ? 2 : 1)) + cfg.engram_head_dim / 32;
   // Both channels: the walk's own and the chunk-ahead prestage's (its ids
   // hold the prefix rows too).
-  return static_cast<size_t>(max_tokens) * L * entries * 4 + L * static_cast<size_t>(max_tokens) * rows_local * row_bytes +
+  const size_t direct = direct_engram_enabled() ? L * (DirectRowCache::reserved_bytes(row_bytes) +
+      2 * DirectRowCache::index_bytes(static_cast<size_t>(max_tokens+4)*rows_local)) : 0;
+  return direct + static_cast<size_t>(max_tokens) * L * entries * 4 + L * static_cast<size_t>(max_tokens) * rows_local * row_bytes +
          static_cast<size_t>(max_tokens + 4) * L * entries * 4 + L * static_cast<size_t>(max_tokens) * rows_local * row_bytes;
 }
 
