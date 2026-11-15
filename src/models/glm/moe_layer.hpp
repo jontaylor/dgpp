@@ -204,6 +204,8 @@ class GlmMoeLayer {
   // holds every expert's biased score for the same enqueue
   // ([tokens, n_experts], fp32) — the near-tie certification inputs.
   const std::vector<int32_t>& last_ids() const { return h_ids_; }
+  // Host-enqueued grouped-chain activation work (not CUDA graph replays).
+  uint64_t activation_elements_processed() const { return activation_elements_; }
   const std::vector<float>& last_weights() const { return h_weights_; }
   const std::vector<float>& last_biased() const { return h_biased_; }
   const GlmMoeConfig& config() const { return cfg_; }
@@ -258,6 +260,7 @@ class GlmMoeLayer {
   SharedProjectionInput shared_projection_input(int tokens, bool decode) const;
 
  private:
+  uint64_t activation_elements_ = 0;
   void check_expert_geometry() const;
   void copy_route_trace(MoeTraceStaging* trace, int tokens, cudaStream_t stream, int output_row = 0);
   // enqueue()/enqueue_f32(): exactly one of out_bf16 / out_f32 is set.
@@ -292,7 +295,8 @@ class GlmMoeLayer {
                             size_t rows_total, cudaStream_t stream,
                             const MoeTile* tiles = nullptr,
                             const int32_t* tile_count = nullptr, int tile_cap = 0,
-                            bool execute_shared = true);
+                            bool execute_shared = true,
+                            int activation_row = 0, int activation_rows = -1);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;

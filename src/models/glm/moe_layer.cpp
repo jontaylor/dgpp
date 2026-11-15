@@ -951,26 +951,45 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           sh_lane_blocks_, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
       DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
     }
-    for (int wave = 0; wave < n_segs; ++wave) {
-      const int e = active_experts[wave];
-      auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/true);
-      if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
-      // Demand loading gets both staging buffers. Start the next expert's
-      // read only once the current expert is assembled, beside its kernels.
-      if (wave + 1 < n_segs)
-        (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[wave + 1])]);
-      const auto matrices = expert::execution_matrices(lease, full, format);
-      for (int entry = 0; entry < E; ++entry)
-        std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
+    // Canonical staging is bounded by the existing execution reservation.
+    // Selected experts are ascending; inactive IDs between them have empty
+    // segments, so a wave can use the original segment table and row order.
+    const size_t wave_capacity = cache->memory().execution_slots;
+    std::vector<expert::ExpertExecutionLease> leases;
+    leases.reserve(std::min(wave_capacity, static_cast<size_t>(n_segs)));
+    int activation_row = 0;
+    for (int wave = 0; wave < n_segs;) {
+      const int first = wave;
+      const int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      int wave_rows = 0, wave_max_rows = 0;
+      for (; wave < end; ++wave) {
+        const int e = active_experts[wave];
+        auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/true);
+        if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
+        if (wave + 1 < n_segs)
+          (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[wave + 1])]);
+        const auto matrices = expert::execution_matrices(lease, full, format);
+        if (leases.empty())
+          for (int entry = 0; entry < E; ++entry)
+            std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
+        std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e) * 3);
+        wave_rows += h_counts_[e];
+        wave_max_rows = std::max(wave_max_rows, h_counts_[e]);
+        leases.push_back(std::move(lease));
+      }
       w_.experts_fp4 = views.data();
       check_expert_geometry();
       upload_expert_views(d_views_prefill_, shared, stream);
+      const int first_expert = active_experts[first];
+      const int expert_span = active_experts[end - 1] - first_expert + 1;
       grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
-          hidden, d_segs_ + e, 1, h_counts_[e],
+          hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
           grouped_decode ? tk : rows_total, stream,
-          nullptr, nullptr, 0, wave + 1 == n_segs);
-      lease.release();  // kernel and table readers complete before reuse
+          nullptr, nullptr, 0, end == n_segs, activation_row, wave_rows);
+      activation_row += wave_rows;
+      for (auto& lease : leases) lease.release();
+      leases.clear();
     }
     if (grouped_decode) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
     accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
@@ -1541,7 +1560,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                        int max_rows, const MoeSegment* shared_seg,
                                        int tokens, size_t rows_total,
                                        cudaStream_t stream, const MoeTile* tiles,
-                                       const int32_t* tile_count, int tile_cap, bool execute_shared) {
+                                       const int32_t* tile_count, int tile_cap, bool execute_shared,
+                                       int activation_row, int activation_rows) {
   const int H = static_cast<int>(cfg_.hidden);
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
@@ -1795,14 +1815,30 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   }();
   const bool fused_swiglu =
       w4a4 && shared_seg == nullptr && fused_act && I_max == static_cast<size_t>(I_r);
+  const bool local_activation = activation_rows >= 0 && !w4a4 && !rotate && !a8;
+  activation_elements_ += local_activation
+      ? (static_cast<size_t>(activation_rows) + (shared_seg && execute_shared ? tokens : 0)) * I_max
+      : rows_total * I_max;
   if (fused_swiglu) {
     launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
                                       d_q_codes_, d_q_scales_, d_q_gs_, stream,
                                       0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
   } else {
-    launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
-                            static_cast<int64_t>(rows_total) * I_max,
-                            cfg_.swiglu_limit, stream);
+    if (local_activation) {
+      // Segment outputs retain their absolute gathered-row positions.
+      // Only rows whose gate/up projections ran in this wave are consumed.
+      const size_t offset = static_cast<size_t>(activation_row) * I_max;
+      launch_moe_swiglu_clamp(d_gate_ + offset, d_up_ + offset, d_act_ + offset,
+          static_cast<int64_t>(activation_rows) * I_max, cfg_.swiglu_limit, stream);
+      if (shared_seg && execute_shared) {
+        const size_t shared_offset = static_cast<size_t>(tokens) * cfg_.top_k * I_max;
+        launch_moe_swiglu_clamp(d_gate_ + shared_offset, d_up_ + shared_offset, d_act_ + shared_offset,
+            static_cast<int64_t>(tokens) * I_max, cfg_.swiglu_limit, stream);
+      }
+    } else {
+      launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
+          static_cast<int64_t>(rows_total) * I_max, cfg_.swiglu_limit, stream);
+    }
     // The routed rows [0, tokens * top_k) of the SwiGLU output rotated in
     // place for the down projection; the shared rows past them stay. The
     // Mixed346 layer quantizes them into the code / scale copies instead

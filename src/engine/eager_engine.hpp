@@ -817,10 +817,25 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       std::vector<int> draft_reqs;
       std::vector<bool> eligible;
       for (int req : reqs) {
-        const auto& s = state_[req];
-        eligible.push_back(s.params.temperature <= 0 && !s.report_logprobs && s.bias.empty() &&
-            s.params.repetition_penalty == 1 && s.params.frequency_penalty == 0 && s.params.presence_penalty == 0 &&
-            model_->session_position(req) + mtp_depth_ + 1 <= model_->max_context());
+        auto& s = state_[req];
+        const int reasons = (!(s.params.temperature <= 0) ? 1 : 0) |
+            (s.report_logprobs ? 2 : 0) | (!s.bias.empty() ? 4 : 0) |
+            (s.params.repetition_penalty != 1 ? 8 : 0) |
+            (s.params.frequency_penalty != 0 ? 16 : 0) |
+            (s.params.presence_penalty != 0 ? 32 : 0) |
+            (model_->session_position(req) + mtp_depth_ + 1 > model_->max_context() ? 64 : 0);
+        eligible.push_back(reasons == 0);
+        if (s.mtp_eligibility_reasons != reasons) {
+          std::string why;
+          for (const auto& [bit, name] : {std::pair{1, "temperature"}, {2, "logprobs"},
+               {4, "logit_bias"}, {8, "repetition_penalty"}, {16, "frequency_penalty"},
+               {32, "presence_penalty"}, {64, "context_limit"}})
+            if (reasons & bit) { if (!why.empty()) why += ','; why += name; }
+          DGPP_LOG_INFO("eager-mtp-eligibility: slot={} eligible={} reason={} depth={} temperature={} grammar={}",
+              req, reasons == 0, why.empty() ? "eligible" : why, mtp_depth_, s.params.temperature,
+              s.grammar != nullptr);
+          s.mtp_eligibility_reasons = reasons;
+        }
         if (eligible.back() && mtp_drafts_[req].empty()) {
           draft_reqs.push_back(req); draft_rows.push_back({pending_[req]});
         }
@@ -905,9 +920,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         const auto ms = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
         size_t fed = 0, committed = 0;
         for (size_t q = 0; q < reqs.size(); ++q) { fed += feeds[q].size(); committed += fresh[q].size(); }
-        DGPP_LOG_INFO("eager-mtp-cost: slots={} rows={} committed={} accepted_predictions={} "
+        DGPP_LOG_INFO("eager-mtp-cost: slots={} rows={} proposed={} committed={} accepted_predictions={} "
                       "draft_ms={:.3f} verify_ms={:.3f} pick_ms={:.3f} state_ms={:.3f} total_ms={:.3f}",
-            reqs.size(), fed, committed, committed - reqs.size(),
+            reqs.size(), fed, fed - reqs.size(), committed, committed - reqs.size(),
             ms(verify_begin - begin) + ms(end - redraft_begin), ms(verify_end - verify_begin),
             ms(pick_end - verify_end), ms(redraft_begin - pick_end), ms(end - begin));
       }
@@ -1008,6 +1023,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
   }
   struct SlotState {
+    int mtp_eligibility_reasons = -1;  // Log once per request and on eligibility changes.
     sample::Params params = sample::greedy_params();
     sample::Rng rng;
     std::vector<int32_t> context;  // prompt + generated: the count table

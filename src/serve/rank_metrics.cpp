@@ -82,7 +82,12 @@ void write_rank_metrics(prom::Writer& w, const RankIdentity& id,
     w.counter("dgpp_rank_expert_cached_copy_bytes_total", "Useful bytes copied from resident chunks into completed execution slots; excludes zeroing and allocation padding.", c.cached_copy_bytes, labels);
     w.counter("dgpp_rank_expert_staged_copy_bytes_total", "Useful bytes copied from file staging into completed execution slots; logical copy volume, not physical NVMe traffic.", c.staged_copy_bytes, labels);
     w.counter("dgpp_rank_expert_execution_zero_bytes_total", "Execution-slot bytes zeroed for successful reconstructions; separate from useful copy volume.", c.execution_zero_bytes, labels);
-    w.counter("dgpp_rank_expert_native_hits_total", "Full-resident executions bound directly to cache-native layout; includes the first layout conversion.", c.native_hits, labels);
+    w.counter("dgpp_rank_expert_native_hits_total", "Native-layout acquisitions, including direct execution and canonical unpacking; NOT a copy-free execution count.", c.native_hits, labels);
+    w.counter("dgpp_rank_expert_direct_native_hits_total", "Executions bound directly to native cache storage; first preparation is counted separately as a native pack.", c.direct_native_hits, labels);
+    w.counter("dgpp_rank_expert_canonical_unpacks_total", "Native-resident acquisitions unpacked into canonical execution scratch.", c.canonical_unpacks, labels);
+    w.counter("dgpp_rank_expert_canonical_unpack_bytes_total", "Useful canonical output bytes produced by native-hit unpacking; NOT physical DRAM traffic.", c.canonical_unpack_bytes, labels);
+    w.counter("dgpp_rank_expert_canonical_unpack_enqueue_seconds_total", "CPU time enqueueing canonical unpack operations; NOT GPU unpack duration.", static_cast<double>(c.canonical_unpack_enqueue_ns) / 1e9, labels);
+    w.counter("dgpp_rank_expert_completion_wait_seconds_total", "Host wait in cache backend completion fences, including pending copies and expert execution; overlaps reconstruction/layout wall timers.", static_cast<double>(c.completion_wait_ns) / 1e9, labels);
     w.counter("dgpp_rank_expert_native_packs_total", "Completed native layout conversions within the existing cache slab.", c.native_packs, labels);
     w.counter("dgpp_rank_expert_native_unpacks_total", "Native layouts restored to compact chunks before partial demotion or relocation.", c.native_unpacks, labels);
     w.counter("dgpp_rank_expert_native_layout_seconds_total", "Nonoverlapping packing/unpacking wall time; separate from reconstruction, nested within engine time.", static_cast<double>(c.native_layout_wall_ns) / 1e9, labels);

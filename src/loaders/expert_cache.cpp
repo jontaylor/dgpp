@@ -453,6 +453,7 @@ void ExpertCache::record_native_hits(std::span<const size_t> selected) {
   for (auto e : unique) {
     s.expert_index(e);
     ++s.counters.requests; ++s.counters.full_hits; ++s.counters.native_hits;
+    ++s.counters.direct_native_hits;
     s.counters.chunk_lookups += s.experts[e].records.size();
     s.counters.chunk_hits += s.experts[e].records.size();
   }
@@ -472,13 +473,19 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
       const auto it = std::find(s.execution_busy.begin(), s.execution_busy.end(), false);
       if (it == s.execution_busy.end()) { ++s.counters.backpressure; return {}; }
       const size_t slot = static_cast<size_t>(it - s.execution_busy.begin());
+      const auto started = std::chrono::steady_clock::now();
       try { s.storage->native_to_execution(slot, s.native_start[expert]); }
       catch (...) { s.counters.poisoned = true; throw; }
+      ++s.counters.canonical_unpacks;
+      s.counters.canonical_unpack_bytes += s.full.useful_bytes;
+      s.counters.canonical_unpack_enqueue_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count();
       s.execution_busy[slot] = true;
       ++s.counters.active_execution_slots;
       s.counters.peak_execution_slots = std::max(s.counters.peak_execution_slots, s.counters.active_execution_slots);
       return ExpertExecutionLease(state_, slot);
     }
+    ++s.counters.direct_native_hits;
     ++s.counters.active_native_leases;
     return ExpertExecutionLease(state_, expert, s.storage->cache_data(s.native_start[expert]));
   }
@@ -501,6 +508,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
         !(canonical && s.config.packed_nvfp4)) {
       s.pack_native(expert, slot);
       ++s.counters.native_hits;
+      ++s.counters.direct_native_hits;
       ++s.counters.active_native_leases;
       return ExpertExecutionLease(state_, expert, s.storage->cache_data(s.native_start[expert]));
     }
@@ -658,7 +666,12 @@ size_t ExpertCache::prefetch(size_t expert) {
   }
   return accepted;
 }
-CacheStats ExpertCache::stats() const { state_->check_thread(); return state_->counters; }
+CacheStats ExpertCache::stats() const {
+  state_->check_thread();
+  auto result = state_->counters;
+  result.completion_wait_ns = state_->storage->completion_wait_ns();
+  return result;
+}
 ReadQueueStats ExpertCache::read_stats() const { return state_->reads->stats(); }
 CacheTelemetry ExpertCache::telemetry() const {
   state_->check_thread();
@@ -667,6 +680,7 @@ CacheTelemetry ExpertCache::telemetry() const {
   result.policy = s.config.planner.policy;
   result.io_mode = s.store->io_mode();
   result.cache = s.counters;
+  result.cache.completion_wait_ns = s.storage->completion_wait_ns();
   result.queue = s.reads->stats();
   result.file = s.store->stats();
   result.memory = s.memory;

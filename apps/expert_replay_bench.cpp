@@ -146,6 +146,8 @@ void report(const std::string& phase, const CacheTelemetry& before,
   DELTA(read_wait_ns); DELTA(reconstruction_wall_ns);
   DELTA(cached_copy_bytes); DELTA(staged_copy_bytes); DELTA(execution_zero_bytes);
   DELTA(native_hits); DELTA(native_packs); DELTA(native_unpacks);
+  DELTA(direct_native_hits); DELTA(canonical_unpacks); DELTA(canonical_unpack_bytes);
+  DELTA(canonical_unpack_enqueue_ns); DELTA(completion_wait_ns);
   DELTA(native_layout_wall_ns); DELTA(native_layout_copy_bytes);
   DELTA(promotions); DELTA(demotions); DELTA(evictions);
   DELTA(promotion_bytes); DELTA(demotion_bytes);

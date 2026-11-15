@@ -276,6 +276,8 @@ DGPP_TEST(expert_cache_native_hits_bind_same_slab_without_reconstruction_or_read
               "native leases bind the same resident payload without consuming execution scratch");
       const auto after = cache.stats();
       require(after.native_packs == 1 && after.native_hits == before.native_hits + 2 &&
+                  after.direct_native_hits == before.direct_native_hits + 2 &&
+                  after.canonical_unpacks == before.canonical_unpacks &&
                   after.cached_copy_bytes == before.cached_copy_bytes &&
                   after.staged_copy_bytes == before.staged_copy_bytes &&
                   after.execution_zero_bytes == before.execution_zero_bytes &&

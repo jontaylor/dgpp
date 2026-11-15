@@ -1,6 +1,7 @@
 #include "loaders/expert_cache_cuda.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -195,13 +196,21 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   // overwrite weights before earlier kernel readers complete. Host leases
   // need not force GPU completion; staging and destruction still drain.
   void retire_native() override {}
-  void finish() override { DGPP_CUDA_OK(cudaStreamSynchronize(stream_)); }
+  void finish() override {
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = cudaStreamSynchronize(stream_);
+    completion_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    DGPP_CUDA_OK(status);
+  }
+  uint64_t completion_wait_ns() const override { return completion_wait_ns_; }
   bool accepts_execution_context(const void* context) const override { return context == stream_; }
   void set_execution_context(void* context) override {
     if (!context) throw std::invalid_argument("expert cache: null execution stream");
     stream_ = static_cast<cudaStream_t>(context);
   }
  private:
+  uint64_t completion_wait_ns_ = 0;
   size_t staging_index(const uint8_t* source) const {
     size_t index = 0;
     while (index < registered_.size() && registered_[index] != source) ++index;

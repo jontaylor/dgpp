@@ -71,6 +71,7 @@ class ExpertCacheStorage {
   virtual void execution_to_native(size_t, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual void unpack_native_chunk(size_t, const StoreRecord&, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual bool accepts_execution_context(const void*) const { return false; }
+  virtual uint64_t completion_wait_ns() const { return 0; }
   // Caller must quiesce all payload readers before switching. A paused GPU
   // demand gate is quiescent: it reads metadata only, never expert payloads.
   virtual void set_execution_context(void*) { throw std::logic_error("cache stream switching unsupported"); }
@@ -118,6 +119,8 @@ struct CacheStats {
   uint64_t reconstruction_wall_ns = 0;
   uint64_t cached_copy_bytes = 0, staged_copy_bytes = 0, execution_zero_bytes = 0;
   uint64_t native_hits = 0, native_packs = 0, native_unpacks = 0;
+  uint64_t direct_native_hits = 0, canonical_unpacks = 0, canonical_unpack_bytes = 0;
+  uint64_t canonical_unpack_enqueue_ns = 0, completion_wait_ns = 0;
   uint64_t native_layout_wall_ns = 0, native_layout_copy_bytes = 0;
   uint64_t active_native_leases = 0;
   uint64_t promotions = 0, demotions = 0, evictions = 0;

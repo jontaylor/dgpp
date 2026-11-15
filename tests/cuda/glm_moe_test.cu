@@ -3392,6 +3392,20 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
               hot.stats().native_packs == before.cache.native_packs,
             "b12x warm graph performs no expert reads or repacking");
     {
+      const auto prior = hot.stats();
+      const auto selected = mapping.at(layer.last_ids().front());
+      auto canonical = hot.acquire(selected, true);
+      require(static_cast<bool>(canonical), "native canonical hit obtains bounded scratch");
+      canonical.release();
+      const auto after = hot.stats();
+      require(after.canonical_unpacks == prior.canonical_unpacks + 1 &&
+                  after.canonical_unpack_bytes == prior.canonical_unpack_bytes + full.useful_bytes &&
+                  after.direct_native_hits == prior.direct_native_hits,
+              "canonical unpacking is accounted separately from direct native execution");
+      require(hot.telemetry().file.calls == before.file.calls,
+              "canonical unpacking of a native hit performs no file read");
+    }
+    {
       // GPU route grouping and miss-only host service, using the SAME graph
       // for resident hits, an injected miss, and changed routing.
       dgpp::ExpertDemand* demand = nullptr;
@@ -3525,7 +3539,7 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
   using namespace dgpp::expert;
   for (const int group : {16, 32}) {
     for (const bool shared_fp4 : {false, true}) {
-      for (const int tokens : {1, 7, 64}) {
+      for (const int tokens : {1, 7, 64, 256, 1024, 4096}) {
         auto c = make_small_case(8, 128, 128, 2, tokens, 0xCA43 + tokens,
                                 true, shared_fp4, 0, group);
         c.cfg.shared_run_lane_min_rows = 1;
@@ -3575,6 +3589,7 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
         } stream_cleanup{stream};
         GlmMoeLayer layer(c.dev_w, c.cfg, tokens, /*decode_slots=*/tokens);
         for (const auto kernel : {dgpp::MoeExpertKernel::kGemv, dgpp::MoeExpertKernel::kMma}) {
+          if (tokens > 64 && kernel == dgpp::MoeExpertKernel::kGemv) continue;
           const char* grouped = std::getenv("DGPP_MOE_FP4_GROUPED_DECODE");
           const bool grouped_case = grouped && grouped[0] == '1' && !shared_fp4 &&
               kernel == dgpp::MoeExpertKernel::kGemv && tokens > 1 && tokens <= 16;
@@ -3593,13 +3608,13 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
           }
           for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
             CacheConfig cfg;
-            cfg.execution_slots = 1;  // every wave must retire before the next
+            cfg.execution_slots = tokens > 64 ? 4 : 1;  // bounded single- and multi-expert waves
             cfg.reads.buffers = 8;
             cfg.reads.workers = 4;
             cfg.reads.max_pending = 16;
             cfg.reads.staging_budget_bytes = 8 * chunk.record_bytes;
             cfg.planner.policy = policy;
-            cfg.planner.budget_bytes = 16 * chunk.allocation_bytes + full.allocation_bytes + cfg.reads.staging_budget_bytes;
+            cfg.planner.budget_bytes = 16 * chunk.allocation_bytes + cfg.execution_slots * full.allocation_bytes + cfg.reads.staging_budget_bytes;
             cfg.planner.minimum_fraction = 0;
             cfg.planner.cooldown_routes = 0;
             ExpertCache cache(store, cfg, cuda_cache_storage(identity, stream));
@@ -3607,6 +3622,7 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
             for (int repeat = 0; repeat < 3; ++repeat) {
               const auto reads_before = store->stats().calls;
               const auto counters_before = cache.stats();
+              const auto activation_before = layer.activation_elements_processed();
               DGPP_CUDA_OK(cudaMemsetAsync(c.d_out, 0x7F, count * 2, stream));
               layer.enqueue_paged(c.d_hidden, c.d_out, tokens, cache, mapping, stream, kernel);
               DGPP_CUDA_OK(cudaDeviceSynchronize());
@@ -3614,6 +3630,9 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
               require(layer.last_ids() == expected_ids && layer.last_weights() == expected_weights,
                       "paged GPU segmentation preserves routing getter semantics");
               require(got == expected, "paged waves must be bitwise the resident complete-expert chain");
+              require(layer.activation_elements_processed() - activation_before <=
+                          static_cast<uint64_t>(tokens) * (c.cfg.top_k + 1) * c.cfg.inter,
+                      "paged activation work must not multiply batch rows by active experts");
               require(cache.stats().active_execution_slots == 0, "no execution lease survives MoE return");
               require(cache.stats().demand_admissions > 0 && cache.residency().cache_bytes > 0,
                       "both policies populate device residency from demand without periodic adaptation");
