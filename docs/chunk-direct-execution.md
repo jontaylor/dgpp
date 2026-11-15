@@ -593,3 +593,35 @@ campaign throughput claim. The direct CPU reduction, preserved pointer semantics
 and unchanged output justify retaining the bulk lookup. Profiling and the
 comparison override are removed from the live deployment, leaving default bulk
 publication enabled. Incremental dirty tables remain unimplemented.
+
+## Adjacent-read feasibility screen
+
+A read-only storage probe at `cb90da1a` screened groups of four adjacent
+544 KiB records before changing the serving queue. Eight Python worker threads
+read the same 128 deterministically selected complete experts from each rank's
+local image using O_DIRECT. Each arm read 1,283,457,024 bytes. Widths were run
+in order 1,4,4,1,1,4. This is a short synthetic storage screen, not a serving
+benchmark, cold-prefill measurement or evidence of application speedup.
+
+Separate anonymous mappings for each record failed with EINVAL for the grouped
+preadv on Spark-1, although individual reads succeeded. Slices of one contiguous
+mapping succeeded. The host has 64 KiB pages and a 4 KiB ext4 filesystem block;
+the precise kernel constraint was not isolated. Do not assume that separately
+4 KiB-aligned buffers are sufficient for a vector of these half-page-ending
+records, or that simply increasing base alignment fixes it.
+
+Contiguous slices reduced calls from 2,304 to 640. Median elapsed times were
+192.38 versus 185.69 ms on rank 0 and 195.37 versus 187.61 ms on rank 1,
+about 3.5–4% lower. The initial scalar rank-1 sample was 248.46 ms; it is
+included in the three-sample median, not presented as the expected gain.
+Python dispatch, repeated offsets, device caching and the tiny duration limit
+these results. These calls bypassed the serving queue and did not measure
+staging contention or time to first ready expert.
+
+No production code or deployment settings changed. A future implementation
+would need contiguous staging ownership (or a proven compatible vector
+layout), per-record leases, and nonblocking acquisition of extra batch slots.
+It must not hold a partial batch waiting for more free staging. Given the
+modest screen result and possible readiness delay, adjacent coalescing remains
+a lower-priority candidate than reducing avoidable demand traffic. No warm or
+cold serving improvement is claimed for this candidate.
