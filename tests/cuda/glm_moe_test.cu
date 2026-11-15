@@ -3498,8 +3498,11 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
         std::memcpy(got.data(),c.d_out,got.size()*2);
         require(got == expected,"grouped miss waves preserve one-expert/native arithmetic under churn");
       }
-      require(batched.stats().peak_execution_slots == 4 && batched.stats().active_execution_slots == 0,
-              "four missing expert reconstructions coexist and retire after grouped execution");
+      const char* async_misses = std::getenv("DGPP_MOE_ASYNC_MISSES");
+      const size_t expected_slots = async_misses && std::atoi(async_misses) != 0 &&
+          policy == Policy::kAdaptiveFractional ? 3 : 4;
+      require(batched.stats().peak_execution_slots == expected_slots && batched.stats().active_execution_slots == 0,
+              "bounded miss reconstructions retire, reserving fractional eviction scratch when needed");
       layer.enqueue_paged(c.d_hidden,c.d_out,4,hot,mapping,stream);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
       const std::vector<uint16_t> four(c.d_out,c.d_out+4*H);

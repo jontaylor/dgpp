@@ -1225,6 +1225,31 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
     sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
     cache.release_native_leases(leases);
   }
+  // Optional independent completion path; retain grouped baseline until a
+  // matched serving comparison establishes whether early launches pay off.
+  static const bool independent_ready = [] {
+    const char* value = std::getenv("DGPP_MOE_ASYNC_MISSES");
+    return value && std::atoi(value) != 0;
+  }();
+  if (independent_ready && !missing.empty()) {
+    std::vector<size_t> selected;
+    for (auto j : missing) selected.push_back(routed[j]);
+    cache.execute_ready(selected, [&](std::span<const size_t> inputs,
+                                     std::span<const expert::ExpertExecutionLease> leases) {
+      std::vector<int> ids;
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto* data = leases[i].packed_data();
+        if (!i) std::fill(addresses.begin(), addresses.end(), data);
+        const int id = active_experts[missing[inputs[i]]];
+        addresses[static_cast<size_t>(id)] = data;
+        ids.push_back(id);
+      }
+      sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
+      sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    });
+    finish();
+    return;
+  }
   // Reconstructed experts have independent, preallocated execution slots.
   // Keep a bounded wave alive through one grouped launch instead of paying
   // for a persistent kernel and route upload for each missing expert.

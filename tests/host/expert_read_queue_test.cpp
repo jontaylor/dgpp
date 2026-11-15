@@ -220,3 +220,18 @@ DGPP_TEST(expert_read_queue_released_waiters_cancel_before_blocked_read_and_budg
 }
 
 int main() { return dgpp::test::run_all(); }
+
+DGPP_TEST(expert_read_queue_wait_any_skips_blocked_first_ticket) {
+  Fixture f;
+  ExpertReadQueue queue(f.store, f.config());
+  auto complete = queue.request(0);
+  auto held = ready(complete);
+  auto blocked = queue.request(1);
+  std::vector<std::shared_ptr<ReadTicket>> tickets{blocked, complete};
+  require(queue.wait_any(tickets) == 1, "completed later ticket bypasses blocked first read");
+  tickets.clear(); complete.reset(); held.reset();
+  tickets.push_back(blocked);
+  require(queue.wait_any(tickets) == 0, "completion wakes waiter");
+  (void)blocked->wait();
+  refuses([&] { queue.wait_any({}); });
+}

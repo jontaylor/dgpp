@@ -624,6 +624,159 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     return ExpertExecutionLease(state_, slot);
   } catch (...) { s.counters.poisoned = true; throw; }
 }
+void ExpertCache::execute_ready(std::span<const size_t> selected,
+    const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute) {
+  auto& s = *state_;
+  s.check();
+  if (s.counters.active_execution_slots || s.counters.active_native_leases)
+    throw std::logic_error("expert cache: ready batch requires quiescent leases");
+  for (auto e : selected) s.expert_index(e);
+  // A partial eviction may unpack a native donor. Give it independent scratch
+  // so it cannot overwrite an expert which is awaiting admission below.
+  const bool fractional = s.config.planner.policy == Policy::kAdaptiveFractional;
+  const size_t capacity = s.memory.execution_slots - (fractional ? 1 : 0);
+  if (!capacity) {
+    for (size_t i = 0; i < selected.size(); ++i) {
+      auto lease = acquire(selected[i], true);
+      execute(std::span<const size_t>(&i, 1), std::span<const ExpertExecutionLease>(&lease, 1));
+    }
+    return;
+  }
+  struct Job { size_t input, expert, slot, remaining = 0; bool launched = false; };
+  struct Read { size_t job, record; std::shared_ptr<ReadTicket> ticket;
+    std::chrono::steady_clock::time_point started; };
+  const auto started = std::chrono::steady_clock::now();
+  const auto waited_before = s.counters.read_wait_ns;
+  try {
+    for (size_t base = 0; base < selected.size(); base += capacity) {
+      const size_t count = std::min(capacity, selected.size() - base);
+      std::vector<Job> jobs;
+      std::vector<ExpertExecutionLease> leases;
+      std::vector<std::pair<size_t, size_t>> missing;
+      jobs.reserve(count); leases.reserve(count);
+      // Snapshot every resident source before any admission can evict it.
+      for (size_t j = 0; j < count; ++j) {
+        const size_t e = selected[base+j];
+        jobs.push_back({base+j, e, j});
+        s.storage->begin_execution(j);
+        s.counters.execution_zero_bytes += s.storage->execution_zero_bytes_per_begin();
+        size_t hits = 0;
+        if (s.native_start[e] != absent) {
+          s.storage->native_to_execution(j, s.native_start[e]);
+          hits = s.experts[e].records.size();
+          ++s.counters.native_hits;
+          ++s.counters.canonical_unpacks;
+          s.counters.canonical_unpack_bytes += s.full.useful_bytes;
+        } else for (const auto r : s.experts[e].records) {
+          if (s.slots[r] != absent) {
+            s.storage->assemble(j, s.store->records()[r], s.slots[r], {});
+            s.counters.cached_copy_bytes += s.store->records()[r].layout.useful_bytes;
+            ++hits;
+          } else {
+            missing.emplace_back(j, r);
+            ++jobs.back().remaining;
+          }
+        }
+        ++s.counters.requests;
+        s.counters.chunk_lookups += s.experts[e].records.size();
+        s.counters.chunk_hits += hits;
+        if (hits == s.experts[e].records.size()) ++s.counters.full_hits;
+        else { s.all_observed_full = false; if (hits) ++s.counters.partial_hits; }
+        s.execution_busy[j] = true;
+        ++s.counters.active_execution_slots;
+        s.counters.peak_execution_slots = std::max(s.counters.peak_execution_slots, s.counters.active_execution_slots);
+        leases.push_back(ExpertExecutionLease(state_, j));
+      }
+      // Preserve useful speculative results, including errors. Unrelated
+      // speculation must not occupy staging needed by these demanded records.
+      for (auto it = s.prefetched.begin(); it != s.prefetched.end();) {
+        if (std::none_of(missing.begin(), missing.end(), [&](const auto& m) { return m.second == it->first; }))
+          it = s.prefetched.erase(it);
+        else ++it;
+      }
+      std::vector<Read> pending;
+      size_t next = 0, launched = 0;
+      const auto drain = [&] { s.storage->finish(); s.pending_copies.clear(); };
+      const auto launch_ready = [&] {
+        // Contiguous completed runs need no additional lease ownership.
+        for (size_t j = 0; j < jobs.size();) {
+          if (jobs[j].remaining || jobs[j].launched) { ++j; continue; }
+          const size_t first = j;
+          std::vector<size_t> inputs;
+          while (j < jobs.size() && !jobs[j].remaining && !jobs[j].launched) {
+            inputs.push_back(jobs[j].input); jobs[j++].launched = true; ++launched;
+          }
+          execute(inputs, std::span<const ExpertExecutionLease>(leases).subspan(first, j-first));
+        }
+      };
+      while (launched < jobs.size()) {
+        while (next < missing.size()) {
+          const auto [j, r] = missing[next];
+          const auto pref = s.prefetched.find(r);
+          if (pref == s.prefetched.end() &&
+              pending.size() + s.pending_copies.size() + s.prefetched.size() >= s.config.reads.buffers) break;
+          const auto queued = std::chrono::steady_clock::now();
+          auto ticket = s.reads->request(r, ReadPriority::kDemand);
+          if (pref != s.prefetched.end()) { ticket = std::move(pref->second); s.prefetched.erase(pref); }
+          if (!ticket) break;
+          pending.push_back({j, r, std::move(ticket), queued}); ++next;
+        }
+        bool consumed = false;
+        for (size_t i = 0; i < pending.size();) {
+          if (!pending[i].ticket->ready()) { ++i; continue; }
+          auto read = std::move(pending[i]);
+          pending.erase(pending.begin()+i);
+          const auto& record = s.store->records()[read.record];
+          s.pending_copy = s.read(read.record, std::move(read.ticket), read.started);
+          s.pending_copies.push_back(std::move(s.pending_copy));
+          s.storage->assemble(jobs[read.job].slot, record, std::nullopt,
+              s.pending_copies.back()->bytes().first(record.layout.allocation_bytes));
+          s.counters.demand_bytes += record.layout.record_bytes;
+          s.counters.staged_copy_bytes += record.layout.useful_bytes;
+          --jobs[read.job].remaining;
+          consumed = true;
+        }
+        launch_ready();  // same-stream consumers follow assembly, without a fence
+        if (launched == jobs.size()) break;
+        if (consumed) continue;
+        if (!s.pending_copies.empty()) { drain(); continue; }
+        if (pending.empty()) throw std::runtime_error("expert cache: ready batch read backpressure");
+        std::vector<std::shared_ptr<ReadTicket>> tickets;
+        for (const auto& r : pending) tickets.push_back(r.ticket);
+        const auto wait = std::chrono::steady_clock::now();
+        (void)s.reads->wait_any(tickets);
+        s.counters.read_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait).count();
+      }
+      drain();
+      // Execution has already been submitted. Admission reads its complete
+      // canonical scratch, not a second file read or retained staging window.
+      for (const auto& job : jobs) {
+        auto plan = s.planner->propose_admission(job.expert);
+        const auto previous = s.planner->current().chunks;
+        if (plan.chunks[job.expert] <= previous[job.expert]) continue;
+        s.evict(plan, fractional ? capacity : job.slot);
+        for (size_t c = previous[job.expert]; c < plan.chunks[job.expert]; ++c) {
+          const auto r = s.experts[job.expert].records[c];
+          if (s.free_slots.empty()) throw std::logic_error("expert cache: ready admission slot missing");
+          const size_t slot = s.free_slots.back();
+          s.storage->unpack_native_chunk(job.slot, s.store->records()[r], slot);
+          s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
+          s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
+        }
+        s.storage->finish();
+        s.planner->commit_admission(job.expert, plan);
+        s.count_transition(plan, previous);
+        ++s.counters.demand_admissions;
+        s.counters.demand_admission_bytes += plan.load_bytes;
+      }
+    }
+    const auto wall = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    const auto waited = s.counters.read_wait_ns - waited_before;
+    s.counters.reconstruction_wall_ns += wall > waited ? wall - waited : 0;
+  } catch (...) { s.counters.poisoned = true; throw; }
+}
 bool ExpertCache::prepare_resident(std::span<const size_t> experts) {
   auto& s = *state_;
   s.check();

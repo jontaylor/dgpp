@@ -69,6 +69,9 @@ class ExpertReadQueue {
   // capacity, so a full queue still accepts another waiter for the same read.
   // Demand takes priority and can displace a queued speculative read.
   std::shared_ptr<ReadTicket> request(size_t record, ReadPriority priority = ReadPriority::kDemand);
+  // Wait for any selected ticket, including failures/cancellation. Returns its
+  // index; callers consume the result with wait(). Tickets must belong here.
+  size_t wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const;
   ReadQueueStats stats() const;
   // Stops new work, cancels queued/blocked work and joins active file reads.
   // Completed leases remain valid afterward, without freeing their staging.

@@ -826,3 +826,49 @@ DGPP_TEST(expert_cache_ready_chunks_share_a_fence_and_survive_a_failed_fence) {
     }
   }
 }
+
+DGPP_TEST(expert_cache_ready_batch_exact_bounded_and_admitted) {
+  for (const auto format : {Format::kNvfp4, Format::kMxfp4})
+    for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+      Fixture f(format, true);
+      auto cfg = f.config(policy);
+      // Reserve enough scratch for concurrent experts plus fractional donor
+      // unpacking without changing the cache population budget.
+      cfg.planner.budget_bytes += 2 * f.expected().size();
+      cfg.execution_slots = 4;
+      auto control = std::make_shared<Control>(); control->native = true;
+      ExpertCache cache(f.store, cfg, host(f, control));
+      cache.initialize();
+      const std::vector<size_t> selected{3, 2, 1, 0};
+      cache.observe(selected);
+      size_t callbacks = 0, done = 0;
+      cache.execute_ready(selected, [&](auto indices, auto leases) {
+        ++callbacks;
+        for (size_t i = 0; i < indices.size(); ++i) {
+          const auto expected = f.expected(selected[indices[i]]);
+          require(std::equal(expected.begin(), expected.end(), leases[i].data()), "ready expert exact payload");
+          ++done;
+        }
+        if (done == 1 && policy == Policy::kWholeExpert)
+          require(cache.read_stats().completed < 16, "first expert runs before all expert reads finish");
+      });
+      require(done == selected.size() && callbacks > 1, "independent ready callbacks cover all experts");
+      require(cache.stats().active_execution_slots == 0, "ready scratch retired");
+      require(cache.read_stats().staging_peak <= cache.memory().staging_bytes, "bounded ready staging");
+      for (auto e : selected) {
+        auto lease = cache.acquire(e, true);
+        const auto expected = f.expected(e);
+        require(std::equal(expected.begin(), expected.end(), lease.data()), "deferred admission preserves expert");
+      }
+    }
+}
+
+DGPP_TEST(expert_cache_ready_callback_failure_poisons_and_retires) {
+  Fixture f;
+  ExpertCache cache(f.store, f.config(Policy::kWholeExpert), host(f));
+  cache.initialize();
+  const std::vector<size_t> selected{0, 1};
+  refuses([&] { cache.execute_ready(selected, [](auto, auto) { throw std::runtime_error("consumer failed"); }); });
+  require(cache.stats().poisoned && cache.stats().active_execution_slots == 0, "failed batch poisons and retires scratch");
+  refuses([&] { (void)cache.acquire(0); });
+}

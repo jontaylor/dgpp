@@ -55,7 +55,7 @@ struct ReadQueueImpl {
   std::shared_ptr<ReadPool> pool = std::make_shared<ReadPool>();
   mutable std::mutex mutex;
   std::mutex shutdown_mutex;
-  std::condition_variable work;
+  std::condition_variable work, completed;
   std::atomic<bool> stopping{false};
   std::deque<std::shared_ptr<Job>> demand, prefetch;
   std::unordered_map<size_t, std::weak_ptr<Job>> jobs;
@@ -111,6 +111,7 @@ struct ReadQueueImpl {
     tickets.erase(job->record);
     ++counters.cancelled;
     job->ticket->completion_.set_exception(cancelled());
+    completed.notify_all();
   }
   std::shared_ptr<ReadTicket> request(size_t record, ReadPriority priority) {
     if (record >= store->records().size() ||
@@ -222,6 +223,7 @@ struct ReadQueueImpl {
         if (failure) tickets.erase(job->record);
         if (failure) job->ticket->completion_.set_exception(failure);
         else job->ticket->completion_.set_value(lease);
+        completed.notify_all();
       }
     }
   }
@@ -254,6 +256,17 @@ ExpertReadQueue::ExpertReadQueue(std::shared_ptr<const ExpertStore> store, ReadQ
     : impl_(std::make_unique<ReadQueueImpl>(std::move(store), cfg)) {}
 ExpertReadQueue::~ExpertReadQueue() = default;
 std::shared_ptr<ReadTicket> ExpertReadQueue::request(size_t record, ReadPriority priority) { return impl_->request(record, priority); }
+size_t ExpertReadQueue::wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const {
+  if (tickets.empty() || std::any_of(tickets.begin(), tickets.end(), [](const auto& t) { return !t; }))
+    throw std::invalid_argument("expert read queue: wait_any requires nonempty valid tickets");
+  std::unique_lock lock(impl_->mutex);
+  size_t ready = tickets.size();
+  impl_->completed.wait(lock, [&] {
+    for (size_t i = 0; i < tickets.size(); ++i) if (tickets[i]->ready()) { ready = i; return true; }
+    return false;
+  });
+  return ready;
+}
 ReadQueueStats ExpertReadQueue::stats() const { return impl_->stats(); }
 void ExpertReadQueue::shutdown() { impl_->shutdown(); }
 std::vector<std::span<uint8_t>> ExpertReadQueue::staging_spans() const {

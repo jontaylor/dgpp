@@ -174,6 +174,13 @@ class ExpertCache {
   // nullptr-style empty lease means bounded execution-slot backpressure.
   // Demand reads wait for completion, using queued prefetch tickets if present.
   ExpertExecutionLease acquire(size_t expert, bool canonical = false);
+  // Reconstruct bounded waves, consuming file completions independently.
+  // Callback indices address selected; leases stay valid through the callback.
+  // Callback only enqueues consumers on the cache stream: it must not release
+  // leases, mutate/reenter the cache, switch streams, or retain their addresses.
+  // Admission follows execution submission and uses the reconstructed payload.
+  void execute_ready(std::span<const size_t> selected,
+      const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute);
   bool packed_nvfp4() const;
   // Borrowed metadata, not a lease. Only usable by a quiescent engine-owned
   // walk that stops payload readers before any cache mutation. A revision
