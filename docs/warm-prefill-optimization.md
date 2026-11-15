@@ -198,3 +198,12 @@ they are separate from cache acquisition drains. Large prefill still launches
 completed waves rather than individual ready experts. Chunk-direct kernels and
 W4A4 qualification remain unimplemented. A broader scheduling change would be
 needed to remove those remaining barriers, and no fourfold warm gain is claimed.
+
+## Chunk-direct follow-up
+
+The [chunk-direct implementation and serving comparison](chunk-direct-execution.md)
+adds an opt-in NVFP4 complete-miss prefill path without reconstruction copies.
+It preserves the tested outputs but has not demonstrated a meaningful serving
+win, so production keeps reconstruction and BF16 activations. The native FP4
+activation screen was slower and is also disabled. Decode, partial-residency
+chunk views and independent chunk readiness remain open.

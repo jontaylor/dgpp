@@ -98,6 +98,10 @@ class ExpertCacheStorage {
     finish();
     return true;
   }
+  virtual bool supports_chunk_direct() const { return false; }
+  virtual const uint8_t* staging_data(std::span<const uint8_t>) const { throw std::logic_error("chunk-direct unsupported"); }
+  virtual void bind_chunk_sources(size_t, std::span<const uint8_t* const>) { throw std::logic_error("chunk-direct unsupported"); }
+  virtual void retire_staging_reader(std::span<const uint8_t>) { finish(); }
   virtual void finish() = 0;
 };
 using CacheStorageFactory = std::function<std::unique_ptr<ExpertCacheStorage>(
@@ -113,6 +117,8 @@ class ExpertExecutionLease {
   ExpertExecutionLease(const ExpertExecutionLease&) = delete;
   ExpertExecutionLease& operator=(const ExpertExecutionLease&) = delete;
   const uint8_t* data() const;
+  bool chunked() const { return chunked_; }
+  const uint8_t* const* chunk_sources() const;
   // Prepared native hits already have this layout; reconstructed misses are
   // converted into their separately charged execution-slot region.
   const uint8_t* packed_data() const;
@@ -122,16 +128,18 @@ class ExpertExecutionLease {
   explicit operator bool() const { return state_ != nullptr; }
  private:
   friend class ExpertCache;
-  ExpertExecutionLease(std::shared_ptr<ExpertCacheState>, size_t);
+  ExpertExecutionLease(std::shared_ptr<ExpertCacheState>, size_t, bool chunked = false);
   ExpertExecutionLease(std::shared_ptr<ExpertCacheState>, size_t, const uint8_t*);
   void release_noexcept() noexcept;
   std::shared_ptr<ExpertCacheState> state_;
   size_t slot_ = 0;
   const uint8_t* native_data_ = nullptr;
+  bool chunked_ = false;
 };
 struct CacheStats {
   uint64_t requests = 0, full_hits = 0, partial_hits = 0, chunk_lookups = 0, chunk_hits = 0;
   uint64_t demand_bytes = 0, retained_bytes = 0;
+  uint64_t chunk_direct_executions = 0, chunk_direct_bytes = 0;
   uint64_t read_wait_ns = 0;  // engine wait on file tickets; not device I/O time
   // Successful reconstruction only. Wall time excludes the file-ticket waits
   // above, but includes engine CPU work and backend completion fences.
@@ -184,7 +192,8 @@ class ExpertCache {
   uint64_t observations() const;
   // nullptr-style empty lease means bounded execution-slot backpressure.
   // Demand reads wait for completion, using queued prefetch tickets if present.
-  ExpertExecutionLease acquire(size_t expert, bool canonical = false);
+  ExpertExecutionLease acquire(size_t expert, bool canonical = false, bool chunk_direct = false);
+  const ChunkLayout& chunk_layout() const;
   // Reconstruct bounded waves, consuming file completions independently.
   // Callback indices address selected; leases stay valid through the callback.
   // Callback only enqueues consumers on the cache stream: it must not release

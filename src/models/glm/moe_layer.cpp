@@ -962,7 +962,20 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     // segments, so a wave can use the original segment table and row order.
     // Leave another bank of scratch for the next wave while this one runs.
     // Native-only waves need no scratch and retain their existing grouping.
-    const size_t wave_capacity = std::max<size_t>(1, cache->memory().execution_slots / 2);
+    static const bool chunk_direct_enabled = [] {
+      const char* value = std::getenv("DGPP_EXPERT_CHUNK_DIRECT");
+      return value && std::atoi(value) != 0;
+    }();
+    const auto& chunk_layout = cache->chunk_layout();
+    const size_t chunks_per_expert = cache->experts().front().records.size();
+    const bool chunk_direct_prefill = chunk_direct_enabled && kernel == MoeExpertKernel::kMma &&
+        cache->packed_nvfp4() && !full_batch_activation && chunk_layout.intermediate_size % 64 == 0 &&
+        (chunk_layout.intermediate_size & (chunk_layout.intermediate_size-1)) == 0 &&
+        full.intermediate_size % chunk_layout.intermediate_size == 0;
+    const size_t staging_buffers = cache->memory().staging_bytes / chunk_layout.record_bytes;
+    const size_t wave_capacity = std::min(std::max<size_t>(1, cache->memory().execution_slots / 2),
+        chunk_direct_prefill ? std::max<size_t>(1, staging_buffers / (2*chunks_per_expert))
+                             : static_cast<size_t>(cache->memory().execution_slots));
     std::vector<expert::ExpertExecutionLease> leases;
     leases.reserve(std::min(wave_capacity, static_cast<size_t>(n_segs)));
     static const bool prepared_prefill = [] {
@@ -1057,18 +1070,32 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           const int e = active_experts[j];
           const size_t expert = cache_experts[static_cast<size_t>(e)];
           if (reconstructed[j-first] || (direct_prefill && cache->prepared_address(expert))) continue;
-          auto lease = cache->acquire(expert, /*canonical=*/true);
+          auto lease = cache->acquire(expert, /*canonical=*/true, chunk_direct_prefill && direct_prefill);
           if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
           for (int next = j+1; next < std::min(n_segs, j+1+(demand_lookahead ? 2 : 1)); ++next)
             (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[next])]);
-          const auto matrices = expert::execution_matrices(lease, full, format);
-          if (leases.empty())
-            for (int entry = 0; entry < E; ++entry)
-              std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry)*3);
-          std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e)*3);
-          if (direct_prefill)
-            for (int m = 0; m < 3; ++m)
-              prepared_views[static_cast<size_t>(e)*3+m] = MoeExpertView::of(matrices[m]);
+          if (lease.chunked()) {
+            const std::array<expert::MatrixLayout,3> matrices{chunk_layout.gate,chunk_layout.up,chunk_layout.down};
+            for (int m = 0; m < 3; ++m) {
+              MoeExpertView view;
+              view.fp4_chunks = lease.chunk_sources();
+              view.fp4_chunk_width = static_cast<int>(chunk_layout.intermediate_size);
+              view.fp4_chunk_columns = m == 2;
+              view.fp4_chunk_payload = matrices[m].payload_offset;
+              view.fp4_chunk_scales = matrices[m].scales_offset;
+              view.fp4_chunk_global = *matrices[m].global_offset;
+              prepared_views[static_cast<size_t>(e)*3+m] = view;
+            }
+          } else {
+            const auto matrices = expert::execution_matrices(lease, full, format);
+            if (leases.empty())
+              for (int entry = 0; entry < E; ++entry)
+                std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry)*3);
+            std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e)*3);
+            if (direct_prefill)
+              for (int m = 0; m < 3; ++m)
+                prepared_views[static_cast<size_t>(e)*3+m] = MoeExpertView::of(matrices[m]);
+          }
           leases.push_back(std::move(lease));
           reconstructed[j-first] = true;
           progress = true;

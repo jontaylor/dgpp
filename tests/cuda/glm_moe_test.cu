@@ -3359,6 +3359,9 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
     auto config = [&](int experts, int execution_slots = 1) {
       CacheConfig cfg; cfg.packed_nvfp4 = true;
       cfg.execution_slots = execution_slots;
+      if (std::getenv("DGPP_EXPERT_CHUNK_DIRECT")) {
+        cfg.reads.buffers = 64; cfg.reads.max_pending = 64; cfg.reads.workers = 4;
+      }
       cfg.reads.staging_budget_bytes = cfg.reads.buffers*chunk.record_bytes;
       cfg.planner.policy = policy; cfg.planner.minimum_fraction = 0; cfg.planner.cooldown_routes = 0;
       // Fractional initialization needs one rounded chunk for every expert.
@@ -3545,8 +3548,16 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
                   hot.stats().direct_native_hits > prior.direct_native_hits &&
                   hot.stats().active_native_leases == 0,
               "prepared prefill executes without unpacking and retires all native leases");
+      const auto direct_before = pressure.stats().chunk_direct_executions;
+      const auto copied_before = pressure.stats().staged_copy_bytes;
       layer.enqueue_paged(c.d_hidden,c.d_out,rows,pressure,mapping,stream,dgpp::MoeExpertKernel::kMma);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      if (std::getenv("DGPP_EXPERT_CHUNK_DIRECT") && policy == Policy::kWholeExpert) {
+        require(pressure.stats().chunk_direct_executions > direct_before,
+                "pressure prefill actually consumes discontiguous chunks without reconstruction");
+        require(pressure.stats().staged_copy_bytes == copied_before,
+                "chunk-direct misses do not copy staged weights into reconstruction scratch");
+      }
       require(std::equal(canonical.begin(),canonical.end(),c.d_out),
               "mixed prepared and reconstructed prefill preserves canonical arithmetic");
       layer.rebind(c.dev_w);
@@ -3794,6 +3805,18 @@ DGPP_TEST(expert_copy_stream_fences_reuse_without_draining_unrelated_compute) {
     require(!storage->staging_complete(staging,false), "overwrite waits for its reader");
     gate.release = true;
     require(storage->staging_complete(staging,true), "storage reusable after retirement");
+    storage->finish();
+  }
+  if (storage->supports_chunk_direct()) {
+    gate.expired = false;
+    DGPP_CUDA_OK(cudaLaunchHostFunc(stream,[](void* ptr) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      static_cast<Gate*>(ptr)->expired = true;
+    },&gate));
+    storage->retire_staging_reader(staging);
+    storage->retain(chunks.size(),staging);
+    require(storage->staging_complete(staging,true), "coalesced staging completes");
+    require(gate.expired.load(), "a later transfer cannot erase a staging kernel reader fence");
     storage->finish();
   }
 }

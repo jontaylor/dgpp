@@ -3898,7 +3898,14 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   const int z0 = m_tile * TileRows;
   if (z0 >= seg.rows) return;  // beyond this segment's rows (no barrier yet)
   const int z1 = min(seg.rows, z0 + TileRows);
-  const MoeExpertView v = views[seg.expert * 3 + which];
+  MoeExpertView v = views[seg.expert * 3 + which];
+  if (v.fp4_chunks) {
+    v.payload = v.fp4_chunks[0] + v.fp4_chunk_payload;
+    v.fp4_scales = v.fp4_chunks[0] + v.fp4_chunk_scales;
+    v.fp4_global = reinterpret_cast<const float*>(v.fp4_chunks[0] + v.fp4_chunk_global);
+  }
+  const int chunk_shift = v.fp4_chunks ? __ffs(v.fp4_chunk_width) - 1 : 0;
+  const int chunk_mask = v.fp4_chunk_width - 1;
   const float g = kGroup == kFp4Group ? *v.fp4_global : 1.f;
   const int n0 = n_tile * BN;
   const size_t payload_stride = static_cast<size_t>(k) / 2;
@@ -3915,10 +3922,16 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   const int b_row = tid / 2, b_half = tid % 2;
   const int gn = n0 + b_row;
   const bool b_ok = gn < n;
-  const uint8_t* b_codes = v.payload + static_cast<size_t>(b_ok ? gn : 0) * payload_stride;
+  const int b_n = b_ok ? gn : 0;
+  const uint8_t* b_codes = v.fp4_chunks && !v.fp4_chunk_columns
+      ? v.fp4_chunks[b_n >> chunk_shift] + v.fp4_chunk_payload + size_t(b_n & chunk_mask) * payload_stride
+      : v.payload + size_t(b_n) * payload_stride;
   const int s_row = tid;  // < BN
   const bool s_ok = tid < BN && n0 + tid < n;
-  const uint8_t* s_scales = v.fp4_scales + static_cast<size_t>(s_ok ? n0 + tid : 0) * scale_stride;
+  const int s_n = s_ok ? n0 + tid : 0;
+  const uint8_t* s_scales = v.fp4_chunks && !v.fp4_chunk_columns
+      ? v.fp4_chunks[s_n >> chunk_shift] + v.fp4_chunk_scales + size_t(s_n & chunk_mask) * scale_stride
+      : v.fp4_scales + size_t(s_n) * scale_stride;
   const int stages = (k + BK - 1) / BK;
   // cp.async needs its width's alignment at every row: 16-byte code copies
   // need k % 32 == 0 (else two 8-byte ones — k % 16 == 0 keeps those
@@ -4019,6 +4032,12 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
             }
             cdst[q] = byte;
           }
+        } else if (v.fp4_chunks && v.fp4_chunk_columns) {
+          const uint8_t* source = v.payload;
+          if (in_codes > 0)
+            source = v.fp4_chunks[gk >> chunk_shift] + v.fp4_chunk_payload +
+                size_t(gn) * (v.fp4_chunk_width / 2) + (gk & chunk_mask) / 2;
+          cp_async(cdst, source, 16, in_codes / 2);
         } else if (codes16) {
           cp_async(cdst, in_codes > 0 ? b_codes + gk / 2 : v.payload, 16, in_codes / 2);
         } else {
@@ -4032,7 +4051,7 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
         // DRAM sees quarter-line requests. Pull the row's NEXT 128-byte line
         // (the codes of stages s+4 .. s+7) into L2 as a whole line, two
         // stages ahead of the ring's own copies.
-        if (!v.fp4_packed_rows && b_half == 0 && b_ok && (s % 4) == 0) {
+        if (!v.fp4_chunks && !v.fp4_packed_rows && b_half == 0 && b_ok && (s % 4) == 0) {
 #pragma unroll
           for (int l = (s == 0 ? 1 : kPrefetchLines); l <= kPrefetchLines; ++l) {
             const int nk = k0 + 4 * BK * l;
@@ -4055,6 +4074,17 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
             if (gi < in_groups)
               word |= uint32_t(v.fp4_scales[(k0/kGroup+gi)*v.fp4_packed_rows+packed_n]) << (8*gi);
           *reinterpret_cast<uint32_t*>(sdst) = word;
+        } else if (v.fp4_chunks && v.fp4_chunk_columns) {
+          const uint8_t* source = v.fp4_scales;
+          if (in_groups > 0)
+            source = v.fp4_chunks[k0 >> chunk_shift] + v.fp4_chunk_scales +
+                size_t(s_n) * (v.fp4_chunk_width / kGroup) + (k0 & chunk_mask) / kGroup;
+          if constexpr (kGroup == kFp4Group) cp_async(sdst, source, 4, in_groups);
+          else {
+            uint32_t word = 0;
+            for (int gi = 0; gi < in_groups; ++gi) word |= uint32_t(source[gi]) << (8*gi);
+            *reinterpret_cast<uint32_t*>(sdst) = word;
+          }
         } else if (scales4) {
           cp_async(sdst, in_groups > 0 ? s_scales + k0 / kGroup : v.fp4_scales, 4, in_groups);
         } else {
@@ -4065,7 +4095,7 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
           *reinterpret_cast<uint32_t*>(sdst) = w;
         }
         // The scales' next 128-byte line likewise (32 stages at 4 bytes per stage, 64 at 2).
-        if (!v.fp4_packed_rows && s_ok && (s % (128 / kGroupsPerStage)) == 0) {
+        if (!v.fp4_chunks && !v.fp4_packed_rows && s_ok && (s % (128 / kGroupsPerStage)) == 0) {
           const int nk = k0 + (128 / kGroupsPerStage) * BK;
           if (nk < k) {
             const uint8_t* line = s_scales + nk / kGroup;

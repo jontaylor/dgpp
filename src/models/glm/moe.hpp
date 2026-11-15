@@ -287,6 +287,12 @@ struct MoeExpertView {
   // Gate/up share a 2I-row allocation; up starts at row I.
   int fp4_packed_rows = 0;
   int fp4_packed_row0 = 0;
+  // Canonical FP4 chunks split gate/up rows and down columns. The W4A16
+  // tile reads them directly; no intermediate full-expert payload is built.
+  const uint8_t* const* fp4_chunks = nullptr;
+  int fp4_chunk_width = 0;
+  int fp4_chunk_columns = 0;
+  size_t fp4_chunk_payload = 0, fp4_chunk_scales = 0, fp4_chunk_global = 0;
   // The packed-int interpretation: payload = the I32 words [n, k*bits/32]
   // as bytes, packed_scales = the group scales (bf16 per 64 or f16 per 128
   // by packed_scale_fmt, quant_matrix.hpp), bits = 4 or 8 (0: not packed).

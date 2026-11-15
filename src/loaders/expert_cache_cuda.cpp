@@ -1,6 +1,7 @@
 #include "loaders/expert_cache_cuda.hpp"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -51,6 +52,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         gather_plans_.push_back(expert_chunk_copy_plan(reverse));
       }
     }
+    const char* direct = std::getenv("DGPP_EXPERT_CHUNK_DIRECT");
+    chunk_direct_ = direct && std::atoi(direct) != 0;
     registered_.reserve(staging.size());
     mapped_.reserve(staging.size());
     try {
@@ -60,16 +63,24 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       execution_readers_.resize(memory_.execution_slots);
       native_extent_readers_.resize((memory_.cache_slots + layouts_.size() - 1) / layouts_.size());
       staging_done_.resize(staging.size());
+      staging_readers_.resize(staging.size());
       for (auto& event : execution_readers_) create_event(event);
       for (auto& event : native_extent_readers_) create_event(event);
       for (auto& event : staging_done_) create_event(event);
+      for (auto& event : staging_readers_) create_event(event);
+      if (chunk_direct_) {
+        metadata_done_.resize(memory_.execution_slots);
+        for (auto& event : metadata_done_) create_event(event);
+        DGPP_CUDA_OK(cudaMallocHost(reinterpret_cast<void**>(&chunk_sources_),
+            memory_.execution_slots * layouts_.size() * sizeof(const uint8_t*)));
+      }
       if (memory_.cache_slots)
         DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&cache_), memory_.cache_slots * memory_.cache_slot_bytes));
       DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&execution_), memory_.execution_slots * memory_.execution_slot_bytes));
       for (const auto span : staging) {
         DGPP_CUDA_OK(cudaHostRegister(span.data(), span.size(), cudaHostRegisterDefault));
         registered_.push_back(span.data());
-        if (gpu_scatter_) {
+        if (gpu_scatter_ || chunk_direct_) {
           void* device = nullptr;
           DGPP_CUDA_OK(cudaHostGetDevicePointer(&device, span.data(), 0));
           mapped_.push_back(static_cast<const uint8_t*>(device));
@@ -234,22 +245,49 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void retire_execution(size_t slot) override {
     DGPP_CUDA_OK(cudaEventRecord(execution_readers_.at(slot), stream_));
   }
+  bool supports_chunk_direct() const override { return chunk_direct_; }
+  const uint8_t* staging_data(std::span<const uint8_t> bytes) const override {
+    if (!chunk_direct_) throw std::logic_error("expert CUDA cache: chunk-direct disabled");
+    return mapped_.at(staging_index(bytes.data()));
+  }
+  void bind_chunk_sources(size_t slot, std::span<const uint8_t* const> sources) override {
+    check_execution(slot);
+    if (!chunk_direct_ || sources.size() != layouts_.size() || sources.size_bytes() > memory_.execution_slot_bytes)
+      throw std::invalid_argument("expert CUDA cache: invalid chunk binding");
+    // Pinned pointer metadata is bounded independently of payload staging.
+    DGPP_CUDA_OK(cudaEventSynchronize(metadata_done_[slot]));
+    auto* host = chunk_sources_ + slot * layouts_.size();
+    std::copy(sources.begin(), sources.end(), host);
+    wait_execution(slot);
+    Transfer transfer(*this);
+    DGPP_CUDA_OK(cudaMemcpyAsync(execution_ + slot * memory_.execution_slot_bytes,
+        host, sources.size_bytes(), cudaMemcpyHostToDevice, copy_stream_));
+    DGPP_CUDA_OK(cudaEventRecord(metadata_done_[slot], copy_stream_));
+  }
+  void retire_staging_reader(std::span<const uint8_t> bytes) override {
+    DGPP_CUDA_OK(cudaEventRecord(staging_readers_.at(staging_index(bytes.data())), stream_));
+  }
   void order_mutations() override {} // all storage operations share copy_stream_
   bool staging_complete(std::span<const uint8_t> bytes, bool wait) override {
-    const auto event = staging_done_.at(staging_index(bytes.data()));
+    const size_t index = staging_index(bytes.data());
+    // Coalesced reads can have both transfer-stream and compute-stream
+    // consumers. A later transfer must not erase an earlier kernel's fence.
+    const std::array<cudaEvent_t,2> events{staging_done_[index], staging_readers_[index]};
     if (!wait) {
-      const auto status = cudaEventQuery(event);
-      if (status == cudaErrorNotReady) return false;
-      DGPP_CUDA_OK(status);
+      for (auto event : events) {
+        const auto status = cudaEventQuery(event);
+        if (status == cudaErrorNotReady) return false;
+        DGPP_CUDA_OK(status);
+      }
       return true;
     }
     const auto started = std::chrono::steady_clock::now();
-    const auto status = cudaEventSynchronize(event);
+    for (auto event : events) DGPP_CUDA_OK(cudaEventSynchronize(event));
     completion_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started).count();
-    DGPP_CUDA_OK(status);
     return true;
   }
+
   void finish() override {
     const auto started = std::chrono::steady_clock::now();
     DGPP_CUDA_OK(cudaStreamSynchronize(copy_stream_));
@@ -329,6 +367,9 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     // already terminal to the owner; destructors cannot propagate it.
     if (copy_stream_) (void)cudaStreamSynchronize(copy_stream_);
     (void)cudaStreamSynchronize(stream_);
+    for (auto event : metadata_done_) if (event) (void)cudaEventDestroy(event);
+    if (chunk_sources_) (void)cudaFreeHost(chunk_sources_);
+    for (auto event : staging_readers_) if (event) (void)cudaEventDestroy(event);
     for (auto event : staging_done_) if (event) (void)cudaEventDestroy(event);
     for (auto event : execution_readers_) if (event) (void)cudaEventDestroy(event);
     for (auto event : native_extent_readers_) if (event) (void)cudaEventDestroy(event);
@@ -345,9 +386,12 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   cudaStream_t stream_;
   cudaStream_t copy_stream_ = nullptr;
   cudaEvent_t ready_ = nullptr, native_readers_ = nullptr;
-  std::vector<cudaEvent_t> staging_done_, execution_readers_, native_extent_readers_;
+  std::vector<cudaEvent_t> staging_done_, staging_readers_, execution_readers_, native_extent_readers_;
   uint64_t generation_ = 0;
   mutable uint64_t published_generation_ = 0;
+  bool chunk_direct_ = false;
+  const uint8_t** chunk_sources_ = nullptr;
+  std::vector<cudaEvent_t> metadata_done_;
   bool packed_nvfp4_ = false;
   bool gpu_scatter_ = false;
   ChunkLayout full_;

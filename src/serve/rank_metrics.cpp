@@ -80,6 +80,8 @@ void write_rank_metrics(prom::Writer& w, const RankIdentity& id,
     w.counter("dgpp_rank_expert_read_wait_seconds_total", "Engine wait on expert read tickets; includes queueing, not a device-I/O clock.", static_cast<double>(c.read_wait_ns) / 1e9, labels);
     w.counter("dgpp_rank_expert_reconstruction_wall_seconds_total", "Successful reconstruction wall time excluding file-ticket waits; includes CPU work and completion fences, not GPU-only time.", static_cast<double>(c.reconstruction_wall_ns) / 1e9, labels);
     w.counter("dgpp_rank_expert_cached_copy_bytes_total", "Useful bytes copied from resident chunks into completed execution slots; excludes zeroing and allocation padding.", c.cached_copy_bytes, labels);
+    w.counter("dgpp_rank_expert_chunk_direct_executions_total", "Experts executed directly from staged chunks.", c.chunk_direct_executions, labels);
+    w.counter("dgpp_rank_expert_chunk_direct_bytes_total", "Useful chunk bytes consumed without reconstruction.", c.chunk_direct_bytes, labels);
     w.counter("dgpp_rank_expert_staged_copy_bytes_total", "Useful bytes copied from file staging into completed execution slots; logical copy volume, not physical NVMe traffic.", c.staged_copy_bytes, labels);
     w.counter("dgpp_rank_expert_execution_zero_bytes_total", "Execution-slot bytes zeroed for successful reconstructions; separate from useful copy volume.", c.execution_zero_bytes, labels);
     w.counter("dgpp_rank_expert_native_hits_total", "Native-layout acquisitions, including direct execution and canonical unpacking; NOT a copy-free execution count.", c.native_hits, labels);

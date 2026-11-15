@@ -83,6 +83,12 @@ struct ExpertCacheState {
   std::vector<uint64_t> expert_record_bytes;
   std::vector<bool> execution_busy;
   size_t next_execution_slot = 0;
+  std::vector<std::vector<std::shared_ptr<const ReadLease>>> direct_reads;
+  size_t direct_staging_count() const {
+    size_t count = 0;
+    for (const auto& reads : direct_reads) count += reads.size();
+    return count;
+  }
   struct QueuedRead {
     std::shared_ptr<ReadTicket> ticket;
     std::chrono::steady_clock::time_point demanded_at{};
@@ -184,14 +190,16 @@ struct ExpertCacheState {
   }
   void reap_copies(bool wait_one = false) {
     try {
-      bool waited = false;
-      for (auto it = pending_copies.begin(); it != pending_copies.end();) {
-        const bool wait = wait_one && !waited;
-        if (storage->staging_complete((*it)->bytes(), wait)) {
-          it = pending_copies.erase(it);
-          waited |= wait;
-        } else ++it;
-      }
+      // Retire a completed prefix once. Chunk-direct waves can keep hundreds
+      // of sources live: repeatedly scanning and erasing that whole vector
+      // for every incoming chunk turns bounded bookkeeping into quadratic work.
+      // Waiting for the oldest consumer is safe; it never depends on a future
+      // acquisition, and later completed sources may remain owned meanwhile.
+      size_t completed = 0;
+      while (completed < pending_copies.size() &&
+             storage->staging_complete(pending_copies[completed]->bytes(), wait_one && completed == 0))
+        ++completed;
+      pending_copies.erase(pending_copies.begin(), pending_copies.begin() + completed);
     } catch (...) { counters.poisoned = true; throw; }
   }
   void retain(size_t record) {
@@ -340,7 +348,14 @@ struct ExpertCacheState {
     check_thread();
     // Backends either fence readers or guarantee that all subsequent writes
     // to this scratch slot are ordered after them on the execution stream.
-    try { storage->retire_execution(slot); }
+    try {
+      storage->retire_execution(slot);
+      for (auto& read : direct_reads[slot]) {
+        storage->retire_staging_reader(read->bytes());
+        pending_copies.push_back(std::move(read));
+      }
+      direct_reads[slot].clear();
+    }
     catch (...) { counters.poisoned = true; throw; }
     execution_busy[slot] = false;
     --counters.active_execution_slots;
@@ -399,6 +414,8 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   s.native_start.assign(s.experts.size(), absent);
   for (size_t slot = 0; slot < m.cache_slots; ++slot) s.add_free_slot(slot);
   s.execution_busy.resize(cfg.execution_slots, false);
+  s.direct_reads.resize(cfg.execution_slots);
+  for (auto& reads : s.direct_reads) reads.reserve(chunks.size());
   s.pending_copies.reserve(cfg.reads.buffers);
   s.reads = std::make_unique<ExpertReadQueue>(s.store, cfg.reads);
   auto spans = s.reads->staging_spans();
@@ -488,7 +505,8 @@ void ExpertCache::record_native_hits(std::span<const size_t> selected) {
     s.counters.chunk_hits += s.experts[e].records.size();
   }
 }
-ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
+const ChunkLayout& ExpertCache::chunk_layout() const { return state_->store->records().front().layout; }
+ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical, bool chunk_direct) {
   auto& s = *state_;
   s.check();
   s.expert_index(expert);
@@ -522,6 +540,15 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
   if (slot == absent) { ++s.counters.backpressure; return {}; }
   size_t hits = 0;
   for (const auto r : e.records) hits += s.slots[r] != absent;
+  // Initial support covers complete misses. Partial cache views continue to
+  // use reconstruction so later admissions cannot invalidate their sources.
+  const auto& chunk = chunk_layout();
+  chunk_direct &= hits == 0 && s.storage->supports_chunk_direct() &&
+      chunk.intermediate_size % 64 == 0 &&
+      (chunk.intermediate_size & (chunk.intermediate_size-1)) == 0 && s.full.intermediate_size % chunk.intermediate_size == 0 &&
+      e.records.size() <= s.config.reads.buffers / 2;
+  std::vector<const uint8_t*> chunk_sources;
+  if (chunk_direct) chunk_sources.reserve(e.records.size());
   if (hits < e.records.size()) s.all_observed_full = false;
   ++s.counters.requests;
   s.counters.chunk_lookups += e.records.size();
@@ -569,7 +596,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     };
     const auto fill_window = [&] {
       s.reap_copies();
-      const size_t reserved = s.prefetched.size() + s.pending_copies.size();
+      const size_t reserved = s.prefetched.size() + s.pending_copies.size() + s.direct_staging_count();
       const size_t ahead = s.config.reads.buffers > reserved ? s.config.reads.buffers - reserved : 0;
       size_t fresh = 0;
       for (const auto& pending : pending_reads)
@@ -607,10 +634,12 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
         }
         s.reap_copies();
         s.pending_copy = s.read(r, std::move(queued), queued_at);
-        s.pending_copies.push_back(std::move(s.pending_copy));
+        auto& readers = chunk_direct ? s.direct_reads[slot] : s.pending_copies;
+        readers.push_back(std::move(s.pending_copy));
         next_chunk = std::max(next_chunk, chunk + 1);
-        const auto bytes = s.pending_copies.back()->bytes().first(record.layout.allocation_bytes);
-        s.storage->assemble(slot, record, std::nullopt, bytes);
+        const auto bytes = readers.back()->bytes().first(record.layout.allocation_bytes);
+        if (chunk_direct) chunk_sources.push_back(s.storage->staging_data(bytes));
+        else s.storage->assemble(slot, record, std::nullopt, bytes);
         const bool retain_demand = admission && record.key.chunk < admission->chunks[expert];
         if (retain_demand) {
           if (s.free_slots.empty()) throw std::logic_error("expert cache: demand admission has no validated slot");
@@ -627,6 +656,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
         staged_bytes += record.layout.useful_bytes;
       }
     }
+    if (chunk_direct) s.storage->bind_chunk_sources(slot, chunk_sources);
     s.reap_copies();
     if (admission) {
       // Publish the admitted prefix after all demand copies are ordered; the
@@ -643,12 +673,15 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     const auto wall_ns = static_cast<uint64_t>(std::max<int64_t>(elapsed, 0));
     s.counters.reconstruction_wall_ns += wall_ns > waited ? wall_ns - waited : 0;
     s.counters.cached_copy_bytes += cached_bytes;
-    s.counters.staged_copy_bytes += staged_bytes;
+    if (chunk_direct) {
+      ++s.counters.chunk_direct_executions;
+      s.counters.chunk_direct_bytes += staged_bytes;
+    } else s.counters.staged_copy_bytes += staged_bytes;
     s.counters.execution_zero_bytes += s.storage->execution_zero_bytes_per_begin();
     s.execution_busy[slot] = true;
     ++s.counters.active_execution_slots;
     s.counters.peak_execution_slots = std::max(s.counters.peak_execution_slots, s.counters.active_execution_slots);
-    return ExpertExecutionLease(state_, slot);
+    return ExpertExecutionLease(state_, slot, chunk_direct);
   } catch (...) { s.counters.poisoned = true; throw; }
 }
 void ExpertCache::execute_ready(std::span<const size_t> selected,
@@ -862,7 +895,7 @@ size_t ExpertCache::lookahead_demand(size_t expert) {
   size_t accepted = 0;
   for (auto record : s.experts[expert].records) {
     if (s.slots[record] != absent || s.prefetched.contains(record)) continue;
-    if (s.prefetched.size() + s.pending_copies.size() >= limit) break;
+    if (s.prefetched.size() + s.pending_copies.size() + s.direct_staging_count() >= limit) break;
     const auto started = std::chrono::steady_clock::now();
     auto ticket = s.reads->request(record, ReadPriority::kDemand);
     if (!ticket) break;
@@ -921,23 +954,30 @@ void ExpertCache::bind_execution_thread() {
     throw std::logic_error("expert cache: previous execution thread must release ownership first");
   s.owner = current;
 }
-ExpertExecutionLease::ExpertExecutionLease(std::shared_ptr<ExpertCacheState> state, size_t slot)
-    : state_(std::move(state)), slot_(slot) {}
+ExpertExecutionLease::ExpertExecutionLease(std::shared_ptr<ExpertCacheState> state, size_t slot, bool chunked)
+    : state_(std::move(state)), slot_(slot), chunked_(chunked) {}
 ExpertExecutionLease::ExpertExecutionLease(std::shared_ptr<ExpertCacheState> state, size_t expert, const uint8_t* data)
     : state_(std::move(state)), slot_(expert), native_data_(data) {}
 ExpertExecutionLease::~ExpertExecutionLease() { release_noexcept(); }
 ExpertExecutionLease::ExpertExecutionLease(ExpertExecutionLease&& other) noexcept
-    : state_(std::move(other.state_)), slot_(other.slot_), native_data_(other.native_data_) {}
+    : state_(std::move(other.state_)), slot_(other.slot_), native_data_(other.native_data_), chunked_(other.chunked_) {}
 ExpertExecutionLease& ExpertExecutionLease::operator=(ExpertExecutionLease&& other) noexcept {
-  if (this != &other) { release_noexcept(); state_ = std::move(other.state_); slot_ = other.slot_; native_data_ = other.native_data_; }
+  if (this != &other) { release_noexcept(); state_ = std::move(other.state_); slot_ = other.slot_; native_data_ = other.native_data_; chunked_ = other.chunked_; }
   return *this;
 }
+const uint8_t* const* ExpertExecutionLease::chunk_sources() const {
+  if (!state_ || !chunked_) throw std::logic_error("expert cache: not a chunk-direct lease");
+  state_->check();
+  return reinterpret_cast<const uint8_t* const*>(state_->storage->execution_data(slot_));
+}
 const uint8_t* ExpertExecutionLease::data() const {
+  if (chunked_) throw std::logic_error("expert cache: chunk-direct lease has no contiguous payload");
   if (!state_) throw std::logic_error("expert cache: empty execution lease");
   state_->check();
   return native_data_ ? native_data_ : state_->storage->execution_data(slot_);
 }
 const uint8_t* ExpertExecutionLease::packed_data() const {
+  if (chunked_) throw std::logic_error("expert cache: chunk-direct lease has no packed payload");
   if (!state_) throw std::logic_error("expert cache: empty execution lease");
   state_->check();
   if (!state_->config.packed_nvfp4) throw std::logic_error("expert cache: packed layout is disabled");
