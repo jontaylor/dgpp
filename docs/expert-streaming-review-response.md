@@ -134,12 +134,16 @@ speculation checks remain validated. Findings 6–8 are addressed by separating
 warm results and quantization differences, checking local storage placement,
 and matching the translated request bodies and acceptance below.
 
-Finding 4 has measured follow-through and a retirement-fence fix, but is not
-fully closed. CUDA scratch reuse is now stream ordered rather than host-fenced.
-An immediate-ready-expert variant was compared with grouped misses and did not
-improve this tool sequence. Acquisition still reconstructs each expert
-synchronously; truly asynchronous reconstruction across multiple experts is
-not implemented. The review remains open on that architectural issue.
+Finding 4 now has a retirement-fence fix and an independently completed miss
+path, tested against grouped execution. CUDA scratch reuse is stream ordered.
+The optional small-batch path reconstructs multiple experts within the existing
+reservation, consumes ready file tickets without waiting on the oldest ticket,
+and submits ready expert groups before other reads finish. Deferred admission
+uses reconstructed scratch. The serving comparison did not establish a decode
+benefit, so grouped acquisition remains the default. Large prefill retains
+bounded mixed-layout groups. This is measured
+follow-through on the scheduling finding, not a claim that all miss stalls or
+host completion fences have been eliminated.
 
 Finding 9's bounded numerical, serving, proxy and GPU-attribution work is
 recorded below. Exact drive-bandwidth characterization remains outside scope
@@ -299,9 +303,67 @@ matched. There is no demonstrated advantage here, so production retains grouped
 misses and the diagnostic override is removed. This comparison does not test a
 fully asynchronous multi-expert reconstruction pipeline or prove it cannot help.
 
-The remaining design work is to separate demand submission, reconstruction
-completion and execution readiness within the existing reservations. It needs
-explicit ownership of in-flight source chunks and staging leases, cache
-publication only after completion, and ready-group execution that avoids both
-whole-group waits and a persistent-kernel launch per expert. The current trace
-motivates that work; the immediate-launch experiment does not close it.
+That immediate-launch experiment alone did not separate demand submission,
+reconstruction completion and execution readiness. The following batch path
+implements that separation and measures its tradeoff against grouped launches.
+
+
+## Independent miss completion
+
+Runtime source: `2e5996ff`; binary SHA-256
+`818489e7ebe61870501847455b06cf25f3e71193943f4c9f6c4e739766cdbd3b`.
+`DGPP_MOE_ASYNC_MISSES=1` selects the optional small-batch NVFP4 path.
+
+The cache snapshots resident source chunks into reserved execution slots before
+admission can evict them. A bounded read window consumes any completed ticket;
+a condition variable wakes the engine when any outstanding read completes.
+Completed experts execute on the same stream as assembly while later reads
+remain outstanding. Currently ready contiguous groups share a launch, but
+staggered completion can still require one launch per expert. Scratch leases
+remain owned through the wave. Staging stays alive until its completion fence.
+No extra file workers, payload allocations or transfer stream are introduced.
+
+Admission follows execution submission and copies chunks from canonical
+scratch, without rereading storage. Fractional caching reserves one execution
+slot for unpacking a partially evicted native donor; a one-slot configuration
+uses the existing sequential path. This prevents donor conversion from
+clobbering a reconstructed expert. These extra admission copies and early
+small launches are costs, so independent readiness is not automatically faster.
+Reconstruction wall accounting for this optional batch includes its callbacks
+and completion fences; it is not an isolated GPU reconstruction duration.
+
+All 26 host-cache and seven read-queue tests pass, including exact bytes for
+both weight formats/policies, staging bounds, early expert execution before
+all reads complete, skipping a blocked first ticket, and callback failure
+poisoning. The CUDA b12x paging fixture passes with independent completion,
+including bitwise output, native/miss transitions, pressure and GPU-demand graph
+service. Its fractional scratch expectation reserves the donor slot explicitly.
+
+The same translated tool-request pair was replayed from fresh servers with
+independent completion and then the grouped control, using this same binary.
+Both used the production million-token context, 100 GiB expert budget per rank,
+24 execution slots, four read workers, 16 staging buffers, fixed depth three and
+target graphs. This is a focused diagnostic, not a standard serving campaign.
+
+| Path | Request | Prefill (s) | Decode (s) | Decode (tok/s) | Wall (s) |
+|---|---|---:|---:|---:|---:|
+| Independent completion | Initial | 62.722 | 3.040 | 16.12 | 65.810 |
+| Grouped control | Initial | 63.262 | 3.002 | 16.32 | 66.299 |
+| Independent completion | Continuation | 6.476 | 1.962 | 14.27 | 8.477 |
+| Grouped control | Continuation | 6.680 | 1.833 | 15.27 | 8.552 |
+
+The optimization targets small-batch misses, not these large prefills. Combined
+decode time was 5.002 s versus 4.835 s grouped; neither request demonstrated a
+decode gain. Combined wall time was 74.288 s versus 74.850 s, with the difference
+coming from prefill. That is insufficient evidence to replace grouped execution,
+and the optional path remains disabled in production. No further width sweep
+or broad campaign was run.
+
+Outputs and tool arguments matched exactly after removing generated call IDs.
+Both arms generated 50/29 tokens, used 14/9 verification passes and accepted
+38/21 predictions. Prompt/cache counts matched, and both ranks had zero swap
+throughout. The normal endpoint, keys, million-token context and grouped-miss
+configuration are active after the comparison. The tested optional path is
+retained for review, not presented as a performance improvement. Eliminating
+remaining miss fences or optimizing large-prefill readiness would be further
+implementation work, not a result established by this comparison.
