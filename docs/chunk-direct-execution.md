@@ -860,3 +860,34 @@ The 2048 setting is not selected for this workload. The 4096 values were
 restored and serving restarted. This screen does not establish the best setting
 for concurrent requests or larger chunks; it shows the smaller idle quantum
 hurt the tested cold, partially warm and fully warm cases.
+
+## Speculative depth five versus three on the current deployment
+
+A focused same-binary screen compared fixed speculative depths three and five
+on binary `e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`
+(implementation `e5d19f1e`, stamped with parent `f3d217f0`). Depth three ran
+first; both arms restarted before the same prefix-enabled four-request tool
+sequence and three 2209-token recomputations. Depth means draft predictions
+per verification; the target verifies one additional pending row. This screen
+is not a campaign or an uncapped quality evaluation.
+
+Initial cold prefill was 38.730 versus 38.607 seconds, with identical initial
+normalized tool response and usage. The three continuations took 40.914 versus
+43.398 seconds wall, with summed prefill 5.365 versus 5.695 seconds and engine
+decode 35.404 versus 37.573 seconds. Expert reads were 47.009 versus 51.062 GiB
+per rank. Depth five accepted more predictions per pass: for the prose, code,
+prose continuations respectively, 172/84, 178/79, 172/84, versus 161/96,
+164/91, 161/96 at depth three. Generated continuation text differed, including
+usage differences on both prose requests, so these elapsed numbers are not a
+same-output comparison and do not establish a numerical correctness issue.
+
+The small recomputations had prefill 7.841, 2.829, 1.602 seconds at depth three
+and 7.862, 3.345, 1.748 at depth five. On their third repeat, depth three read
+zero expert bytes per rank and reached 50.37 decode tokens/s; depth five still
+read 0.243 GiB per rank and reached 52.33 tokens/s. Thus the depth-five anchor
+is not a zero-read comparison, and the small rate difference is not a proven
+fully resident improvement. Tool-call arguments and introductory text should
+not be assumed identical: the three small responses differed in their full
+normalized messages, although their usage records matched. Both ranks remained
+at zero swap. Fixed depth three is restored. This single screen does not rule
+out depth five for other workloads or a separately designed depth scheduler.
