@@ -1007,6 +1007,14 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       const char* value = std::getenv("DGPP_EXPERT_DEMAND_LOOKAHEAD");
       return !value || std::atoi(value) != 0;
     }();
+    // Submit known prefill demand earlier without enlarging the cache's
+    // staging reservation. lookahead_demand itself enforces the shared cap.
+    static const int prefill_lookahead = [] {
+      const char* value = std::getenv("DGPP_EXPERT_PREFILL_LOOKAHEAD");
+      return value ? std::clamp(std::atoi(value), 1, 16) : 2;
+    }();
+    const int lookahead_experts = !demand_lookahead ? 1 :
+        (kernel == MoeExpertKernel::kMma ? prefill_lookahead : 2);
     const auto read_ahead = [&](size_t expert) {
       return demand_lookahead ? cache->lookahead_demand(expert) : cache->prefetch(expert);
     };
@@ -1039,7 +1047,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total*sizeof(int), cudaMemcpyHostToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk*sizeof(int), cudaMemcpyHostToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
-      for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + (demand_lookahead ? 2u : 1u)); ++j)
+      for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + static_cast<size_t>(lookahead_experts)); ++j)
         (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
     } else {
       launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
@@ -1086,7 +1094,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           if (reconstructed[j-first] || (direct_prefill && cache->prepared_address(expert))) continue;
           auto lease = cache->acquire(expert, /*canonical=*/true, chunk_direct_prefill && direct_prefill);
           if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
-          for (int next = j+1; next < std::min(n_segs, j+1+(demand_lookahead ? 2 : 1)); ++next)
+          for (int next = j+1; next < std::min(n_segs, j+1+lookahead_experts); ++next)
             (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[next])]);
           if (lease.chunked()) {
             const std::array<expert::MatrixLayout,3> matrices{chunk_layout.gate,chunk_layout.up,chunk_layout.down};

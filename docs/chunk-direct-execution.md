@@ -730,3 +730,23 @@ weight is restored in serving; 1/16 is not selected. The result argues against
 further tuning this scalar without new evidence. It does not establish that
 separate phase histories or scan-resistant admission cannot help, but those
 remain unimplemented rather than demonstrated optimization opportunities.
+
+## Prefill demand read-ahead window
+
+`DGPP_EXPERT_PREFILL_LOOKAHEAD` controls how many known upcoming prefill experts
+are offered to `lookahead_demand`. It defaults to the existing two, is clamped
+to 1–16, and does not change decode's two-expert window. With demand lookahead
+disabled, the existing one-expert speculative path remains unchanged. The
+candidate is six, matching the retained configuration's maximum miss-wave
+width. It starts reads earlier before the resident group and after each miss
+acquisition, without reordering expert execution or changing the staging cap.
+`lookahead_demand` continues to count queued, pending-copy and direct-held
+buffers against its existing half-pool limit.
+
+This is not arbitrary ready-expert grouping. That requires supporting
+noncontiguous activation segments or rebuilding each wave's row mapping;
+the current compact activation range assumes contiguous execution order.
+The six-expert GPU paging fixture passed for both whole and fractional cache
+policies under constrained staging, with bitwise agreement with the resident
+chain. Full serving comparison is required to determine whether earlier
+submission helps rather than merely increasing outstanding demand.
