@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1002,13 +1003,25 @@ void Dsv41EngramTableMmap::gather(const int32_t* ids, int64_t ids_stride, const 
   // Every row's pages asked for up front (the faults in flight together),
   // then the copies: a decode step's few dozen rows in one thread, a
   // prefill chunk's thousands across a few.
+  static const size_t page_bytes = [] {
+    const long size = ::sysconf(_SC_PAGESIZE);
+    if (size <= 0) throw std::runtime_error("Engram: cannot determine host page size");
+    return static_cast<size_t>(size);
+  }();
+  const auto prefetch_row = [&](const uint8_t* data, size_t bytes) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+    const uintptr_t page = address - address % page_bytes;
+    // madvise requires HOST-page alignment (64 KiB on GB10), not the
+    // 4 KiB direct-I/O alignment used by the separate expert-image reader.
+    // Include precisely the row's offset and extent; Linux rounds the end.
+    if (::madvise(reinterpret_cast<void*>(page), address - page + bytes, MADV_WILLNEED) != 0 && errno == EINVAL)
+      throw std::runtime_error("Engram: invalid page-aligned prefetch range");
+  };
   for (int64_t pair = 0; pair < total; ++pair) {
     const int64_t t = pair / rows_local, j = pair - t * rows_local;
     const int32_t id = ids[t * ids_stride + sel[j]];
-    for (const uint8_t* p : {payload_row(id), scale_row(id)}) {
-      const uintptr_t page = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{4095};
-      madvise(reinterpret_cast<void*>(page), 4096 + static_cast<size_t>(head_dim_), MADV_WILLNEED);
-    }
+    prefetch_row(payload_row(id), static_cast<size_t>(payload_row_bytes()));
+    prefetch_row(scale_row(id), sb);
   }
   constexpr int64_t kPerThread = 256;
   if (total <= kPerThread) {
