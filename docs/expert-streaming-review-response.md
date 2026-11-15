@@ -631,7 +631,10 @@ not measurements from the live Sparks or instructions to implement every idea.
   Layer-aware ageing, phase-aware histories and fetch-event statistics are not
   implemented. Larger decay helped recomputed prefill but hurt prefix-enabled
   continuations; the proportional-horizon control also failed to improve serving.
-  Decay 65536 with horizon 8192 remains selected.
+  Decay 65536 with horizon 8192 remains selected. A subsequent opt-in
+  once-per-expert prefill history control also regressed continuations and
+  short-prompt adaptation; it is disabled. This does not resolve phase-aware
+  weighting or layer-aware ageing.
 - **Blocking-reader concurrency: verified and tested.** Each worker
   calls the blocking store reader before taking another job. Queue capacity
   256 is not 256 concurrent expert read calls, and the queue's active count

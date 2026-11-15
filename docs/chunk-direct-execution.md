@@ -405,3 +405,51 @@ performance gap. It is deferred behind reducing decode misses and separating
 prefill/decode cache history. Publication-before-resume remains mandatory, and
 any dirty tracking must cover evictions, demotions and relocations. Profiling
 has been disabled in the retained eight-reader deployment.
+
+## Per-expert prefill-demand history experiment
+
+Implementation `2c1bdcfd` adds opt-in
+`DGPP_EXPERT_PREFILL_DEMAND_HISTORY=1`. For paged MMA invocations, it observes
+each routed expert once instead of once per routed token. DSV4.1 sends prefill
+reader rows to MMA and decode/verification rows to GEMV, including split mixed
+batches. Decode token observations and GPU-native hit accounting remain unchanged.
+This is not a separate phase-aware history: deduplication changes access counts,
+global clock advancement and periodic adaptation cadence together. Counts are
+per layer invocation, including prefill sub-batches, not per entire request.
+
+The experiment is **disabled in production**. A fresh-process off/on comparison
+used eight readers, decay 65536, horizon 8192 and the same binary on both ranks,
+SHA-256 `89acf5c823d5f1f84f4275c0153e7277cc02ef1e63ebac7357e2f4c40ee62afe`.
+The executable contains `2c1bdcfd` changes built before commit and stamped with
+parent `be0ba509`. Each arm ran the prefix-enabled four-request tool sequence,
+one 24,317-token recomputation with prefix reuse disabled, then three repeated
+2,209-token recomputations. Budget, precision, speculative depth and all other
+settings were held fixed. These are focused diagnostics, not campaign rows.
+
+Cold tool-request prefill was essentially unchanged at 38.617 versus 38.855
+seconds. The three continuations increased from 44.120 to 47.811 seconds summed
+service-level elapsed time (8.4%). Their summed prefill rose from 5.630 to 6.817
+seconds, and engine decode from 38.364 to 40.876 seconds. Average per-rank expert
+reads increased from 55.32 to 69.88 GiB (26.3%).
+
+The long recomputation took 20.181 versus 19.223 seconds in prefill, but engine
+decode fell from 17.99 to 14.94 tokens/s. The short-prompt adaptation sequence
+was worse: the control reached zero expert reads on both ranks at the third
+request, with 1.458-second prefill and 52.31 decode tokens/s. The candidate still
+read 7.20/7.43 GiB on ranks 0/1 at its third request, with 2.389-second prefill
+and 36.00 decode tokens/s. It was not forced through extra repetitions to hide
+that adaptation penalty; candidate fully resident steady state is unmeasured.
+
+All eight normalized outputs, usage and acceptance records matched between
+arms, and both ranks remained at zero swap. The generic GPU fixture passed
+bitwise arithmetic checks and checks that prefill history deduplicates while
+GEMV observations retain token counts. The checkpoint-sized packed B12x fixture
+also passed with the flag enabled. The retained deployment uses token-frequency
+history, eight readers, decay 65536 and horizon 8192.
+
+Counting each touched expert equally discards prefill popularity differences;
+this control does not establish that all phase-aware policies are ineffective.
+Preserving relative frequency while bounding prefill influence remains open.
+A separate constant-load-cost control can test the queue-age weighting without
+simultaneously removing popularity information. Neither alternative is yet
+implemented or measured.
