@@ -891,3 +891,32 @@ not be assumed identical: the three small responses differed in their full
 normalized messages, although their usage records matched. Both ranks remained
 at zero swap. Fixed depth three is restored. This single screen does not rule
 out depth five for other workloads or a separately designed depth scheduler.
+
+## One additional GiB of expert cache per rank
+
+A focused same-binary screen added 1,073,741,824 bytes per rank to the configured
+expert budget, from 107,242,240,000 to 108,315,981,824 bytes. The existing
+configuration ran first; each arm restarted before the four-request
+prefix-enabled tool sequence and three 2209-token recomputations. Binary
+`e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`
+contains implementation `e5d19f1e` and was stamped with parent `f3d217f0`.
+This is a single focused comparison, not a campaign or long-context test.
+
+Initial cold prefill was 38.629 versus 38.595 seconds. Three continuations took
+40.649 versus 39.925 seconds wall; summed engine prefill was 5.505 versus 5.276
+seconds and decode was 35.023 versus 34.531 seconds. Expert reads fell from
+47.009 to 44.600 GiB per rank. This 1.8% wall difference is small for one
+ordering; it does not establish a general throughput improvement. All seven
+normalized outputs and usage records matched, as did tool-loop speculative
+acceptance. Server processes remained at zero swap at captured boundaries.
+
+The third small recomputation reached zero expert reads in both arms. Prefill
+was 1.630 versus 1.604 seconds and decode 51.82 versus 52.53 tokens/s. At the
+end of that sequence, MemAvailable was approximately 4.06/4.30 GiB with the
+original budget and 2.97/3.34 GiB with the larger budget on ranks 0/1. These
+are system snapshots, not guarantees of memory available for longer contexts,
+concurrency or other processes. The larger budget was not retained: the small
+single-run improvement has not established a worthwhile trade for reducing
+headroom at the configured million-token context. The original budget and
+serving configuration were restored. A larger cache may still help another
+working set; no capacity sweep or long-context qualification was performed.
