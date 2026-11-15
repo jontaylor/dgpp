@@ -946,3 +946,34 @@ Zero margin showed no meaningful benefit in this workload, so the default 0.25
 was restored. Equal aggregate reads do not prove that the internal residency
 or eviction decisions were identical. Other margins, workload switches and
 phase-specific admission remain untested by this screen.
+
+## Buffered versus direct expert reads
+
+A focused screen compared `io_mode=direct` and `io_mode=buffered` using the
+same binary `e1ae2b2e5ab48fe311ee41f69bd670e46d9962c38b07873e838683a06779a625`
+(implementation `e5d19f1e`, stamped with parent `f3d217f0`). Direct ran first;
+each arm restarted before the same four-request prefix-enabled tool loop and
+three 2209-token recomputations. The OS page cache was not cleared between
+arms. This is a single serving diagnostic, not an isolated storage benchmark,
+fully cold filesystem test or campaign result. Buffered reads add a kernel
+page-cache path and a copy into the existing staging buffers; no cache or RAM
+budget was changed.
+
+Fresh-process initial prefill took 38.626 seconds direct versus 45.217 buffered.
+Across three continuations, wall time increased from 40.030 to 44.904 seconds;
+summed engine prefill increased from 5.245 to 6.459 seconds and decode from
+34.628 to 38.293 seconds. Logical expert reads were identical at 47.009 GiB per
+rank. On the third small recomputation, both ranks had zero expert reads;
+prefill was 1.602 versus 1.607 seconds and decode 52.19 versus 52.79 tokens/s.
+All seven normalized outputs and usage records matched, as did tool-loop
+acceptance; both server processes had zero swap at recorded boundaries.
+
+Rank-zero process `/proc/PID/io` read-byte deltas for the three continuations
+were 19.376/19.691/8.078 GiB direct versus 19.857/20.193/8.301 buffered. They
+include all process reads and filesystem effects, not just expert payload, and
+are not exact device-bandwidth or cache-hit measurements. After the sequence,
+whole-system `Cached` was about 2.93/3.08 GiB on ranks 0/1 for direct versus
+4.46/4.47 GiB for buffered. This shows more filesystem cache at the snapshot,
+not that the extra cache held useful expert records. The tested buffered path
+was slower despite that increase. Direct I/O was restored; different cache
+sizes, explicit page-cache policies and other workloads remain untested.
