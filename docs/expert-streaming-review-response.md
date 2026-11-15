@@ -13,8 +13,9 @@ expert accumulation.
 - Large prefills stage bounded groups of canonical experts using the existing
   execution-slot reservation. One view-table upload and one grouped chain serve
   each wave. Empty expert IDs between selected IDs retain empty segments.
-  Whole-model prefill chunks are unchanged. Prepared NVFP4 weights still need
-  unpacking for this large-prefill recipe; small batches retain direct b12x.
+  Whole-model prefill chunks are unchanged. This initial correction still
+  unpacked prepared NVFP4 weights; the direct-prepared follow-up below removes
+  that conversion for W4A16 prefill. Small batches retain direct b12x.
 - Telemetry distinguishes direct native bindings from native hits that unpack
   into canonical scratch. Canonical output-byte counts are logical bytes, not
   physical DRAM traffic. Enqueue time is CPU time, not GPU unpack duration.
@@ -125,20 +126,25 @@ do not make the deployment fully resident or eliminate its capacity penalty.
 
 ## Review disposition
 
-The review remains open. Segment-local activation, bounded canonical grouping,
-conversion counters and effective speculation eligibility are implemented and
-validated above. They do not close the following gaps:
+Findings 1–3 now have concrete implementation fixes: segment-local activation,
+bounded mixed-layout prefill, direct prepared bindings, one-time preparation of
+complete resident experts, removal of unused scratch clears, and explicit
+conversion/clear/wait accounting. Finding 5's eligibility logging and tool-aware
+speculation checks remain validated. Findings 6–8 are addressed by separating
+warm results and quantization differences, checking local storage placement,
+and matching the translated request bodies and acceptance below.
 
-- Prepared-weight large prefill still needs a measured direct execution path.
-- The remaining prefill cost needs GPU attribution; enqueue and synchronization
-  wall counters cannot isolate unpack, expert, dense and communication time.
-- The proxy check and direct check above used different requests. A matched
-  tool-request sequence is still required to compare the paths.
-- Miss groups still wait for synchronous acquisitions. Independent readiness
-  requires follow-through after profiling the corrected prefill path.
+Finding 4 has measured follow-through and a retirement-fence fix, but is not
+fully closed. CUDA scratch reuse is now stream ordered rather than host-fenced.
+An immediate-ready-expert variant was compared with grouped misses and did not
+improve this tool sequence. Acquisition still reconstructs each expert
+synchronously; truly asynchronous reconstruction across multiple experts is
+not implemented. The review remains open on that architectural issue.
 
-No drive-limit claim is made. Exact drive-bandwidth characterization remains
-outside scope at the user's request.
+Finding 9's bounded numerical, serving, proxy and GPU-attribution work is
+recorded below. Exact drive-bandwidth characterization remains outside scope
+at the user's request. No claim is made that all remaining latency is storage
+transfer time.
 
 ## Direct prepared prefill implementation
 
@@ -170,5 +176,132 @@ The initial and continuation generated identical outputs to baseline, excluding
 call IDs, with 50 and 29 tokens respectively. Both ranks remained at zero swap.
 
 The expanded fixture also passes with four execution slots, exercising bounded
-prepared and reconstructed groups. Proxy translation and GPU attribution are
-still in progress.
+prepared and reconstructed groups. The matched proxy comparison and GPU attribution follow below.
+
+## Matched translation/proxy comparison
+
+The runtime implementation corresponding to `9e05096b` used binary SHA-256
+`72e9c2e1df06e5dc52af5259c361720d07776bd5cea318f626d4119558d4760f`.
+This focused diagnostic used the same authored long system prompt and directory
+listing tool exchange on both paths; it is not a captured historical user chat.
+Both sequences began with a freshly started server at the existing production
+configuration.
+
+Equivalent supplied messages were initially insufficient to match rendering:
+OpenCodex appended a 956-character tool-contract instruction during Responses
+translation, adding 197 initial prompt tokens and 198 continuation tokens. Only
+the two test request bodies after translation were captured, excluding HTTP
+headers, then replayed unchanged against DGPP's Chat endpoint.
+
+- Normal Responses → OpenCodex/Combo → DGPP sequence: 69.810 s initial request,
+  10.019 s continuation, 79.828 s combined.
+- Exact translated bodies sent directly to DGPP: 69.262 s initial request,
+  10.124 s continuation, 79.386 s combined.
+- Both paths rendered 24,317 initial prompt tokens with no cached tokens, then
+  25,225 continuation tokens with 24,192 cached and 1,033 computed tokens.
+  Visible text and tool arguments matched, with 50 and 29 output tokens.
+- Speculation also matched: 14 initial verification passes / 38 accepted
+  predictions, then 9 passes / 21 accepted predictions. Tools remained enabled.
+- Engine prefill plus decode-step timing accounts for approximately 79.702 s
+  of the proxy path's 79.828 s. The residual includes HTTP/client/proxy handling
+  and is not an isolated measurement of any one component. Engine variation
+  prevents attributing the 0.442 s between sequences solely to proxy overhead.
+- Both ranks remained at zero swap, with zero canonical unpacks. Initial expert
+  reads matched exactly at about 110.118 GiB per rank. Continuation reads were
+  approximately 12.95–12.99 GiB per rank, including prefill and decode.
+
+The proxy is not the dominant latency source in this matched tool sequence.
+Its added instruction does change tokenization and routing, so comparisons
+must use the rendered request rather than assume identical supplied messages
+produce identical model inputs.
+
+## GPU cost attribution after direct prepared binding
+
+A short two-rank Nsight capture used the identical translated tool continuation.
+The profiler could not reliably fit beside the million-token reservation and
+4 GiB startup headroom, so this diagnostic used a 262,144-token KV reservation;
+expert-cache capacity, execution slots, weights, speculation and the 25K-token
+request were unchanged. Normal serving retains the million-token reservation.
+This capture is cost attribution, not an uninstrumented throughput comparison.
+
+The prefill-to-first-target-graph interval was about 7.45 s on each rank:
+
+- No GPU activity occupied 3.56 / 3.91 s on ranks 0 / 1.
+- Routed prefill kernels occupied about 1.04 s per rank.
+- Expert layout/scatter kernels occupied about 1.03 s per rank, mostly chunk
+  scatter rather than canonical unpacking (the latter remained zero).
+- Copies/clears occupied about 0.81 s of exclusive timeline per rank. Across
+  the full turn, rank 0 executed 9,409 memsets, clearing 182.9 GB in 0.690 s.
+- Dense projections accounted for about 0.157 s per rank in this interval.
+  They are not its dominant remaining cost.
+
+The following roughly 2.14 s target-graph interval contained 0.72–0.73 s with
+only the expert-demand gate active and no useful overlapping GPU work. The
+longer total gate duration overlaps reconstruction and expert execution and
+must not be counted as entirely idle. Both ranks issued roughly 188K CUDA
+launches and 31K stream synchronizations across the full turn. CUDA API sums,
+kernel sums and GPU-empty intervals overlap and must not be added together.
+The first-target-graph boundary includes a small amount of initial draft work;
+it is not an exact engine-timer boundary.
+
+These observations support removing repeated resident reconstruction and
+unnecessary scratch initialization/retirement fences. They do not establish
+that all remaining latency is SSD transfer time, nor that extra I/O threads
+alone would remove the GPU-empty intervals.
+
+## Resident preparation, scratch reuse and ready-miss comparison
+
+Runtime source: `1f2f7032`; binary SHA-256
+`fdc35e553441c0140b5dd15b243d02fd107b955530f4c1396544ae54069b8a80`.
+All uninstrumented runs below use the production million-token KV reservation,
+100 GiB per-rank expert subsystem budget, 24 execution slots, four I/O workers,
+16 staging buffers, fixed depth three and target-layer graphs.
+
+Complete resident experts are prepared before a wave owns native or scratch
+leases, so later prefills can execute them directly rather than repeatedly
+scatter their chunks. Preparation uses existing reserved scratch and does not
+increase cache capacity. `DGPP_MOE_PREFILL_PREPARE_RESIDENT=0` disables this
+follow-up independently of direct prepared consumption.
+
+CUDA reconstruction no longer clears its two scratch reservations before
+assembly/packing: every consumed payload, scale and global is overwritten;
+allocation padding is not read by consumers. Clear-byte telemetry reports zero
+for this backend. Canonical scratch retirement now follows the same stream-order
+contract as native retirement. Staging-buffer completion fences remain, and
+callers must still quiesce readers before switching execution streams.
+
+The host cache suite (24 tests), both-format paged-wave fixture and b12x paging
+fixture pass. The latter now also checks repeated large prefill without a
+preceding decode: after preparation, a feasible hot set needs no file reads,
+reconstruction or repacking, stays within budget and remains bitwise canonical.
+
+The same translated initial request and fixed tool-result continuation were
+replayed from fresh servers. Against direct-prepared mixed waves (`9e05096b`):
+
+- Initial prefill: 65.119 → 62.496 s; initial request wall: 69.262 → 65.427 s.
+- Continuation prefill: 7.644 → 6.402 s; continuation wall: 10.124 → 8.295 s.
+- Decode intervals: 4.113 → 2.892 s initially and 2.433 → 1.837 s on continuation.
+- Combined wall time: 79.386 → 73.722 s. These are focused paired observations,
+  not a general throughput claim or an isolated contribution for each change.
+- Outputs, tool arguments, prompt/cache counts and acceptance matched: 50/29
+  output tokens, 14/9 passes and 38/21 accepted predictions. Both ranks stayed
+  at zero swap. Canonical-unpack and reconstruction-clear counters stayed zero.
+- Expert-image reads remained approximately 110.12 GiB per rank initially and
+  12.97–12.98 GiB on continuation. Removing implementation work did not remove
+  the deployment's missing expert bytes.
+
+`DGPP_MOE_MISS_READY_LIMIT=1` launches each reconstructed small-batch miss
+immediately, with next-expert prefetch and stream-ordered scratch reuse. It
+changes no memory/I/O reservation. With that diagnostic cap, initial decode was
+2.860 s versus 2.892 s grouped; continuation decode was 2.010 s versus 1.837 s.
+The complete sequence was 74.409 s versus 73.722 s. Output and acceptance still
+matched. There is no demonstrated advantage here, so production retains grouped
+misses and the diagnostic override is removed. This comparison does not test a
+fully asynchronous multi-expert reconstruction pipeline or prove it cannot help.
+
+The remaining design work is to separate demand submission, reconstruction
+completion and execution readiness within the existing reservations. It needs
+explicit ownership of in-flight source chunks and staging leases, cache
+publication only after completion, and ready-group execution that avoids both
+whole-group waits and a persistent-kernel launch per expert. The current trace
+motivates that work; the immediate-launch experiment does not close it.
