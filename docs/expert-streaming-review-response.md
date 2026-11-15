@@ -147,9 +147,9 @@ layout directly. It gathers only the current weight tile into shared memory,
 then retains the canonical BF16 decode, MMA order and output rounding. Packing,
 unpacking and prefill share the same layout-index functions.
 
-The host executes contiguous prepared runs directly and reconstructs other
-runs within the existing execution-slot budget. It retires native leases before
-miss admission can relocate cache storage. Source descriptors may remain
+The host reconstructs misses before pinning native bindings, then executes both
+layouts in the same bounded wave. It revisits prepared selections evicted by
+those admissions before taking native leases. Source descriptors may remain
 metadata-only. W4A4 and GEMV keep their canonical fallback; small b12x batches
 and graph replay are unchanged. `DGPP_MOE_PREPARED_PREFILL=0` retains the previous
 large-prefill binding for comparisons.
@@ -159,4 +159,16 @@ against canonical MMA at 65, 129 and 256 rows, including metadata-only source
 descriptors, prepared hits, residency pressure and subsequent verification.
 Prepared hits add no canonical unpack operations and leave no live native
 leases. The 24 host cache tests and both-format paged-wave regression pass.
-Serving latency validation remains pending.
+An initial implementation split waves at layout transitions. Although it removed
+unpacking, the matched tool continuation regressed from 7.690 s to 8.757 s
+prefill. That scheduling choice was removed. Mixed-layout waves measured
+7.425 s on the same continuation (963 computed tokens, 24,064 cached), with
+zero canonical unpacks versus 7,499 per rank previously. This is one focused
+comparison, not an established percentage speedup. Initial uncached prefill was
+64.304 s versus 65.941 s; neither initial prefill performed canonical unpacking.
+The initial and continuation generated identical outputs to baseline, excluding
+call IDs, with 50 and 29 tokens respectively. Both ranks remained at zero swap.
+
+The expanded fixture also passes with four execution slots, exercising bounded
+prepared and reconstructed groups. Proxy translation and GPU attribution are
+still in progress.

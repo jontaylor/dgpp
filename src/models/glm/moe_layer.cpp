@@ -960,9 +960,6 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const size_t wave_capacity = cache->memory().execution_slots;
     std::vector<expert::ExpertExecutionLease> leases;
     leases.reserve(std::min(wave_capacity, static_cast<size_t>(n_segs)));
-    // A prepared run uses native leases and the same prefill MMA arithmetic.
-    // End the run before a miss: native leases prevent cache relocation and
-    // admission, so they must retire before reconstructing the next run.
     static const bool prepared_prefill = [] {
       const char* e = std::getenv("DGPP_MOE_PREPARED_PREFILL");
       return e == nullptr || e[0] != '0';
@@ -970,29 +967,50 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const bool direct_prefill = prepared_prefill && cache->packed_nvfp4() &&
         kernel == MoeExpertKernel::kMma &&
         (w_.weight_only_fp4 || !moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total));
-    std::vector<MoeExpertView> prepared_views(static_cast<size_t>(E)*3);
+    std::vector<MoeExpertView> prepared_views(direct_prefill ? static_cast<size_t>(E)*3 : 0);
+    std::vector<expert::ExpertExecutionLease> native_leases;
+    native_leases.reserve(wave_capacity);
     int activation_row = 0;
     for (int wave = 0; wave < n_segs;) {
       const int first = wave;
-      const bool native = direct_prefill &&
-          cache->prepared_address(cache_experts[static_cast<size_t>(active_experts[wave])]);
-      int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
-      if (direct_prefill)
-        for (int j = wave + 1; j < end; ++j)
-          if (bool(cache->prepared_address(cache_experts[static_cast<size_t>(active_experts[j])])) != native) {
-            end = j;
-            break;
-          }
+      const int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      std::vector<bool> reconstructed(static_cast<size_t>(end-first), false);
+      // Complete admissions before pinning native addresses. An admission can
+      // evict an earlier prepared selection, so revisit skipped selections
+      // until every remaining one is prepared. Each pass either reconstructs
+      // another expert or terminates; all scratch stays in this wave's budget.
+      bool progress;
+      do {
+        progress = false;
+        for (int j = first; j < end; ++j) {
+          const int e = active_experts[j];
+          const size_t expert = cache_experts[static_cast<size_t>(e)];
+          if (reconstructed[j-first] || (direct_prefill && cache->prepared_address(expert))) continue;
+          auto lease = cache->acquire(expert, /*canonical=*/true);
+          if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
+          if (j+1 < n_segs)
+            (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[j+1])]);
+          const auto matrices = expert::execution_matrices(lease, full, format);
+          if (leases.empty())
+            for (int entry = 0; entry < E; ++entry)
+              std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry)*3);
+          std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e)*3);
+          if (direct_prefill)
+            for (int m = 0; m < 3; ++m)
+              prepared_views[static_cast<size_t>(e)*3+m] = MoeExpertView::of(matrices[m]);
+          leases.push_back(std::move(lease));
+          reconstructed[j-first] = true;
+          progress = true;
+        }
+      } while (direct_prefill && progress);
       int wave_rows = 0, wave_max_rows = 0;
       for (; wave < end; ++wave) {
         const int e = active_experts[wave];
-        auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/!native);
-        if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
-        if (wave + 1 < n_segs)
-          (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[wave + 1])]);
-        if (native) {
-          const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(lease.data()),
-              static_cast<int>(cfg_.hidden), static_cast<int>(full.intermediate_size));
+        if (!reconstructed[wave-first]) {
+          auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)]);
+          if (!lease) throw std::runtime_error("GlmMoeLayer: missing prepared execution lease");
+          const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(lease.packed_data()),
+              cfg_.hidden, static_cast<int>(full.intermediate_size));
           for (int m = 0; m < 3; ++m) {
             auto& v = prepared_views[static_cast<size_t>(e)*3+m];
             v = MoeExpertView{};
@@ -1002,32 +1020,27 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
             v.fp4_packed_rows = m == 2 ? cfg_.hidden : 2*full.intermediate_size;
             v.fp4_packed_row0 = m == 1 ? full.intermediate_size : 0;
           }
-        } else {
-          const auto matrices = expert::execution_matrices(lease, full, format);
-          if (leases.empty())
-            for (int entry = 0; entry < E; ++entry)
-              std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
-          std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(e) * 3);
+          native_leases.push_back(std::move(lease));
         }
         wave_rows += h_counts_[e];
         wave_max_rows = std::max(wave_max_rows, h_counts_[e]);
-        leases.push_back(std::move(lease));
       }
-      w_.experts_fp4 = native ? original.experts_fp4 : views.data();
-      // Paged source descriptors carry geometry only. Native device views
-      // above come from live cache leases, not those absent source pointers.
-      if (!native) check_expert_geometry();
-      upload_expert_views(d_views_prefill_, shared, stream, native ? prepared_views.data() : nullptr);
+      // Paged source descriptors carry geometry only. Both layouts in the
+      // device table above are bound to live leases, never source pointers.
+      w_.experts_fp4 = direct_prefill ? original.experts_fp4 : views.data();
+      if (!direct_prefill) check_expert_geometry();
+      upload_expert_views(d_views_prefill_, shared, stream, direct_prefill ? prepared_views.data() : nullptr);
       const int first_expert = active_experts[first];
-      const int expert_span = active_experts[end - 1] - first_expert + 1;
+      const int expert_span = active_experts[end-1] - first_expert + 1;
       grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
           hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
           grouped_decode ? tk : rows_total, stream,
           nullptr, nullptr, 0, end == n_segs, activation_row, wave_rows);
       activation_row += wave_rows;
-      if (native) cache->release_native_leases(leases);
-      else for (auto& lease : leases) lease.release();
+      cache->release_native_leases(native_leases);
+      native_leases.clear();
+      for (auto& lease : leases) lease.release();
       leases.clear();
     }
     if (grouped_decode) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));

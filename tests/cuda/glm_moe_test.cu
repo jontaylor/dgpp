@@ -3367,7 +3367,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
           execution_slots*2*full.allocation_bytes + cfg.reads.staging_budget_bytes;
       return cfg;
     };
-    ExpertCache hot(store,config(live),cuda_cache_storage(identity,stream,true)); hot.initialize();
+    ExpertCache hot(store,config(live,4),cuda_cache_storage(identity,stream,true)); hot.initialize();
     for (int pass = 0; pass < 3; ++pass) {
       layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
@@ -3484,7 +3484,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       cold.reset();
       cudaStreamDestroy(service);cudaFree(table);cudaFreeHost(demand);
     }
-    ExpertCache pressure(store,config(2),cuda_cache_storage(identity,stream,true)); pressure.initialize();
+    ExpertCache pressure(store,config(2,4),cuda_cache_storage(identity,stream,true)); pressure.initialize();
     layer.enqueue_paged(c.d_hidden,c.d_out,6,pressure,mapping,stream);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     std::memcpy(got.data(),c.d_out,got.size()*2);
@@ -3555,7 +3555,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
     layer.enqueue_paged(c.d_hidden,c.d_out,1,pressure,mapping,stream);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     require(std::equal(one.begin(),one.end(),c.d_out),"b12x one-row hits and miss waves match");
-    require(hot.memory().allocated_bytes() <= config(live).planner.budget_bytes,"packed scratch stays within cache budget");
+    require(hot.memory().allocated_bytes() <= config(live,4).planner.budget_bytes,"packed scratch stays within cache budget");
   }
 }
 
