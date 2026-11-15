@@ -644,12 +644,14 @@ not measurements from the live Sparks or instructions to implement every idea.
   deduplicates one record; it does not combine neighboring records. Preserve
   alignment, per-chunk views and GPU reader lifetimes if physical coalescing
   proves useful. No image rebuild or chunk-width change has been made.
-- **Full GPU binding publication: verified mechanism, cost unmeasured.** A
+- **Full GPU binding publication: verified and timed.** A
   prepared revision change still rebuilds every target layer's table, copies
   all entries and synchronizes the service stream. An unchanged revision exits
-  immediately. Dirty publication is not implemented; timing that function
-  should precede the change. Any eventual dirty set must include removals and
-  relocations, not only admissions.
+  immediately. Opt-in timing measured publication at about 3–4% of target
+  walk time per rank in the tool continuations, mostly CPU rebuilding; a fully
+  warm anchor published nothing. Dirty publication is deferred behind reducing
+  decode misses. Any eventual dirty set must include removals and relocations,
+  not only admissions. See the publication attribution in the chunk-direct doc.
 - **Ready prefill groups: partially investigated, no serving win.** The newer
   opt-in ready-prefix experiment was correct but did not improve the matched
   serving sequence, and is disabled. It preserves order and does not run

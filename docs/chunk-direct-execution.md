@@ -362,3 +362,46 @@ initial process-cold 2,209-token prefill took 21.463 seconds; that is an anchor,
 not a new paired short-cold comparison. Serving remains running with eight
 workers. GPU binding-publication timing, phase-aware cache admission, physical
 read coalescing and exact normal-client traffic remain open.
+
+## GPU binding-publication attribution
+
+Implementation `201dde62` adds opt-in `DGPP_EXPERT_PROFILE_PUBLISH=1` diagnostics.
+When a prepared revision changes, it records CPU table-build time separately
+from copy submission plus the existing service-stream wait. Per-pass cumulative
+logs also record calls, bytes, serviced misses and enclosing walk wall time.
+No new synchronization is added; with the flag off, no profiling clocks or
+per-pass profiling logs run. The executable was built from those changes before
+commit, stamped with parent `941cd893`, SHA-256
+`2b99816f986a274878b720fdbb93ab2d8a8b050fdf86cf3e5a196134f97a26d7`
+on both ranks.
+
+One instrumented run used the eight-reader prefix-enabled tool sequence and
+then the small recomputation anchor. These are attribution data, not throughput
+benchmark results. Both ranks remained at zero swap; all four normalized tool
+sequence outputs, usage and acceptance matched the preceding eight-reader run.
+Peer logs were collected from Spark-2's active stage directory, not the stale
+peer-log copy in Spark-1's deployment directory. Request boundaries were taken
+from retirement records and matched between ranks by target replay count.
+
+For the three continuations, publication was 3.44/3.59%, 3.59/3.85% and
+3.15/3.26% of enclosing walk time on ranks 0/1 respectively. Rank 0 spent
+1.105 seconds building tables and 0.087 seconds submitting/waiting for copies;
+rank 1 spent 1.159 and 0.091 seconds. There were 4007/4027 publications across
+283 target replays, averaging approximately 294–313 microseconds per publication.
+The initial cold request's decode walk was similar: 3.57/3.67% publication.
+The final fully warm anchor had thirteen target replays, zero layer misses,
+zero expert reads and **zero publications** on both ranks.
+
+The enclosing clock includes publication, graph execution, miss servicing,
+hit accounting and final adaptation; it excludes graph capture, drafting and
+prefill. Publication is nested inside it and must not be added to it. Rank
+wall times overlap and must not be summed into a speedup prediction. Copy/wait
+time can include earlier service work; it is not a GPU memcpy-only timer.
+
+Full table rebuilding is measurable and mostly CPU work, but it is not the
+dominant cost of these misses. Incremental dirty publication remains a possible
+small optimization, not an explanation for the much larger resident/miss-heavy
+performance gap. It is deferred behind reducing decode misses and separating
+prefill/decode cache history. Publication-before-resume remains mandatory, and
+any dirty tracking must cover evictions, demotions and relocations. Profiling
+has been disabled in the retained eight-reader deployment.
