@@ -148,3 +148,60 @@ preserves resident expert capacity and warm speed, and improved the long
 request in this comparison. The cold-prefill penalty of approximately 1.18
 seconds is explicit. No claim is made that all reconstruction scratch has
 been removed; decode and fallback execution still require twelve slots.
+
+## Cache history follow-up (2026-11-15)
+
+The retained two-Spark deployment now also sets
+`engine.expert_streaming.decay_routes = 65536`, replacing the default 1024.
+All lower-memory settings above remain unchanged. This is a deployment-specific
+choice; the global planner default and shipped example templates are unchanged.
+
+The planner already shares capacity across layers and scores reuse against load
+cost. Its decay clock advances once per routed token/expert assignment across
+all layers. A large prefill can therefore age earlier layers' observations
+rapidly. Longer history is a low-cost way to test retention without adding a
+second layer-allocation policy. It also changes the normalized benefit in
+periodic adaptation; this is a comparison of that configuration, not an isolated
+proof that demand eviction alone caused the gain.
+
+A focused diagnostic compared freshly restarted deployments at 1024 and 65536,
+using the same binary from `a7320e7b`, tree `c147652c`, SHA-256
+`91afe785695b63768441e3184f33e1d698f631ed58209d8bb5b322cf62cc2c14`
+on both ranks. The five sequential C1 requests used the full tool-enabled
+system prompt (approximately 24.3K input tokens), a 64-token output limit,
+fixed speculation depth three and disabled prefix caching. The tasks requested
+directory listings of the repository root, `src`, `tests`, then root twice.
+The root task additionally requested a brief confirmation and two directory
+names. Both arms replayed identical request bodies in the same order.
+
+Cold prefill was effectively unchanged: 40.017 versus 39.974 seconds. Across
+the four subsequent requests, summed prefill fell from 87.160 to 62.908 seconds
+(27.8%). Their individual prefill times were 24.505/15.507/21.894/25.254 seconds
+before and 16.086/14.397/16.100/16.325 seconds after. Expert reads, summed across
+those requests and averaged across ranks, fell from 184.54 to 92.81 GiB.
+These warmed requests still miss the expert cache; they are not fully resident
+execution measurements.
+
+Decode did not improve: summed engine decode time for the four warmed requests
+rose from 11.651 to 12.149 seconds (4.3%), with reported per-request engine rates
+of 18.16/16.08/16.44/16.21 versus 17.46/14.51/15.99/16.38 tokens/s. The labelled
+service-level result, including prefill and request overhead, improved from
+98.979 to 75.259 seconds across those requests (24.0%). All five normalized
+outputs, usage and speculative acceptance counts matched. Prefix cached-token
+counts were zero, and both processes remained at zero swap.
+
+A subsequent short-prompt anchor on the retained candidate reached 100% expert
+hits and zero expert reads on both ranks. After layout preparation settled,
+the 2,209-token prompt took 1.427 seconds to prefill and decoded at 52.91
+tokens/s. This is consistent with the earlier small warm diagnostic above,
+but its preceding cache-warming sequence differs, so it is not a fresh paired
+comparison against that earlier result.
+
+These are focused diagnostics, not new benchmark campaign rows or evidence
+across concurrency levels and diverse applications. The cold anchor resets
+the process/expert cache; it does not claim to flush every OS or SSD cache.
+The longer history remains deployed because it substantially improves this
+partially warm tool workload without consuming more memory or changing outputs.
+Long-output decode, abrupt topic shifts and a wider request mix remain open.
+Independent readiness for chunk-direct prefill is also still unimplemented;
+the existing ready-expert executor currently serves the reconstructed B12x path.
