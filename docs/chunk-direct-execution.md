@@ -507,3 +507,38 @@ and configuration round-trip coverage. The 256-token continuation cap still
 precludes a completed-task quality claim. The retained deployment uses fixed
 initial costs with eight workers; phase-aware weighting, coalesced physical
 reads, replay bounds and broader normal-client workloads remain open.
+
+## Speculative-depth refresh after I/O and cache changes
+
+The retained configuration remains **fixed DSpark depth three**, with confidence
+scheduling disabled. A focused depth-three/depth-two comparison used the same
+binary (`36df49d50e413b4ea0d18d30004f5bef5d3fabf3324c4c0f8623ae71feef0411`),
+eight readers, fixed initial load costs, decay 65536 and horizon 8192. Each arm
+restarted, ran the prefix-enabled tool sequence and then three small recomputed
+requests. No weight, precision or memory-budget change was made. Depth N means
+N draft predictions and N+1 target verification rows.
+
+Cold initial prefill was essentially unchanged: 38.543 versus 38.605 seconds.
+Across the three continuations, summed prefill was 5.415 versus 5.372 seconds,
+engine decode was 35.569 versus 34.744 seconds, and service-level elapsed time
+was 41.116 versus 40.246 seconds. Average per-rank expert reads were 47.01 versus
+43.67 GiB. Per-request engine decode rates were 18.63/21.53/25.41 tokens/s at
+three and 19.39/21.34/26.43 at two. Raw accepted predictions per draft pass
+were 1.68/1.80/1.68 versus 1.38/1.36/1.38; these counters are not substituted
+for committed output tokens when computing throughput.
+
+**The generated continuations did not match**, so the apparent 2.1% elapsed-time
+gain is not a clean same-output performance improvement. The initial tool call
+matched, but later prose/code text changed, including a one-token difference in
+reported reasoning count on prose. Small tool requests kept the same normalized
+tool arguments but changed their introductory wording. This screen does not
+establish whether numerical batching differences or another depth-dependent
+execution detail caused the text differences, and is not a quality evaluation.
+
+At the third small recomputation both ranks had zero expert reads in both arms.
+Depth three decoded at 52.70 tokens/s, while depth two reached 44.79 (15% lower).
+Their prefill times were 1.652 and 1.598 seconds. This is the first zero-read
+anchor after the workload switch, not a separate long steady-state campaign.
+Both ranks stayed at zero swap. Given the warm decode loss and changed outputs,
+depth two is not selected. Depths one/five and speculation off were not repeated
+on this latest configuration. No general optimal-depth claim is made.
