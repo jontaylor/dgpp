@@ -55,7 +55,11 @@ class ExpertCacheStorage {
   virtual ~ExpertCacheStorage() = default;
   virtual const CacheMemory& memory() const = 0;
   virtual void retain(size_t slot, std::span<const uint8_t> bytes) = 0;
+  // Every successful reconstruction assembles all chunks before publication.
+  // Backends may leave scratch untouched when their consumers read only the
+  // fully overwritten tensor ranges, rather than allocation padding.
   virtual void begin_execution(size_t slot) = 0;
+  virtual uint64_t execution_zero_bytes_per_begin() const { return memory().execution_slot_bytes; }
   virtual void assemble(size_t execution_slot, const StoreRecord& record,
       std::optional<size_t> cache_slot, std::span<const uint8_t> host_bytes) = 0;
   virtual const uint8_t* execution_data(size_t slot) const = 0;
@@ -79,6 +83,10 @@ class ExpertCacheStorage {
   // stream may release host leases without draining it: all future writes
   // are ordered after these readers. Other backends retain the full fence.
   virtual void retire_native() { finish(); }
+  // The same ordering rule applies to reconstruction scratch. Staging leases
+  // have already been drained before acquire() returns; only device readers
+  // remain. A backend may reuse the slot through ordered GPU submissions.
+  virtual void retire_execution() { finish(); }
   virtual void finish() = 0;
 };
 using CacheStorageFactory = std::function<std::unique_ptr<ExpertCacheStorage>(

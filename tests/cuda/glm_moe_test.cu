@@ -3545,6 +3545,33 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
               "mixed prepared and reconstructed prefill preserves canonical arithmetic");
       layer.rebind(c.dev_w);
     }
+    {
+      // No preceding decode prepares this cache: repeated large prefill must
+      // promote complete chunks once, then consume native bindings directly.
+      ExpertCache prefill_only(store,config(live,4),cuda_cache_storage(identity,stream,true));
+      prefill_only.initialize();
+      layer.enqueue(c.d_hidden,c.d_out,129,stream,dgpp::MoeExpertKernel::kMma);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      const std::vector<uint16_t> canonical(c.d_out,c.d_out+129*H);
+      layer.rebind(paged_weights);
+      for (int repeat = 0; repeat < 3; ++repeat) {
+        const auto prior = prefill_only.telemetry();
+        layer.enqueue_paged(c.d_hidden,c.d_out,129,prefill_only,mapping,stream,dgpp::MoeExpertKernel::kMma);
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        require(std::equal(canonical.begin(),canonical.end(),c.d_out),
+                "prefill-only native preparation preserves canonical output");
+        if (repeat == 2)
+          require(prefill_only.stats().direct_native_hits > prior.cache.direct_native_hits &&
+                      prefill_only.stats().native_packs == prior.cache.native_packs &&
+                      prefill_only.stats().cached_copy_bytes == prior.cache.cached_copy_bytes &&
+                      prefill_only.stats().canonical_unpacks == prior.cache.canonical_unpacks &&
+                      prefill_only.telemetry().file.calls == prior.file.calls,
+                  "repeated resident prefill needs no reads, reconstruction or repacking");
+      }
+      require(prefill_only.memory().allocated_bytes() <= config(live,4).planner.budget_bytes,
+              "prefill native preparation stays within the existing cache reservation");
+      layer.rebind(c.dev_w);
+    }
     layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     std::memcpy(got.data(),c.d_out,got.size()*2);

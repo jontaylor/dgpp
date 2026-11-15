@@ -77,9 +77,12 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   }
   void begin_execution(size_t slot) override {
     check_execution(slot);
-    DGPP_CUDA_OK(cudaMemsetAsync(execution_ + slot * memory_.execution_slot_bytes, 0,
-                                 memory_.execution_slot_bytes, stream_));
+    // assemble() overwrites every payload, scale and global of the complete
+    // expert. Packing likewise overwrites its companion's tensor ranges.
+    // Neither consumer reads allocation padding. Clearing both reservations
+    // first adds a full memory sweep without supplying any consumed values.
   }
+  uint64_t execution_zero_bytes_per_begin() const override { return 0; }
   void assemble(size_t execution_slot, const StoreRecord& record,
       std::optional<size_t> cache_slot, std::span<const uint8_t> host_bytes) override {
     check_execution(execution_slot);
@@ -196,6 +199,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   // overwrite weights before earlier kernel readers complete. Host leases
   // need not force GPU completion; staging and destruction still drain.
   void retire_native() override {}
+  void retire_execution() override {}
   void finish() override {
     const auto started = std::chrono::steady_clock::now();
     const auto status = cudaStreamSynchronize(stream_);

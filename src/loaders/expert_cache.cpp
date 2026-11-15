@@ -309,8 +309,9 @@ struct ExpertCacheState {
   }
   void release_execution(size_t slot) {
     check_thread();
-    // Even a poisoned cache must fence outstanding kernel readers.
-    try { storage->finish(); }
+    // Backends either fence readers or guarantee that all subsequent writes
+    // to this scratch slot are ordered after them on the execution stream.
+    try { storage->retire_execution(); }
     catch (...) { counters.poisoned = true; throw; }
     execution_busy[slot] = false;
     --counters.active_execution_slots;
@@ -616,7 +617,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     s.counters.reconstruction_wall_ns += wall_ns > waited ? wall_ns - waited : 0;
     s.counters.cached_copy_bytes += cached_bytes;
     s.counters.staged_copy_bytes += staged_bytes;
-    s.counters.execution_zero_bytes += s.memory.execution_slot_bytes;
+    s.counters.execution_zero_bytes += s.storage->execution_zero_bytes_per_begin();
     s.execution_busy[slot] = true;
     ++s.counters.active_execution_slots;
     s.counters.peak_execution_slots = std::max(s.counters.peak_execution_slots, s.counters.active_execution_slots);

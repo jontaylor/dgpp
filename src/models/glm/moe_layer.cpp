@@ -974,6 +974,25 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     for (int wave = 0; wave < n_segs;) {
       const int first = wave;
       const int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      // Full resident chunks need only one conversion to the direct layout.
+      // Do it before this wave owns any scratch/native leases: preparation
+      // relocates cache slots and uses the existing reconstruction reservation.
+      static const bool prepare_prefill = [] {
+        const char* e = std::getenv("DGPP_MOE_PREFILL_PREPARE_RESIDENT");
+        return e == nullptr || e[0] != '0';
+      }();
+      if (direct_prefill && prepare_prefill) {
+        std::vector<size_t> complete;
+        complete.reserve(static_cast<size_t>(end-first));
+        for (int j = first; j < end; ++j) {
+          const size_t e = cache_experts[static_cast<size_t>(active_experts[j])];
+          if (!cache->prepared_address(e) &&
+              cache->residency().chunks[e] == cache->experts()[e].records.size())
+            complete.push_back(e);
+        }
+        if (!complete.empty() && !cache->prepare_resident(complete))
+          throw std::logic_error("GlmMoeLayer: resident prefill bindings changed during preparation");
+      }
       std::vector<bool> reconstructed(static_cast<size_t>(end-first), false);
       // Complete admissions before pinning native addresses. An admission can
       // evict an earlier prepared selection, so revisit skipped selections
@@ -1209,8 +1228,18 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
   // Reconstructed experts have independent, preallocated execution slots.
   // Keep a bounded wave alive through one grouped launch instead of paying
   // for a persistent kernel and route upload for each missing expert.
+  // Diagnostic cap: one launches each reconstructed expert immediately,
+  // allowing queued next-expert reads to overlap its stream-ordered execution.
+  // The default retains grouped execution; this cap changes no reservation.
+  static const size_t ready_limit = [] {
+    const char* e = std::getenv("DGPP_MOE_MISS_READY_LIMIT");
+    if (!e) return size_t{0};
+    const long value = std::strtol(e, nullptr, 10);
+    return value > 0 ? static_cast<size_t>(value) : size_t{0};
+  }();
   const size_t wave_capacity = std::min(missing.size(),
-      static_cast<size_t>(cache.memory().execution_slots));
+      ready_limit ? std::min(ready_limit, static_cast<size_t>(cache.memory().execution_slots))
+                  : static_cast<size_t>(cache.memory().execution_slots));
   std::vector<expert::ExpertExecutionLease> leases;
   std::vector<int> wave_ids;
   leases.reserve(wave_capacity);
