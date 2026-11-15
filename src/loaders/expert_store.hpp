@@ -80,7 +80,7 @@ class ExpertStore {
   StoreIdentity identity_;
   IoMode mode_;
   bool verify_record_checksums_;
-  int fd_ = -1;
+  int fd_ = -1, trace_fd_ = -1;
   mutable std::atomic<uint64_t> calls_{0}, bytes_{0}, failures_{0};
 };
 

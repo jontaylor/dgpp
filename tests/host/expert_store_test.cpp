@@ -196,3 +196,32 @@ DGPP_TEST(expert_store_direct_reads_require_aligned_budgeted_staging_without_fal
 }
 
 int main() { return dgpp::test::run_all(); }
+
+DGPP_TEST(expert_store_optional_trace_records_first_and_repeated_reads) {
+  Fixture f; f.build();
+  const auto prefix = (f.dir / "reads").string();
+  const char* prior = std::getenv("DGPP_EXPERT_READ_TRACE");
+  const std::optional<std::string> previous = prior ? std::optional<std::string>(prior) : std::nullopt;
+  struct Restore {
+    std::optional<std::string> previous;
+    ~Restore() { if (previous) ::setenv("DGPP_EXPERT_READ_TRACE", previous->c_str(), 1);
+                 else ::unsetenv("DGPP_EXPERT_READ_TRACE"); }
+  } restore{previous};
+  ::setenv("DGPP_EXPERT_READ_TRACE", prefix.c_str(), 1);
+  ExpertStore store(f.path, f.identity, f.keys.size(), IoMode::kBuffered);
+  const std::array<size_t, 3> reads{0, 0, 2};
+  for (auto i : reads) {
+    std::vector<uint8_t> bytes(store.records()[i].layout.record_bytes);
+    store.read(i, bytes);
+  }
+  std::ifstream trace(prefix + ".r1.p" + std::to_string(::getpid()) + ".bin", std::ios::binary);
+  for (auto i : reads) {
+    std::array<uint64_t, 8> event{};
+    require(static_cast<bool>(trace.read(reinterpret_cast<char*>(event.data()), sizeof(event))), "complete trace event");
+    const auto& r = store.records()[i];
+    require(event[0] > 0 && event[1] >= event[0] && event[2] == r.key.layer && event[3] == r.key.expert &&
+        event[4] == r.key.chunk && event[5] == r.key.draft && event[6] == r.layout.record_bytes &&
+        event[7] == r.file_offset, "trace preserves expert/chunk identity and bytes including rereads");
+  }
+  require(trace.peek() == std::char_traits<char>::eof(), "one event per successful record read");
+}

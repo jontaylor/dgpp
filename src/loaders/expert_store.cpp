@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -233,14 +235,31 @@ ExpertStore::ExpertStore(const std::string& path, const StoreIdentity& expected,
     if (body >= 0) ::close(body);
     throw;
   }
+  // Optional diagnostic only: fixed-size completion records, no model payload.
+  // One append per read preserves worker concurrency without a tracing mutex.
+  try {
+    if (const char* prefix = std::getenv("DGPP_EXPERT_READ_TRACE"); prefix && *prefix) {
+      const auto trace = std::string(prefix) + ".r" + std::to_string(identity_.rank) +
+          ".p" + std::to_string(::getpid()) + ".bin";
+      trace_fd_ = ::open(trace.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+      if (trace_fd_ < 0) error("cannot open diagnostic read trace");
+    }
+  } catch (...) { ::close(fd_); fd_ = -1; throw; }
 }
-ExpertStore::~ExpertStore() { if (fd_ >= 0) ::close(fd_); }
+ExpertStore::~ExpertStore() {
+  if (trace_fd_ >= 0) ::close(trace_fd_);
+  if (fd_ >= 0) ::close(fd_);
+}
 void ExpertStore::read(size_t index, std::span<uint8_t> destination) const {
   if (index >= records_.size()) error("invalid read index");
   const auto& record = records_[index];
   if (destination.size() != record.layout.record_bytes ||
       (mode_ == IoMode::kDirect && reinterpret_cast<uintptr_t>(destination.data()) % kPage))
     error("read staging has invalid size/alignment");
+  const auto timestamp = [] { return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count()); };
+  const uint64_t trace_start = trace_fd_ >= 0 ? timestamp() : 0;
   auto remaining = destination;
   uint64_t offset = record.file_offset;
   try {
@@ -254,6 +273,15 @@ void ExpertStore::read(size_t index, std::span<uint8_t> destination) const {
       remaining = remaining.subspan(static_cast<size_t>(n));
     }
     if (verify_record_checksums_ && hash(destination) != record.checksum) error("record checksum mismatch");
+    if (trace_fd_ >= 0) {
+      // Native uint64 fields: start/end Unix ns, layer, expert, chunk, draft,
+      // record bytes, file offset. Consumers must reject incomplete records.
+      const uint64_t event[]{trace_start, timestamp(), record.key.layer, record.key.expert,
+          record.key.chunk, record.key.draft, record.layout.record_bytes, record.file_offset};
+      ssize_t written;
+      do { written = ::write(trace_fd_, event, sizeof(event)); } while (written < 0 && errno == EINTR);
+      if (written != static_cast<ssize_t>(sizeof(event))) error("incomplete diagnostic read trace");
+    }
   } catch (...) {
     failures_.fetch_add(1, std::memory_order_relaxed);
     throw;
