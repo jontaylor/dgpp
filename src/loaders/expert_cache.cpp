@@ -82,7 +82,11 @@ struct ExpertCacheState {
   std::vector<size_t> record_owner;
   std::vector<uint64_t> expert_record_bytes;
   std::vector<bool> execution_busy;
-  std::map<size_t, std::shared_ptr<ReadTicket>> prefetched;
+  struct QueuedRead {
+    std::shared_ptr<ReadTicket> ticket;
+    std::chrono::steady_clock::time_point demanded_at{};
+  };
+  std::map<size_t, QueuedRead> prefetched;
   CacheStats counters;
   uint64_t prepared_revision = 1;
   bool observed_for_adaptation = false;
@@ -120,8 +124,9 @@ struct ExpertCacheState {
     bool speculative = false;
     std::shared_ptr<ReadTicket> ticket = std::move(queued_ticket);
     if (auto it = prefetched.find(record); it != prefetched.end()) {
-      speculative = true;
-      if (!ticket) ticket = std::move(it->second);
+      speculative = it->second.demanded_at == std::chrono::steady_clock::time_point{};
+      if (!speculative) queued = it->second.demanded_at;
+      if (!ticket) ticket = std::move(it->second.ticket);
       prefetched.erase(it);
       // A look-ahead already promoted this ticket. Preserve its original
       // result, including errors, rather than retrying a failed queued read.
@@ -717,7 +722,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
               pending.size() + s.pending_copies.size() + s.prefetched.size() >= s.config.reads.buffers) break;
           const auto queued = std::chrono::steady_clock::now();
           auto ticket = s.reads->request(r, ReadPriority::kDemand);
-          if (pref != s.prefetched.end()) { ticket = std::move(pref->second); s.prefetched.erase(pref); }
+          if (pref != s.prefetched.end()) { ticket = std::move(pref->second.ticket); s.prefetched.erase(pref); }
           if (!ticket) break;
           pending.push_back({j, r, std::move(ticket), queued}); ++next;
         }
@@ -815,7 +820,24 @@ size_t ExpertCache::prefetch(size_t expert) {
     if (s.prefetched.size() >= s.config.reads.buffers - 1) break;
     auto ticket = s.reads->request(record, ReadPriority::kPrefetch);
     if (!ticket) break;
-    s.prefetched.emplace(record, std::move(ticket));
+    s.prefetched.emplace(record, ExpertCacheState::QueuedRead{std::move(ticket), {}});
+    ++accepted;
+  }
+  return accepted;
+}
+size_t ExpertCache::lookahead_demand(size_t expert) {
+  auto& s = *state_;
+  s.check();
+  s.expert_index(expert);
+  const size_t limit = s.config.reads.buffers / 2;
+  size_t accepted = 0;
+  for (auto record : s.experts[expert].records) {
+    if (s.slots[record] != absent || s.prefetched.contains(record)) continue;
+    if (s.prefetched.size() + s.pending_copies.size() >= limit) break;
+    const auto started = std::chrono::steady_clock::now();
+    auto ticket = s.reads->request(record, ReadPriority::kDemand);
+    if (!ticket) break;
+    s.prefetched.emplace(record, ExpertCacheState::QueuedRead{std::move(ticket), started});
     ++accepted;
   }
   return accepted;

@@ -700,6 +700,32 @@ DGPP_TEST(expert_cache_resource_pressure_defers_only_background_work) {
             "background promotions resume after pressure clears");
   }
 }
+DGPP_TEST(expert_cache_demand_lookahead_is_bounded_under_pressure) {
+  for (auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+    Fixture f;
+    auto cfg = f.config(policy);
+    cfg.reads.prefetch_bytes = 0;
+    ResourcePressure pressure;
+    pressure.memory_pressure = pressure.storage_pressure = true;
+    ExpertCache cache(f.store, cfg, host(f), [&] { return pressure; });
+    cache.initialize();
+    const auto before = cache.residency().chunks;
+    require(cache.prefetch(0) == 0, "speculative reads remain pressure gated");
+    const auto accepted = cache.read_stats().accepted;
+    require(cache.lookahead_demand(0) == 1, "known demand uses reserved staging despite pressure");
+    require(cache.lookahead_demand(0) == 0 && cache.lookahead_demand(1) == 0,
+            "repeated or additional lookahead cannot consume the current-demand reserve");
+    require(cache.read_stats().accepted == accepted + 1 && cache.read_stats().speculative_bytes == 0,
+            "known demand coalesces without speculative budget");
+    require(cache.residency().chunks == before, "lookahead alone never admits or evicts weights");
+    auto lease = cache.acquire(0);
+    check_bytes(lease, f);
+    lease.release();
+    require(cache.read_stats().staging_peak <= cfg.reads.staging_budget_bytes,
+            "lookahead and synchronous acquisition share the bounded pool");
+  }
+}
+
 int main() { return dgpp::test::run_all(); }
 
 DGPP_TEST(expert_cache_demand_io_overlaps_current_chunk_completion_with_two_buffers) {

@@ -32,9 +32,9 @@
       "adapt_every_routes": 1024,
       "adaptation_bytes": 67108864,
       "prefetch_bytes": 8388608,
-      "io_buffers": 16,
+      "io_buffers": 64,
       "io_workers": 4,
-      "queue_depth": 16,
+      "queue_depth": 64,
       "execution_slots": 1,
       "io_mode": "direct"
     },

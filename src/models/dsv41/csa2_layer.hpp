@@ -318,8 +318,6 @@ class Csa2Layer {
   void* exl3_ws_ = nullptr;
   size_t exl3_ws_bytes_ = 0;
   void window_exl3(const Exl3Matrix& m);
-  std::vector<int64_t> host_i64_;
-  std::vector<int32_t> host_i32_;
 
   uint8_t* scratch_ = nullptr;
   uint16_t* qr_ = nullptr;        // [T, q_lora]

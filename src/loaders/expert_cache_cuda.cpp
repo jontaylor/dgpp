@@ -184,7 +184,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     if (record.key.chunk >= copies_.size()) throw std::invalid_argument("expert CUDA cache: native chunk index");
     auto* dest = cache_ + cache_slot * memory_.cache_slot_bytes;
     const auto* source = execution_ + execution_slot * memory_.execution_slot_bytes;
-    DGPP_CUDA_OK(cudaMemsetAsync(dest, 0, memory_.cache_slot_bytes, stream_));
+    // The gather overwrites every tensor byte; allocation padding is never
+    // consumed by a matrix kernel or included in a reconstructed tensor.
     if (gpu_scatter_) {
       launch_expert_chunk_scatter(dest, source, gather_plans_[record.key.chunk], stream_);
       return;

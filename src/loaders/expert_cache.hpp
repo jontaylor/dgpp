@@ -198,6 +198,9 @@ class ExpertCache {
   // Keeps at most buffers-1 speculative tickets, reserving staging for demand.
   // Returns number accepted/coalesced; never calls the device backend.
   size_t prefetch(size_t expert);
+  // Already-routed upcoming work, not speculative background traffic. Uses
+  // at most half of the existing staging slots and never changes residency.
+  size_t lookahead_demand(size_t expert);
   CacheStats stats() const;
   ReadQueueStats read_stats() const;
   CacheTelemetry telemetry() const;

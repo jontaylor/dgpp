@@ -803,14 +803,18 @@ void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, 
 
 // ---- prefill --------------------------------------------------------------------------------------
 
+namespace {
+__global__ void prefill_metadata_kernel(int64_t* positions, int32_t* requests,
+                                       int tokens, int req, int64_t pos0) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < tokens) { positions[i] = pos0 + i; requests[i] = req; }
+}
+}
 void Csa2Layer::stage_prefill_rows(int req, int64_t pos0, int tokens, cudaStream_t stream) {
-  // Host staging (prefill is never captured): positions and request ids.
-  host_i64_.assign(static_cast<size_t>(tokens), 0);
-  host_i32_.assign(static_cast<size_t>(tokens), req);
-  for (int i = 0; i < tokens; ++i) host_i64_[static_cast<size_t>(i)] = pos0 + i;
-  DGPP_CUDA_OK(cudaMemcpyAsync(pos_, host_i64_.data(), static_cast<size_t>(tokens) * 8, cudaMemcpyHostToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(req_ids_, host_i32_.data(), static_cast<size_t>(tokens) * 4, cudaMemcpyHostToDevice, stream));
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream));  // the staging vectors are reused by the callers
+  // Produce deterministic metadata on the consumer stream; no host buffer
+  // lifetime or host/device fence is needed between prefill chunks.
+  prefill_metadata_kernel<<<(tokens + 255) / 256, 256, 0, stream>>>(pos_, req_ids_, tokens, req, pos0);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 
 void Csa2Layer::publish_rows(const void* hidden_in, Csa2StatePool& pool, int req, int64_t pos0, int tokens,

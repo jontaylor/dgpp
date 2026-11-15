@@ -65,3 +65,69 @@ stamp predates the final commit. Both ranks had matching binary hashes:
 |---|---|
 | Baseline / resident-first | `d8398763ccb2006e1c0c7d768cf22e6b5c404a6557654330576974eb87e9b47c` |
 | Retained prepared-copy implementation | `d6f15940e8e458194135ceef6d478331eb5ff129decec276bd32508f00bafa6e` |
+
+## Bounded demand read-ahead follow-up
+
+The next pass queues already-selected experts as demanded reads, independently
+of background-prefetch pressure gates. It uses the existing staging pool,
+limits outstanding look-ahead to half that pool, and looks ahead at most two
+selected experts. It neither admits nor evicts weights early. Demand timing
+includes time spent queued. `DGPP_EXPERT_DEMAND_LOOKAHEAD=0` restores the prior
+speculative-prefetch behavior; demand look-ahead is enabled by default.
+
+Attention row metadata is now generated on the GPU, removing its host staging
+and stream synchronization. Wave-local activation skips unnecessary full-buffer
+clears; the W4A4 full-batch path retains them. Native chunk unpacking no longer
+clears padding that the matrix kernels do not consume.
+
+The retained NVFP4 configuration increases staging buffers and queue depth from
+16 to 64, retaining four workers, 24 execution slots and the same 100 GiB cache
+reservation per rank. Staging is charged within that reservation.
+
+| Focused diagnostic | Previous production | Demand, 16 buffers | Demand, 64 buffers |
+|---|---:|---:|---:|
+| 2,209-token cold prefill, seconds | 31.8274 | 31.0823 | 25.3854 |
+| 2,209-token steady warm prefill, seconds | 1.4229 / 1.4239 | 1.4135 / 1.4108 | 1.4112 / 1.4150 |
+| 4,559-token first prefill after small workload, seconds | 9.8376 | 8.7631 | 7.4103 |
+| 4,559-token repeated miss-heavy prefill, seconds | 16.4010 / 15.6908 | 13.7376 / 13.6382 | 10.8163 / 10.3771 |
+
+These are focused diagnostics, not published deployment campaign throughput
+rows. Every request recomputes its prompt (`prefix_cache=false`). Outputs,
+normalized tool arguments, usage and speculative acceptance match across all
+arms; both ranks have zero swap. Cold reads are exactly 95.316833496 GiB per
+rank in every arm. Steady warm requests have zero expert reads and 100% hits.
+Repeated large requests read approximately 36.5–37.8 GiB per rank, with small
+arm-dependent differences, so the miss-heavy gain cannot be attributed solely
+to overlap. Warm decode remains approximately 0.92 seconds; this pass establishes
+no material warm speedup or broader decode/concurrency claim.
+
+The measured source is `d0504bac` plus this follow-up's implementation changes.
+Baseline SHA-256 is `d6f15940e8e458194135ceef6d478331eb5ff129decec276bd32508f00bafa6e`;
+candidate SHA-256 is `3be30c66f80d007ef538eb62a151ead2d782a778f0cad0630b80a3928de9c6f8`.
+Both candidate arms explicitly enabled demand look-ahead. The final source
+makes that same path the default; the deployed rebuild is distinct from the
+measured binary. No profiling or concurrent builds ran during these requests.
+
+Validation: 27 expert-cache tests and two attention-layer tests passed on Spark.
+The prepared/mixed/pressure B12x paging fixture and generic NVFP4/MXFP4 paged-wave
+fixture also passed, preserving bitwise results. The new host regression covers
+both cache policies, pressure gates, deduplication, bounded staging and unchanged
+residency before acquisition.
+
+### Remaining review work
+
+- Dedicated copy streams and per-slot completion fences are not implemented.
+  Acquisition/admission still drains the compute stream. Cache writes, eviction,
+  relocation and scratch reuse need explicit reader/write dependencies before
+  removing those drains; demand read-ahead does not provide full copy/compute overlap.
+- Large prefill still launches whole reconstructed waves. Independent expert
+  readiness needs the same buffer-lifetime and execution-order integration.
+- Chunk-direct projection kernels are not implemented. They must preserve FP32
+  accumulation across chunks and final scaling; summing independently rounded
+  partial outputs is not equivalent. Reconstruction/scatter therefore remains.
+- W4A4 activation quantization is unchanged: its quality and correctness gate
+  has not been performed. Smaller BF16 tile designs remain possible; the earlier
+  rejected compact grid does not exhaust them.
+- No worker-count or bandwidth sweep was run. The bounded capacity comparison
+  already demonstrates a useful gain with four workers. No fourfold warm gain
+  or full concurrency campaign is claimed.

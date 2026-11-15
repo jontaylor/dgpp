@@ -922,10 +922,14 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     std::vector<GlmFp4Matrix> views(static_cast<size_t>(E) * 3);
     const size_t i_max = static_cast<size_t>(std::max<int64_t>(full.intermediate_size,
         shared ? (w_.shared_nvfp4() ? w_.shared_fp4[0].rows : w_.shared[0].rows) : 0));
-    // The existing activation launcher covers all segment rows. Initialize
-    // rows belonging to later waves so it never reads uninitialized scratch.
-    DGPP_CUDA_OK(cudaMemsetAsync(d_gate_, 0, rows_total * i_max * sizeof(uint16_t), stream));
-    DGPP_CUDA_OK(cudaMemsetAsync(d_up_, 0, rows_total * i_max * sizeof(uint16_t), stream));
+    // Local activation reads only the rows produced by this wave. Only
+    // W4A4's full-batch quantization can inspect not-yet-produced rows.
+    const bool full_batch_activation = !w_.weight_only_fp4 && format == expert::Format::kNvfp4 &&
+        kernel == MoeExpertKernel::kMma && moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total);
+    if (full_batch_activation) {
+      DGPP_CUDA_OK(cudaMemsetAsync(d_gate_, 0, rows_total * i_max * sizeof(uint16_t), stream));
+      DGPP_CUDA_OK(cudaMemsetAsync(d_up_, 0, rows_total * i_max * sizeof(uint16_t), stream));
+    }
     const bool grouped_decode = fp4_grouped_decode_enabled() && kernel == MoeExpertKernel::kGemv &&
         out_bf16 && tokens > 1 && tokens <= 16 && tokens <= decode_slots_ &&
         shared_lane_takes(true, tokens) && !shared_aside_takes(true, tokens);
@@ -970,6 +974,13 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       const char* value = std::getenv("DGPP_MOE_RESIDENT_FIRST");
       return value && std::atoi(value) != 0;
     }();
+    static const bool demand_lookahead = [] {
+      const char* value = std::getenv("DGPP_EXPERT_DEMAND_LOOKAHEAD");
+      return !value || std::atoi(value) != 0;
+    }();
+    const auto read_ahead = [&](size_t expert) {
+      return demand_lookahead ? cache->lookahead_demand(expert) : cache->prefetch(expert);
+    };
     const bool resident_first = direct_prefill && resident_first_enabled;
     size_t resident_count = 0;
     if (resident_first) {
@@ -999,8 +1010,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total*sizeof(int), cudaMemcpyHostToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk*sizeof(int), cudaMemcpyHostToDevice, stream));
       DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
-      if (resident_count < active_experts.size())
-        (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[resident_count])]);
+      for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + (demand_lookahead ? 2u : 1u)); ++j)
+        (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
     } else {
       launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
     }
@@ -1046,8 +1057,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           if (reconstructed[j-first] || (direct_prefill && cache->prepared_address(expert))) continue;
           auto lease = cache->acquire(expert, /*canonical=*/true);
           if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
-          if (j+1 < n_segs)
-            (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[j+1])]);
+          for (int next = j+1; next < std::min(n_segs, j+1+(demand_lookahead ? 2 : 1)); ++next)
+            (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[next])]);
           const auto matrices = expert::execution_matrices(lease, full, format);
           if (leases.empty())
             for (int entry = 0; entry < E; ++entry)

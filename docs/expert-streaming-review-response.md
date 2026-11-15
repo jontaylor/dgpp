@@ -596,3 +596,14 @@ of prepared NVFP4 weights. Warm 2,209-token prefill falls from about 2.08 to
 in the Spark deployment based on that warm result; the earlier cold-pair result
 above remains valid. The attempted compact tile grid did not improve serving
 and was removed. Warm, cold and prefix-cache performance remain separate claims.
+
+### Demand scheduling and residual review scope
+
+The [bounded demand read-ahead follow-up](warm-prefill-optimization.md#bounded-demand-read-ahead-follow-up)
+addresses pressure-blocked reads for already-selected experts, attention metadata
+staging and redundant clears. A larger staging pool within the same cache budget
+reduces cold prefill by about 20% and repeated miss-heavy prefill by about 34–35%;
+steady warm performance is effectively unchanged. The linked section records
+validation and explicitly lists remaining stream ownership, independent readiness,
+chunk-direct execution and activation-precision work. Those architectural findings
+are still open, rather than resolved by the demand queue change.
