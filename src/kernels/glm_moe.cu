@@ -3875,7 +3875,7 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
     const uint16_t* __restrict__ act, size_t act_stride, int act_vec,
     const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride,
-    int n, int k, int m_tiles) {
+    int n, int k, int m_tiles, bool packed_direct) {
   dgpp_pdl_wait();
   using namespace fp4_ldm;
   static_assert(TileRows == 16 || TileRows == 64);
@@ -3992,7 +3992,19 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
         const int gk = k0 + b_half * 32;
         const int in_codes = b_ok ? max(0, min(32, k - gk)) : 0;
         uint8_t* cdst = slotCodes(slot) + static_cast<size_t>(b_row) * kRawStride + b_half * 16;
-        if (v.fp4_packed_rows) {
+        if (v.fp4_packed_rows && packed_direct) {
+          // Keep the prepared MMA lane layout in shared memory. Each warp
+          // copies one contiguous 512-byte n64/k16 slab instead of gathering
+          // sixteen individual bytes per thread into canonical row order.
+          const int nk = tid / 64, nn = (tid / 32) % 2;
+          const int pn = n0 + v.fp4_packed_row0 + nn * 64;
+          const int pk = k0 + nk * 16;
+          const bool valid = n0 + nn * 64 < n && pk < k;
+          const auto* source = reinterpret_cast<const uint32_t*>(v.payload);
+          const size_t word = ((static_cast<size_t>(pk / 16) * (v.fp4_packed_rows / 64) +
+                                pn / 64) * 128) + (tid % 32) * 4;
+          cp_async(slotCodes(slot) + tid * 16, valid ? source + word : source, 16, valid ? 16 : 0);
+        } else if (v.fp4_packed_rows) {
           const int pn = gn + v.fp4_packed_row0;
           const auto* words = reinterpret_cast<const uint32_t*>(v.payload);
 #pragma unroll
@@ -4095,11 +4107,20 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
           const int bn = wn * 16 + j * 8 + r;
-          const uint2 w = *reinterpret_cast<const uint2*>(
-              codes + static_cast<size_t>(bn) * kRawStride + (kk / 16) * 8);
           const uint8_t sc = static_cast<uint8_t>((sc4[j] >> (8 * (kk / kGroup))) & 0xFFu);
-          const uint32_t byte0 = __byte_perm(w.x, 0u, byte_sel);
-          const uint32_t byte1 = __byte_perm(w.y, 0u, byte_sel);
+          uint32_t byte0, byte1;
+          if (v.fp4_packed_rows && packed_direct) {
+            const int word_index = (kk / 16) * 256 + fp4_layout::packed_word(bn, cc, 128);
+            const uint32_t word = reinterpret_cast<const uint32_t*>(codes)[word_index];
+            const int shift = fp4_layout::packed_slot(bn, cc) * 4;
+            byte0 = ((word >> shift) & 15) | ((word >> (shift + 12)) & 240);
+            byte1 = ((word >> (shift + 4)) & 15) | ((word >> (shift + 16)) & 240);
+          } else {
+            const uint2 w = *reinterpret_cast<const uint2*>(
+                codes + static_cast<size_t>(bn) * kRawStride + (kk / 16) * 8);
+            byte0 = __byte_perm(w.x, 0u, byte_sel);
+            byte1 = __byte_perm(w.y, 0u, byte_sel);
+          }
           if constexpr (kGroup == kFp4Group) {
             const __half2 s2 = __half2half2(__half(__nv_cvt_fp8_to_halfraw(
                 static_cast<__nv_fp8_storage_t>(sc), __NV_E4M3)));
@@ -4187,6 +4208,10 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tile_smem)));
     opted_in[gi] = true;
   }
+  static const bool packed_direct = [] {
+    const char* value = std::getenv("DGPP_MOE_PACKED_PREFILL_COPY");
+    return !value || std::atoi(value) != 0;
+  }();
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
   if (static_cast<size_t>(n_tiles) * m_tiles > 0x7fffffffu)
     throw std::invalid_argument("moe grouped mma fp4 ldm: grid too large");
@@ -4194,11 +4219,11 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
   if (gi == 0)
     moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
-                                                which, out, out_stride, n, k, m_tiles);
+                                                which, out, out_stride, n, k, m_tiles, packed_direct);
   else
     moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
-                                                which, out, out_stride, n, k, m_tiles);
+                                                which, out, out_stride, n, k, m_tiles, packed_direct);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

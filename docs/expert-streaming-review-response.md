@@ -585,3 +585,14 @@ read workers and fixed speculative depth. Engram amplification was a removable
 cost; the remaining expert I/O, reconstruction/layout preparation and rank
 coordination are still optimization opportunities, not established hardware
 limits.
+
+
+### Subsequent warm-path optimization
+
+The later [warm prefill investigation](warm-prefill-optimization.md) revisits
+resident-first grouping under zero-read conditions and adds contiguous copies
+of prepared NVFP4 weights. Warm 2,209-token prefill falls from about 2.08 to
+1.42 seconds with matching outputs and acceptance. Resident-first is now enabled
+in the Spark deployment based on that warm result; the earlier cold-pair result
+above remains valid. The attempted compact tile grid did not improve serving
+and was removed. Warm, cold and prefix-cache performance remain separate claims.
