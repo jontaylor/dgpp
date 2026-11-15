@@ -919,7 +919,6 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       cache->release_native_leases(leases);
       return;
     }
-    launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
     std::vector<GlmFp4Matrix> views(static_cast<size_t>(E) * 3);
     const size_t i_max = static_cast<size_t>(std::max<int64_t>(full.intermediate_size,
         shared ? (w_.shared_nvfp4() ? w_.shared_fp4[0].rows : w_.shared[0].rows) : 0));
@@ -967,13 +966,53 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const bool direct_prefill = prepared_prefill && cache->packed_nvfp4() &&
         kernel == MoeExpertKernel::kMma &&
         (w_.weight_only_fp4 || !moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total));
+    static const bool resident_first_enabled = [] {
+      const char* value = std::getenv("DGPP_MOE_RESIDENT_FIRST");
+      return value && std::atoi(value) != 0;
+    }();
+    const bool resident_first = direct_prefill && resident_first_enabled;
+    size_t resident_count = 0;
+    if (resident_first) {
+      const auto boundary = std::stable_partition(active_experts.begin(), active_experts.end(), [&](int e) {
+        const size_t index = cache_experts[static_cast<size_t>(e)];
+        return cache->residency().chunks[index] == cache->experts()[index].records.size();
+      });
+      resident_count = static_cast<size_t>(boundary-active_experts.begin());
+      // Grouped kernels use explicit expert ids in each segment. Reorder only
+      // gathered-row storage, retaining the original token/route-slot mapping
+      // used by final ordered accumulation. Prepared rows are then contiguous
+      // and can share one activation/kernel group regardless of scratch slots.
+      std::vector<int> fill(E, 0);
+      int row = 0;
+      for (size_t j = 0; j < active_experts.size(); ++j) {
+        const int e = active_experts[j];
+        h_segs_[j] = MoeSegment{row, h_counts_[e], e};
+        fill[e] = row; row += h_counts_[e];
+      }
+      h_segs_[E] = MoeSegment{static_cast<int>(tk), tokens, E};
+      for (int t = 0; t < tokens; ++t) for (int k = 0; k < K; ++k) {
+        const size_t slot = static_cast<size_t>(t)*K+k;
+        const int gathered = fill[h_ids_[slot]]++;
+        h_seg_rows_[gathered] = t; h_slot_row_[slot] = gathered;
+      }
+      if (shared) for (int t = 0; t < tokens; ++t) h_seg_rows_[tk+t] = t;
+      DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total*sizeof(int), cudaMemcpyHostToDevice, stream));
+      DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk*sizeof(int), cudaMemcpyHostToDevice, stream));
+      DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
+      if (resident_count < active_experts.size())
+        (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[resident_count])]);
+    } else {
+      launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
+    }
     std::vector<MoeExpertView> prepared_views(direct_prefill ? static_cast<size_t>(E)*3 : 0);
     std::vector<expert::ExpertExecutionLease> native_leases;
     native_leases.reserve(wave_capacity);
     int activation_row = 0;
     for (int wave = 0; wave < n_segs;) {
       const int first = wave;
-      const int end = wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
+      const int end = resident_first && wave == 0 && resident_count
+          ? static_cast<int>(resident_count)
+          : wave + static_cast<int>(std::min(wave_capacity, static_cast<size_t>(n_segs - wave)));
       // Full resident chunks need only one conversion to the direct layout.
       // Do it before this wave owns any scratch/native leases: preparation
       // relocates cache slots and uses the existing reconstruction reservation.
@@ -1049,8 +1088,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       w_.experts_fp4 = direct_prefill ? original.experts_fp4 : views.data();
       if (!direct_prefill) check_expert_geometry();
       upload_expert_views(d_views_prefill_, shared, stream, direct_prefill ? prepared_views.data() : nullptr);
-      const int first_expert = active_experts[first];
-      const int expert_span = active_experts[end-1] - first_expert + 1;
+      const int first_expert = resident_first ? first : active_experts[first];
+      const int expert_span = resident_first ? end-first : active_experts[end-1] - first_expert + 1;
       grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
           hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
