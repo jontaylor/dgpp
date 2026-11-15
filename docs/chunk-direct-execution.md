@@ -453,3 +453,57 @@ Preserving relative frequency while bounding prefill influence remains open.
 A separate constant-load-cost control can test the queue-age weighting without
 simultaneously removing popularity information. Neither alternative is yet
 implemented or measured.
+
+## Fixed initial load-cost control
+
+The current deployment sets `engine.expert_streaming.learn_load_cost = false`.
+Implementation `9c91bbd1` adds this explicit, serialized setting. The general
+default remains `true`. Disabling learning retains each expert's initial cost
+estimate; it does not force arbitrary unequal experts to equal costs. This
+DSV4.1 NVFP4 target population starts with equal estimates. Input validation,
+popularity observations, ageing, demand reads and memory accounting are unchanged.
+The existing cache still measures read waits for telemetry.
+
+The motivation is that the learned estimate includes elapsed queue time and
+extrapolates individual chunk waits to an expert. It can weight cache retention
+by scheduling delay rather than future avoided work. Fixed costs are a control
+for that feedback, not a claim that load cost never matters.
+
+A same-binary learned/fixed comparison used eight workers, decay 65536, horizon
+8192, ordinary token-frequency history and the preceding eight-request sequence:
+four prefix-enabled tool requests, one long recomputation, then three small
+recomputations. Both ranks used SHA-256
+`36df49d50e413b4ea0d18d30004f5bef5d3fabf3324c4c0f8623ae71feef0411`.
+The executable contains `9c91bbd1` changes built before commit and stamped with
+parent `626a9918`. A reversed fixed/learned repeat replayed just the four-request
+tool loop after fresh process starts to check the modest timing difference.
+
+Across the three continuations, learned versus fixed summed service-level time
+was 42.786 versus 40.816 seconds in the first pair and 43.463 versus 43.080 in
+the reversed repeat: fixed was 4.6% and 0.9% faster. Summed prefill was 5.389
+versus 5.369 seconds in the first pair, and 5.536 versus 6.111 in the repeat.
+Summed engine decode was 37.245 versus 35.322 seconds initially and 37.803
+versus 36.847 in the repeat. The repeated per-request engine decode rates were
+16.87/20.34/25.12 tokens/s learned and 17.34/21.18/25.25 fixed. These are two
+focused comparisons, not a precise general-throughput estimate or campaign rows.
+
+Average per-rank expert traffic across continuations was 55.56/55.53 GiB in the
+two learned runs and exactly 47.01 GiB in each fixed run, a roughly 15% reduction.
+Both fixed runs also had identical read volumes between ranks in this sequence;
+that does not guarantee rank-identical residency under other resource pressures.
+Initial cold prefill stayed between 38.60 and 38.72 seconds across all four boots.
+
+The first long recomputation's elapsed time was slightly worse with fixed costs
+(23.29 versus 22.92 seconds), and the first small-prompt warmup was also slower
+(5.93 versus 5.26 seconds). By the third small request both had zero expert reads:
+1.452/1.447 seconds prefill and 52.45/52.73 decode tokens/s for learned/fixed.
+These tradeoffs remain explicit; fixed costs were selected for the repeated
+prefix-enabled continuations rather than for every individual request.
+
+All normalized outputs, usage and speculative acceptance matched in both orders,
+and both ranks stayed at zero swap. The 17 residency, three paging-config and
+28 cache host tests passed, including fixed-cost ranking, retained validation,
+and configuration round-trip coverage. The 256-token continuation cap still
+precludes a completed-task quality claim. The retained deployment uses fixed
+initial costs with eight workers; phase-aware weighting, coalesced physical
+reads, replay bounds and broader normal-client workloads remain open.
