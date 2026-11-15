@@ -607,3 +607,12 @@ steady warm performance is effectively unchanged. The linked section records
 validation and explicitly lists remaining stream ownership, independent readiness,
 chunk-direct execution and activation-precision work. Those architectural findings
 are still open, rather than resolved by the demand queue change.
+
+### Cache copy/compute ownership follow-up
+
+The [copy/compute overlap implementation](warm-prefill-optimization.md#copycompute-overlap-and-cache-completion-fences)
+now resolves the previously open cache transfer-stream and acquisition/admission
+drain findings with per-buffer staging completion, scratch/native reader fences
+and rotating prefill scratch. Cold prefill improves about 4.8% in the focused
+comparison; steady warm performance is unchanged. Independent ready-expert
+launches, chunk-direct kernels and activation-precision qualification remain open.

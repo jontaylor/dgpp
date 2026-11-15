@@ -12,6 +12,9 @@
 // strict oracle, budgeted there at 0 mismatches — here slightly loosened
 // for the extra chained roundings).
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -3739,5 +3742,58 @@ DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
         }
       }
     }
+  }
+}
+
+
+DGPP_TEST(expert_copy_stream_fences_reuse_without_draining_unrelated_compute) {
+  using namespace dgpp::expert;
+  StoreIdentity id;
+  id.hidden = 128; id.intermediate = 128; id.chunk_intermediate = 64;
+  id.format = Format::kNvfp4;
+  const auto chunks = partition(128,128,1,0,64,id.format);
+  const auto full = partition(128,128,1,0,128,id.format).front();
+  CacheMemory memory{};
+  memory.cache_slots = 4; memory.cache_slot_bytes = chunks.front().allocation_bytes;
+  memory.execution_slots = 2; memory.execution_slot_bytes = full.allocation_bytes;
+  std::vector<uint8_t> staging(memory.cache_slot_bytes, 0x35);
+  std::array<std::span<uint8_t>,1> spans{std::span(staging)};
+  cudaStream_t stream = nullptr;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+  struct Gate { std::atomic<bool> entered{false}, release{false}, expired{false}; } gate;
+  struct Cleanup {
+    Gate& gate; cudaStream_t stream;
+    ~Cleanup() { gate.release = true; cudaStreamSynchronize(stream); cudaStreamDestroy(stream); }
+  } cleanup{gate,stream};
+  auto storage = cuda_cache_storage(id,stream)(memory,spans);
+  StoreRecord record{}; record.key.chunk = 0; record.layout = chunks.front();
+  for (const bool native : {false, true}) {
+    gate.entered = false; gate.release = false; gate.expired = false;
+    if (native) storage->retain(0,staging);
+    else storage->assemble(0,record,std::nullopt,staging);
+    require(storage->staging_complete(staging,true), "initial staging completion");
+    // Block a consumer without occupying an SM, with a bounded escape on failure.
+    DGPP_CUDA_OK(cudaLaunchHostFunc(stream,[](void* ptr) {
+      auto& g = *static_cast<Gate*>(ptr);
+      const auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(5);
+      g.entered = true;
+      while (!g.release.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) { g.expired = true; break; }
+        std::this_thread::yield();
+      }
+    },&gate));
+    if (native) storage->retire_native_extent(0,chunks.size());
+    else storage->retire_execution(0);
+    while (!gate.entered.load()) std::this_thread::yield();
+    if (native) storage->retain(chunks.size(),staging);
+    else storage->assemble(1,record,std::nullopt,staging);
+    require(storage->staging_complete(staging,true), "independent staging finishes");
+    require(!gate.expired.load(), "independent copies must not drain compute");
+    if (native) storage->retain(0,staging);
+    else storage->assemble(0,record,std::nullopt,staging);
+    require(!storage->staging_complete(staging,false), "overwrite waits for its reader");
+    gate.release = true;
+    require(storage->staging_complete(staging,true), "storage reusable after retirement");
+    storage->finish();
   }
 }

@@ -812,7 +812,7 @@ DGPP_TEST(expert_cache_parallel_demand_window_preserves_bytes_and_staging_reserv
   }
 }
 
-DGPP_TEST(expert_cache_ready_chunks_share_a_fence_and_survive_a_failed_fence) {
+DGPP_TEST(expert_cache_staging_sources_survive_a_failed_completion_fence) {
   for (const auto format : {Format::kMxfp4, Format::kNvfp4}) {
     for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
       for (const bool fail : {false, true}) {
@@ -829,23 +829,23 @@ DGPP_TEST(expert_cache_ready_chunks_share_a_fence_and_survive_a_failed_fence) {
         bool batched = false;
         control->before_finish = [&] {
           if (!control->staged_assemblies || batched) return;
-          require(control->staged_assemblies >= 2, "ready chunks share the first copy fence");
-          require(cache.read_stats().staging_in_use >= 2 * cache.memory().staging_bytes / 3,
+          require(control->staged_assemblies >= 1, "submitted copy reaches its completion fence");
+          require(cache.read_stats().staging_in_use >= cache.memory().staging_bytes / 3,
                   "every pending copy retains its staging source through the fence");
           batched = true;
           control->fail_finish = fail;
         };
         if (fail) {
           refuses([&] { (void)cache.acquire(0); });
-          require(cache.stats().poisoned && cache.read_stats().staging_in_use >= 2 * cache.memory().staging_bytes / 3,
-                  "failed batch keeps every source alive and poisons the cache");
+          require(cache.stats().poisoned && cache.read_stats().staging_in_use >= cache.memory().staging_bytes / 3,
+                  "failed completion keeps its source alive and poisons the cache");
           refuses([&] { (void)cache.acquire(0); });
         } else {
           auto lease = cache.acquire(0);
           check_bytes(lease, f, 0);
           require(cache.read_stats().staging_in_use == 0, "successful batch releases its sources");
         }
-        require(batched, "batched copy fence was exercised");
+        require(batched, "copy completion fence was exercised");
         control->before_finish = {};
         control->fail_finish = false;
       }

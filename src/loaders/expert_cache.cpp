@@ -82,6 +82,7 @@ struct ExpertCacheState {
   std::vector<size_t> record_owner;
   std::vector<uint64_t> expert_record_bytes;
   std::vector<bool> execution_busy;
+  size_t next_execution_slot = 0;
   struct QueuedRead {
     std::shared_ptr<ReadTicket> ticket;
     std::chrono::steady_clock::time_point demanded_at{};
@@ -171,13 +172,36 @@ struct ExpertCacheState {
     free_slots.pop_back();
     free_positions[slot] = absent;
   }
+  size_t free_execution_slot() {
+    for (size_t i = 0; i < execution_busy.size(); ++i) {
+      const size_t slot = (next_execution_slot + i) % execution_busy.size();
+      if (!execution_busy[slot]) {
+        next_execution_slot = (slot + 1) % execution_busy.size();
+        return slot;
+      }
+    }
+    return absent;
+  }
+  void reap_copies(bool wait_one = false) {
+    try {
+      bool waited = false;
+      for (auto it = pending_copies.begin(); it != pending_copies.end();) {
+        const bool wait = wait_one && !waited;
+        if (storage->staging_complete((*it)->bytes(), wait)) {
+          it = pending_copies.erase(it);
+          waited |= wait;
+        } else ++it;
+      }
+    } catch (...) { counters.poisoned = true; throw; }
+  }
   void retain(size_t record) {
     if (free_slots.empty()) throw std::logic_error("expert cache: no free slot in validated transition");
+    reap_copies(true);
     pending_copy = read(record);
     const auto size = store->records()[record].layout.allocation_bytes;
     const auto slot = free_slots.back();
     storage->retain(slot, pending_copy->bytes().first(size));
-    storage->finish();  // staging cannot be reused until the copy is complete
+    storage->staging_complete(pending_copy->bytes(), true);
     pending_copy.reset();
     remove_free_slot(slot);
     slots[record] = slot;
@@ -189,7 +213,7 @@ struct ExpertCacheState {
     storage->native_to_execution(scratch, native_start[expert]);
     for (const auto r : experts[expert].records)
       storage->unpack_native_chunk(scratch, store->records()[r], slots[r]);
-    storage->finish();
+    storage->order_mutations();
     native_start[expert] = absent;
     ++prepared_revision;
     ++counters.native_unpacks;
@@ -247,7 +271,7 @@ struct ExpertCacheState {
     storage->begin_execution(scratch);
     for (const auto r : records)
       storage->assemble(scratch, store->records()[r], slots[r], {});
-    storage->finish();
+    storage->order_mutations();
     native_holes.clear();
     for (const auto r : records) {
       const size_t slot = slots[r];
@@ -269,7 +293,7 @@ struct ExpertCacheState {
       slot_records[slot] = absent;
     }
     storage->execution_to_native(scratch, first);
-    storage->finish();
+    storage->order_mutations();
     for (size_t c = 0; c < records.size(); ++c) {
       if (free_positions[first + c] != absent) remove_free_slot(first + c);
       slots[records[c]] = first + c;
@@ -316,14 +340,14 @@ struct ExpertCacheState {
     check_thread();
     // Backends either fence readers or guarantee that all subsequent writes
     // to this scratch slot are ordered after them on the execution stream.
-    try { storage->retire_execution(); }
+    try { storage->retire_execution(slot); }
     catch (...) { counters.poisoned = true; throw; }
     execution_busy[slot] = false;
     --counters.active_execution_slots;
   }
-  void release_native() {
+  void release_native(size_t expert) {
     check_thread();
-    try { storage->retire_native(); }
+    try { storage->retire_native_extent(native_start[expert], experts[expert].records.size()); }
     catch (...) { counters.poisoned = true; throw; }
     --counters.active_native_leases;
   }
@@ -411,8 +435,8 @@ uint64_t ExpertCache::observations() const { state_->check(); return state_->pla
 void ExpertCache::adapt() {
   auto& s = *state_;
   s.check();
-  // Execution slots contain their own complete weights, but drain kernels
-  // before making any backend transfer (the fabric's safe boundary contract).
+  // Host leases must be retired before adaptation; the backend orders slot
+  // writes against the corresponding device readers.
   if (s.counters.active_execution_slots || s.counters.active_native_leases)
     throw std::logic_error("expert cache: release execution leases before adapting");
   if (!s.background_allowed()) { ++s.counters.adaptations_deferred; return; }
@@ -427,7 +451,7 @@ void ExpertCache::adapt() {
   const auto plan = s.planner->propose();
   const auto previous = s.planner->current().chunks;
   try {
-    s.storage->finish();
+    s.storage->order_mutations();
     s.evict(plan);
     for (size_t e = 0; e < s.experts.size(); ++e)
       for (size_t c = previous[e]; c < plan.chunks[e]; ++c) s.retain(s.experts[e].records[c]);
@@ -476,9 +500,8 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     s.counters.chunk_hits += e.records.size();
     ++s.counters.native_hits;
     if (canonical && s.config.packed_nvfp4) {
-      const auto it = std::find(s.execution_busy.begin(), s.execution_busy.end(), false);
-      if (it == s.execution_busy.end()) { ++s.counters.backpressure; return {}; }
-      const size_t slot = static_cast<size_t>(it - s.execution_busy.begin());
+      const size_t slot = s.free_execution_slot();
+      if (slot == absent) { ++s.counters.backpressure; return {}; }
       const auto started = std::chrono::steady_clock::now();
       try { s.storage->native_to_execution(slot, s.native_start[expert]); }
       catch (...) { s.counters.poisoned = true; throw; }
@@ -495,9 +518,8 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     ++s.counters.active_native_leases;
     return ExpertExecutionLease(state_, expert, s.storage->cache_data(s.native_start[expert]));
   }
-  const auto it = std::find(s.execution_busy.begin(), s.execution_busy.end(), false);
-  if (it == s.execution_busy.end()) { ++s.counters.backpressure; return {}; }
-  const size_t slot = static_cast<size_t>(it - s.execution_busy.begin());
+  const size_t slot = s.free_execution_slot();
+  if (slot == absent) { ++s.counters.backpressure; return {}; }
   size_t hits = 0;
   for (const auto r : e.records) hits += s.slots[r] != absent;
   if (hits < e.records.size()) s.all_observed_full = false;
@@ -525,17 +547,16 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
       if (plan.chunks[expert] > s.planner->current().chunks[expert]) {
         previous = s.planner->current().chunks;
         admission = std::move(plan);
-        // Earlier executions own independent reconstruction slots. Drain any
-        // pending copies before reassigning persistent cache slots.
-        s.storage->finish();
+        // Earlier executions own independent reconstruction slots. The backend
+        // orders writes after readers of the persistent slots being reused.
+        s.storage->order_mutations();
         s.evict(*admission, slot);
       }
     }
     s.storage->begin_execution(slot);
-    // Keep a bounded window of missing chunks in flight, including the first
-    // read. Ready chunks can share one device fence; their leases remain live
-    // until that fence succeeds. Drain before waiting on an unfinished read
-    // or refilling a window whose buffers are all held by device readers.
+    // Keep a bounded window of missing chunks in flight. Staging leases remain
+    // live until their individual copy fences complete, even across acquire().
+    // Wait for one buffer only when the read window cannot make progress.
     struct PendingRead {
       size_t chunk;
       std::shared_ptr<ReadTicket> ticket;
@@ -544,10 +565,10 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
     std::deque<PendingRead> pending_reads;
     size_t next_chunk = 0;
     const auto drain_copies = [&] {
-      s.storage->finish();
-      s.pending_copies.clear();
+      s.reap_copies(true);
     };
     const auto fill_window = [&] {
+      s.reap_copies();
       const size_t reserved = s.prefetched.size() + s.pending_copies.size();
       const size_t ahead = s.config.reads.buffers > reserved ? s.config.reads.buffers - reserved : 0;
       size_t fresh = 0;
@@ -584,7 +605,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
           queued_at = pending_reads.front().started;
           pending_reads.pop_front();
         }
-        if ((!queued || !queued->ready()) && !s.pending_copies.empty()) drain_copies();
+        s.reap_copies();
         s.pending_copy = s.read(r, std::move(queued), queued_at);
         s.pending_copies.push_back(std::move(s.pending_copy));
         next_chunk = std::max(next_chunk, chunk + 1);
@@ -596,7 +617,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
           const auto slot = s.free_slots.back();
           s.storage->retain(slot, bytes);
           // Reserve each destination immediately, but do not publish the
-          // planner's new residency until every copy has completed below.
+          // planner's new residency until every copy has been ordered below.
           s.remove_free_slot(slot);
           s.slots[r] = slot;
           s.slot_records[slot] = r;
@@ -606,9 +627,10 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical) {
         staged_bytes += record.layout.useful_bytes;
       }
     }
-    drain_copies();
+    s.reap_copies();
     if (admission) {
-      // Publish the admitted prefix only after all demand copies are fenced,
+      // Publish the admitted prefix after all demand copies are ordered; the
+      // backend fences consumers before they can read these addresses,
       // without a second storage read. Whole policy remains all-or-nothing.
       s.planner->commit_admission(expert, *admission);
       s.count_transition(*admission, previous);
@@ -701,7 +723,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       }
       std::vector<Read> pending;
       size_t next = 0, launched = 0;
-      const auto drain = [&] { s.storage->finish(); s.pending_copies.clear(); };
+      const auto drain = [&] { s.reap_copies(true); };
       const auto launch_ready = [&] {
         // Contiguous completed runs need no additional lease ownership.
         for (size_t j = 0; j < jobs.size();) {
@@ -741,7 +763,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           --jobs[read.job].remaining;
           consumed = true;
         }
-        launch_ready();  // same-stream consumers follow assembly, without a fence
+        launch_ready();  // lease publication orders consumers after assembly
         if (launched == jobs.size()) break;
         if (consumed) continue;
         if (!s.pending_copies.empty()) { drain(); continue; }
@@ -753,7 +775,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
         s.counters.read_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wait).count();
       }
-      drain();
+      s.reap_copies();
       // Execution has already been submitted. Admission reads its complete
       // canonical scratch, not a second file read or retained staging window.
       for (const auto& job : jobs) {
@@ -769,7 +791,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
           s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
         }
-        s.storage->finish();
+        s.storage->order_mutations();
         s.planner->commit_admission(job.expert, plan);
         s.count_transition(plan, previous);
         ++s.counters.demand_admissions;
@@ -804,7 +826,13 @@ void ExpertCache::release_native_leases(std::span<ExpertExecutionLease> leases) 
     if (lease.state_.get() != state_.get() || !lease.native_data_)
       throw std::invalid_argument("expert cache: grouped release requires this cache's native leases");
   if (leases.empty()) return;
-  try { s.storage->retire_native(); }
+  try {
+    std::vector<std::pair<size_t, size_t>> extents;
+    extents.reserve(leases.size());
+    for (const auto& lease : leases)
+      extents.emplace_back(s.native_start[lease.slot_], s.experts[lease.slot_].records.size());
+    s.storage->retire_native_extents(extents);
+  }
   catch (...) { s.counters.poisoned = true; throw; }
   for (auto& lease : leases) { lease.state_.reset(); lease.native_data_ = nullptr; }
   s.counters.active_native_leases -= leases.size();
@@ -829,6 +857,7 @@ size_t ExpertCache::lookahead_demand(size_t expert) {
   auto& s = *state_;
   s.check();
   s.expert_index(expert);
+  s.reap_copies();
   const size_t limit = s.config.reads.buffers / 2;
   size_t accepted = 0;
   for (auto record : s.experts[expert].records) {
@@ -881,6 +910,7 @@ void ExpertCache::release_execution_thread() {
     throw std::logic_error("expert cache: cannot hand off live execution leases or copies");
   try { s.storage->finish(); }
   catch (...) { s.counters.poisoned = true; throw; }
+  s.pending_copies.clear();
   s.owner = {};
 }
 void ExpertCache::bind_execution_thread() {
@@ -918,7 +948,7 @@ const uint8_t* ExpertExecutionLease::packed_data() const {
 void ExpertExecutionLease::release() {
   if (!state_) return;
   auto state = state_;  // retain storage through the completion fence
-  if (native_data_) state->release_native();
+  if (native_data_) state->release_native(slot_);
   else state->release_execution(slot_);
   state_.reset();
 }

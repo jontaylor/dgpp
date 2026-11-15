@@ -960,7 +960,9 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     // Canonical staging is bounded by the existing execution reservation.
     // Selected experts are ascending; inactive IDs between them have empty
     // segments, so a wave can use the original segment table and row order.
-    const size_t wave_capacity = cache->memory().execution_slots;
+    // Leave another bank of scratch for the next wave while this one runs.
+    // Native-only waves need no scratch and retain their existing grouping.
+    const size_t wave_capacity = std::max<size_t>(1, cache->memory().execution_slots / 2);
     std::vector<expert::ExpertExecutionLease> leases;
     leases.reserve(std::min(wave_capacity, static_cast<size_t>(n_segs)));
     static const bool prepared_prefill = [] {

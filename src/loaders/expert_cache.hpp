@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "loaders/expert_read_queue.hpp"
 #include "loaders/expert_pressure.hpp"
@@ -84,9 +85,19 @@ class ExpertCacheStorage {
   // are ordered after these readers. Other backends retain the full fence.
   virtual void retire_native() { finish(); }
   // The same ordering rule applies to reconstruction scratch. Staging leases
-  // have already been drained before acquire() returns; only device readers
-  // remain. A backend may reuse the slot through ordered GPU submissions.
-  virtual void retire_execution() { finish(); }
+  // remain owned by the cache until their individual copy fences complete.
+  // A backend may reuse the slot through ordered GPU submissions.
+  virtual void retire_execution(size_t) { finish(); }
+  // Fence a specific native extent; bulk graph readers may use retire_native().
+  virtual void retire_native_extent(size_t, size_t) { retire_native(); }
+  virtual void retire_native_extents(std::span<const std::pair<size_t, size_t>>) { retire_native(); }
+  // Order storage mutations without requiring host completion.
+  virtual void order_mutations() { finish(); }
+  // A staging lease may be released only after its last device reader.
+  virtual bool staging_complete(std::span<const uint8_t>, bool /*wait*/) {
+    finish();
+    return true;
+  }
   virtual void finish() = 0;
 };
 using CacheStorageFactory = std::function<std::unique_ptr<ExpertCacheStorage>(

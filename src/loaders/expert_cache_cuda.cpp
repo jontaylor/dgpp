@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -53,6 +54,15 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     registered_.reserve(staging.size());
     mapped_.reserve(staging.size());
     try {
+      DGPP_CUDA_OK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+      create_event(ready_);
+      create_event(native_readers_);
+      execution_readers_.resize(memory_.execution_slots);
+      native_extent_readers_.resize((memory_.cache_slots + layouts_.size() - 1) / layouts_.size());
+      staging_done_.resize(staging.size());
+      for (auto& event : execution_readers_) create_event(event);
+      for (auto& event : native_extent_readers_) create_event(event);
+      for (auto& event : staging_done_) create_event(event);
       if (memory_.cache_slots)
         DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&cache_), memory_.cache_slots * memory_.cache_slot_bytes));
       DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&execution_), memory_.execution_slots * memory_.execution_slot_bytes));
@@ -72,8 +82,10 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void retain(size_t slot, std::span<const uint8_t> bytes) override {
     if (slot >= memory_.cache_slots || bytes.size() > memory_.cache_slot_bytes)
       throw std::invalid_argument("expert CUDA cache: invalid retention span");
+    wait_cache(slot);
+    Transfer transfer(*this, bytes.data());
     DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + slot * memory_.cache_slot_bytes, bytes.data(), bytes.size(),
-                                 cudaMemcpyHostToDevice, stream_));
+                                 cudaMemcpyHostToDevice, copy_stream_));
   }
   void begin_execution(size_t slot) override {
     check_execution(slot);
@@ -86,6 +98,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void assemble(size_t execution_slot, const StoreRecord& record,
       std::optional<size_t> cache_slot, std::span<const uint8_t> host_bytes) override {
     check_execution(execution_slot);
+    wait_execution(execution_slot);
+    Transfer transfer(*this, host_bytes.empty() ? nullptr : host_bytes.data());
     if (record.key.chunk >= copies_.size()) throw std::invalid_argument("expert CUDA cache: chunk index");
     const uint8_t* source = nullptr;
     auto kind = cudaMemcpyHostToDevice;
@@ -109,15 +123,16 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       if (!cache_slot) {
         source = mapped_[staging_index(source)];
       }
-      launch_expert_chunk_scatter(destination, source, scatter_plans_[record.key.chunk], stream_);
+      launch_expert_chunk_scatter(destination, source, scatter_plans_[record.key.chunk], copy_stream_);
       return;
     }
     for (const auto& c : copies_[record.key.chunk])
       DGPP_CUDA_OK(cudaMemcpy2DAsync(destination + c.destination_offset, c.destination_pitch,
-                                     source + c.source_offset, c.source_pitch, c.row_bytes, c.rows, kind, stream_));
+                                     source + c.source_offset, c.source_pitch, c.row_bytes, c.rows, kind, copy_stream_));
   }
   const uint8_t* execution_data(size_t slot) const override {
     check_execution(slot);
+    publish();
     return execution_ + slot * memory_.execution_slot_bytes;
   }
   const uint8_t* packed_execution_data(size_t slot) override {
@@ -125,29 +140,36 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     if (!packed_nvfp4_) throw std::logic_error("expert CUDA cache: packed layout disabled");
     auto* source = execution_ + slot * memory_.execution_slot_bytes;
     auto* destination = source + full_.allocation_bytes;
-    pack(destination, source);
+    wait_execution(slot);
+    { Transfer transfer(*this); pack(destination, source); }
+    publish();
     return destination;
   }
   const uint8_t* cache_data(size_t slot) const override {
     check_cache(slot);
+    publish();
     return cache_ + slot * memory_.cache_slot_bytes;
   }
   void move_cache_slot(size_t dest, size_t source) override {
     check_cache(dest);
     check_cache(source);
+    wait_cache(dest);
+    Transfer transfer(*this);
     if (gpu_scatter_) {
       const auto bytes = memory_.cache_slot_bytes;
       const ScatterCopy copy{0, 0, bytes, 1, bytes, bytes};
       const auto plan = expert_chunk_copy_plan(std::span(&copy, 1));
-      launch_expert_chunk_scatter(cache_ + dest * bytes, cache_ + source * bytes, plan, stream_);
+      launch_expert_chunk_scatter(cache_ + dest * bytes, cache_ + source * bytes, plan, copy_stream_);
     } else {
       DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + dest * memory_.cache_slot_bytes,
           cache_ + source * memory_.cache_slot_bytes, memory_.cache_slot_bytes,
-          cudaMemcpyDeviceToDevice, stream_));
+          cudaMemcpyDeviceToDevice, copy_stream_));
     }
   }
   void native_to_execution(size_t execution_slot, size_t first) override {
     check_native(execution_slot, first);
+    wait_execution(execution_slot);
+    Transfer transfer(*this);
     if (packed_nvfp4_) {
       auto* destination = execution_ + execution_slot * memory_.execution_slot_bytes;
       auto* source = cache_ + first * memory_.cache_slot_bytes;
@@ -160,15 +182,17 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       }
       launch_moe_fp4_unpack(out, moe_fp4_packed_view(source, identity_.hidden,
           identity_.intermediate / identity_.world), identity_.hidden,
-          identity_.intermediate / identity_.world, stream_);
+          identity_.intermediate / identity_.world, copy_stream_);
       return;
     }
     DGPP_CUDA_OK(cudaMemcpyAsync(execution_ + execution_slot * memory_.execution_slot_bytes,
         cache_ + first * memory_.cache_slot_bytes, memory_.execution_slot_bytes,
-        cudaMemcpyDeviceToDevice, stream_));
+        cudaMemcpyDeviceToDevice, copy_stream_));
   }
   void execution_to_native(size_t execution_slot, size_t first) override {
     check_native(execution_slot, first);
+    for (size_t c = 0; c < layouts_.size(); ++c) wait_cache(first+c);
+    Transfer transfer(*this);
     if (packed_nvfp4_) {
       pack(cache_ + first * memory_.cache_slot_bytes,
            execution_ + execution_slot * memory_.execution_slot_bytes);
@@ -176,45 +200,99 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     }
     DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + first * memory_.cache_slot_bytes,
         execution_ + execution_slot * memory_.execution_slot_bytes, memory_.execution_slot_bytes,
-        cudaMemcpyDeviceToDevice, stream_));
+        cudaMemcpyDeviceToDevice, copy_stream_));
   }
   void unpack_native_chunk(size_t execution_slot, const StoreRecord& record, size_t cache_slot) override {
     check_execution(execution_slot);
     check_cache(cache_slot);
+    wait_cache(cache_slot);
+    Transfer transfer(*this);
     if (record.key.chunk >= copies_.size()) throw std::invalid_argument("expert CUDA cache: native chunk index");
     auto* dest = cache_ + cache_slot * memory_.cache_slot_bytes;
     const auto* source = execution_ + execution_slot * memory_.execution_slot_bytes;
     // The gather overwrites every tensor byte; allocation padding is never
     // consumed by a matrix kernel or included in a reconstructed tensor.
     if (gpu_scatter_) {
-      launch_expert_chunk_scatter(dest, source, gather_plans_[record.key.chunk], stream_);
+      launch_expert_chunk_scatter(dest, source, gather_plans_[record.key.chunk], copy_stream_);
       return;
     }
     for (const auto& c : copies_[record.key.chunk])
       DGPP_CUDA_OK(cudaMemcpy2DAsync(dest + c.source_offset, c.source_pitch,
           source + c.destination_offset, c.destination_pitch, c.row_bytes, c.rows,
-          cudaMemcpyDeviceToDevice, stream_));
+          cudaMemcpyDeviceToDevice, copy_stream_));
   }
-  // require_execution_context binds kernels to stream_. Every cache write,
-  // relocation and unpack is submitted to that same stream, so none can
-  // overwrite weights before earlier kernel readers complete. Host leases
-  // need not force GPU completion; staging and destruction still drain.
-  void retire_native() override {}
-  void retire_execution() override {}
-  void finish() override {
+  // CPU lease retirement records device readers; subsequent writes wait only
+  // for the storage they reuse. Transfers to other scratch slots can overlap.
+  void retire_native() override { DGPP_CUDA_OK(cudaEventRecord(native_readers_, stream_)); }
+  void retire_native_extent(size_t first, size_t count) override {
+    for (size_t group = first / layouts_.size(); group <= (first+count-1) / layouts_.size(); ++group)
+      DGPP_CUDA_OK(cudaEventRecord(native_extent_readers_.at(group), stream_));
+  }
+  void retire_native_extents(std::span<const std::pair<size_t, size_t>> extents) override {
+    for (auto [first, count] : extents) retire_native_extent(first, count);
+  }
+  void retire_execution(size_t slot) override {
+    DGPP_CUDA_OK(cudaEventRecord(execution_readers_.at(slot), stream_));
+  }
+  void order_mutations() override {} // all storage operations share copy_stream_
+  bool staging_complete(std::span<const uint8_t> bytes, bool wait) override {
+    const auto event = staging_done_.at(staging_index(bytes.data()));
+    if (!wait) {
+      const auto status = cudaEventQuery(event);
+      if (status == cudaErrorNotReady) return false;
+      DGPP_CUDA_OK(status);
+      return true;
+    }
     const auto started = std::chrono::steady_clock::now();
-    const auto status = cudaStreamSynchronize(stream_);
+    const auto status = cudaEventSynchronize(event);
     completion_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started).count();
     DGPP_CUDA_OK(status);
+    return true;
+  }
+  void finish() override {
+    const auto started = std::chrono::steady_clock::now();
+    DGPP_CUDA_OK(cudaStreamSynchronize(copy_stream_));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    completion_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
   }
   uint64_t completion_wait_ns() const override { return completion_wait_ns_; }
   bool accepts_execution_context(const void* context) const override { return context == stream_; }
   void set_execution_context(void* context) override {
     if (!context) throw std::invalid_argument("expert cache: null execution stream");
     stream_ = static_cast<cudaStream_t>(context);
+    published_generation_ = 0;
   }
  private:
+  static void create_event(cudaEvent_t& event) {
+    DGPP_CUDA_OK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  }
+  // Publication follows the last transfer, including both uses of a staging
+  // buffer when a demanded chunk is assembled and retained.
+  struct Transfer {
+    CudaCacheStorage& owner;
+    const uint8_t* staging;
+    Transfer(CudaCacheStorage& o, const uint8_t* p = nullptr) : owner(o), staging(p) {}
+    ~Transfer() noexcept(false) {
+      if (std::uncaught_exceptions()) return;
+      if (staging) DGPP_CUDA_OK(cudaEventRecord(owner.staging_done_.at(owner.staging_index(staging)), owner.copy_stream_));
+      DGPP_CUDA_OK(cudaEventRecord(owner.ready_, owner.copy_stream_));
+      ++owner.generation_;
+    }
+  };
+  void publish() const {
+    if (published_generation_ == generation_) return;
+    DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, ready_, 0));
+    published_generation_ = generation_;
+  }
+  void wait_execution(size_t slot) {
+    DGPP_CUDA_OK(cudaStreamWaitEvent(copy_stream_, execution_readers_.at(slot), 0));
+  }
+  void wait_cache(size_t slot) {
+    DGPP_CUDA_OK(cudaStreamWaitEvent(copy_stream_, native_readers_, 0));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(copy_stream_, native_extent_readers_.at(slot / layouts_.size()), 0));
+  }
   uint64_t completion_wait_ns_ = 0;
   size_t staging_index(const uint8_t* source) const {
     size_t index = 0;
@@ -232,7 +310,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     }
     launch_moe_fp4_pack(moe_fp4_packed_view(destination, identity_.hidden,
         identity_.intermediate / identity_.world), in, identity_.hidden,
-        identity_.intermediate / identity_.world, stream_);
+        identity_.intermediate / identity_.world, copy_stream_);
   }
   void check_cache(size_t slot) const {
     if (slot >= memory_.cache_slots) throw std::invalid_argument("expert CUDA cache: cache slot");
@@ -249,7 +327,14 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void cleanup() noexcept {
     // Drain before unregister/free. On device/context failure the error is
     // already terminal to the owner; destructors cannot propagate it.
+    if (copy_stream_) (void)cudaStreamSynchronize(copy_stream_);
     (void)cudaStreamSynchronize(stream_);
+    for (auto event : staging_done_) if (event) (void)cudaEventDestroy(event);
+    for (auto event : execution_readers_) if (event) (void)cudaEventDestroy(event);
+    for (auto event : native_extent_readers_) if (event) (void)cudaEventDestroy(event);
+    if (ready_) (void)cudaEventDestroy(ready_);
+    if (native_readers_) (void)cudaEventDestroy(native_readers_);
+    if (copy_stream_) (void)cudaStreamDestroy(copy_stream_);
     for (auto* ptr : registered_) (void)cudaHostUnregister(ptr);
     registered_.clear();
     if (execution_) (void)cudaFree(std::exchange(execution_, nullptr));
@@ -258,6 +343,11 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   CacheMemory memory_;
   StoreIdentity identity_;
   cudaStream_t stream_;
+  cudaStream_t copy_stream_ = nullptr;
+  cudaEvent_t ready_ = nullptr, native_readers_ = nullptr;
+  std::vector<cudaEvent_t> staging_done_, execution_readers_, native_extent_readers_;
+  uint64_t generation_ = 0;
+  mutable uint64_t published_generation_ = 0;
   bool packed_nvfp4_ = false;
   bool gpu_scatter_ = false;
   ChunkLayout full_;

@@ -1844,11 +1844,11 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   auto& g = it->second;
   cur_ = g.cur; nxt_ = g.next; pre_cur_ = g.pre; pre_nxt_ = g.pre_next;
   std::fill_n(p.demands, p.layers, ExpertDemand{});
-  p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
   // Cache changes occur only in the engine thread while a demand gate
   // holds the main stream. Its independent service stream must never wait
   // on that paused stream. Before release, service kernels are completed.
   expert_cache_->set_execution_context(p.service);
+  p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
   int accounted = 0;
   auto account = [&](int end) {
     for (; accounted < end; ++accounted) {

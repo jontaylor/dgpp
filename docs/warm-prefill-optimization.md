@@ -131,3 +131,70 @@ residency before acquisition.
 - No worker-count or bandwidth sweep was run. The bounded capacity comparison
   already demonstrates a useful gain with four workers. No fourfold warm gain
   or full concurrency campaign is claimed.
+
+## Copy/compute overlap and cache completion fences
+
+The CUDA cache now owns a nonblocking transfer stream for retention, chunk
+scatter/gather, native layout conversion and relocation. Publication inserts a
+GPU event dependency on the execution stream. Scratch slots and aligned native
+extents record their retiring readers; only writes reusing that storage wait
+for those readers. Staging buffers have individual completion events and remain
+owned across acquisitions until their last device reader completes. The host
+waits for a staging buffer only when the bounded read window needs capacity.
+Admission and layout bookkeeping no longer drain the execution stream.
+
+Reconstructed prefill waves use half the existing scratch slots, and acquisition
+rotates through the reservation so the next wave can use different storage.
+Native-only resident-first grouping is unchanged. No payload reservation or
+worker count increases. GPU demand-gate publication switches to its service
+context before publishing readiness, so it cannot enqueue the new dependency
+on the paused main stream.
+
+A fresh two-Spark comparison against `31793be0` used the same tool request,
+64 buffers, four workers, 100 GiB cache reservation per rank and fixed depth
+three. These remain focused diagnostics, not formal campaign throughput rows.
+All prompt tokens were recomputed, outputs and tool arguments matched after
+normalizing call IDs, usage and speculative acceptance matched, and both ranks
+remained at zero swap.
+
+| Prefill diagnostic | Before, seconds | After, seconds |
+|---|---:|---:|
+| 2,209 tokens, cold | 25.8528 | 24.6228 |
+| 2,209 tokens, steady warm | 1.4113 / 1.4147 | 1.4140 / 1.4138 |
+| 4,559 tokens, first after small workload | 7.3099 | 6.9757 |
+| 4,559 tokens, repeated miss-heavy | 11.0504 / 10.7970 | 10.8274 / 10.5635 |
+
+Cold expert reads are identical at 95.316833496 GiB per rank. Repeated large
+requests retain small read-volume differences (approximately 36.7–37.4 GiB per
+rank), limiting precise causal attribution of their roughly 2% gain. Warm decode
+remains about 0.92 seconds; no broad decode improvement is established.
+
+Recorded cache host-completion waiting drops from 4.62–4.67 seconds per rank to
+0.0004–0.0026 seconds for the cold request. These counters are not extra GPU idle
+time and must not be subtracted from total request latency. End-to-end cold
+prefill improves about 4.8%, not by the entire removed host-wait duration.
+Native-layout wall counters now measure asynchronous submission rather than
+completed GPU execution and likewise cannot establish a kernel speedup.
+
+Baseline binary SHA-256:
+`92ead7dec5235559675b01bf77ee0b3e9970092c8c43d05bc2664f4a7528d9ed`.
+Measured candidate SHA-256:
+`2a7dc36ef391fb7a97dab8295e4a8ba6f5fef455877e11ca48193c231c9a7464`.
+The candidate is `31793be0` plus this section's implementation. The final build
+also poisons the cache if a completion query fails outside acquisition; this
+error-path hardening does not alter the successful measured execution.
+
+Validation includes the 27 host cache tests, bitwise B12x paging/graph/pressure
+and generic NVFP4/MXFP4 wave fixtures, and a CUDA regression that deliberately
+blocks a consumer. Independent transfers must finish while that consumer is
+blocked; writes to its scratch slot or native extent must remain incomplete
+until it retires. This establishes dependency behavior, not a claim that every
+transfer in serving is completely hidden by computation.
+
+The earlier copy-stream and acquisition/admission-drain findings are addressed.
+Full drains remain at shutdown and execution-thread handoff. The model's GPU
+miss-service completion boundary and CPU routing synchronization also remain;
+they are separate from cache acquisition drains. Large prefill still launches
+completed waves rather than individual ready experts. Chunk-direct kernels and
+W4A4 qualification remain unimplemented. A broader scheduling change would be
+needed to remove those remaining barriers, and no fourfold warm gain is claimed.
