@@ -643,3 +643,38 @@ The default remains false pending serving evidence. Tests cover layer-order and
 observation-batching invariance of final ranking, preserved popularity,
 workload-switch adaptation, invalid-observation atomicity, exact single-group
 agreement with the existing estimator, and configuration serialization.
+
+### Serving screen: not selected
+
+Implementation `818b4297` was compared in the same binary on both ranks,
+SHA-256 `5ed042a6881e26ea327cb65845b5e2847bf62521eaf269ed62fceef380ab1ff7`
+(built before commit, stamped with parent `74929a75`). The global-clock control
+ran first, followed by the local-clock candidate. Each restarted before the
+same four-request prefix-enabled tool loop, then ran three small recomputations.
+Other settings retained eight workers, fixed load costs, decay 65536, horizon
+8192, fixed depth three and the same cache budget. This is a focused diagnostic,
+not a campaign row or an uncapped completed-task quality comparison.
+
+Cold prefill was effectively unchanged: 38.735 versus 38.700 seconds. Across
+three continuations, expert reads fell from 47.009 to 44.516 GiB per rank (5.3%),
+but service wall time increased from 39.738 to 40.045 seconds. Summed prefill
+was 5.318 versus 5.159 seconds; engine decode was 34.286 versus 34.768 seconds.
+All four normalized outputs, usage and speculative acceptance records matched.
+
+The workload switch exposed the larger regression. Control small-request
+prefills were 7.892, 2.833 and 1.601 seconds; candidate times were 6.035, 4.151
+and 3.460 seconds. The first candidate request benefited, but subsequent
+adaptation was worse. On the third repeat, control had zero expert reads and
+52.87 decode tokens/s; candidate still read 13.326 GiB per rank and decoded at
+34.02 tokens/s. Three additional candidate-only repeats still did not establish
+a fully resident anchor: reads declined to 9.460 GiB per rank on the sixth
+repeat, with 2.734 seconds prefill and 37.76 decode tokens/s. Those extra repeats
+are a convergence check, not matched additional control observations.
+
+All seven matched outputs and usage records agreed, and both ranks stayed at
+zero swap throughout. The control warm-helper initially lacked its copied
+prompt file; after supplying it, execution continued on the same process and
+cache state, without replaying the completed loop. Layer-local history remains
+disabled and the global-clock deployment is restored. This experiment does not
+reject phase-aware admission or other layer-aware estimators; it rejects this
+clock substitution as the serving choice for the tested workload.
