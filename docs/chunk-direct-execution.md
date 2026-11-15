@@ -2,8 +2,9 @@
 
 An opt-in NVFP4 prefill path now consumes missing experts directly from the
 registered SSD-read buffers. It removes the full-expert reconstruction copy,
-but has not demonstrated a meaningful serving improvement. Production keeps
-chunk-direct disabled and BF16 activations enabled.
+but the initial copy-only comparison did not demonstrate a meaningful serving
+improvement. The later memory-reclamation comparison below keeps chunk-direct
+enabled with fewer reconstruction slots. BF16 activations remain enabled.
 
 ## Implementation and limits
 
@@ -64,8 +65,9 @@ The control is implementation revision `8f8f0cdc`, with SHA-256
 The measured candidate is `341e61e1` plus this implementation, with SHA-256
 `b8541ae7b8719ba09b04898b5cba81aec084ba52811be35bc70ba57ca1fb2694`.
 The version stamp predates the final commit. The final release rebuild changes
-that stamp. Production returns to 64 staging buffers and queue entries, four
-workers, and the original endpoint, keys and token limits.
+that stamp. At the end of that comparison production returned to 64 staging
+buffers and queue entries. The memory-reclamation follow-up below supersedes
+that configuration, retaining the endpoint, keys and token limits.
 
 Validation: all 27 host cache tests passed. The B12x paging fixture explicitly
 exercised chunk-direct prefill, checked zero reconstruction-copy bytes for those
@@ -83,8 +85,66 @@ no broader quality qualification was performed because it failed the speed
 screen. This does not establish that an optimized native FP4 implementation
 cannot win, only that this existing path is not a useful deployment choice.
 
-Chunk-direct decode, direct partial-residency reads, independent chunk readiness
-and smaller scratch reservations remain unimplemented. Extending this approach
-before demonstrating a useful prefill win would add complexity without an
-established benefit. No matched EXL3 2.9-bit serving or quality comparison was
+Chunk-direct decode, direct partial-residency reads and independent chunk
+readiness remain unimplemented. Smaller scratch reservations are evaluated
+below using existing configuration controls. No matched EXL3 2.9-bit serving or quality comparison was
 run, so these results do not decide the user's model-format choice.
+
+
+## Reclaiming RAM without enlarging the expert cache
+
+The follow-up reduces real allocations rather than merely bypassing copies.
+Both arms use implementation revision `a7320e7b`, binary SHA-256
+`91afe785695b63768441e3184f33e1d698f631ed58209d8bb5b322cf62cc2c14`
+on both ranks. No rebuild, competing workload or fabric transfer ran during
+measurements. These are focused configuration diagnostics, not campaign rows.
+
+| Per-rank setting | Prior production | Retained lower-memory configuration |
+|---|---:|---:|
+| Chunk-direct | Off | On |
+| Reconstruction slots | 24 | 12 |
+| Staging buffers / queue depth | 64 / 64 | 256 / 256 |
+| Read workers | 4 | 4 |
+| Total expert reservation, bytes | 107374182400 | 107242240000 |
+| Accounted expert allocation, bytes | 103764337408 | 103632395008 |
+| Resident chunk capacity, bytes | 103250891520 | 103250891520 |
+
+Each reconstruction slot occupies 19,908,096 bytes; each staging buffer
+557,056 bytes. Removing twelve slots and adding 192 buffers therefore releases
+131,942,400 bytes (125.83 MiB) per rank. Lowering the total reservation by that
+exact amount prevents the planner from giving the saving to resident experts.
+The resident chunk capacity is identical. The configuration uses
+`DGPP_EXPERT_CHUNK_DIRECT=1`, 1M context and the existing 262144 output default;
+activation quantization remains disabled.
+
+The sequence is four recomputed 2,209-token tool requests followed by the
+original 24,317-token request. Prefix-cache reuse is disabled. All five outputs,
+normalized tool arguments, token usage and speculative acceptance match, and
+both ranks remain at zero swap. This warming sequence differs from the earlier
+comparison, so its long-prompt time must not be compared directly to that table.
+
+| Prefill diagnostic | Prior production, seconds | Lower-memory, seconds |
+|---|---:|---:|
+| 2,209 tokens, cold | 24.305 | 25.490 |
+| 2,209 tokens, steady warm | 1.418 / 1.415 | 1.414 / 1.413 |
+| 24,317-token tool prompt after that sequence | 21.829 | 20.780 |
+
+Engine decode rates at concurrency one are essentially unchanged on the warm
+small requests: 53.09 / 52.95 tokens/s before, 52.77 / 53.02 after. The long
+request records 15.31 versus 15.58 decode tokens/s. These decode rates exclude
+prefill; no broad concurrency or decode improvement is established.
+
+After the long request, Linux `MemAvailable` was 3,595 / 3,893 MiB on ranks
+0 / 1 before, and 3,962 / 4,202 MiB after. Those are whole-node snapshots;
+the observed 367 / 310 MiB increases include runtime and system variation and
+must not all be attributed to the exact 125.83 MiB allocation reduction.
+Filesystem `Cached` stayed essentially constant: approximately 3,303 / 3,123
+MiB in both arms. Thus RAM was available to the OS, but this workload did not
+turn it into substantially more filesystem cache. Expert reads use `O_DIRECT`;
+these results do not establish a filesystem-cache-driven speedup.
+
+The lower-memory configuration is retained on both Sparks: it frees memory,
+preserves resident expert capacity and warm speed, and improved the long
+request in this comparison. The cold-prefill penalty of approximately 1.18
+seconds is explicit. No claim is made that all reconstruction scratch has
+been removed; decode and fallback execution still require twelve slots.

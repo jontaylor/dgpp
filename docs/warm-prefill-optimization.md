@@ -207,3 +207,12 @@ It preserves the tested outputs but has not demonstrated a meaningful serving
 win, so production keeps reconstruction and BF16 activations. The native FP4
 activation screen was slower and is also disabled. Decode, partial-residency
 chunk views and independent chunk readiness remain open.
+
+
+The subsequent [RAM-reclamation comparison](chunk-direct-execution.md#reclaiming-ram-without-enlarging-the-expert-cache)
+keeps chunk-direct enabled with twelve reconstruction slots, 256 staging buffers
+and a correspondingly smaller total reservation. It releases 125.83 MiB per
+rank without enlarging the resident expert cache. Warm prefill remains unchanged;
+the original long request improves in the focused comparison, while cold
+prefill is approximately 1.18 seconds slower. This supersedes the initial
+copy-only pass's decision to leave chunk-direct disabled.
