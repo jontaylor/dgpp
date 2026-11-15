@@ -1153,3 +1153,32 @@ DGPP_TEST(dsv41_paged_eager_dspark_batches_and_matches_plain_greedy) {
     }
   }
 }
+
+DGPP_TEST(dsv41_paged_prefill_overlap_matches_eager_and_preserves_decode) {
+  const char* old = std::getenv("DGPP_EXPERT_PREFILL_OVERLAP");
+  const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+  struct Restore {
+    std::optional<std::string> value;
+    ~Restore() { if (value) setenv("DGPP_EXPERT_PREFILL_OVERLAP", value->c_str(), 1);
+                 else unsetenv("DGPP_EXPERT_PREFILL_OVERLAP"); }
+  } restore{saved};
+  for (bool nvfp4 : {false, true}) {
+    const Fixture fx = make_fixture(nvfp4);
+    const auto prompt = tokens_of(0xA134, 256, fx.cfg.vocab_size);
+    for (auto policy : {dgpp::expert::Policy::kWholeExpert, dgpp::expert::Policy::kAdaptiveFractional}) {
+      auto paging = fixture_paging(fx, policy);
+      std::vector<std::vector<float>> expected;
+      for (bool overlap : {false, true}) {
+        setenv("DGPP_EXPERT_PREFILL_OVERLAP", overlap ? "1" : "0", 1);
+        dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 512, dgpp::Dsv41Residency::Resident,
+                              nullptr, 0, 1, 1, false, 8, false, &paging);
+        if (overlap) model.set_prefill_fold_overlap(true, 256, true);
+        std::vector<std::vector<float>> outputs{model.session_prefill(0, prompt).logits};
+        for (int i=0; i<3; ++i) outputs.push_back(model.session_step(0, 17+i).logits);
+        if (!overlap) expected = std::move(outputs);
+        else require(outputs == expected, "paged row-block overlap preserves prefill and subsequent decode logits bitwise");
+        require(model.expert_cache()->stats().active_execution_slots == 0, "overlap retires all paged scratch");
+      }
+    }
+  }
+}

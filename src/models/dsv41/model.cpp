@@ -1340,8 +1340,9 @@ void Dsv41Model::join_comb() {
 
 // ---- the prefill's fold overlap (model.hpp) -------------------------------------
 void Dsv41Model::set_prefill_fold_overlap(bool on, int min_rows, bool without_reducer) {
-  if (on && expert_cache_)
-    throw std::invalid_argument("set_prefill_fold_overlap: expert paging requires the ordinary eager walk");
+  const char* paged = std::getenv("DGPP_EXPERT_PREFILL_OVERLAP");
+  if (on && expert_cache_ && !(paged && std::atoi(paged) != 0))
+    throw std::invalid_argument("set_prefill_fold_overlap: paged overlap requires explicit qualification");
   if (min_rows < 2 * kBlockTokens)
     throw std::invalid_argument("set_prefill_fold_overlap: min_rows under two blocks");
   fold_overlap_ = on;
@@ -1604,22 +1605,39 @@ void Dsv41Model::enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, i
   fw.scale = r.mhc.ffn_scale;
   update_rows(attn_out, 0, TA);
   mhc_site_rows(nxt_, fw, r.ffn_norm, 0, TA, decode_prefix);
-  moe_->route_prefill_rows(x_, 0, TA, stream_);
+  if (!expert_cache_) moe_->route_prefill_rows(x_, 0, TA, stream_);
   const bool fold_b = begin_fold_after(attn_out, TA, TB, ov_ev_[1]);  // under A's site and router
   end_fold(fold_b);
   update_rows(attn_out, TA, TB);
   std::swap(cur_, nxt_);
   mhc_site_rows(cur_, fw, r.ffn_norm, TA, TB, decode_prefix);
-  moe_->route_prefill_rows(x_, TA, TB, stream_);
+  if (!expert_cache_) moe_->route_prefill_rows(x_, TA, TB, stream_);
   swap_pre();
   // The expert chain over every row (its cost is the weights it decodes);
   // then the accumulation per block, so block B's runs under A's fold.
   uint16_t* ffn_out = y_;
-  moe_->enqueue_prefill_phased(x_, T, stream_, decode_prefix, ffn_out);
-  moe_->accumulate_prefill_rows(ffn_out, T, 0, TA, stream_, decode_prefix);
-  DGPP_CUDA_OK(cudaEventRecord(ov_ev_[2], stream_));  // A's accumulation
-  moe_->accumulate_prefill_rows(ffn_out, T, TA, TB, stream_, decode_prefix);
-  DGPP_CUDA_OK(cudaEventRecord(ov_ev_[3], stream_));  // B's accumulation
+  if (expert_cache_) {
+    // Preserve the proven paged chain and its ordered accumulation. Both
+    // row blocks finish together; attention/Engram folds and the following
+    // layer can still overlap, without pretending the paged chain exposes
+    // separate accumulation events or retaining scratch through a collective.
+    const auto& mapping = expert_cache_map_[static_cast<size_t>(layer)];
+    if (decode_prefix)
+      moe_->enqueue_paged(x_, ffn_out, decode_prefix, *expert_cache_, mapping, stream_, MoeExpertKernel::kGemv);
+    if (decode_prefix < T) {
+      const size_t offset = static_cast<size_t>(decode_prefix)*H;
+      moe_->enqueue_paged(x_+offset, ffn_out+offset, T-decode_prefix, *expert_cache_, mapping,
+                          stream_, MoeExpertKernel::kMma);
+    }
+    DGPP_CUDA_OK(cudaEventRecord(ov_ev_[2], stream_));
+    DGPP_CUDA_OK(cudaEventRecord(ov_ev_[3], stream_));
+  } else {
+    moe_->enqueue_prefill_phased(x_, T, stream_, decode_prefix, ffn_out);
+    moe_->accumulate_prefill_rows(ffn_out, T, 0, TA, stream_, decode_prefix);
+    DGPP_CUDA_OK(cudaEventRecord(ov_ev_[2], stream_));  // A's accumulation
+    moe_->accumulate_prefill_rows(ffn_out, T, TA, TB, stream_, decode_prefix);
+    DGPP_CUDA_OK(cudaEventRecord(ov_ev_[3], stream_));  // B's accumulation
+  }
   const bool ffn_a = begin_fold_after(ffn_out, 0, TA, ov_ev_[2]);  // under B's accumulation
   end_fold(ffn_a);
   // Block A's update; block B's fold pending — begun behind the next
@@ -1631,6 +1649,10 @@ void Dsv41Model::enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, i
   overlap_rows_ = T;
   overlap_ta_ = TA;
   if (flush) flush_overlap();
+  if (expert_cache_ && expert_cache_->observations() - expert_last_adapt_ >= expert_adapt_every_routes_) {
+    expert_cache_->adapt();
+    expert_last_adapt_ = expert_cache_->observations();
+  }
 }
 
 void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, const WalkRows& rows) {
@@ -2055,7 +2077,9 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // spans) on a multi-rank world, never a capture, a traced or a
   // diagnostic walk; the boundary per walk shape (the bounded decoder
   // re-packs the rows at dec0: its own, if any — the segments are short).
-  const bool overlap_walk = !expert_cache_ && fold_overlap_ && !run.decode && !run.capture && !capture_layers &&
+  const char* paged_overlap_setting = std::getenv("DGPP_EXPERT_PREFILL_OVERLAP");
+  const bool paged_overlap = expert_cache_ && paged_overlap_setting && std::atoi(paged_overlap_setting) != 0;
+  const bool overlap_walk = ((!expert_cache_ && fold_overlap_) || paged_overlap) && !run.decode && !run.capture && !capture_layers &&
                             debug_teacher_ == nullptr && !traces &&
                             (boundary_ != nullptr || fold_overlap_without_reducer_);
   const char* gpu_paging = std::getenv("DGPP_EXPERT_GPU_PAGING");

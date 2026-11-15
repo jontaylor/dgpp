@@ -515,3 +515,73 @@ does not claim to solve the remaining prefill latency. Future work should includ
 Engram's mapped-file read amplification alongside resident-first prefill
 scheduling. A chunk identity trace alone cannot declare either subsystem the
 irreducible hardware bottleneck.
+
+### Compact Engram reads and large-prefill scheduling
+
+`DGPP_ENGRAM_DIRECT=1` replaces demand-faulted Engram gathers with aligned
+4 KiB direct reads and a bounded, four-way compact row cache. Payload and
+scale rows are cached together; large gathers sort requests within worker
+shards while preserving destination order. The two MXFP4 tables reserve about
+72.4 MiB per rank, plus budgeted per-call indices. This reservation is charged
+to staging memory; the 100 GiB expert budget is unchanged. The checkpoint's
+Engram tables are MXFP4 even when its routed experts are NVFP4.
+
+The mode is explicit because it requires a filesystem supporting direct I/O.
+The mmap gather remains available. Host tests cover block boundaries, short
+final blocks, warm hits, concurrent gathers, invalid rows and failed reads;
+FP8 and MXFP4 GPU gather fixtures match the reference bitwise on Spark.
+
+A focused replay of the same initial tool request and cached continuation,
+with production 1M context, fixed speculative depth three, unchanged sampling
+and no tracing, produced:
+
+| Configuration | Initial prefill (s) | Continuation prefill (s) | Combined request wall (s) |
+|---|---:|---:|---:|
+| mmap, no explicit hints | 63.153 | 6.467 | 74.459 |
+| Direct compact cache | 54.149 | 6.438 | 65.696 |
+| Direct cache + resident-first experts | 54.949 | 6.123 | 66.070 |
+| Direct cache + paged prefill overlap | 54.777 | 6.610 | 66.483 |
+
+Direct caching reduced initial prefill by 14.3% and pair wall time by 11.8%
+in this comparison. Initial process reads fell from about 149 GiB to about
+113 GiB per rank, while expert reads stayed at 110.118 GiB. Both ranks had
+zero major faults and zero swap. Outputs, tool arguments, token usage and
+speculative acceptance matched: 38 accepted predictions across 14 initial
+passes, and 21 across nine continuation passes. These are focused request
+pairs, not a broad throughput or concurrency result. Process-read counters
+include all process I/O, not exclusively Engram reads.
+
+`DGPP_MOE_RESIDENT_FIRST=1` groups prepared resident experts ahead of misses
+without capping the resident group by reconstruction-slot capacity. It preserves
+route-slot accumulation order and prefetches the first miss before resident
+execution. Prepared/mixed prefill and cache-pressure fixtures pass bitwise.
+The continuation improved, but the complete pair did not; this option remains
+disabled in production. Larger resident groups alone do not guarantee faster
+execution.
+
+Both TP ranks process the same tokens and layers, splitting every expert's
+intermediate width (1,152 dimensions per rank), rather than assigning whole
+experts or layers to different ranks. Shared experts and attention projections
+are also partitioned, and reductions join partial outputs. Engram hash heads
+are partitioned. A slower read or kernel on either rank can therefore delay
+both; adding rank times would double-count overlapping work.
+
+`DGPP_EXPERT_PREFILL_OVERLAP=1` allows the existing two-row-block attention,
+Engram and boundary-reduction schedule to run with paging. The paged expert
+chain retains its ordinary ordered accumulation; both row blocks become ready
+together, rather than claiming independent expert completion. NVFP4 and MXFP4
+model fixtures, for both cache policies, match ordinary paged prefill and three
+subsequent decode logits bitwise. The two-rank request pair also matched outputs,
+usage and acceptance, with zero major faults and swap. It did not improve total
+time and remains disabled. This does not rule out a more granular expert
+completion schedule; the candidate deliberately retains the existing expert
+chain and its synchronization.
+
+Runtime sources were `5a516a9c` for no hints, `ba5f70db` for direct caching,
+`0f661f5f` for resident-first, and `0f661f5f` plus the paged overlap changes for
+the overlap candidate. Final deployment enables only `DGPP_ENGRAM_DIRECT=1`
+from this pass, retaining the endpoint, keys, 1M context, expert cache budget,
+read workers and fixed speculative depth. Engram amplification was a removable
+cost; the remaining expert I/O, reconstruction/layout preparation and rank
+coordination are still optimization opportunities, not established hardware
+limits.

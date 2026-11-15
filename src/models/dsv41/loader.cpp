@@ -1116,9 +1116,9 @@ const Dsv41EngramTables& Dsv41LayerStream::load_engram_tables() {
                                                                     tw.shape[0], cfg_.engram_head_dim, cfg_.engram_mxfp4));
   }
   engram_loaded_ = true;
-  DGPP_LOG_INFO("dsv41 loader: rank {} Engram tables mmap'ed from the checkpoint ({} tables, {:.2f} GiB mapped, "
+  DGPP_LOG_INFO("dsv41 loader: rank {} Engram tables using {} gather ({} tables, {:.2f} GiB mapped, "
                 "{} rows per token: {} heads x {} n-gram sizes)",
-                rank_, engram_.tables.size(), engram_.mapped_bytes() / (1024.0 * 1024.0 * 1024.0),
+                rank_, direct_engram_enabled() ? "direct-block cached" : "mmap", engram_.tables.size(), engram_.mapped_bytes() / (1024.0 * 1024.0 * 1024.0),
                 engram_.rows_local(), engram_.heads_local, engram_.ngrams);
   return engram_;
 }
