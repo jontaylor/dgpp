@@ -324,6 +324,44 @@ DGPP_TEST(dsv41_engram_staged_gather_is_exact) {
   cudaFree(out);
 }
 
+DGPP_TEST(dsv41_engram_mxfp4_staged_gather_covers_all_codes_and_scales) {
+  // Every E8M0 byte crossed with every E2M1 code, using an independent
+  // FP64 oracle. Includes signed zero, BF16 subnormals/overflow and NaNs.
+  const double magnitudes[8] = {0, .5, 1, 1.5, 2, 3, 4, 6};
+  const int n = 4, rows_local = 8, head_dim = 256;
+  const int payload_bytes = head_dim / 2, row_bytes = payload_bytes + head_dim / 32;
+  uint8_t* staged = managed<uint8_t>(static_cast<size_t>(n) * rows_local * row_bytes);
+  uint16_t* out = managed<uint16_t>(static_cast<size_t>(n) * rows_local * head_dim);
+  for (int pair = 0; pair < n * rows_local; ++pair) {
+    uint8_t* row = staged + pair * row_bytes;
+    for (int d = 0; d < payload_bytes; ++d)
+      row[d] = static_cast<uint8_t>((2 * d % 16) | ((2 * d + 1) % 16 << 4));
+    for (int b = 0; b < head_dim / 32; ++b)
+      row[payload_bytes + b] = static_cast<uint8_t>(pair * (head_dim / 32) + b);
+  }
+  dgpp::dsv41_engram_gather_staged_bf16(staged, n, rows_local, head_dim, out, nullptr, true);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  for (int pair = 0; pair < n * rows_local; ++pair) {
+    const uint8_t* row = staged + pair * row_bytes;
+    for (int d = 0; d < head_dim; ++d) {
+      const uint8_t scale = row[payload_bytes + d / 32];
+      const unsigned code = (row[d / 2] >> (4 * (d % 2))) & 15;
+      const uint16_t got = out[pair * head_dim + d];
+      if (scale == 255) {
+        require(std::isnan(bf16_bits_to_float(got)), "MXFP4 NaN scale propagates, including zero codes");
+      } else {
+        const double value = std::ldexp(std::copysign(magnitudes[code & 7], code & 8 ? -1.0 : 1.0),
+                                        static_cast<int>(scale) - 127);
+        const uint16_t want = float_to_bf16_bits(static_cast<float>(value));
+        require(got == want, "MXFP4 all-code/all-scale oracle at scale " + std::to_string(scale) +
+                            " code " + std::to_string(code));
+      }
+    }
+  }
+  cudaFree(staged);
+  cudaFree(out);
+}
+
 DGPP_TEST(dsv41_engram_gate_matches_double_oracle) {
   const int rows = 5, hc = 4, hidden = 5120;
   const float eps = 1e-20f;

@@ -44,6 +44,7 @@
 #include "loaders/resident_stream.hpp"
 #include "loaders/safetensors.hpp"
 #include "loaders/weight_build.hpp"
+#include "models/dsv41/expert_image.hpp"
 #include "models/dsv41/binding.hpp"
 #include "models/dsv41/config.hpp"
 #include "models/exl3_matrix.hpp"
@@ -96,7 +97,7 @@ struct Dsv41MoeResident {
   const uint16_t* router = nullptr;     // bf16 [E, hidden]
   const float* router_bias = nullptr;   // f32 [E]
   GlmQuantMatrix shared[3];             // fp8: w1, w3 [S/W, hidden]; w2 [hidden, S/W]
-  std::vector<GlmFp4Matrix> experts;    // [E * 3]: w1, w3, w2 per expert (MXFP4, inter-sliced)
+  std::vector<GlmFp4Matrix> experts;    // [E * 3]: w1, w3, w2 per expert (native FP4, inter-sliced)
   // The EXL3 pack's experts: [E * 3] gate, up, down per expert and the
   // shared triple, sliced on the intermediate in whole 128-blocks (the
   // uneven split alternating by parity, exl3_expert_block_split: a
@@ -165,15 +166,16 @@ struct Dsv41GlobalsResident {
 };
 
 // One Engram table kept in its shard (plan D5): the payload tensor
-// [rows, head_dim] e4m3 and the scale tensor [rows, head_dim / 32] e8m0,
+// [rows, head_dim] e4m3 (or packed [rows, head_dim/2] MXFP4) and the
+// scale tensor [rows, head_dim / 32] e8m0,
 // mapped read-only with random-access advice, never copied to the device.
 // The host gathers the rows a step needs into pinned staging as [n,
-// rows_local, head_dim + head_dim / 32] (a row's payload then its scales),
+// rows_local, row_bytes()] (a row's source payload then its scales),
 // the staged gather kernel converts them.
 class Dsv41EngramTableMmap {
  public:
   Dsv41EngramTableMmap(const std::string& path, uint64_t payload_begin, uint64_t scale_begin,
-                       int64_t rows, int head_dim);
+                       int64_t rows, int head_dim, bool mxfp4 = false);
   ~Dsv41EngramTableMmap();
   Dsv41EngramTableMmap(const Dsv41EngramTableMmap&) = delete;
   Dsv41EngramTableMmap& operator=(const Dsv41EngramTableMmap&) = delete;
@@ -186,7 +188,9 @@ class Dsv41EngramTableMmap {
               uint8_t* dst) const;
   int64_t rows() const { return rows_; }
   int head_dim() const { return head_dim_; }
-  int row_bytes() const { return head_dim_ + head_dim_ / 32; }
+  bool mxfp4() const { return mxfp4_; }
+  int payload_row_bytes() const { return head_dim_ / (mxfp4_ ? 2 : 1); }
+  int row_bytes() const { return payload_row_bytes() + head_dim_ / 32; }
   size_t mapped_bytes() const { return len_; }
 
  private:
@@ -197,6 +201,7 @@ class Dsv41EngramTableMmap {
   uint64_t scale_begin_ = 0;
   int64_t rows_ = 0;
   int head_dim_ = 0;
+  bool mxfp4_ = false;
 };
 
 // The Engram tables of a rank: one mapping per Engram layer, and the
@@ -307,6 +312,8 @@ class Dsv41LayerStream : public ResidentLayerStream<Dsv41LoaderFamily> {
   // first call from the shard mappings, so it must precede
   // release_sources(); the mappings outlive the release.
   const Dsv41EngramTables& load_engram_tables();
+  std::shared_ptr<expert::ExpertStore> prepare_expert_image(const std::string& path,
+      uint64_t chunk_intermediate, bool include_draft, expert::IoMode mode);
 
  protected:
   const std::string& image_dir() const override { return resident_image_dir(); }

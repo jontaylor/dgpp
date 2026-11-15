@@ -46,7 +46,8 @@ class Histogram {
 // Seconds, 1 ms to 10 min: time to first token on a 256K-token prompt runs
 // to minutes, an attached prefix answers in milliseconds.
 std::vector<double> latency_buckets();
-// Seconds, 1 ms to 10 s: a decode step or the gap between token batches.
+// Seconds, 1 ms to 640 s: a decode step or the gap between token batches,
+// including long expert-weight reads from storage. Existing bounds are kept.
 std::vector<double> step_buckets();
 // Tokens per request, 1 to 1M.
 std::vector<double> token_buckets();

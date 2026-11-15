@@ -2928,3 +2928,58 @@ DGPP_TEST(compact_mapping_commit_draft_chain_and_ple_padding) {
   const auto conv_snapshots = read(snapshots, groups * 9);
   for (int i = 9; i < 18; ++i) require(conv_snapshots[i] == 0, "padded PLE conv snapshots");
 }
+
+DGPP_TEST(pick_large_plain_batches_preserve_all_request_slots_and_padding) {
+  for (const int requests : {17, 32, 64}) {
+    constexpr int count = 32;
+    std::vector<float> logits(static_cast<size_t>(requests) * count, -10.0f);
+    std::vector<int64_t> fed(requests, 0), positions(requests, 100);
+    for (int q = 0; q < requests; ++q) {
+      logits[static_cast<size_t>(q) * count + q % count] = 10.0f;
+      if (q % 7 == 0) positions[q] = -1;
+    }
+    const auto local = run_local(logits, requests, count, 0, 0, 1, 0x1234);
+    uint64_t carry = 0;
+    const auto got = run_verdict_batch(local.table, requests, 1, 0, fed,
+                                      positions, requests, 1, &carry);
+    for (int q = 0; q < requests; ++q) {
+      const bool live = positions[q] >= 0;
+      require(got[q].rows == (live ? 1 : 0) && got[q].accepted == (live ? 1 : 0) &&
+                  got[q].next == (live ? q % count : -1),
+              "large batch retains independent decisions through the last slot");
+      require(got[q].digest == carry && got[q].digest_mismatch == 0,
+              "all request slots carry the same batch digest");
+    }
+  }
+}
+
+DGPP_TEST(sample_pick_large_plain_batch_keeps_rng_and_padding_slot_local) {
+  constexpr int requests = 64, world = 2, count = 32, vocab = world * count;
+  std::vector<float> logits(static_cast<size_t>(requests) * vocab, -100.0f);
+  std::vector<dgpp::SampleSpec> specs(requests);
+  std::vector<int32_t> counts(requests * vocab, 0);
+  std::vector<int64_t> fed(requests, 0), positions(requests, 100);
+  for (int q = 0; q < requests; ++q) {
+    logits[static_cast<size_t>(q) * vocab + q] = 10.0f;
+    specs[q].temperature = 1.0f;
+    specs[q].top_p = 1.0f;
+    specs[q].top_k = 1;
+    specs[q].seed = 0x5000 + q;
+    specs[q].counter = 3;
+    if (q % 7 == 0) positions[q] = -1;
+  }
+  const auto run = run_sample_world(logits, requests, world, count, specs,
+                                    counts, fed, positions, 16, 0x5555);
+  for (int rank = 0; rank < world; ++rank) {
+    for (int q = 0; q < requests; ++q) {
+      const auto& result = run.outcomes[rank][q];
+      const bool live = positions[q] >= 0;
+      const auto& verdict = run.verdicts[rank][q];
+      require(result.fallback == 0 && verdict.accepted == (live ? 1 : 0) &&
+                  verdict.next == (live ? q : -1),
+              "64-request sampling selects each live slot independently");
+      require(run.specs_after[rank][q].counter == specs[q].counter + (live ? 1 : 0),
+              "only active request RNG counters advance");
+    }
+  }
+}

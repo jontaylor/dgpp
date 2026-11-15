@@ -38,6 +38,34 @@ class SiteEnvTest(unittest.TestCase):
             "PATH": os.environ.get("PATH", os.defpath),
         }
 
+    def test_supervised_serving_stops_world_on_rank_failure(self):
+        module = runpy.run_path(str(ROOT / "scripts/dgpp-cluster"))
+        alive = [(0, "head", 123), (1, "peer", 456)]
+        for case in ("stop", "rank_exit", "rank_replaced", "unreachable", "startup_failure"):
+            with self.subTest(case=case):
+                cluster = object.__new__(module["Cluster"])
+                cluster.nodes = ["head", "peer"]
+                cluster.log_dir = str(self.root / case)
+                Path(cluster.log_dir).mkdir()
+                (Path(cluster.log_dir) / "serve_r0.log").write_text("original failure\n")
+                observed = {
+                    "rank_exit": (alive[:1], []),
+                    "rank_replaced": ([(0, "head", 123), (1, "peer", 789)], []),
+                    "unreachable": (alive[:1], [(1, "peer", "SSH failed")]),
+                }.get(case, (alive, []))
+                with patch.object(cluster, "up", return_value=int(case == "startup_failure")), \
+                     patch.object(cluster, "down", return_value=0) as down, \
+                     patch.object(cluster, "live_ranks", side_effect=[(alive, []), observed]), \
+                     patch.object(module["signal"], "signal"), \
+                     patch.object(module["threading"], "Event") as event:
+                    event.return_value.wait.return_value = case == "stop"
+                    self.assertEqual(cluster.run(), int(case != "stop"))
+                    self.assertEqual(down.call_count, int(case != "startup_failure"))
+                saved = list(Path(cluster.log_dir).glob("failures/*/serve_r0.log"))
+                self.assertEqual(len(saved), int(case not in ("stop", "startup_failure")))
+                if saved:
+                    self.assertEqual(saved[0].read_text(), "original failure\n")
+
     def values(self, **overrides):
         return site_env.settings({**self.environ, **overrides})
 
@@ -294,7 +322,10 @@ class SiteEnvTest(unittest.TestCase):
         for path in (ROOT / "deploy").glob("*.example.json"):
             with self.subTest(path=path.name):
                 cfg = json.loads(path.read_text())
-                self.assertFalse(set(cfg) & {"nodes", "ssh_user", "ports"})
+                self.assertFalse(set(cfg) & {"nodes", "ssh_user"})
+                # Metrics are a deployment opt-in; serving/fabric addresses
+                # and ports still come from the site's environment.
+                self.assertFalse(set(cfg.get("ports", {})) - {"metrics"})
                 resolved = site_env.resolve_config(path, self.values())
                 self.assertEqual(len(resolved["nodes"]), cfg["world_size"])
                 self.assertEqual(resolved["engine"], cfg["engine"])

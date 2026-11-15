@@ -204,7 +204,7 @@ class ScriptReportsTest(unittest.TestCase):
                     b'data: {"choices":[{"delta":{"role":"assistant"}}]}\r\n\r',
                     b'\ndata: {"choices":[{"delta":{"content":"two tokens"}}]}\n\n',
                     b'data: {"choices":[{"delta":{"reasoning_content":"think","content":"answer"}}]}\n\n',
-                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"completion_tokens":7}}\n\ndata: [DONE]\n\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"completion_tokens":7},"timings":{"prompt_ms":4,"predicted_ms":90,"predicted_per_second":66.666}}\n\ndata: [DONE]\n\n',
                     b''])
             def read1(self, _): return next(self.parts)
         ticks = iter([1.0, 2.0, 4.0, 8.0])
@@ -212,6 +212,8 @@ class ScriptReportsTest(unittest.TestCase):
         self.assertEqual((result['first'], result['last'], result['tokens'], result['chunks']), (2, 4, 7, 2))
         self.assertEqual(result['text'], 'two tokensthinkanswer')
         self.assertEqual(result['update_gaps_ms'], [2000])
+        self.assertEqual(result['timings'], {'prompt_ms': 4, 'predicted_ms': 90,
+                                            'predicted_per_second': 66.666})
 
     def test_live_stream_rejects_missing_usage_and_truncation(self):
         class Response:
@@ -234,9 +236,10 @@ class ScriptReportsTest(unittest.TestCase):
 
     def test_high_concurrency_corpus_is_distinct_and_keeps_anchors(self):
         serve_load.check_corpus()
-        for prompts in [serve_load.PROMPTS, *serve_load.CLASSES.values()]:
-            self.assertEqual(len(prompts), 16)
-            self.assertEqual(len(set(prompts)), 16)
+        for name, prompts in [("mixed", serve_load.PROMPTS), *serve_load.CLASSES.items()]:
+            expected = 64 if name in ("mixed", "prose") else 16
+            self.assertEqual(len(prompts), expected)
+            self.assertEqual(len(set(prompts)), expected)
 
     def test_load_reports_actual_thinking_mode_when_switch_is_unsupported(self):
         first, second = Mock(), Mock()
@@ -532,6 +535,54 @@ class ScriptReportsTest(unittest.TestCase):
                 result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+
+
+class QualityDeadlineTest(unittest.TestCase):
+    def test_reply_and_retry_use_configured_socket_deadline_and_keep_caps(self):
+        import http.client
+        import runpy
+        for timeout in (900, 7200):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
+                requests = []
+                replies = iter([
+                    {"data": [{"id": "fixture"}]},
+                    {"choices": [{"message": {"content": "{}"}, "finish_reason": "length"}],
+                     "usage": {"completion_tokens": 512}},
+                    {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                     "usage": {"completion_tokens": 600}},
+                ])
+                def connection(host, port, timeout):
+                    c = Mock()
+                    def request(method, path, body=None, **kwargs):
+                        requests.append((path, json.loads(body) if body else None, timeout))
+                    c.request.side_effect = request
+                    response = Mock(status=200)
+                    response.read.side_effect = lambda: json.dumps(next(replies)).encode()
+                    c.getresponse.return_value = response
+                    return c
+                argv = [str(SCRIPTS / "serve_eval.py"), "fixture", "1", "--out", directory,
+                        "--tasks", "extract", "--limit", "1"]
+                if timeout != 900:
+                    argv += ["--request-timeout", str(timeout)]
+                with patch.object(sys, "argv", argv), patch.object(http.client, "HTTPConnection", side_effect=connection), redirect_stdout(io.StringIO()):
+                    runpy.run_path(str(SCRIPTS / "serve_eval.py"), run_name="__main__")
+                posts = [(body, deadline) for path, body, deadline in requests if path == "/v1/chat/completions"]
+                self.assertEqual([body["max_tokens"] for body, _ in posts], [512, 8192])
+                self.assertEqual([deadline for _, deadline in posts], [timeout, timeout])
+                summary = json.loads((Path(directory) / "summary.json").read_text())
+                self.assertEqual(summary["settings"]["request_timeout_seconds"], timeout)
+                self.assertEqual(summary["tasks"]["extract"]["passed"], 0)
+
+    def test_bad_deadlines_fail_before_output_or_network(self):
+        for timeout in ("0", "-1", "nan", "inf"):
+            with tempfile.TemporaryDirectory() as directory:
+                out = Path(directory) / "results"
+                result = subprocess.run([sys.executable, str(SCRIPTS / "serve_eval.py"),
+                    "invalid", "1", "--tasks", "extract", "--out", str(out),
+                    "--request-timeout", timeout], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("finite and positive", result.stderr)
+                self.assertFalse(out.exists())
 
 if __name__ == "__main__":
     unittest.main()

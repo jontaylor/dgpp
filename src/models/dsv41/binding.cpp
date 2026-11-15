@@ -42,6 +42,18 @@ void add_fp4(TensorList& out, const std::string& base, int64_t rows, int64_t col
   add(out, base + ".scale", DType::F8_E8M0, {rows, cols / block}, cls, layer, expert, Dsv41TensorRole::Fp4Scale);
 }
 
+// ModelOpt's main experts use per-16 E4M3 scales and scalar metadata.
+// Draft experts retain the release's MXFP4 representation.
+void add_nvfp4(TensorList& out, const std::string& base, int64_t rows, int64_t cols,
+               Dsv41WeightClass cls, int layer, int expert) {
+  if (cols % 16 != 0)
+    throw std::invalid_argument("dsv41 binding: NVFP4 K must be a multiple of 16 on " + base);
+  add(out, base + ".weight", DType::U8, {rows, cols / 2}, cls, layer, expert, Dsv41TensorRole::Fp4Payload);
+  add(out, base + ".weight_scale", DType::F8_E4M3, {rows, cols / 16}, cls, layer, expert, Dsv41TensorRole::Fp4Scale);
+  add(out, base + ".weight_scale_2", DType::F32, {}, cls, layer, expert);
+  add(out, base + ".input_scale", DType::F32, {}, cls, layer, expert);
+}
+
 // One EXL3 matrix with input width K and output width N at `bits`.
 void add_exl3(TensorList& out, const std::string& base, int64_t K, int64_t N, int bits, Dsv41WeightClass cls,
               int layer, int expert = -1) {
@@ -147,9 +159,15 @@ void expect_moe(TensorList& out, const std::string& p, const Dsv41TextConfig& cf
   if (cfg.vision_present) add_f32(out, p + "gate.bias_vl", {E}, Dsv41WeightClass::Router, layer);
   for (int e = 0; e < E; ++e) {
     const std::string ep = p + "experts." + std::to_string(e) + ".";
-    add_fp4(out, ep + "w1", I, H, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
-    add_fp4(out, ep + "w2", H, I, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
-    add_fp4(out, ep + "w3", I, H, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
+    if (cfg.experts_nvfp4 && !draft) {
+      add_nvfp4(out, ep + "w1", I, H, Dsv41WeightClass::RoutedExpert, layer, e);
+      add_nvfp4(out, ep + "w2", H, I, Dsv41WeightClass::RoutedExpert, layer, e);
+      add_nvfp4(out, ep + "w3", I, H, Dsv41WeightClass::RoutedExpert, layer, e);
+    } else {
+      add_fp4(out, ep + "w1", I, H, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
+      add_fp4(out, ep + "w2", H, I, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
+      add_fp4(out, ep + "w3", I, H, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
+    }
   }
   const std::string sp = p + "shared_experts.";
   add_fp8(out, sp + "w1", S, H, Dsv41WeightClass::SharedExpert, layer, cfg.fp8_block_size);
@@ -173,9 +191,10 @@ void expect_engram(TensorList& out, const std::string& p, const Dsv41TextConfig&
   const std::string ep = p + "engram.";
   const int64_t rows = cfg.engram_num_embeddings[static_cast<size_t>(idx)];
   const int64_t hd = cfg.engram_head_dim;
-  add(out, ep + "embed.weight", DType::F8_E4M3, {rows, hd}, Dsv41WeightClass::EngramTable, layer, -1,
+  add(out, ep + "embed.weight", cfg.engram_mxfp4 ? DType::U8 : DType::F8_E4M3,
+      {rows, hd / (cfg.engram_mxfp4 ? 2 : 1)}, Dsv41WeightClass::EngramTable, layer, -1,
       Dsv41TensorRole::TablePayload);
-  add(out, ep + "embed.scale", DType::F8_E8M0, {rows, hd / cfg.fp4_block_size}, Dsv41WeightClass::EngramTable,
+  add(out, ep + "embed.scale", DType::F8_E8M0, {rows, hd / 32}, Dsv41WeightClass::EngramTable,
       layer, -1, Dsv41TensorRole::TableScale);
   if (cfg.weights_exl3) {
     add_exl3(out, ep + "wkv", cfg.engram_width(), static_cast<int64_t>(cfg.hidden_size) * (cfg.hc_mult + 1),

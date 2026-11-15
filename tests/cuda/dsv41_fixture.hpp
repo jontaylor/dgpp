@@ -173,6 +173,11 @@ inline std::vector<uint8_t> tensor_bytes(const Dsv41ExpectedTensor& e) {
       for (size_t i = 0; i < n; ++i) out[i] = static_cast<uint8_t>(rng.next());  // every e2m1 code is finite
       return out;
     case Dsv41TensorRole::Fp4Scale:
+      if (e.dtype == dgpp::DType::F8_E4M3) {
+        for (size_t i = 0; i < n; ++i)
+          out[i] = dgpp::float_to_fp8_e4m3_bits(0.5f + 0.5f * std::fabs(rng.unit()));
+        return out;
+      }
       for (size_t i = 0; i < n; ++i) out[i] = static_cast<uint8_t>(118 + rng.next() % 3);  // 2^-9 .. 2^-7
       return out;
     case Dsv41TensorRole::Exl3Trellis:
@@ -203,6 +208,11 @@ inline std::vector<uint8_t> tensor_bytes(const Dsv41ExpectedTensor& e) {
       break;
   }
   const bool is_norm = has(name, "norm") && e.shape.size() == 1;  // gains near 1
+  if (e.cls == Dsv41WeightClass::RoutedExpert && e.dtype == dgpp::DType::F32 && e.shape.empty()) {
+    const float value = has(name, ".weight_scale_2") ? std::ldexp(1.0f, -8 - static_cast<int>(rng.next() % 7)) : 0.00125f;
+    std::memcpy(out.data(), &value, sizeof(value));
+    return out;
+  }
   const bool is_bias = has(name, ".bias");
   const bool is_hc_scale = e.cls == Dsv41WeightClass::Mhc && has(name, "_scale");
   const bool is_small = e.cls == Dsv41WeightClass::Mhc || has(name, "attn_sink") || is_bias;

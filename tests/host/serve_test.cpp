@@ -97,11 +97,11 @@ class FakeEngine : public SchedulerEngine {
     stats.active = 5;
     stats.rows_per_request = 2;
     stats.replays = 3;
-    stats.rows = 29;
+    stats.rows = 77;
     stats.padded_rows = 2;
     stats.replays_by_slots[1] = 1;
     stats.replays_by_slots[6] = 1;
-    stats.replays_by_slots[16] = 1;
+    stats.replays_by_slots[64] = 1;
     return stats;
   }
 
@@ -1550,14 +1550,14 @@ DGPP_TEST(serve_decodeBatchMetrics_retainsLastLaunchWhileIdle) {
                                                     {"last_active", 5},
                                                     {"last_rows_per_request", 2},
                                                     {"replays", 3},
-                                                    {"rows", 29},
+                                                    {"rows", 77},
                                                     {"padded_rows", 2}})
         require(batch.at(key).as_int() == (reported ? value : 0), "decode batch " + key);
       const auto& histogram = batch.at("replays_by_slots");
-      require(histogram.members().size() == 16, "all slot buckets are exposed");
-      for (int slots = 1; slots <= 16; ++slots)
+      require(histogram.members().size() == 64, "all slot buckets are exposed");
+      for (int slots = 1; slots <= 64; ++slots)
         require(histogram.at(std::to_string(slots)).as_int() ==
-                    (reported && (slots == 1 || slots == 6 || slots == 16) ? 1 : 0),
+                    (reported && (slots == 1 || slots == 6 || slots == 64) ? 1 : 0),
                 "scalar, batched and zero histogram buckets");
     }
   }

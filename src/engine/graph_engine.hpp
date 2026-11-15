@@ -1454,7 +1454,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // engine.prefill_group: off, the scheduler prefills one cold prompt per
   // walk (the span limit reads 0), so a prompt's prefill never rides a
   // walk whose row count another prompt set.
-  void set_prefill_group(bool on) { prefill_group_ = on; }
+  void set_prefill_group(bool on) override { prefill_group_ = on; }
   int64_t prefill_group_span_limit() const override {
     if (!prefill_group_) return 0;
     if constexpr (requires { model_->prefill_group_span_limit(); })
@@ -1571,6 +1571,17 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       commit();
       return out;
     });
+  }
+  bool prefix_snapshot_ready(int req) const override {
+    if constexpr (requires { model_->mtp_enabled(); model_->session_position(req);
+                             model_->session_draft_position(req); }) {
+      if (model_->mtp_enabled()) {
+        const auto pos = model_->session_position(req);
+        const auto draft = model_->session_draft_position(req);
+        return draft == pos || draft == pos - 1;
+      }
+    }
+    return true;
   }
   void prefix_snapshot(int req, int slot, int64_t position) override {
     check_live(req, "prefix_snapshot");

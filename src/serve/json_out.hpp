@@ -63,6 +63,14 @@ inline std::string json_int(int64_t v) {
   return out;
 }
 
+// Byte and operation counters may use the full unsigned 64-bit range.
+inline void append_json_uint(std::string* out, uint64_t v) {
+  char buf[24];
+  const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+  out->append(buf, end - buf);
+  (void)ec;
+}
+
 // The one float surface: the effective sampling defaults /v1/models reports.
 // Shortest round-trip form (std::to_chars), so the number a client reads
 // back parses to the exact value the server applies. Callers pass finite

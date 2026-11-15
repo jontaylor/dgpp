@@ -35,6 +35,7 @@
 #include "sched/prefill_latency.hpp"
 #include "common/prefill_progress.hpp"
 #include "common/image_input.hpp"
+#include "loaders/expert_cache.hpp"
 #include "sample/sampler.hpp"
 #include "text/tool_grammar.hpp"
 
@@ -69,6 +70,11 @@ class SchedulerEngine {
   // DSA pool meters (a no-DSA model reports an unbounded pool).
   virtual int64_t pool_blocks_total() const = 0;
   virtual int64_t pool_blocks_in_use() const = 0;
+  virtual std::optional<expert::CacheTelemetry> expert_paging_metrics() const { return std::nullopt; }
+  // Quiescent transfer from startup to the engine loop; default engines have
+  // no thread-bound state. HTTP threads read published meters only.
+  virtual void release_execution_thread() {}
+  virtual void bind_execution_thread() {}
   // Raw block geometry, without engine-specific reservation headroom.
   virtual int64_t blocks_for_tokens(int64_t tokens) const = 0;
   // Physical block footprint of reserve(req, tokens) and begin_prefill's
@@ -109,6 +115,7 @@ class SchedulerEngine {
   // prefill_group_span_limit() tokens, the group within
   // prefill_group_total_limit(); no prefix-cache plans. Returns each
   // request's first token, in order. The default runs them one by one.
+  virtual void set_prefill_group(bool) {}
   virtual int64_t prefill_group_span_limit() const { return 0; }  // 0: no grouping
   virtual int64_t prefill_group_total_limit() const { return 0; }
   virtual std::vector<int32_t> prefill_group(const std::vector<int>& reqs,
@@ -144,6 +151,11 @@ class SchedulerEngine {
   // decode; T for a speculative engine whose verify writes T rows). The
   // grow-on-demand policy sizes each reservation's headroom by it.
   virtual int max_tokens_per_step() const { return 1; }
+  virtual void configure_eager_mtp(int,
+      std::function<std::vector<int32_t>(const std::vector<sample::Candidate>&)>,
+      bool = false, float = 8, float = 28, float = 0, int = 1, bool = true) {
+    throw std::logic_error("engine does not support eager MTP");
+  }
   // Speculative acceptance by draft position: attempts[p] is
   // the steps that verified draft p (0-based; depth of them), accepts[p]
   // the steps that accepted it. Engine-wide since construction, or per
@@ -167,7 +179,7 @@ class SchedulerEngine {
   };
   // Last launched decode graph, retained while idle; counters since startup.
   struct DecodeBatchStats {
-    static constexpr int kMaxSlots = 16;
+    static constexpr int kMaxSlots = 64;
     int slots = 0, active = 0, rows_per_request = 0;
     uint64_t replays = 0, rows = 0, padded_rows = 0;
     uint64_t replays_by_slots[kMaxSlots + 1] = {};
@@ -383,6 +395,9 @@ class SchedulerEngine {
   // The live slot's state at its current position (`position` tokens
   // committed, a multiple of align — the scheduler's view; the engine
   // verifies) into arena slot `slot`, replacing whatever the slot held.
+  // Optional snapshots need all model state to be current. Ordinary
+  // constrained decoding can leave an enabled but unused draft behind.
+  virtual bool prefix_snapshot_ready(int req) const { (void)req; return true; }
   virtual void prefix_snapshot(int req, int slot, int64_t position) {
     (void)req;
     (void)slot;
@@ -707,6 +722,7 @@ class Scheduler {
 
   // The /v1/metrics snapshot.
   struct Meters {
+    std::optional<expert::CacheTelemetry> expert_streaming;
     int active = 0;        // requests with an open engine slot
     int prefilling = 0;    // subset of active, not yet eligible for decode
     int queued = 0;        // admitted-not, waiting on slots/budget

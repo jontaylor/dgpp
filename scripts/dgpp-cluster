@@ -17,6 +17,8 @@ under DGPP_LOG_DIR/deployments: status lists running or uncheckable ones,
 status --all also lists stopped ones, and down stops the running ones.
 up always starts one deployment: without --config it uses DGPP_CLUSTER_CONFIG
 or the default deployment file.
+run starts that deployment and stays alive supervising both ranks, stopping
+the whole deployment if a rank exits. Use it with systemd Restart=on-failure.
 
 Log and staging paths are namespaced by deployment-file path. Process identity
 records limit cleanup to this deployment; up --replace explicitly replaces a
@@ -470,6 +472,52 @@ class Cluster:
         say(f"READY — curl http://{client_host}:{self.http}/v1/models  (stop: {stop})")
         return 0
 
+    # ---- supervised serving ------------------------------------------------
+    def run(self):
+        stopping = threading.Event()
+        previous = {number: signal.signal(number, lambda *_: stopping.set())
+                    for number in (signal.SIGTERM, signal.SIGINT)}
+        started, failed = False, False
+        try:
+            if self.up():
+                return 1
+            started = True
+            alive, unreachable = self.live_ranks()
+            expected = {rank: pid for rank, _, pid in alive}
+            if unreachable or len(expected) != len(self.nodes):
+                raise RuntimeError("not every rank is alive after startup")
+            say("=== supervising recorded rank processes")
+            while not stopping.wait(5):
+                alive, unreachable = self.live_ranks()
+                if unreachable:
+                    raise RuntimeError(f"rank supervision failed: {unreachable}")
+                current = {rank: pid for rank, _, pid in alive}
+                if current != expected:
+                    raise RuntimeError(f"rank exited or changed: expected {expected}, observed {current}")
+            return 0
+        except (ValueError, OSError, RuntimeError) as error:
+            failed = True
+            say(f"FAILED: {error}")
+            return 1
+        finally:
+            try:
+                if started:
+                    if self.down():
+                        raise RuntimeError("supervised deployment shutdown is incomplete")
+                    if failed:
+                        # The next launch replaces live logs; retain the crash.
+                        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                        saved = Path(self.log_dir) / "failures" / stamp
+                        saved.mkdir(parents=True, exist_ok=True)
+                        for rank in range(len(self.nodes)):
+                            source = Path(self.log_dir) / f"serve_r{rank}.log"
+                            if source.exists():
+                                shutil.copy2(source, saved / source.name)
+                        say(f"failure logs retained in {saved}")
+            finally:
+                for number, handler in previous.items():
+                    signal.signal(number, handler)
+
     # ---- down --------------------------------------------------------------
     def down(self):
         with self.launcher_lock():
@@ -679,7 +727,7 @@ def every_deployment(args, verb):
 
 def main():
     ap = argparse.ArgumentParser(description="the serving world's launcher over the cluster config")
-    ap.add_argument("verb", choices=["up", "down", "status", "install", "releases", "resolve", "doctor", "signal", "paths"])
+    ap.add_argument("verb", choices=["up", "run", "down", "status", "install", "releases", "resolve", "doctor", "signal", "paths"])
     ap.add_argument("tarball", nargs="?", help="install: the release tarball from scripts/release.sh")
     ap.add_argument("--config", type=config_argument, default=None)
     ap.add_argument("--bin", default=None, help="the dgpp-serve binary (default: the named release, else DGPP_BUILD_DIR/dgpp-serve or build-release/dgpp-serve)")

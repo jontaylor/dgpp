@@ -58,10 +58,11 @@ struct Fixture {
     throw std::runtime_error("fixture: no tensor " + name);
   }
 };
-Fixture make_fixture() {
+Fixture make_fixture(bool mxfp4 = false) {
   Fixture fx;
   fx.cfg = dsv41fx::tiny_config();
-  fx.dir = (fs::current_path() / "dsv41_engram_layer_fixture").string();
+  fx.cfg.engram_mxfp4 = mxfp4;
+  fx.dir = (fs::current_path() / (mxfp4 ? "dsv41_engram_mxfp4_layer_fixture" : "dsv41_engram_layer_fixture")).string();
   dsv41fx::write_fixture(fx.cfg, fx.dir);
   fx.table = dgpp::dsv41_expected_text_tensors(fx.cfg);
   fx.sidecar = dsv41fx::fixture_sidecar(fx.cfg, fx.dir);
@@ -91,8 +92,8 @@ std::vector<int32_t> hash_row(const dgpp::Dsv41EngramSidecar& sc, const std::vec
 }
 }  // namespace
 
-DGPP_TEST(dsv41_engram_layer_stages_rows_from_the_mmap_bitwise_the_host_lookup) {
-  const Fixture fx = make_fixture();
+void check_staged_layer(bool mxfp4) {
+  const Fixture fx = make_fixture(mxfp4);
   const dgpp::Dsv41TextConfig& cfg = fx.cfg;
   const int L = cfg.engram_index(cfg.engram_layer_ids.back()) + 1, G = cfg.engram_max_ngram_size - 1, Hh = cfg.engram_n_heads;
   const int hd = cfg.engram_head_dim, entries = G * Hh;
@@ -169,8 +170,13 @@ DGPP_TEST(dsv41_engram_layer_stages_rows_from_the_mmap_bitwise_the_host_lookup) 
               const int32_t id = want_ids[size_t(t)][size_t(li * entries + col)];
               const int j = n * tables.heads_local + hl;
               for (int d = 0; d < hd; ++d) {
-                const float v = dgpp::fp8_e4m3_bits_to_float(payload[size_t(id) * hd + d]) *
-                                dgpp::e8m0_byte_to_float(scales[size_t(id) * (hd / 32) + d / 32]);
+                float decoded;
+                if (mxfp4) {
+                  const double magnitudes[8] = {0, .5, 1, 1.5, 2, 3, 4, 6};
+                  const unsigned code = (payload[size_t(id) * (hd / 2) + d / 2] >> (4 * (d % 2))) & 15;
+                  decoded = static_cast<float>(std::copysign(magnitudes[code & 7], code & 8 ? -1.0 : 1.0));
+                } else decoded = dgpp::fp8_e4m3_bits_to_float(payload[size_t(id) * hd + d]);
+                const float v = decoded * dgpp::e8m0_byte_to_float(scales[size_t(id) * (hd / 32) + d / 32]);
                 require(e[(size_t(t) * tables.rows_local() + j) * hd + d] == float_to_bf16_bits(v),
                         tag + "staged row " + std::to_string(t) + " layer " + std::to_string(li));
               }
@@ -219,6 +225,14 @@ DGPP_TEST(dsv41_engram_layer_stages_rows_from_the_mmap_bitwise_the_host_lookup) 
   }
   dgpp::kda_test::require_bf16("TP-4 Engram partials vs the world-1 projection",
                                dgpp::kda_test::compare_bf16(summed, kv_world1, 8), 0.01, 0.05);
+}
+
+DGPP_TEST(dsv41_engram_layer_stages_rows_from_the_mmap_bitwise_the_host_lookup) {
+  check_staged_layer(false);
+}
+
+DGPP_TEST(dsv41_engram_mxfp4_layer_stages_rows_bitwise_the_host_lookup) {
+  check_staged_layer(true);
 }
 
 int main() { return dgpp::test::run_all(); }

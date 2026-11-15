@@ -150,6 +150,13 @@ class SafetensorsFile {
   const uint8_t* map_base() const { return map_; }
   size_t map_size() const { return map_len_; }
   const std::string& path() const { return path_; }
+  // Metadata of the mapped inode, rather than a possibly replaced pathname.
+  struct stat file_stat() const {
+    struct stat result{};
+    if (fd_ < 0 || fstat(fd_, &result) != 0)
+      throw std::runtime_error("cannot stat mapped safetensors: " + path_);
+    return result;
+  }
   const minijson::Value& header_meta() const { return meta_; }
   // FNV-1a of the raw header JSON: the shard's identity for cache keys
   // (names, dtypes, shapes, offsets — a swapped checkpoint changes it).

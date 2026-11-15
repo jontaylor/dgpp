@@ -13,6 +13,7 @@
 // Allocate pick buffers before decoding. Allocating device-related memory
 // inside a pick can synchronize with another rank's spinning collective.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +36,7 @@
 #include "sched/scheduler.hpp"
 #include "text/tool_grammar.hpp"
 #include "engine/speculative.hpp"
+#include "engine/verify_schedule.hpp"
 
 namespace dgpp {
 
@@ -53,6 +55,10 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // is the request's dense logit_bias row over [0, this rank's slice end),
   // null when the request has none.
   using Sample = DecodeSample;
+  static constexpr bool kEagerMtp = [] {
+    if constexpr (requires { Model::kEagerMtp; }) return Model::kEagerMtp;
+    return false;
+  }();
 
   // `prefix_slots` (M7): snapshot slots of the prefix cache's arena this
   // engine holds (0: no cache; the scheduler then never calls the prefix
@@ -70,12 +76,46 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         state_(static_cast<size_t>(max_requests)),
         arena_(model, prefix_slots) {
     spec_.resize(static_cast<size_t>(max_requests));
+    mtp_drafts_.resize(static_cast<size_t>(max_requests));
+    mtp_slot_attempts_.resize(static_cast<size_t>(max_requests));
+    mtp_slot_accepts_.resize(static_cast<size_t>(max_requests));
     prefills_.resize(static_cast<size_t>(max_requests));
     if constexpr (requires { model_->set_prefill_monitor(prefill_monitor()); })
       model_->set_prefill_monitor(prefill_monitor());
   }
 
   int max_concurrent_requests() const override { return slots_; }
+  void configure_eager_mtp(int depth, SpecPickRows pick_rows, bool schedule = false,
+      float row_ms = 8, float base_ms = 28, float lambda = 0, int min_depth = 1, bool adapt = true) override {
+    if constexpr (kEagerMtp) {
+      if (!model_->mtp_enabled() || depth < 1 || depth >= kSpecRows ||
+          depth + 1 > model_->max_decode_rows() || !pick_rows)
+        throw std::invalid_argument("eager MTP: invalid model, depth or row picker");
+      mtp_depth_ = depth;
+      mtp_pick_rows_ = std::move(pick_rows);
+      if (!(row_ms > 0) || !(base_ms >= 0) || !(lambda >= 0) || min_depth < 1 || min_depth > depth)
+        throw std::invalid_argument("eager MTP: invalid depth scheduler");
+      mtp_schedule_ = schedule;
+      mtp_row_ms_ = row_ms; mtp_base_ms_ = base_ms; mtp_min_depth_ = min_depth;
+      mtp_lambda_floor_ = lambda > 0 ? lambda : verify_reservation_lambda(base_ms, row_ms);
+      mtp_lambda_ = mtp_lambda_floor_; mtp_adapt_ = adapt;
+      mtp_confidence_.resize(static_cast<size_t>(model_->confidence_rows()));
+    } else {
+      throw std::invalid_argument("eager MTP is not supported by this model");
+    }
+  }
+  std::optional<expert::CacheTelemetry> expert_paging_metrics() const override {
+    if constexpr (requires { model_->expert_cache(); }) {
+      if (const auto* cache = model_->expert_cache()) return cache->telemetry();
+    }
+    return std::nullopt;
+  }
+  void release_execution_thread() override {
+    if constexpr (requires { model_->release_execution_thread(); }) model_->release_execution_thread();
+  }
+  void bind_execution_thread() override {
+    if constexpr (requires { model_->bind_execution_thread(); }) model_->bind_execution_thread();
+  }
   int64_t pool_blocks_total() const override {
     return model_->kv_blocks_total();
   }
@@ -136,6 +176,48 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
 
   int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
     return open_slot(req, prompt, [&] { return model_->session_prefill(req, prompt); });
+  }
+  void set_prefill_group(bool on) override { prefill_group_ = on; }
+  int64_t prefill_group_span_limit() const override {
+    if (!prefill_group_) return 0;
+    if constexpr (requires { model_->prefill_group_span_limit(); })
+      return model_->prefill_group_span_limit();
+    return 0;
+  }
+  int64_t prefill_group_total_limit() const override {
+    if constexpr (requires { model_->max_tokens(); }) return model_->max_tokens();
+    return 0;
+  }
+  std::vector<int32_t> prefill_group(const std::vector<int>& reqs,
+      const std::vector<const std::vector<int64_t>*>& prompts) override {
+    if (reqs.empty() || reqs.size() != prompts.size())
+      throw std::invalid_argument("eager engine: prefill_group takes one prompt per request");
+    if constexpr (requires { model_->session_prefill_group(reqs, prompts); }) {
+      if (reqs.size() > 1 && prefill_group_span_limit() > 0) {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+          const size_t req = static_cast<size_t>(reqs[i]);
+          if (!prompts[i]) throw std::invalid_argument("eager engine: null group prompt");
+          if (pending_.at(req) >= 0 || prefills_.at(req))
+            throw std::logic_error("eager engine: prefill on an open request");
+          if (std::find(reqs.begin(), reqs.begin() + i, reqs[i]) != reqs.begin() + i)
+            throw std::invalid_argument("eager engine: duplicate group request");
+        }
+        try {
+          const auto outputs = model_->session_prefill_group(reqs, prompts);
+          if (outputs.size() != reqs.size())
+            throw std::runtime_error("eager engine: group prefill output count mismatch");
+          std::vector<int32_t> firsts;
+          firsts.reserve(reqs.size());
+          for (size_t i = 0; i < reqs.size(); ++i)
+            firsts.push_back(open_slot_finish(reqs[i], *prompts[i], outputs[i]));
+          return firsts;
+        } catch (...) {
+          for (int req : reqs) close(req);
+          throw;
+        }
+      }
+    }
+    return sched::SchedulerEngine::prefill_group(reqs, prompts);
   }
   bool supports_video() const override {
     if constexpr (requires { model_->supports_video(); }) return model_->supports_video();
@@ -405,6 +487,17 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       return out;
     });
   }
+  bool prefix_snapshot_ready(int req) const override {
+    if constexpr (requires { model_->mtp_enabled(); model_->session_position(req);
+                             model_->session_draft_position(req); }) {
+      if (model_->mtp_enabled()) {
+        const auto pos = model_->session_position(req);
+        const auto draft = model_->session_draft_position(req);
+        return draft == pos || draft == pos - 1;
+      }
+    }
+    return true;
+  }
   void prefix_snapshot(int req, int slot, int64_t position) override {
     arena_.snapshot(req, slot, position);
   }
@@ -475,6 +568,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     model_->session_reserve_blocks(req, tokens);
   }
   std::vector<int32_t> step(int req) override {
+    if constexpr (kEagerMtp)
+      if (mtp_depth_) return mtp_step_batch({req}).front();
     int64_t& pending = pending_.at(static_cast<size_t>(req));
     if (pending < 0)
       throw std::logic_error("generation step on a slot without a pending "
@@ -517,6 +612,30 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // batch takes the scalar path, so a C1 transcript keeps the scalar
   // kernel sequence bit-for-bit.
   std::vector<std::vector<int32_t>> step_batch(const std::vector<int>& reqs) override {
+    if constexpr (kEagerMtp)
+      if (mtp_depth_) return mtp_step_batch(reqs);
+    if constexpr (requires { model_->eager_plain_decode_batch_capacity(); }) {
+      const int capacity = std::min(slots_, model_->eager_plain_decode_batch_capacity());
+      if (reqs.size() > 1 && capacity > 1) {
+        if (reqs.size() > static_cast<size_t>(capacity))
+          throw std::invalid_argument("eager engine: plain decode batch exceeds capacity");
+        std::vector<std::vector<int64_t>> feeds;
+        std::vector<int> seen;
+        for (const int req : reqs) {
+          if (req < 0 || req >= slots_ ||
+              std::find(seen.begin(), seen.end(), req) != seen.end())
+            throw std::invalid_argument("eager engine: invalid or duplicate plain decode slot");
+          if (pending_[req] < 0)
+            throw std::logic_error("eager engine: plain decode slot has no pending token");
+          seen.push_back(req);
+          feeds.push_back({pending_[req]});
+        }
+        std::vector<int> offsets;
+        const auto outputs = model_->session_verify_batch(reqs, feeds, &offsets);
+        return finish_verifications(reqs, feeds, outputs, offsets,
+                                    std::vector<char>(reqs.size(), false), [] {});
+      }
+    }
     if constexpr (requires { model_->dflash2_enabled(); }) {
       if (!model_->dflash2_enabled() || reqs.size() < 2)
         return SchedulerEngine::step_batch(reqs);
@@ -595,6 +714,11 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // One physical pass advances every arriving spec slot; the row budget
   // (max_decode_rows verify rows, a full block per spec slot) bounds it.
   int decode_batch_capacity() const override {
+    if constexpr (kEagerMtp)
+      if (mtp_depth_) return std::min(slots_, model_->max_decode_rows() / (mtp_depth_ + 1));
+    if constexpr (requires { model_->eager_plain_decode_batch_capacity(); })
+      if (model_->eager_plain_decode_batch_capacity() > 1)
+        return std::min(slots_, model_->eager_plain_decode_batch_capacity());
     if constexpr (requires { model_->dflash2_enabled(); model_->max_decode_rows(); })
       if (model_->dflash2_enabled()) {
         const int cap = model_->max_decode_rows() / kSpecRows;
@@ -605,6 +729,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // A spec step writes up to a full block of positions (the scheduler's
   // reservation window grows accordingly); plain engines keep 1.
   int max_tokens_per_step() const override {
+    if (mtp_depth_) return mtp_depth_ + 1;
     if constexpr (requires { model_->dflash2_enabled(); })
       if (model_->dflash2_enabled()) return kSpecRows;
     return 1;
@@ -634,6 +759,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
   }
   void close(int req) override {
+    mtp_drafts_.at(static_cast<size_t>(req)).clear();
+    mtp_slot_attempts_.at(static_cast<size_t>(req)) = {};
+    mtp_slot_accepts_.at(static_cast<size_t>(req)) = {};
     prefills_.at(static_cast<size_t>(req)).reset();
     pending_.at(static_cast<size_t>(req)) = -1;
     if constexpr (requires { model_->dflash2_enabled(); }) retire_spec(spec_.at(static_cast<size_t>(req)));
@@ -649,6 +777,236 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
 
  private:
+  // An allowed unmasked maximum is already the exact masked maximum.
+  // Most prose rows take this path; constrained tool syntax scans a mask
+  // only when the local winner is forbidden. The row collective is shared
+  // with the other verify/draft rows, without a per-token collective.
+  sample::Candidate mtp_row_max(const DecodeOutputs& out, int row,
+                                const text::GrammarState* grammar) const {
+    const float* logits = out.logits.data() + static_cast<size_t>(row) * out.lm_vocab_count;
+    const auto best = sample::local_max(logits, out.lm_vocab_count, out.lm_vocab_begin);
+    if (!grammar || grammar->allows(best.id)) return best;
+    text::TokenMask mask;
+    grammar->mask(&mask);
+    std::vector<float> masked(logits, logits + out.lm_vocab_count);
+    sample::apply_mask(masked.data(), out.lm_vocab_count, out.lm_vocab_begin,
+                       mask.constrained() ? mask.words.data() : nullptr, mask.vocab);
+    return sample::local_max(masked.data(), out.lm_vocab_count, out.lm_vocab_begin);
+  }
+
+  // All target rows share one forward and one distributed row pick. Restore
+  // every request's target state before any draft can reuse model scratch.
+  std::vector<std::vector<int32_t>> mtp_step_batch(const std::vector<int>& reqs) {
+    if constexpr (kEagerMtp) {
+      if (reqs.empty() || reqs.size() > static_cast<size_t>(decode_batch_capacity()))
+        throw std::invalid_argument("eager MTP: invalid batch size");
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        const size_t req = static_cast<size_t>(reqs[i]);
+        if (req >= pending_.size() || pending_[req] < 0 ||
+            std::find(reqs.begin(), reqs.begin() + i, reqs[i]) != reqs.begin() + i)
+          throw std::invalid_argument("eager MTP: invalid, duplicate or unopened request");
+      }
+      static const bool timing = [] {
+        const char* value = std::getenv("DGPP_EAGER_MTP_TIMING");
+        return value && value[0] == '1';
+      }();
+      using Clock = std::chrono::steady_clock;
+      const auto stamp = [] { return timing ? Clock::now() : Clock::time_point{}; };
+      const auto begin = stamp();
+      std::vector<std::vector<int64_t>> feeds, draft_rows;
+      std::vector<int> draft_reqs;
+      std::vector<bool> eligible;
+      for (int req : reqs) {
+        const auto& s = state_[req];
+        eligible.push_back(s.params.temperature <= 0 && !s.report_logprobs && s.bias.empty() &&
+            s.params.repetition_penalty == 1 && s.params.frequency_penalty == 0 && s.params.presence_penalty == 0 &&
+            model_->session_position(req) + mtp_depth_ + 1 <= model_->max_context());
+        if (eligible.back() && mtp_drafts_[req].empty()) {
+          draft_reqs.push_back(req); draft_rows.push_back({pending_[req]});
+        }
+      }
+      mtp_redraft_batch(draft_reqs, draft_rows);
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        const int req = reqs[i];
+        feeds.push_back({pending_[req]});
+        if (eligible[i]) feeds.back().insert(feeds.back().end(), mtp_drafts_[req].begin(), mtp_drafts_[req].end());
+      }
+      const auto verify_begin = stamp();
+      std::vector<int> offsets;
+      std::vector<typename Model::Outputs> outputs;
+      if (reqs.size() == 1) {
+        offsets.push_back(0);
+        outputs.push_back(model_->session_verify(reqs[0], feeds[0]));
+      } else outputs = model_->session_verify_batch(reqs, feeds, &offsets);
+      const auto verify_end = stamp();
+      std::vector<sample::Candidate> local;
+      for (size_t i = 0; i < reqs.size(); ++i)
+        if (feeds[i].size() > 1) {
+          if (state_[reqs[i]].grammar) {
+            // Only the copy follows proposals. A forbidden proposal kills
+            // that copy; the judge rejects it before any later row stands.
+            auto after = *state_[reqs[i]].grammar;
+            for (size_t r = 0; r < feeds[i].size(); ++r) {
+              local.push_back(mtp_row_max(outputs[i], static_cast<int>(r), &after));
+              if (r + 1 < feeds[i].size()) after.advance(feeds[i][r + 1]);
+            }
+          } else {
+            const auto rows = local_row_maxes(outputs[i], static_cast<int>(feeds[i].size()));
+            local.insert(local.end(), rows.begin(), rows.end());
+          }
+        }
+      const auto winners = local.empty() ? std::vector<int32_t>{} : mtp_pick_rows_(local);
+      if (winners.size() != local.size()) throw std::runtime_error("eager MTP: row picker count mismatch");
+      const auto pick_end = stamp();
+      std::vector<SpecVerdict> verdicts(reqs.size());
+      size_t at = 0;
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        if (feeds[i].size() > 1) {
+          std::vector<int32_t> rows(winners.begin() + at, winners.begin() + at + feeds[i].size());
+          verdicts[i] = judge_verify(feeds[i], rows);
+          at += feeds[i].size();
+        } else verdicts[i].accepted = 1;
+        model_->session_rollback(reqs[i], verdicts[i].accepted, static_cast<int>(feeds[i].size()), offsets[i]);
+      }
+      std::vector<std::vector<int32_t>> fresh(reqs.size());
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        const int req = reqs[i];
+        auto& s = state_[req];
+        if (feeds[i].size() > 1) {
+          const auto& v = verdicts[i];
+          fresh[i].assign(v.committed.begin() + 1, v.committed.end());
+          fresh[i].push_back(v.next);
+          if (s.grammar)
+            for (const auto token : fresh[i]) s.grammar->advance(token);
+          for (size_t p = 0; p + 1 < feeds[i].size() && p < static_cast<size_t>(v.accepted); ++p) {
+            ++spec_att_[p]; ++mtp_slot_attempts_[req][p];
+            if (p + 1 < static_cast<size_t>(v.accepted)) { ++spec_acc_[p]; ++mtp_slot_accepts_[req][p]; }
+          }
+        } else fresh[i].push_back(decide(s, outputs[i]));
+        pending_[req] = fresh[i].back();
+        s.context.insert(s.context.end(), fresh[i].begin(), fresh[i].end());
+      }
+      if (mtp_schedule_ && mtp_adapt_) {
+        int committed = 0, rows = 0;
+        for (size_t i = 0; i < reqs.size(); ++i) { committed += fresh[i].size(); rows += feeds[i].size(); }
+        mtp_lambda_ = verify_lambda_update(mtp_lambda_, committed, rows, mtp_base_ms_, mtp_row_ms_, 1.0 / 64.0);
+      }
+      draft_reqs.clear(); draft_rows.clear();
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        const int req = reqs[i];
+        if (feeds[i].size() > 1 && model_->session_position(req) + mtp_depth_ + 1 <= model_->max_context()) {
+          draft_reqs.push_back(req); draft_rows.emplace_back(fresh[i].begin(), fresh[i].end());
+        } else mtp_drafts_[req].clear();
+      }
+      const auto redraft_begin = stamp();
+      mtp_redraft_batch(draft_reqs, draft_rows);
+      const auto end = stamp();
+      if (timing) {
+        const auto ms = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
+        size_t fed = 0, committed = 0;
+        for (size_t q = 0; q < reqs.size(); ++q) { fed += feeds[q].size(); committed += fresh[q].size(); }
+        DGPP_LOG_INFO("eager-mtp-cost: slots={} rows={} committed={} accepted_predictions={} "
+                      "draft_ms={:.3f} verify_ms={:.3f} pick_ms={:.3f} state_ms={:.3f} total_ms={:.3f}",
+            reqs.size(), fed, committed, committed - reqs.size(),
+            ms(verify_begin - begin) + ms(end - redraft_begin), ms(verify_end - verify_begin),
+            ms(pick_end - verify_end), ms(redraft_begin - pick_end), ms(end - begin));
+      }
+      return fresh;
+    }
+    throw std::logic_error("eager MTP unavailable");
+  }
+  void mtp_redraft_batch(const std::vector<int>& reqs,
+                         const std::vector<std::vector<int64_t>>& rows) {
+    if constexpr (kEagerMtp) {
+      if (reqs.empty()) return;
+      if (reqs.size() == 1) { mtp_redraft(reqs[0], rows[0]); return; }
+      const int block = model_->confidence_rows();
+      std::vector<float> confidence(reqs.size() * static_cast<size_t>(block));
+      std::vector<bool> active(reqs.size(), true);
+      std::vector<std::unique_ptr<text::GrammarState>> grammars(reqs.size());
+      for (size_t q = 0; q < reqs.size(); ++q)
+        if (state_[reqs[q]].grammar)
+          grammars[q] = std::make_unique<text::GrammarState>(*state_[reqs[q]].grammar);
+      auto out = model_->session_draft_batch(reqs, rows);
+      for (int c = 0; c < mtp_depth_; ++c) {
+        if (c > 0) {
+          std::vector<int64_t> tokens(reqs.size(), -1);
+          bool any = false;
+          for (size_t q = 0; q < reqs.size(); ++q) if (active[q]) {
+            tokens[q] = mtp_drafts_[reqs[q]].back(); any = true;
+          }
+          if (!any) break;
+          out = model_->session_draft_chain_batch(tokens);
+        }
+        if (mtp_schedule_) {
+          DGPP_CUDA_OK(cudaMemcpyAsync(confidence.data(), model_->device_confidence(),
+              confidence.size() * sizeof(float), cudaMemcpyDeviceToHost, model_->stream()));
+          DGPP_CUDA_OK(cudaStreamSynchronize(model_->stream()));
+          for (size_t q = 0; q < reqs.size(); ++q)
+            if (active[q] && c >= mtp_min_depth_ &&
+                scheduled_verify_depth(confidence.data() + q * block, c + 1, mtp_row_ms_,
+                    static_cast<float>(std::max<double>(mtp_lambda_floor_, mtp_lambda_))) < c + 1)
+              active[q] = false;
+        }
+        std::vector<sample::Candidate> local;
+        for (size_t q = 0; q < reqs.size(); ++q)
+          if (active[q]) local.push_back(mtp_row_max(out, static_cast<int>(q), grammars[q].get()));
+        if (c == 0) for (int req : reqs) mtp_drafts_[req].clear();
+        if (local.empty()) break;
+        const auto picks = mtp_pick_rows_(local);
+        if (picks.size() != local.size()) throw std::runtime_error("eager DSpark batch: picker count mismatch");
+        size_t at = 0;
+        for (size_t q = 0; q < reqs.size(); ++q) if (active[q]) {
+          const auto token = picks[at++];
+          mtp_drafts_[reqs[q]].push_back(token);
+          if (grammars[q]) grammars[q]->advance(token);
+        }
+      }
+    }
+  }
+  void mtp_redraft(int req, const std::vector<int64_t>& rows) {
+    if constexpr (kEagerMtp) {
+      auto& drafts = mtp_drafts_[req];
+      std::unique_ptr<text::GrammarState> grammar;
+      if (state_[req].grammar) grammar = std::make_unique<text::GrammarState>(*state_[req].grammar);
+      const auto pick_draft = [&](const DecodeOutputs& out) {
+        const auto token = mtp_pick_rows_({mtp_row_max(out, 0, grammar.get())}).at(0);
+        if (grammar) grammar->advance(token);
+        return token;
+      };
+      const auto first = model_->session_draft(req, rows);
+      if (!mtp_schedule_) {
+        drafts.assign(static_cast<size_t>(mtp_depth_), -1);
+        drafts[0] = pick_draft(first);
+        chain_drafts(*model_, req, mtp_depth_, &drafts, [&](const DecodeOutputs& out) {
+          return pick_draft(out);
+        });
+        return;
+      }
+      // DSpark writes confidence row c only when chain row c executes.
+      // Never inspect later rows left over from a preceding block/slot.
+      auto keep = [&](int c) {
+        DGPP_CUDA_OK(cudaMemcpyAsync(mtp_confidence_.data() + c,
+            model_->device_confidence() + static_cast<size_t>(req) * model_->confidence_rows() + c,
+            sizeof(float), cudaMemcpyDeviceToHost, model_->stream()));
+        DGPP_CUDA_OK(cudaStreamSynchronize(model_->stream()));
+        return c < mtp_min_depth_ || scheduled_verify_depth(mtp_confidence_.data(), c + 1, mtp_row_ms_,
+            static_cast<float>(std::max<double>(mtp_lambda_floor_, mtp_lambda_))) == c + 1;
+      };
+      drafts.clear();
+      (void)keep(0);  // The configured minimum always includes the first draft.
+      drafts.push_back(pick_draft(first));
+      for (int c = 1; c < mtp_depth_; ++c) {
+        if (!model_->session_draft_chain_fits(req, c - 1)) break;
+        const auto out = model_->session_draft_chain(req, drafts.back(), c - 1, c == 1, false);
+        if (!keep(c)) break;
+        drafts.push_back(pick_draft(out));
+      }
+      // Eager DSpark chain heads only read the block state. Keep the session
+      // restoration contract even when confidence stops the chain early.
+      model_->restore_chain_state(req);
+    }
+  }
   struct SlotState {
     sample::Params params = sample::greedy_params();
     sample::Rng rng;
@@ -781,8 +1139,18 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
 
   std::vector<std::unique_ptr<PrefillTask<Model>>> prefills_;
+  int mtp_depth_ = 0;
+  bool mtp_schedule_ = false, mtp_adapt_ = true;
+  int mtp_min_depth_ = 1;
+  float mtp_row_ms_ = 8, mtp_base_ms_ = 28, mtp_lambda_floor_ = 0;
+  double mtp_lambda_ = 0;
+  std::vector<float> mtp_confidence_;
+  SpecPickRows mtp_pick_rows_;
+  std::vector<std::vector<int32_t>> mtp_drafts_;
+  std::vector<std::array<uint64_t, 8>> mtp_slot_attempts_, mtp_slot_accepts_;
   Model* model_;
   int slots_;
+  bool prefill_group_ = false;  // serving explicitly enables supported grouped walks
   Pick pick_;
   Sample sample_;
   const text::GrammarVocab* grammar_vocab_ = nullptr;
@@ -897,6 +1265,11 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
 
   sched::SchedulerEngine::MtpAcceptance mtp_acceptance() const override {
     sched::SchedulerEngine::MtpAcceptance a;
+    if (mtp_depth_) {
+      a.depth = mtp_depth_;
+      for (int p = 0; p < 8; ++p) { a.attempts[p] = spec_att_[p]; a.accepts[p] = spec_acc_[p]; }
+      return a;
+    }
     if constexpr (requires { model_->dflash2_drafts(); }) {
       if (model_->dflash2_enabled()) a.depth = model_->dflash2_drafts();
       for (int p = 0; p < 8; ++p) {
@@ -914,6 +1287,13 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
 
   sched::SchedulerEngine::MtpAcceptance mtp_acceptance(int req) const override {
     sched::SchedulerEngine::MtpAcceptance a;
+    if (mtp_depth_) {
+      a.depth = mtp_depth_;
+      for (int p = 0; p < 8; ++p) {
+        a.attempts[p] = mtp_slot_attempts_.at(req)[p]; a.accepts[p] = mtp_slot_accepts_.at(req)[p];
+      }
+      return a;
+    }
     if constexpr (requires { model_->dflash2_drafts(); }) {
       const auto& sp = spec_.at(static_cast<size_t>(req));
       if (sp) {

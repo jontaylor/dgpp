@@ -343,7 +343,7 @@ DGPP_TEST(fp4_gemv_rows_are_independent_of_row_count) {
   // Each row's chain is the same sequence of FMAs whatever m: m=3 against
   // three m=1 runs, and the m=8 chunked launch against eight singles, for
   // both epilogues and for a short-row geometry too.
-  for (int k : {4096, 512, 5120, 384}) {
+  for (int k : {4096, 512, 5120, 384, 576, 1152, 2304}) {
     const Problem p3 = make_problem(3, 296, k, 0xE3 + k);
     const std::vector<uint16_t> got3 = run_bf16(p3);
     for (int r = 0; r < 3; ++r) {
@@ -368,6 +368,29 @@ DGPP_TEST(fp4_gemv_rows_are_independent_of_row_count) {
     }
   }
   std::printf("[ OK ] fp4 gemv rows independent of m through m=8 chunks\n");
+}
+
+DGPP_TEST(fp4_gemv_nvfp4_deepseek_down_matches_oracle) {
+  // Actual down-projection N and TP1/2/4 K. These widths use nine chunks
+  // per lane, unlike the previous NVFP4 models' power-of-two/three-chunk
+  // widths. Exercise partial row groups and a launch split at four rows.
+  for (int k : {2304, 1152, 576}) {
+    for (int rows : {1, 3, 8}) {
+      const Problem p = make_problem(rows, 5120, k, 0xD541 + k + rows);
+      DevMatrix view(p);
+      require(dgpp::fp4_gemv_accepts(view.view), "DeepSeek NVFP4 down geometry accepted");
+      const auto got = run_bf16(p);
+      const auto f32 = run_f32(p);
+      const auto label = "DeepSeek NVFP4 down M" + std::to_string(rows) +
+                         "xN5120xK" + std::to_string(k);
+      check_oracle(p, got, label.c_str());
+      for (size_t i = 0; i < got.size(); ++i) {
+        require(std::isfinite(f32[i]), "DeepSeek NVFP4 down output is finite");
+        require(dgpp::float_to_bf16_bits(f32[i]) == got[i],
+                "DeepSeek NVFP4 down f32/bf16 epilogues agree");
+      }
+    }
+  }
 }
 
 DGPP_TEST(fp4_gemv_f32_epilogue_is_the_unrounded_bf16) {

@@ -40,6 +40,7 @@ import argparse
 import concurrent.futures
 import http.client
 import json
+import math
 import os
 import random
 import re
@@ -58,6 +59,8 @@ ap.add_argument("--tasks", default="humaneval,gsm8k,extract")
 ap.add_argument("--limit", type=int, default=300)
 ap.add_argument("--concurrency", type=int, default=4)
 ap.add_argument("--max-tokens", type=int, default=2048)
+ap.add_argument("--request-timeout", type=float, default=900,
+                help="positive finite HTTP read timeout in seconds for each evaluation reply, including retries")
 ap.add_argument("--retry-max-tokens", type=int, default=8192,
                 help="the larger cap a response cut at the standard cap is asked once more under (0: no retry)")
 ap.add_argument("--reasoning-effort", default="low")
@@ -69,6 +72,8 @@ ap.add_argument("--allow-code-execution", action="store_true", help="acknowledge
 ap.add_argument("--seed", type=int, default=20260908)
 ap.add_argument("--model", default=None, help="defaults to the served id")
 args = ap.parse_args()
+if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
+    ap.error("--request-timeout must be finite and positive")
 args.data = args.data or str(data_dir())
 tasks = args.tasks.split(",")
 if "humaneval" in tasks and not args.allow_code_execution:
@@ -109,7 +114,7 @@ def chat(messages, max_tokens=None, response_format=None):
     if response_format is not None:
         body["response_format"] = response_format
     t0 = time.perf_counter()
-    r = request("/v1/chat/completions", body)
+    r = request("/v1/chat/completions", body, timeout=args.request_timeout)
     choice = r["choices"][0]
     usage = r.get("usage", {})
     return {
@@ -252,7 +257,7 @@ TASKS = {
 }
 
 summary = {"model": MODEL, "settings": dict(max_tokens=args.max_tokens, extract_max_tokens=EXTRACT_MAX_TOKENS,
-                                            retry_max_tokens=args.retry_max_tokens,
+                                            retry_max_tokens=args.retry_max_tokens, request_timeout_seconds=args.request_timeout,
                                             reasoning_effort=args.reasoning_effort, no_think=args.no_think,
                                             limit=args.limit, seed=args.seed), "tasks": {}}
 for task in args.tasks.split(","):

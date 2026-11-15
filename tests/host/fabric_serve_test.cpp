@@ -2568,3 +2568,71 @@ DGPP_TEST(fabric_serve_runtime_adapter_settings_identity) {
   require(decoded.world_settings.runtime_adapter_id == settings.runtime_adapter_id,
           "runtime adapter identity survives settings handshake");
 }
+
+DGPP_TEST(fabric_expert_streaming_settings_roundtrip_and_legacy_default) {
+  dgpp::serve::WorldSettings settings;
+  settings.version = "test";
+  settings.world = 2;
+  settings.fabric_port = 29970;
+  settings.max_concurrency = 1;
+  settings.kv_capacity = 128;
+  settings.admission = "full";
+  settings.model = "fixture";
+  settings.checkpoint = "/fixture";
+  settings.prefill_fold_overlap = false;
+  const auto off = dgpp::serve::encode_journal_settings(settings);
+  require(!dgpp::serve::decode_journal_line(off).world_settings.expert_streaming, "legacy record has no expert pager");
+  const std::string json = R"({"policy":"adaptive_fractional_cache","budget_bytes":1073741824,
+    "image_directory":"/ssd/experts","io_buffers":3,"queue_depth":4,"prefetch_bytes":4096,
+    "minimum_fraction":0.125,"cooldown_routes":23,"adaptation_bytes":65536})";
+  const auto parsed = dgpp::minijson::parse(json);
+  settings.expert_streaming = dgpp::serve::parse_expert_paging(parsed.root, "test");
+  const auto encoded = dgpp::serve::encode_journal_settings(settings);
+  require(encoded != off && dgpp::serve::decode_journal_line(encoded).world_settings == settings,
+          "all expert settings cross the journal before peers construct their models");
+}
+
+DGPP_TEST(rank_expert_metrics_keep_file_io_distinct_from_physical_nvme_and_hits_from_prefetch) {
+  dgpp::sched::Scheduler::Meters meters;
+  auto& x = meters.expert_streaming.emplace();
+  x.policy = dgpp::expert::Policy::kAdaptiveFractional;
+  x.io_mode = dgpp::expert::IoMode::kDirect;
+  x.cache.requests = 7;
+  x.cache.full_hits = 2;
+  x.cache.partial_hits = 4;
+  x.cache.chunk_lookups = 28;
+  x.cache.chunk_hits = 11;
+  x.file.returned_bytes = 8192;
+  x.file.calls = 2;
+  x.queue.coalesced = 3;
+  x.pressure.sample = 42;
+  x.pressure.available_bytes = 0;
+  x.pressure.memory_pressure = true;
+  x.cache.adaptations_deferred = 3;
+  x.memory.budget_bytes = 32768;
+  x.memory.cache_slots = 8;
+  x.memory.cache_slot_bytes = 512;
+  x.memory.execution_slots = 1;
+  x.memory.execution_slot_bytes = 4096;
+  x.memory.staging_bytes = 8192;
+  dgpp::serve::prom::Writer writer("");
+  dgpp::serve::write_rank_metrics(writer, {2, 4, "v", "g"}, meters, 0, 17, nullptr);
+  const auto text = writer.take();
+  const std::string labels = "{rank=\"2\",policy=\"adaptive_fractional_cache\",io_mode=\"direct\"}";
+  require(text.find("dgpp_rank_expert_file_read_bytes_total" + labels + " 8192\n") != std::string::npos &&
+          text.find("NOT physical NVMe bytes") != std::string::npos,
+          "file bytes carry their actual source and direct mode, without claiming physical attribution");
+  require(text.find("dgpp_rank_expert_chunk_hits_total" + labels + " 11\n") != std::string::npos &&
+          text.find("dgpp_rank_expert_coalesced_reads_total" + labels + " 3\n") != std::string::npos,
+          "device cache hits and shared file tickets have separate denominators");
+  require(text.find("dgpp_rank_expert_allocated_bytes" + labels + " 16384\n") != std::string::npos,
+          "memory metric includes execution and pinned staging alongside cached chunks");
+  require(text.find("dgpp_rank_expert_memory_signal_known" + labels + " 1\n") != std::string::npos &&
+          text.find("dgpp_rank_expert_node_available_bytes" + labels + " 0\n") != std::string::npos &&
+          text.find("dgpp_rank_expert_memory_pressure" + labels + " 1\n") != std::string::npos &&
+          text.find("dgpp_rank_expert_adaptations_deferred_total" + labels + " 3\n") != std::string::npos,
+          "known zero availability remains visible as pressure with deferred background work");
+  require(text.find("dgpp_rank_expert_storage_signal_known" + labels + " 0\n") != std::string::npos &&
+          text.find("dgpp_rank_expert_storage_busy_fraction" + labels) == std::string::npos,
+          "unknown device utilization is omitted, never emitted as measured idle storage");
+}

@@ -291,6 +291,17 @@ scripts/dgpp-cluster status --config deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.j
 scripts/dgpp-cluster down --config deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json
 ```
 
+For persistent serving, use `dgpp-cluster run` with the same arguments as
+`up`. It stays alive watching the deployment's recorded process identities
+on every node. If a rank exits or changes, it stops the remaining ranks,
+retains their logs under `failures/` in the deployment log directory and
+exits with failure. SIGTERM or SIGINT stops the whole deployment normally.
+Use `Type=simple`, `Restart=on-failure` and `TimeoutStopSec=330` in systemd;
+do not use `Type=oneshot` with `RemainAfterExit`, which cannot detect later
+rank failures. `run --replace` also recovers recorded ranks left behind if
+the supervisor itself was killed. HTTP `/health` reports serving readiness
+while the supervisor's process remains alive during model startup.
+
 `doctor` performs read-only preflight checks locally and over SSH; `up` runs
 it automatically. Use `doctor --local-only` to inspect just rank 0.
 `--skip-preflight` is available for diagnosis, but does not bypass process

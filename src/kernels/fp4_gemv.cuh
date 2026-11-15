@@ -713,7 +713,9 @@ __device__ __forceinline__ void block_rows(const uint8_t* __restrict__ w,
 // 1536 (the expert down at worlds 4 / 2 / 1), 3072 / 6144 / 12288 (the
 // dense down at worlds 4 / 2 / 1). Qwen3.8-Flash-Next's NVFP4 experts
 //: 2560 (hidden: gate/up), 640 / 320 / 160 (the expert down
-// at worlds 1 / 2 / 4).
+// at worlds 1 / 2 / 4). DeepSeek-V4.1's NVFP4 expert down uses
+// 2304 / 1152 / 576 at worlds 1 / 2 / 4, with the same row geometry as
+// its MXFP4 source and the NVFP4 core's per-16 scales/global epilogue.
 template <typename F>
 __host__ inline void dispatch_k(int k, F&& f) {
   switch (k) {
@@ -725,11 +727,14 @@ __host__ inline void dispatch_k(int k, F&& f) {
     case 320: f(std::integral_constant<int, 320>{}); return;
     case 384: f(std::integral_constant<int, 384>{}); return;
     case 512: f(std::integral_constant<int, 512>{}); return;
+    case 576: f(std::integral_constant<int, 576>{}); return;
     case 640: f(std::integral_constant<int, 640>{}); return;
     case 768: f(std::integral_constant<int, 768>{}); return;
     case 1024: f(std::integral_constant<int, 1024>{}); return;
+    case 1152: f(std::integral_constant<int, 1152>{}); return;
     case 1536: f(std::integral_constant<int, 1536>{}); return;
     case 2048: f(std::integral_constant<int, 2048>{}); return;
+    case 2304: f(std::integral_constant<int, 2304>{}); return;
     case 2560: f(std::integral_constant<int, 2560>{}); return;
     case 3072: f(std::integral_constant<int, 3072>{}); return;
     case 4096: f(std::integral_constant<int, 4096>{}); return;
@@ -740,7 +745,7 @@ __host__ inline void dispatch_k(int k, F&& f) {
     default:
       throw std::invalid_argument(
           "fp4_gemv: K is not in the compiled set (32..4096 powers of two, "
-          "160, 320, 384, 640, 768, 1536, 2560, 3072, 5120, 6144, 7168, 12288)");
+          "160, 320, 384, 576, 640, 768, 1152, 1536, 2304, 2560, 3072, 5120, 6144, 7168, 12288)");
   }
 }
 // The MXFP4 compiled set (2026-09-13): DeepSeek-V4.1-Flash's widths —
@@ -748,8 +753,8 @@ __host__ inline void dispatch_k(int k, F&& f) {
 // 1152 / 2304: 18 / 36 / 72 chunks — 2 x 9, 4 x 9 and 8 x 9 in passes of
 // four), plus the power-of-two test geometries; MiMo-V2.6-Flash's
 // (2026-09-22) — 4096 (hidden: gate/up) and the expert down at worlds 4 /
-// 2 / 1 (512 / 1024 / 2048). Its own switch keeps the NVFP4 instantiation
-// set as it is.
+// 2 / 1 (512 / 1024 / 2048). Its own switch avoids instantiating the
+// other models' NVFP4-only widths for MXFP4.
 template <typename F>
 __host__ inline void dispatch_k_mx(int k, F&& f) {
   switch (k) {
@@ -779,7 +784,8 @@ __host__ __device__ constexpr bool k_compiled_mx(int k) {
 __host__ __device__ constexpr bool k_compiled(int k) {
   // 7168: the Dory1.0-4B MLP down projection (2026-10-18, docs/dory_plan.md).
   return k == 32 || k == 64 || k == 128 || k == 160 || k == 256 || k == 320 || k == 384 ||
-         k == 512 || k == 640 || k == 768 || k == 1024 || k == 1536 || k == 2048 || k == 2560 ||
+         k == 512 || k == 576 || k == 640 || k == 768 || k == 1024 || k == 1152 ||
+         k == 1536 || k == 2048 || k == 2304 || k == 2560 ||
          k == 3072 || k == 4096 || k == 5120 || k == 6144 || k == 7168 || k == 12288;
 }
 // The compiled check for either group.

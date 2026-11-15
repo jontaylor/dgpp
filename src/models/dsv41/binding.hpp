@@ -51,9 +51,9 @@ enum class Dsv41TensorRole : uint8_t {
   Plain,        // BF16 / F32 as stored
   Fp8Payload,   // F8_E4M3 [N, K]
   Fp8Scale,     // F8_E8M0 [N/32, K/32]
-  Fp4Payload,   // I8 [N, K/2]
-  Fp4Scale,     // F8_E8M0 [N, K/32]
-  TablePayload, // F8_E4M3 [rows, 256] (the Engram table, never resident)
+  Fp4Payload,   // MX I8 or NV U8 [N, K/2]
+  Fp4Scale,     // MX F8_E8M0 [N, K/32] or NV F8_E4M3 [N, K/16]
+  TablePayload, // F8_E4M3 [rows, 256] or U8 MXFP4 [rows, 128], never resident
   TableScale,   // F8_E8M0 [rows, 8]
   Skipped,      // in the file, not loaded (vision)
   // The EXL3 quadruple (docs/deepseek_v41_flash_exl3_plan.md §1.1): one

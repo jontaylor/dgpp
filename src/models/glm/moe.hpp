@@ -108,6 +108,9 @@ struct GlmMoeConfig {
   // family on shared_mma_aside keeps that. false: the slot form, for the
   // lane's own gate.
   bool shared_run_lane = true;
+  // One-row splitting can trade launch work for fewer routed registers;
+  // the paging engine amortizes those launches with expert-only graphs.
+  int shared_run_lane_min_rows = 2;
   // The Mixed346 contract (2026-10-09): the layer keeps the int8 code and
   // scale copies of the routed rows the converted experts multiply
   // (kMoeInputHadamard32Int8), sized with the scratch; off for every other

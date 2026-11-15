@@ -18,7 +18,9 @@
 #include "kernels/moe_w4a4.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
+#include "kernels/sm12x_moe.hpp"
 #include "models/glm/step_timing.hpp"
+#include "loaders/expert_cache_cuda.hpp"
 
 namespace dgpp {
 
@@ -51,6 +53,15 @@ int fp4_group_of(const GlmMoeWeights& w) {
     if (w.fp4_of(i)) return w.experts_fp4[static_cast<size_t>(i)].scale_group;
   return kFp4Group;
 }
+
+bool fp4_grouped_decode_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_MOE_FP4_GROUPED_DECODE");
+    const char* w4a4 = std::getenv("DGPP_MOE_W4A4");
+    return value && value[0] == '1' && !(w4a4 && w4a4[0] == '1');
+  }();
+  return enabled;
+}
 }  // namespace
 
 namespace {
@@ -81,6 +92,10 @@ size_t GlmMoeLayer::scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
   const size_t tk_max = M * K;
   const size_t segs_max = E + 1;
   size_t dev = 0, pin = 0;
+  if (decode_slots > 0 && sm12x_moe_enabled(cfg.hidden, cfg.inter, cfg.n_experts, cfg.top_k)) {
+    dev += Sm12xMoe::device_bytes();
+    pin += Sm12xMoe::pinned_bytes();
+  }
   dev += M * K * 4 * 2;              // d_ids_, d_weights_
   dev += M * E * 4 * 2;              // d_biased_, d_scores_
   dev += rows_total * 4;             // d_rows_
@@ -133,6 +148,8 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
                           int graph_table_slots)
     : w_(weights), cfg_(cfg), max_tokens_(max_tokens),
       decode_slots_(decode_slots), graph_table_slots_(graph_table_slots) {
+  if (decode_slots > 0 && sm12x_moe_enabled(cfg.hidden, cfg.inter, cfg.n_experts, cfg.top_k))
+    sm12x_moe_ = std::make_unique<Sm12xMoe>();
   GlmMoeConfig::validate_config(cfg_);
   if (max_tokens_ <= 0)
     throw std::invalid_argument("GlmMoeLayer: max_tokens must be positive");
@@ -311,6 +328,10 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
 }
 
 GlmMoeLayer::~GlmMoeLayer() {
+  for (auto& [key, binding] : paged_bindings_) {
+    for (auto& [rows, graph] : binding.decode_graphs) cudaGraphExecDestroy(graph.exec);
+    cudaFree(binding.device);
+  }
   cudaFree(d_ids_);
   cudaFree(d_slot_row_);
   cudaFree(d_segs_);
@@ -605,9 +626,38 @@ void GlmMoeLayer::enqueue_f32(const uint16_t* hidden, float* out, int tokens,
   enqueue_host(hidden, nullptr, out, tokens, stream, kernel);
 }
 
+void GlmMoeLayer::enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
+    expert::ExpertCache& cache, std::span<const size_t> cache_experts,
+    cudaStream_t stream, MoeExpertKernel kernel, MoeTraceStaging* trace) {
+  cudaStreamCaptureStatus capture;
+  DGPP_CUDA_OK(cudaStreamIsCapturing(stream, &capture));
+  if (capture != cudaStreamCaptureStatusNone)
+    throw std::logic_error("GlmMoeLayer: expert paging requires eager execution outside graph capture");
+  cache.require_execution_context(stream);
+  if (w_.packq() || w_.exl3() || w_.experts || !w_.experts_fp4 ||
+      w_.routed_input_transform != kMoeInputPlain)
+    throw std::invalid_argument("GlmMoeLayer: paged execution requires a uniform plain-input FP4 table");
+  const auto& layout = cache.execution_layout();
+  if (layout.gate.cols != static_cast<uint64_t>(cfg_.hidden) ||
+      layout.intermediate_size > static_cast<uint64_t>(cfg_.inter) ||
+      cache_experts.size() != static_cast<size_t>(cfg_.n_experts))
+    throw std::invalid_argument("GlmMoeLayer: cache geometry/population does not match the layer");
+  const auto& experts = cache.experts();
+  for (size_t e = 0; e < cache_experts.size(); ++e) {
+    if (cache_experts[e] >= experts.size()) throw std::out_of_range("GlmMoeLayer: cache expert index");
+    const auto& key = experts[cache_experts[e]];
+    const auto& first = experts[cache_experts.front()];
+    if (key.expert != e || key.layer != first.layer || key.draft != first.draft)
+      throw std::invalid_argument("GlmMoeLayer: cache mapping mixes layers or expert IDs");
+  }
+  enqueue_host(hidden, out, nullptr, tokens, stream, kernel, &cache, cache_experts);
+  copy_route_trace(trace, tokens, stream);
+}
+
 void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
                                float* out_f32, int tokens, cudaStream_t stream,
-                               MoeExpertKernel kernel) {
+                               MoeExpertKernel kernel, expert::ExpertCache* cache,
+                               std::span<const size_t> cache_experts) {
   step_timing::Scope tick(step_timing::kMoe);
   if (tokens <= 0) return;
   if (tokens > max_tokens_)
@@ -616,67 +666,315 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     throw std::invalid_argument("GlmMoeLayer: null pointer");
   const int E = cfg_.n_experts, K = cfg_.top_k;
   const bool shared = has_shared();
-  check_expert_geometry();
+  if (!cache) check_expert_geometry();
 
-  // 1. Router + one sync: the ids/weights round-trip is the diagnostic
-  //    mode's cost; the production path keeps segmentation device-side.
-  route(hidden, tokens, stream);
+  // Router and a single host decision fence. Paging needs route IDs for
+  // demand I/O, but builds row/slot maps on the GPU. Keep host getter copies
+  // of IDs and weights consistent with the diagnostic enqueue contract.
+  // Paging provisions the same replay-safe router counters as resident
+  // decode. Use its fused dot/selection kernel before the host decision.
+  route(hidden, tokens, stream, cache && tokens <= decode_slots_ ? d_router_counters_ : nullptr);
   const size_t tk = static_cast<size_t>(tokens) * K;
   DGPP_CUDA_OK(cudaMemcpyAsync(h_ids_pinned_, d_ids_, tk * 4,
                                cudaMemcpyDeviceToHost, stream));
   DGPP_CUDA_OK(cudaMemcpyAsync(h_weights_pinned_, d_weights_, tk * 4,
                                cudaMemcpyDeviceToHost, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(h_biased_pinned_, d_biased_,
-                               static_cast<size_t>(tokens) * E * 4,
-                               cudaMemcpyDeviceToHost, stream));
+  if (!cache) {
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_biased_pinned_, d_biased_,
+                                 static_cast<size_t>(tokens) * E * 4,
+                                 cudaMemcpyDeviceToHost, stream));
+  }
   {
     step_timing::Scope sync_tick(step_timing::kMoeSync);
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
   }
   h_ids_.assign(h_ids_pinned_, h_ids_pinned_ + tk);
   h_weights_.assign(h_weights_pinned_, h_weights_pinned_ + tk);
-  h_biased_.assign(h_biased_pinned_,
-                   h_biased_pinned_ + static_cast<size_t>(tokens) * E);
-
-  // 2. Segment by expert (ascending expert id — the accumulation order)
-  //    straight into the pinned staging: the routed rows in segment order,
-  //    then every token once more for the shared expert; per (token, slot)
-  //    its gathered row; the segment table; the expert views (the shared
-  //    triple last). one upload of each per layer.
-  std::fill(h_counts_.begin(), h_counts_.end(), 0);
-  for (size_t i = 0; i < tk; ++i) ++h_counts_[h_ids_[i]];
-  std::vector<int> seg_begin(E, 0);
-  for (int e = 1; e < E; ++e) seg_begin[e] = seg_begin[e - 1] + h_counts_[e - 1];
-  std::vector<int> fill(seg_begin.begin(), seg_begin.end());
-  for (int t = 0; t < tokens; ++t)
-    for (int i = 0; i < K; ++i) {
-      const int e = h_ids_[static_cast<size_t>(t) * K + i];
-      h_seg_rows_[fill[e]] = t;
-      h_slot_row_[static_cast<size_t>(t) * K + i] = fill[e];
-      ++fill[e];
-    }
-  // The shared segment (when the chain has one): every token once more,
-  // after the routed rows; shared_row0 = -1 tells the accumulation to end
-  // the chain after the routed slots.
-  const int shared_row0 = shared ? static_cast<int>(tk) : -1;
-  if (shared)
-    for (int t = 0; t < tokens; ++t) h_seg_rows_[tk + t] = t;
-  int n_segs = 0, max_rows = 1;
-  for (int e = 0; e < E; ++e) {
-    if (h_counts_[e] == 0) continue;
-    h_segs_[n_segs++] = MoeSegment{seg_begin[e], h_counts_[e], e};
-    max_rows = std::max(max_rows, h_counts_[e]);
+  if (!cache) {
+    h_biased_.assign(h_biased_pinned_,
+                     h_biased_pinned_ + static_cast<size_t>(tokens) * E);
+  } else {
+    h_biased_.clear();
   }
-  if (shared) h_segs_[n_segs] = MoeSegment{shared_row0, tokens, E};
+
+  const int shared_row0 = shared ? static_cast<int>(tk) : -1;
   const size_t rows_total = tk + (shared ? static_cast<size_t>(tokens) : 0);
-  DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total * 4,
-                               cudaMemcpyHostToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk * 4,
-                               cudaMemcpyHostToDevice, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_,
-                               static_cast<size_t>(n_segs + (shared ? 1 : 0)) *
-                                   sizeof(MoeSegment),
-                               cudaMemcpyHostToDevice, stream));
+  int n_segs = 0, max_rows = 1;
+  std::vector<int> active_experts;
+  if (cache) {
+    // Route IDs are already required for demand admission. Count them here
+    // rather than building and copying the GPU segment table. Native fused
+    // decode does not need segments at all; grouped paths build them below.
+    std::fill(h_counts_.begin(), h_counts_.end(), 0);
+    active_experts.reserve(std::min(static_cast<size_t>(E), tk));
+    for (const int e : h_ids_) {
+      if (h_counts_[e]++ == 0) active_experts.push_back(e);
+      max_rows = std::max(max_rows, h_counts_[e]);
+    }
+    // Preserve ascending expert order for admission and reconstruction.
+    std::sort(active_experts.begin(), active_experts.end());
+    n_segs = static_cast<int>(active_experts.size());
+  } else {
+    // 2. Segment by expert (ascending expert id — the accumulation order)
+    //    straight into the pinned staging: the routed rows in segment order,
+    //    then every token once more for the shared expert; per (token, slot)
+    //    its gathered row; the segment table; the expert views (the shared
+    //    triple last). one upload of each per layer.
+    std::fill(h_counts_.begin(), h_counts_.end(), 0);
+    for (size_t i = 0; i < tk; ++i) ++h_counts_[h_ids_[i]];
+    std::vector<int> seg_begin(E, 0);
+    for (int e = 1; e < E; ++e) seg_begin[e] = seg_begin[e - 1] + h_counts_[e - 1];
+    std::vector<int> fill(seg_begin.begin(), seg_begin.end());
+    for (int t = 0; t < tokens; ++t)
+      for (int i = 0; i < K; ++i) {
+        const int e = h_ids_[static_cast<size_t>(t) * K + i];
+        h_seg_rows_[fill[e]] = t;
+        h_slot_row_[static_cast<size_t>(t) * K + i] = fill[e];
+        ++fill[e];
+      }
+    // The shared segment (when the chain has one): every token once more,
+    // after the routed rows; shared_row0 = -1 tells the accumulation to end
+    // the chain after the routed slots.
+    if (shared)
+      for (int t = 0; t < tokens; ++t) h_seg_rows_[tk + t] = t;
+    for (int e = 0; e < E; ++e) {
+      if (h_counts_[e] == 0) continue;
+      h_segs_[n_segs++] = MoeSegment{seg_begin[e], h_counts_[e], e};
+      max_rows = std::max(max_rows, h_counts_[e]);
+    }
+    if (shared) h_segs_[n_segs] = MoeSegment{shared_row0, tokens, E};
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, rows_total * 4,
+                                 cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk * 4,
+                                 cudaMemcpyHostToDevice, stream));
+    DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_,
+                                 static_cast<size_t>(n_segs + (shared ? 1 : 0)) *
+                                     sizeof(MoeSegment),
+                                 cudaMemcpyHostToDevice, stream));
+  }
+  if (cache) {
+    // Repeated route IDs are observations of reuse, not a unique-expert set.
+    std::vector<size_t> selected;
+    selected.reserve(tk);
+    for (const auto id : h_ids_) selected.push_back(cache_experts[static_cast<size_t>(id)]);
+    cache->observe(selected);
+    if (cache->packed_nvfp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
+        (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
+      enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts);
+      return;
+    }
+    // Metadata-only tables are rebound to a live reconstruction before a
+    // kernel can see them. All entries carry its geometry; only this wave's
+    // single routed segment can dereference the corresponding weights.
+    const auto original = w_;
+    struct Restore {
+      GlmMoeWeights& target;
+      GlmMoeWeights saved;
+      ~Restore() { target = saved; }
+    } restore{w_, original};
+    const auto& full = cache->execution_layout();
+    const auto format = full.gate.global_offset ? expert::Format::kNvfp4 : expert::Format::kMxfp4;
+    std::vector<size_t> routed;
+    routed.reserve(static_cast<size_t>(n_segs));
+    for (int wave = 0; wave < n_segs; ++wave)
+      routed.push_back(cache_experts[static_cast<size_t>(active_experts[wave])]);
+    if (!cache->packed_nvfp4() && cache->prepare_resident(routed)) {
+      // The executor may be rebound across all model layers. Keep tables
+      // separate by the layer's global expert base, not by executor address.
+      auto& binding = paged_bindings_[cache_experts.front()];
+      auto& views = binding.views;
+      if (binding.cache_identity != cache->binding_identity()) {
+        for (auto& [rows, graph] : binding.decode_graphs) cudaGraphExecDestroy(graph.exec);
+        binding.decode_graphs.clear();
+        binding.cache_identity = cache->binding_identity();
+        binding.valid = false;
+        views.resize(static_cast<size_t>(E) * 3);
+        binding.addresses.assign(static_cast<size_t>(E), nullptr);
+      }
+      if (!binding.device)
+        DGPP_CUDA_OK(cudaMalloc(&binding.device, static_cast<size_t>(E + 1) * 3 * sizeof(MoeExpertView)));
+      struct RestoreTable {
+        MoeExpertView*& target;
+        MoeExpertView* saved;
+        ~RestoreTable() { target = saved; }
+      } restore_table{d_views_prefill_, d_views_prefill_};
+      d_views_prefill_ = binding.device;
+      std::vector<expert::ExpertExecutionLease> leases;
+      leases.reserve(routed.size());
+      bool changed = !binding.valid;
+      if (!binding.valid)
+        std::fill(binding.addresses.begin(), binding.addresses.end(), nullptr);
+      for (int wave = 0; wave < n_segs; ++wave) {
+        leases.push_back(cache->acquire(routed[static_cast<size_t>(wave)]));
+        const auto e = static_cast<size_t>(active_experts[wave]);
+        const auto* address = leases.back().data();
+        if (!binding.valid || binding.addresses[e] != address) {
+          const auto matrices = expert::execution_matrices(leases.back(), full, format);
+          if (!binding.valid && wave == 0)
+            for (int entry = 0; entry < E; ++entry)
+              std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
+          std::copy(matrices.begin(), matrices.end(), views.begin() + e * 3);
+          binding.addresses[e] = address;
+          changed = true;
+        }
+      }
+      w_.experts_fp4 = views.data();
+      if (changed) {
+        check_expert_geometry();
+        upload_expert_views(d_views_prefill_, shared, stream);
+        binding.valid = true;
+      }
+      if (kernel == MoeExpertKernel::kGemv && tokens <= decode_slots_ &&
+          out_bf16 && shared && !down_bf16_) {
+        if (fp4_grouped_decode_enabled() && tokens > 1 && tokens <= 16 &&
+            shared_lane_takes(true, tokens) && !shared_aside_takes(true, tokens)) {
+          // Routing is already on the host for cache admission. Upload a
+          // compact segment table rather than launching over all E experts.
+          // Pad to the token-dependent bound so graph replay can change routes.
+          std::vector<int> begin(static_cast<size_t>(E), 0);
+          for (int e = 1; e < E; ++e) begin[e] = begin[e - 1] + h_counts_[e - 1];
+          auto next = begin;
+          for (int t = 0; t < tokens; ++t)
+            for (int j = 0; j < K; ++j) {
+              const size_t slot = static_cast<size_t>(t) * K + j;
+              const int row = next[h_ids_[slot]]++;
+              h_seg_rows_[row] = t;
+              h_slot_row_[slot] = row;
+            }
+          const int cap = static_cast<int>(std::min(static_cast<size_t>(E), tk));
+          std::fill_n(h_segs_, cap, MoeSegment{0, 0, 0});
+          for (int i = 0; i < n_segs; ++i) {
+            const int e = active_experts[i];
+            h_segs_[i] = MoeSegment{begin[e], h_counts_[e], e};
+          }
+          DGPP_CUDA_OK(cudaMemcpyAsync(d_rows_, h_seg_rows_, tk * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+          DGPP_CUDA_OK(cudaMemcpyAsync(d_slot_row_, h_slot_row_, tk * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+          DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, cap * sizeof(MoeSegment),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        // Reuse the resident decode recipe: fused gate/up/SwiGLU and
+        // per-routed-slot kernels, not a grid over every empty expert.
+        // Routing is already available and this layer's table is persistent.
+        // Paging still makes an eager host decision. Replay just the native
+        // expert kernels as one graph launch; IDs/weights and the persistent
+        // table remain device inputs, so changing routes/addresses needs no
+        // recapture. The shared FP8 lane forks and rejoins within the graph.
+        if (stream && stream != cudaStreamLegacy && tokens <= 16 && !w_.shared_nvfp4() &&
+            !shared_aside_takes(true, tokens)) {
+          std::array<uint64_t, 18> signature{};
+          for (size_t m = 0; m < 3; ++m) {
+            const auto& q = w_.shared[m];
+            signature[m * 6] = reinterpret_cast<uintptr_t>(q.payload);
+            signature[m * 6 + 1] = reinterpret_cast<uintptr_t>(q.scales);
+            signature[m * 6 + 2] = q.rows;
+            signature[m * 6 + 3] = q.cols;
+            signature[m * 6 + 4] = q.scale_block_rows;
+            signature[m * 6 + 5] = q.scale_block_cols;
+          }
+          auto& graph = binding.decode_graphs[tokens];
+          if (graph.exec && (graph.hidden != hidden || graph.out != out_bf16 ||
+                             graph.shared_signature != signature)) {
+            DGPP_CUDA_OK(cudaGraphExecDestroy(graph.exec));
+            graph.exec = nullptr;
+          }
+          if (!graph.exec) {
+            DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            cudaGraph_t captured = nullptr;
+            try {
+              enqueue_decode_impl(hidden, out_bf16, nullptr, tokens, nullptr, stream,
+                                  -1, true, binding.device);
+            } catch (...) {
+              (void)cudaStreamEndCapture(stream, &captured);
+              if (captured) cudaGraphDestroy(captured);
+              throw;
+            }
+            DGPP_CUDA_OK(cudaStreamEndCapture(stream, &captured));
+            const auto status = cudaGraphInstantiate(&graph.exec, captured, nullptr, nullptr, 0);
+            DGPP_CUDA_OK(cudaGraphDestroy(captured));
+            DGPP_CUDA_OK(status);
+            graph.hidden = hidden;
+            graph.out = out_bf16;
+            graph.shared_signature = signature;
+          }
+          DGPP_CUDA_OK(cudaGraphLaunch(graph.exec, stream));
+        } else {
+          enqueue_decode_impl(hidden, out_bf16, nullptr, tokens, nullptr, stream,
+                              -1, true, binding.device);
+        }
+        cache->release_native_leases(leases);
+        return;
+      }
+      launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
+      const int tile_cap = tile_list_for(kernel, E, static_cast<int>(tk), stream);
+      grouped_expert_chain(kernel, hidden, d_segs_, E, max_rows,
+          shared ? d_segs_ + E : nullptr, tokens, rows_total,
+          stream, tile_cap ? d_tiles_ : nullptr, d_tile_count_, tile_cap);
+      accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
+      cache->release_native_leases(leases);
+      return;
+    }
+    launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
+    std::vector<GlmFp4Matrix> views(static_cast<size_t>(E) * 3);
+    const size_t i_max = static_cast<size_t>(std::max<int64_t>(full.intermediate_size,
+        shared ? (w_.shared_nvfp4() ? w_.shared_fp4[0].rows : w_.shared[0].rows) : 0));
+    // The existing activation launcher covers all segment rows. Initialize
+    // rows belonging to later waves so it never reads uninitialized scratch.
+    DGPP_CUDA_OK(cudaMemsetAsync(d_gate_, 0, rows_total * i_max * sizeof(uint16_t), stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(d_up_, 0, rows_total * i_max * sizeof(uint16_t), stream));
+    const bool grouped_decode = fp4_grouped_decode_enabled() && kernel == MoeExpertKernel::kGemv &&
+        out_bf16 && tokens > 1 && tokens <= 16 && tokens <= decode_slots_ &&
+        shared_lane_takes(true, tokens) && !shared_aside_takes(true, tokens);
+    if (grouped_decode) {
+      // Keep the same arithmetic on a miss as on a native hit. The shared
+      // lane writes after all routed rows; each miss wave uses W4A16 too.
+      const auto& g = w_.shared[0];
+      const auto& u = w_.shared[1];
+      const auto& d = w_.shared[2];
+      const int width = static_cast<int>(g.rows);
+      const auto shift = [](int block) {
+        int result = 0;
+        while ((1 << result) < block) ++result;
+        return result;
+      };
+      DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
+      DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
+      auto* act = d_act_ + tk * i_max;
+      launch_moe_shared_run_gate_up_swiglu(hidden, cfg_.hidden, g.payload, g.scales, u.payload, u.scales,
+          act, i_max, tokens, width, cfg_.hidden, cfg_.swiglu_limit,
+          moe_shared_run_rows(tokens, cfg_.hidden), sh_lane_blocks_, sh_lane_,
+          shift(g.scale_block_rows), shift(g.scale_block_cols));
+      launch_moe_shared_run_down(act, i_max, d.payload, d.scales, d_down_ + tk * cfg_.hidden,
+          cfg_.hidden, tokens, cfg_.hidden, width, moe_shared_run_rows(tokens, cfg_.hidden),
+          sh_lane_blocks_, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
+      DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
+    }
+    for (int wave = 0; wave < n_segs; ++wave) {
+      const int e = active_experts[wave];
+      auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)], /*canonical=*/true);
+      if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
+      // Demand loading gets both staging buffers. Start the next expert's
+      // read only once the current expert is assembled, beside its kernels.
+      if (wave + 1 < n_segs)
+        (void)cache->prefetch(cache_experts[static_cast<size_t>(active_experts[wave + 1])]);
+      const auto matrices = expert::execution_matrices(lease, full, format);
+      for (int entry = 0; entry < E; ++entry)
+        std::copy(matrices.begin(), matrices.end(), views.begin() + static_cast<size_t>(entry) * 3);
+      w_.experts_fp4 = views.data();
+      check_expert_geometry();
+      upload_expert_views(d_views_prefill_, shared, stream);
+      grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
+          hidden, d_segs_ + e, 1, h_counts_[e],
+          shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
+          grouped_decode ? tk : rows_total, stream,
+          nullptr, nullptr, 0, wave + 1 == n_segs);
+      lease.release();  // kernel and table readers complete before reuse
+    }
+    if (grouped_decode) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
+    accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
+    return;
+  }
   upload_expert_views(d_views_prefill_, /*with_shared=*/shared, stream);
   const int tile_cap = tile_list_for(kernel, n_segs, static_cast<int>(tk), stream);
 
@@ -694,6 +992,152 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   //    rounding onto the wire buffer — or the chain unrounded, for a
   //    caller that continues it.
   accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
+}
+
+void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
+    cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
+    std::span<const int> active_experts) {
+  if (!sm12x_moe_ || !stream || stream == cudaStreamLegacy || !shared_lane_takes(true, tokens) ||
+      shared_aside_takes(true, tokens) || !has_shared() || w_.shared_nvfp4() ||
+      w_.shared[0].rows > cfg_.inter)
+    throw std::logic_error("b12x paged MoE requires its prepared target and FP8 shared lane");
+  const int E = cfg_.n_experts, K = cfg_.top_k, H = cfg_.hidden, I = cfg_.inter;
+  auto* const slots = tokens <= decode_slots_ ? d_slot_down_ : d_down_;
+  auto* const shared_act = tokens <= decode_slots_ ? d_slot_act_ : d_act_;
+  std::vector<size_t> routed;
+  for (const int e : active_experts) routed.push_back(cache_experts[static_cast<size_t>(e)]);
+  const bool resident = cache.prepare_resident(routed);
+  std::vector<const uint8_t*> addresses(static_cast<size_t>(E), nullptr);
+  auto shared = [&] {
+    const auto& g = w_.shared[0]; const auto& u = w_.shared[1]; const auto& d = w_.shared[2];
+    const auto shift = [](int block) { int n = 0; while ((1 << n) < block) ++n; return n; };
+    const int run = moe_shared_run_rows(tokens, H);
+    DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
+    auto* act = shared_act + K*I;
+    launch_moe_shared_run_gate_up_swiglu(hidden, H, g.payload, g.scales, u.payload, u.scales,
+        act, static_cast<size_t>(K+1)*I, tokens, static_cast<int>(g.rows), H, cfg_.swiglu_limit,
+        run, sh_lane_blocks_, sh_lane_, shift(g.scale_block_rows), shift(g.scale_block_cols));
+    launch_moe_shared_run_down(act, static_cast<size_t>(K+1)*I, d.payload, d.scales,
+        slots + K*H, static_cast<size_t>(K+1)*H, tokens, H, static_cast<int>(g.rows),
+        run, sh_lane_blocks_, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
+    DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
+  };
+  auto finish = [&] {
+    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
+    launch_moe_slot_accum(out, slots, d_weights_, tokens, H, K, stream);
+  };
+  if (resident) {
+    std::vector<expert::ExpertExecutionLease> leases;
+    leases.reserve(routed.size());
+    for (size_t j = 0; j < routed.size(); ++j) {
+      leases.push_back(cache.acquire(routed[j]));
+      const auto* data = leases.back().packed_data();
+      if (j == 0) std::fill(addresses.begin(), addresses.end(), data);
+      addresses[static_cast<size_t>(active_experts[j])] = data;
+    }
+    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream);
+    auto& binding = paged_bindings_[cache_experts.front()];
+    if (binding.cache_identity != cache.binding_identity()) {
+      for (auto& [rows, graph] : binding.decode_graphs) DGPP_CUDA_OK(cudaGraphExecDestroy(graph.exec));
+      binding.decode_graphs.clear();
+      binding.cache_identity = cache.binding_identity();
+    }
+    std::array<uint64_t,18> signature{};
+    for (size_t m = 0; m < 3; ++m) {
+      const auto& q = w_.shared[m];
+      signature[m*6] = reinterpret_cast<uintptr_t>(q.payload);
+      signature[m*6+1] = reinterpret_cast<uintptr_t>(q.scales);
+      signature[m*6+2] = q.rows; signature[m*6+3] = q.cols;
+      signature[m*6+4] = q.scale_block_rows; signature[m*6+5] = q.scale_block_cols;
+    }
+    auto& graph = binding.decode_graphs[tokens];
+    if (graph.exec && (graph.hidden != hidden || graph.out != out || graph.shared_signature != signature)) {
+      DGPP_CUDA_OK(cudaGraphExecDestroy(graph.exec)); graph.exec = nullptr;
+    }
+    if (!graph.exec) {
+      cudaGraph_t captured = nullptr;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+      try {
+        shared();
+        sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+        finish();
+      } catch (...) {
+        (void)cudaStreamEndCapture(stream, &captured);
+        if (captured) (void)cudaGraphDestroy(captured);
+        throw;
+      }
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &captured));
+      const auto status = cudaGraphInstantiate(&graph.exec, captured, nullptr, nullptr, 0);
+      DGPP_CUDA_OK(cudaGraphDestroy(captured)); DGPP_CUDA_OK(status);
+      graph.hidden = hidden; graph.out = out; graph.shared_signature = signature;
+    }
+    DGPP_CUDA_OK(cudaGraphLaunch(graph.exec, stream));
+    cache.release_native_leases(leases);
+    return;
+  }
+  // A single missing expert must not turn all cached experts into serial
+  // waves. Execute the complete resident subset once, then retire its leases
+  // before admitting misses, which may relocate their cache slots.
+  std::vector<size_t> complete, missing;
+  std::vector<int> complete_ids;
+  for (size_t j = 0; j < routed.size(); ++j) {
+    const auto e = routed[j];
+    if (cache.residency().chunks[e] == cache.experts()[e].records.size()) {
+      complete.push_back(e);
+      complete_ids.push_back(active_experts[j]);
+    } else missing.push_back(j);
+  }
+  // File workers can fill the bounded staging window while the shared and
+  // resident experts run. No speculative device allocation or cache binding
+  // changes occur here.
+  if (!missing.empty()) (void)cache.prefetch(routed[missing.front()]);
+  shared();
+  if (!complete.empty()) {
+    if (!cache.prepare_resident(complete)) throw std::logic_error("b12x resident subset changed during preparation");
+    std::vector<expert::ExpertExecutionLease> leases;
+    leases.reserve(complete.size());
+    for (size_t j = 0; j < complete.size(); ++j) {
+      leases.push_back(cache.acquire(complete[j]));
+      const auto* data = leases.back().packed_data();
+      if (j == 0) std::fill(addresses.begin(), addresses.end(), data);
+      addresses[static_cast<size_t>(complete_ids[j])] = data;
+    }
+    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, complete_ids);
+    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    cache.release_native_leases(leases);
+  }
+  // Reconstructed experts have independent, preallocated execution slots.
+  // Keep a bounded wave alive through one grouped launch instead of paying
+  // for a persistent kernel and route upload for each missing expert.
+  const size_t wave_capacity = std::min(missing.size(),
+      static_cast<size_t>(cache.memory().execution_slots));
+  std::vector<expert::ExpertExecutionLease> leases;
+  std::vector<int> wave_ids;
+  leases.reserve(wave_capacity);
+  wave_ids.reserve(wave_capacity);
+  for (size_t at = 0; at < missing.size();) {
+    const size_t end = at + std::min(wave_capacity, missing.size() - at);
+    for (; at < end; ++at) {
+      const size_t j = missing[at];
+      // Even if an earlier admission completed this expert, use independent
+      // scratch: a native lease would prevent subsequent cache admissions.
+      auto lease = cache.acquire(routed[j], /*canonical=*/true);
+      if (!lease) throw std::runtime_error("b12x paged MoE: execution slot backpressure");
+      if (at+1 < missing.size()) (void)cache.prefetch(routed[missing[at+1]]);
+      const auto* data = lease.packed_data();
+      if (leases.empty()) std::fill(addresses.begin(), addresses.end(), data);
+      addresses[static_cast<size_t>(active_experts[j])] = data;
+      wave_ids.push_back(active_experts[j]);
+      leases.push_back(std::move(lease));
+    }
+    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, wave_ids);
+    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    for (auto& lease : leases) lease.release();
+    leases.clear();
+    wave_ids.clear();
+  }
+  finish();
 }
 
 void GlmMoeLayer::accumulate_grouped(uint16_t* out_bf16, float* out_f32, int shared_row0,
@@ -1069,7 +1513,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                        int max_rows, const MoeSegment* shared_seg,
                                        int tokens, size_t rows_total,
                                        cudaStream_t stream, const MoeTile* tiles,
-                                       const int32_t* tile_count, int tile_cap) {
+                                       const int32_t* tile_count, int tile_cap, bool execute_shared) {
   const int H = static_cast<int>(cfg_.hidden);
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
@@ -1193,7 +1637,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   if (exl3) {
     launch_exl3_moe_rotate_segments(d_gather_, static_cast<size_t>(H), segs, n_segs, max_rows, d_views_prefill_, 0, H,
                                     d_xh_g_, d_xh_u_, static_cast<size_t>(H), stream);
-    if (shared_seg)
+    if (shared_seg && execute_shared)
       launch_exl3_moe_rotate_segments(d_gather_, static_cast<size_t>(H), shared_seg, 1, tokens, d_views_prefill_, 0, H,
                                       d_xh_g_, d_xh_u_, static_cast<size_t>(H), stream);
   }
@@ -1230,7 +1674,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                    I_max, n, H, stream);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
-                                      which, out, I_max, n, H, stream, d_rows_, fp4_group);
+                                      which, out, I_max, n, H, stream, d_rows_, fp4_group,
+                                      mr <= 16 ? 16 : 64);
     else if (mma)
       launch_moe_grouped_mma_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                   which, out, I_max, n, H, stream, d_rows_);
@@ -1285,7 +1730,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                   k, stream);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
-                                     2, d_down_, H, H, k, stream, nullptr, fp4_group);
+                                     2, d_down_, H, H, k, stream, nullptr, fp4_group,
+                                     mr <= 16 ? 16 : 64);
     else if (mma)
       launch_moe_grouped_mma_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                  2, d_down_, H, H, k, stream);
@@ -1307,9 +1753,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                       tiles, tile_count, tile_cap, d_up_, 1);
   else
     gemm_bf16(segs, n_segs, max_rows, 0, 0, d_gate_, I_r, true);
-  if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
+  if (shared_seg && execute_shared) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
   if (!paired) gemm_bf16(segs, n_segs, max_rows, 0, 1, d_up_, I_r, true);
-  if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 1, d_up_, I_s, false);
+  if (shared_seg && execute_shared) gemm_bf16(shared_seg, 1, tokens, shared_split, 1, d_up_, I_s, false);
   // The down projection's activations to NVFP4 (routed rows; the shared
   // expert's rows, when present, sit past them and keep the bf16 path).
   // Without a shared segment the bf16 act buffer feeds nothing but that
@@ -1344,7 +1790,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                  stream, 0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
   }
   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
-  if (shared_seg) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);
+  if (shared_seg && execute_shared) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);
   if (std::getenv("DGPP_MOE_CHAIN_DUMP") != nullptr) {
     // Hunt instrument: per-stage checksums of the chain's buffers.
     // Materialize stages bypassed by the optimized chain before reading them.
@@ -1435,7 +1881,7 @@ bool GlmMoeLayer::shared_aside_takes(bool with_shared, int tokens) const {
 // (GlmMoeConfig::shared_run_lane): two rows or more, an FP8 shared expert
 // on launch arguments, and shapes the fp8 core takes.
 bool GlmMoeLayer::shared_lane_takes(bool with_shared, int tokens) const {
-  if (!cfg_.shared_run_lane || !with_shared || sh_lane_ == nullptr || tokens < 2) return false;
+  if (!cfg_.shared_run_lane || !with_shared || sh_lane_ == nullptr || tokens < cfg_.shared_run_lane_min_rows) return false;
   if (w_.shared_nvfp4() || w_.packq() || w_.exl3() || w_.shared[0].payload == nullptr) return false;
   const auto pow2 = [](int b) { return b > 0 && (b & (b - 1)) == 0; };
   for (int m = 0; m < 3; ++m) {
@@ -1457,7 +1903,8 @@ bool GlmMoeLayer::shared_lane_takes(bool with_shared, int tokens) const {
 void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                                       float* out_f32, int tokens,
                                       MoeTraceStaging* trace, cudaStream_t stream,
-                                      int table_slot, bool accumulate) {
+                                      int table_slot, bool accumulate,
+                                      const MoeExpertView* paged_table) {
   step_timing::Scope tick(step_timing::kMoe);
   if (tokens <= 0) return;
   const bool with_shared = out_bf16 != nullptr;
@@ -1475,7 +1922,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   if (!hidden)
     throw std::invalid_argument("GlmMoeLayer: null pointer");
   const int H = cfg_.hidden, E = cfg_.n_experts, K = cfg_.top_k;
-  check_expert_geometry();
+  if (!paged_table) check_expert_geometry();
 
   // 0. The shared expert aside (GlmMoeConfig::shared_mma_aside): gate and up
   //    on the two side streams, forked HERE — before the router, so both
@@ -1518,11 +1965,13 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   //     launches so the router's blocks are placed first; its rows go into
   //     the shared slots of d_slot_act_ and d_slot_down_.
   const bool shared_lane = !shared_aside && shared_lane_takes(with_shared, tokens);
+  const bool grouped_fp4 = fp4_grouped_decode_enabled() && shared_lane && w_.nvfp4() &&
+                           !moe_w4a4_opt_in() && tokens > 1 && tokens <= 16;
   if (shared_lane) DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
 
   // 1. Router, dots and selection in one launch — ids ASCENDING per row,
   //    on device.
-  route(hidden, tokens, stream, d_router_counters_);
+  if (!paged_table) route(hidden, tokens, stream, d_router_counters_);
   if (shared_lane) {
     const GlmQuantMatrix& g = w_.shared[0];
     const GlmQuantMatrix& u = w_.shared[1];
@@ -1535,14 +1984,17 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
       return sft;
     };
     const int run = moe_shared_run_rows(tokens, H);
-    uint16_t* sh_act = d_slot_act_ + static_cast<size_t>(K) * I_row;
-    const size_t act_step = static_cast<size_t>(K + 1) * I_row;
+    const size_t shared_row = grouped_fp4 ? static_cast<size_t>(tokens) * K : K;
+    uint16_t* sh_act = (grouped_fp4 ? d_act_ : d_slot_act_) + shared_row * I_row;
+    const size_t act_step = grouped_fp4 ? I_row : static_cast<size_t>(K + 1) * I_row;
     DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
     launch_moe_shared_run_gate_up_swiglu(hidden, static_cast<size_t>(H), g.payload, g.scales, u.payload, u.scales, sh_act,
                                          act_step, tokens, I_sh, H, cfg_.swiglu_limit, run, sh_lane_blocks_, sh_lane_,
                                          log2_of(g.scale_block_rows), log2_of(g.scale_block_cols));
-    launch_moe_shared_run_down(sh_act, act_step, d.payload, d.scales, d_slot_down_ + static_cast<size_t>(K) * H,
-                               static_cast<size_t>(K + 1) * H, tokens, H, I_sh, run, sh_lane_blocks_, sh_lane_,
+    launch_moe_shared_run_down(sh_act, act_step, d.payload, d.scales,
+                               (grouped_fp4 ? d_down_ : d_slot_down_) + shared_row * H,
+                               grouped_fp4 ? H : static_cast<size_t>(K + 1) * H,
+                               tokens, H, I_sh, run, sh_lane_blocks_, sh_lane_,
                                log2_of(d.scale_block_rows), log2_of(d.scale_block_cols));
     DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
   }
@@ -1562,8 +2014,10 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   //    slot never prepared is refused (the wrong-weights class the 4c
   //    cache bug taught, caught at capture time instead of in the
   //    transcript).
-  const MoeExpertView* table = d_expert_views_;
-  if (table_slot >= 0) {
+  const MoeExpertView* table = paged_table ? paged_table : d_expert_views_;
+  if (paged_table) {
+    // Already routed, pinned and bound by enqueue_host's native-hit path.
+  } else if (table_slot >= 0) {
     if (table_slot >= graph_table_slots_ || d_expert_views_graph_ == nullptr)
       throw std::invalid_argument(
           "GlmMoeLayer: graph table slot out of range (construct with "
@@ -1577,6 +2031,25 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   } else {
     upload_expert_views(d_expert_views_,
                         /*with_shared=*/w_.shared_nvfp4() || w_.shared_packq() || w_.shared_exl3_set(), stream);
+  }
+
+  if (grouped_fp4) {
+    // Reuse each routed expert's decoded weight tile across its token rows,
+    // while the FP8 shared expert keeps its concurrent decode lane.
+    if (!paged_table)
+      launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
+    struct RestoreTable {
+      MoeExpertView*& target;
+      MoeExpertView* saved;
+      ~RestoreTable() { target = saved; }
+    } restore_table{d_views_prefill_, d_views_prefill_};
+    d_views_prefill_ = const_cast<MoeExpertView*>(table);
+    const int segments = paged_table ? std::min(E, tokens * K) : E;
+    grouped_expert_chain(MoeExpertKernel::kMma, hidden, d_segs_, segments, tokens,
+                         nullptr, tokens, static_cast<size_t>(tokens) * K, stream);
+    DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
+    accumulate_grouped(out_bf16, nullptr, tokens * K, tokens, stream);
+    return;
   }
 
   const int slots = tokens * (K + 1);

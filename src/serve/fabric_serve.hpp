@@ -53,6 +53,7 @@
 #include "net/tcp.hpp"
 #include "serve/generation_service.hpp"
 #include "serve/serve_stats.hpp"
+#include "serve/expert_paging.hpp"
 
 namespace dgpp::serve {
 
@@ -188,6 +189,7 @@ struct WorldSettings {
   bool no_eos = false;
   bool compact_batches = false;
   bool decode_graph = false;
+  std::optional<expert::PagingOptions> expert_streaming;
   bool mtp = false;
   int mtp_depth = 1;  // draft tokens per step
   // The scheduled verify depth and its constants (identical on every rank:

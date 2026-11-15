@@ -113,32 +113,61 @@ __device__ __forceinline__ float e8m0_to_float(uint8_t b) {
   return b == 0 ? 0x1p-127f : __uint_as_float(static_cast<uint32_t>(b) << 23);
 }
 
-// One warp per (token, local row): the row's head_dim / 8 chunks of eight
-// e4m3 codes, each lane one chunk -> eight bf16 under the chunk's block
-// scale (a chunk of 8 lies inside one block of 32).
+__device__ __forceinline__ uint16_t mxfp4_to_bf16(uint32_t code, uint8_t scale) {
+  // E2M1 times an E8M0 power of two is exactly representable in BF16
+  // unless it overflows. Place the bits directly so CUDA FTZ cannot erase
+  // the smallest scales, including E8M0 byte zero (2^-127).
+  if (scale == 255) return 0x7fc0;
+  const uint16_t sign = static_cast<uint16_t>((code & 8u) << 12);
+  const int mag = code & 7u;
+  if (!mag) return sign;
+  const int exponent = static_cast<int>(scale) + (mag == 1 ? -1 : (mag - 2) / 2);
+  const uint16_t mantissa = mag > 1 && (mag & 1) ? 64 : 0;
+  if (exponent <= 0) {
+    const uint16_t significand = static_cast<uint16_t>(128 + mantissa);
+    return sign | (significand >> (1 - exponent));
+  }
+  if (exponent >= 255) return sign | 0x7f80;
+  return sign | static_cast<uint16_t>(exponent << 7) | mantissa;
+}
+
+// One warp per (token, local row): each lane converts eight values inside
+// one scale block, loading eight FP8 bytes or four packed MXFP4 bytes.
+template<bool Mxfp4>
 __global__ void gather_staged_kernel(const uint8_t* __restrict__ staged, int n, int rows_local,
                                      int head_dim, uint16_t* __restrict__ out) {
   dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t pair = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp;
   if (pair >= static_cast<int64_t>(n) * rows_local) return;
-  const int row_bytes = head_dim + head_dim / 32;
+  const int payload_bytes = head_dim / (Mxfp4 ? 2 : 1);
+  const int row_bytes = payload_bytes + head_dim / 32;
   const uint8_t* src = staged + pair * row_bytes;
-  const uint8_t* scales = src + head_dim;
+  const uint8_t* scales = src + payload_bytes;
   uint16_t* dst = out + pair * head_dim;
   const int chunks = head_dim / 8;
   for (int ch = lane; ch < chunks; ch += 32) {
-    const float s = e8m0_to_float(scales[(ch * 8) / 32]);
-    const uint2 codes = reinterpret_cast<const uint2*>(src)[ch];
-    const uint32_t cw[2] = {codes.x, codes.y};
     uint32_t packed[4];
+    if constexpr (Mxfp4) {
+      const uint8_t scale = scales[(ch * 8) / 32];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const uint32_t w = cw[j / 2] >> (16 * (j % 2));
-      const uint16_t lo = float_to_bf16_bits(fp8_e4m3_bits_to_float(static_cast<uint8_t>(w & 0xFFu)) * s);
-      const uint16_t hi =
-          float_to_bf16_bits(fp8_e4m3_bits_to_float(static_cast<uint8_t>((w >> 8) & 0xFFu)) * s);
-      packed[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+      for (int j = 0; j < 4; ++j) {
+        const uint8_t byte = src[ch * 4 + j];
+        packed[j] = static_cast<uint32_t>(mxfp4_to_bf16(byte & 15u, scale)) |
+                    (static_cast<uint32_t>(mxfp4_to_bf16(byte >> 4, scale)) << 16);
+      }
+    } else {
+      const float s = e8m0_to_float(scales[(ch * 8) / 32]);
+      const uint2 codes = reinterpret_cast<const uint2*>(src)[ch];
+      const uint32_t cw[2] = {codes.x, codes.y};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t w = cw[j / 2] >> (16 * (j % 2));
+        const uint16_t lo = float_to_bf16_bits(fp8_e4m3_bits_to_float(static_cast<uint8_t>(w & 0xFFu)) * s);
+        const uint16_t hi =
+            float_to_bf16_bits(fp8_e4m3_bits_to_float(static_cast<uint8_t>((w >> 8) & 0xFFu)) * s);
+        packed[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+      }
     }
     reinterpret_cast<uint4*>(dst)[ch] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
   }
@@ -240,20 +269,23 @@ void dsv41_engram_context_rows(const int64_t* tokens, int rows, const int32_t* r
 }
 
 void dsv41_engram_gather_staged_bf16(const uint8_t* staged, int n, int rows_local, int head_dim,
-                                     uint16_t* out, cudaStream_t stream) {
+                                     uint16_t* out, cudaStream_t stream, bool mxfp4) {
   if (n <= 0) return;
   if (!staged || !out) throw std::invalid_argument("dsv41_engram_gather: null pointer");
   if (head_dim <= 0 || head_dim % 32 != 0 || rows_local <= 0)
     throw std::invalid_argument("dsv41_engram_gather: bad geometry (head_dim % 32, rows)");
-  if ((reinterpret_cast<uintptr_t>(staged) & 7u) || (reinterpret_cast<uintptr_t>(out) & 15u))
+  if ((!mxfp4 && (reinterpret_cast<uintptr_t>(staged) & 7u)) || (reinterpret_cast<uintptr_t>(out) & 15u))
     throw std::invalid_argument("dsv41_engram_gather: staged 8-byte and out 16-byte aligned required");
   const int row_bytes = head_dim + head_dim / 32;
-  if (row_bytes % 8 != 0)
+  if (!mxfp4 && row_bytes % 8 != 0)
     throw std::invalid_argument("dsv41_engram_gather: the staged row must be 8-byte aligned (head_dim % 64)");
   const int64_t pairs = static_cast<int64_t>(n) * rows_local;
   constexpr int kWarps = 8;
   const int blocks = static_cast<int>((pairs + kWarps - 1) / kWarps);
-  gather_staged_kernel<<<blocks, kWarps * 32, 0, stream>>>(staged, n, rows_local, head_dim, out);
+  if (mxfp4)
+    gather_staged_kernel<true><<<blocks, kWarps * 32, 0, stream>>>(staged, n, rows_local, head_dim, out);
+  else
+    gather_staged_kernel<false><<<blocks, kWarps * 32, 0, stream>>>(staged, n, rows_local, head_dim, out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

@@ -19,6 +19,7 @@ Restart the deployment after changing either file.
 | Load a LoRA adapter or expose logits and activations to research tools | [Runtime adapters and research inference](#runtime-adapters-and-research-inference) |
 | Serve longer prompts or more simultaneous requests | [Request capacity and memory](#request-capacity-and-memory) |
 | Reuse work from earlier prompts | [Prefix caching](#prefix-caching) |
+| Stream MoE expert weights from SSD within a bounded budget | [Expert streaming](adaptive-expert-residency.md#runtime-configuration) |
 | Keep evicted prefix entries on local NVMe | [NVMe cache](#nvme-cache) |
 | Keep an existing compatible NVMe cache across server upgrades | [`nvme_cache.reuse_binding`](nvme-cache.md#across-restarts) |
 | Balance prompt processing against smooth streaming | [Prefill scheduling](#prefill-scheduling) |
@@ -220,7 +221,7 @@ the others. Startup checks the combined memory plan before loading the model.
 
 | Key | What it controls and what to expect | Default |
 |---|---|---|
-| `engine.max_concurrency` | Maximum actively executing requests, from 1 to 16, subject to the model and speculation limits below. More slots can improve total throughput but need more working memory and can increase each request's latency. | 8 |
+| `engine.max_concurrency` | Maximum actively executing requests: 1–16 normally, or up to 64 for plain expert-streaming serving. Model and speculation limits below also apply. More slots can improve total throughput but need more working memory and can increase each request's latency. | 8 |
 | `engine.kv_capacity` | Shared context-token pool on each rank, used by all active requests. Prompt and answer tokens both consume space. Increase for longer contexts or more simultaneous context, at the cost of memory. Allocation is rounded to model block boundaries. This does not extend the model's positional limit. | 8192 tokens |
 | `engine.default_max_tokens` | Answer-token budget when a request omits `max_tokens`. Clients can set their own value. Under `full` admission, the prompt plus this budget must fit the context allowance or the request is rejected. Templates generally use much larger defaults to allow long answers and reasoning. | 256 tokens |
 | `engine.queue_limit` | Maximum requests waiting for a slot or memory. Further arrivals receive HTTP 503 `overloaded`. A larger queue absorbs bursts but allows longer waits without adding processing capacity. | 64 |
@@ -370,7 +371,7 @@ launch each generation step. Batching runs several requests together.
 
 | Key | What it controls and what to expect | Default |
 |---|---|---|
-| `engine.decode_graph` | Replay recorded GPU work during generation to reduce launch overhead. On one node this also selects the engine that keeps model weights resident rather than streaming layers. Required for native MTP. Retain the value in the matching serving template. | false |
+| `engine.decode_graph` | Replay recorded GPU work during generation to reduce launch overhead. On one node this also selects the engine that keeps model weights resident rather than streaming layers. Required for native MTP except DeepSeek V4.1 expert streaming, which uses eager DSpark verification. Retain the value in the matching serving template. | false |
 | `engine.graph_batch_min_live` | Active-request count at which decode switches from individual to batched graphs. Lower values start batching sooner, which may improve throughput but can compute unused padding rows. `0` chooses `min(2, max_concurrency)`; explicit values must be 1 through `max_concurrency`. | 0 (automatic) |
 | `engine.compact_batches` | Use the smallest compatible recorded batch for active requests, reducing unused work when some slots are empty. Some computation paths retain padding for numerical consistency; block drafters and confidence-based schedules keep their physical slot mappings. See [compact graph batches](operations.md#compact-graph-batch-mappings). | true |
 | `engine.sampling_candidates` | Number of likely tokens gathered per rank on the fast sampling path, from 1 to 256. Smaller values do less routine work but may need more expensive full-gather fallbacks. Fallback preserves the sampling distribution; this does not limit the client's `top_k`. | 128 |
@@ -419,6 +420,78 @@ Keep the template's choices unless you have measured both speed and quality.
 
 See the [Qwen3.8-27B NVFP4 model card](model_cards/Qwen3.8-27B-NVFP4.md)
 and [AutoRound notes](qwen38_autoround_int4_plan.md) for measured tradeoffs.
+
+### Expert weight streaming
+
+`engine.expert_streaming` selects `whole_expert_cache` or
+`adaptive_fractional_cache` for DeepSeek V4.1 MXFP4 and NVFP4 checkpoints. Both use the
+same bounded cache, reconstructed-expert scratch and pinned I/O staging.
+Required fields are `policy`, `budget_bytes` (the total per-rank expert
+subsystem budget) and `image_directory` (local indexed expert images).
+
+The NVFP4 two-node throughput template uses 16 I/O buffers, four read workers
+and queue depth 16. This wider demand-read window substantially reduces file
+waiting when experts miss; the staging pool is charged within `budget_bytes`.
+The program defaults remain two buffers, one worker and queue depth eight.
+
+On integrated GPUs such as GB10, expert reconstruction uses one GPU scatter
+per chunk for its packed payloads, scales and globals, reading registered
+staging memory directly. Discrete GPUs retain the pitched-copy path. Set
+`DGPP_EXPERT_GPU_SCATTER=0` to select pitched copies, or `1` to force the
+scatter path. Both paths copy weight bytes exactly and use the same reserved
+cache, reconstruction and staging allocations.
+
+For the optional b12x NVFP4 backend, `execution_slots` also bounds the number
+of reconstructed missing experts in one grouped kernel launch. Each slot
+includes canonical and prepared expert storage, charged inside `budget_bytes`;
+additional slots reduce the persistent cache capacity. A slot count of 24
+can hold all missing experts in four-row/top6 verification. File-worker count
+still controls concurrent chunk reads; reconstruction slots are not I/O
+threads. The default remains one slot, and the canonical backend retains its
+existing expert execution path.
+
+`minimum_fraction` accepts zero: cold experts may then lose all coverage after
+universal fractional startup. Both policies can retain demand-loaded weights
+without waiting for periodic adaptation; `adaptation_bytes` limits speculative
+promotion traffic only. Demand retention and native execution pass host and
+GB10 model/MoE fixtures; both formats passed full-model TP2 numerical comparisons.
+
+Serving omits serial payload checksums on each expert-image read. Image identity,
+index checksums, record geometry and complete reads are still checked. Set
+`DGPP_EXPERT_VERIFY_RECORDS=1` for per-read payload integrity diagnostics.
+
+Set `decode_graph: false` and `prefill_fold_overlap: false`.
+DeepSeek V4.1 supports `mtp: true` through eager DSpark verification. Greedy
+requests without penalties, logit bias or logprobs use speculative decoding,
+including tool calls and structured output. Draft predictions and target
+verification use the grammar at each proposed position; only accepted output
+advances the live grammar. Other requests retain ordinary decoding.
+`mtp_depth` defaults to the checkpoint's
+DSpark block width. `mtp_schedule: true` enables confidence-based depth
+selection and skips unused draft-chain calls; the default remains fixed depth.
+Keep `lookup_draft: false` and `lookup_tail: 0`. NVFP4 main weights use the existing main-only paged image;
+MXFP4 draft experts stay resident and their exact allocation is deducted from
+the same expert budget. Main-cache telemetry reports the remaining cache budget.
+For the measured NVFP4 C1 b12x workload, use `mtp: true`, `mtp_depth: 3`
+and `mtp_schedule: false` as the starting point. The short fixed-depth
+comparison favored depth two for prose and depth three for code; depth three
+also minimized combined decode time across the pair. Confidence scheduling
+remains deferred. On this C1 recipe, `bf16_weights: "bf12+bf16"` improves
+decode by about 3% with identical outputs, using an additional approximately
+0.46 GiB per rank for the lossless head companion. For C16 aggregate
+throughput, retain `mtp: false` and the default canonical expert backend
+(`DGPP_MOE_B12X` unset). The current template uses this recipe with the wider
+read window: both policies reach about 103 aggregate decode tok/s with zero
+warm expert reads, versus about 33 for fixed-depth-three b12x speculation
+under the same total expert budget. See the serving results in
+[adaptive expert residency](adaptive-expert-residency.md).
+External drafts and runtime adapters are currently unsupported with paging.
+Both MXFP4 and NVFP4 have recorded TP2 serving comparisons; physical DRAM
+bandwidth remains unmeasured. DSpark fixtures cover both formats, both policies,
+batched accepts, rejects, rollback and slot reuse. The implementation also samples node available memory
+and image-device busy time to pause background promotion/prefetch under pressure;
+demand reads continue and fixed slabs are not reclaimed. See the
+[configuration example, limits and validation status](adaptive-expert-residency.md).
 
 ### Attention precision
 
@@ -518,7 +591,7 @@ settings; use your deployment's measured values.
 
 | Key | What it controls and what to expect | Default |
 |---|---|---|
-| `engine.mtp_schedule` | Choose how many leading drafts to verify from their predicted acceptance and the cost settings below. Requires graph execution with MTP or DFlash2. Supports DSpark, DFlash2 and native MTP confidence estimates. Sampled requests use it with greedy proposals; drawn proposals keep their configured depth. Can avoid wasted verification work. Cannot be combined with `dflash_batch_rows` or `lookup_tail`. Qwen at 16 slots and MTP depth 3 exceeds the available graph variants; leave it off there. | false |
+| `engine.mtp_schedule` | Choose how many leading drafts to verify from their predicted acceptance and the cost settings below. Requires graph execution with MTP or DFlash2, or eager DeepSeek V4.1 expert-streaming MTP. Supports DSpark, DFlash2 and native MTP confidence estimates. Sampled requests use it with greedy proposals; drawn proposals keep their configured depth. Can avoid wasted verification work. Cannot be combined with `dflash_batch_rows` or `lookup_tail`. Qwen at 16 slots and MTP depth 3 exceeds the available graph variants; leave it off there. | false |
 | `engine.mtp_schedule_row_ms` | Estimated milliseconds for one verification row; must be greater than 0. Higher row cost makes extra drafts less attractive. Set from measurements of the deployment: a sweep of fixed depths gives the row cost as the slope of the pass time and the base as its intercept (DeepSeek-V4.1-Flash-1017 on four nodes, 2026-10-18: 5.17 ms per row on a 31.1 ms base; the template carries 5.2 / 31.1). | 8.0 ms |
 | `engine.mtp_schedule_base_ms` | Estimated fixed milliseconds per pass, including draft work; must be nonnegative. Higher fixed cost makes accepting several tokens in one pass more valuable. Used with row cost to estimate throughput. | 28.0 ms |
 | `engine.mtp_schedule_lambda` | Value assigned to decode time, in tokens/ms. Higher values demand more expected benefit before checking another draft. `0` derives an initial value as `1 / (base_ms + row_ms)`; a positive value supplies the floor for adaptation. | 0 (derived) |

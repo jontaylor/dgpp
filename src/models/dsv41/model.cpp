@@ -1,4 +1,5 @@
 #include "models/dsv41/model.hpp"
+#include "kernels/sm12x_moe.hpp"
 
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/exl3_gemv.hpp"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -16,10 +18,74 @@
 #include "common/log.hpp"
 #include "kernels/glm_norm.hpp"
 #include "kernels/kernels.hpp"
+#include "loaders/expert_cache_cuda.hpp"
 
 namespace dgpp {
 using session_detail::dev_alloc;
 using session_detail::pinned_alloc;
+
+namespace {
+expert::StoreIdentity paging_identity(const Dsv41TextConfig& cfg, int rank, int world,
+                                      const Dsv41ExpertPaging& paging) {
+  expert::StoreIdentity id;
+  id.format = cfg.experts_nvfp4 ? expert::Format::kNvfp4 : expert::Format::kMxfp4;
+  id.hidden = cfg.hidden_size;
+  id.intermediate = cfg.moe_intermediate_size;
+  id.chunk_intermediate = paging.chunk_intermediate;
+  id.rank = static_cast<uint32_t>(rank);
+  id.world = static_cast<uint32_t>(world);
+  return id;
+}
+expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, int world,
+    const Dsv41ExpertPaging& paging, bool mtp) {
+  auto cache = paging.cache;
+  cache.packed_nvfp4 = cfg.experts_nvfp4 && sm12x_moe_enabled(cfg.hidden_size,
+      cfg.moe_intermediate_size / world, cfg.n_routed_experts, cfg.num_experts_per_tok);
+  if (cfg.experts_nvfp4 && mtp) {
+    auto resident = cfg, descriptors = cfg;
+    resident.runtime_page_experts = false;
+    descriptors.runtime_page_experts = true;
+    descriptors.runtime_resident_draft_experts = false;
+    uint64_t draft_bytes = 0;
+    for (int layer = cfg.num_hidden_layers; layer < cfg.max_layer(); ++layer)
+      draft_bytes += Dsv41LayerStream::layer_bytes(resident, layer, rank, world) -
+          Dsv41LayerStream::layer_bytes(descriptors, layer, rank, world);
+    if (draft_bytes >= cache.planner.budget_bytes)
+      throw std::invalid_argument("Dsv41Model: expert budget cannot cover resident DSpark draft experts");
+    cache.planner.budget_bytes -= draft_bytes;
+  }
+  return cache;
+}
+Dsv41TextConfig paging_config(const Dsv41TextConfig& source, Dsv41Residency residency,
+    const Dsv41ExpertPaging* paging, int rank, int world, bool mtp) {
+  auto cfg = source;
+  if (!paging) {
+    if (cfg.runtime_page_experts)
+      throw std::invalid_argument("Dsv41Model: runtime_page_experts requires explicit cache options");
+    return cfg;
+  }
+  if (residency != Dsv41Residency::Resident || cfg.weights_exl3 || cfg.fp4_block_size != 32 ||
+      cfg.num_hidden_layers <= 0 || cfg.n_routed_experts <= 0 ||
+      (mtp && (cfg.num_nextn_predict_layers <= 0 || cfg.dspark_n_routed_experts <= 0)) ||
+      paging->image_directory.empty() || !paging->adapt_every_routes || rank < 0 || world <= 0)
+    throw std::invalid_argument("Dsv41Model: expert paging needs a resident native-FP4 backbone and bounded cache options");
+  const auto id = paging_identity(cfg, rank, world, *paging);
+  const auto cache = paging_cache_config(cfg, rank, world, *paging, mtp);
+  const auto memory = expert::expert_cache_memory(id, cache);
+  const auto chunks = expert::partition(id.hidden, id.intermediate, id.world, id.rank, id.chunk_intermediate, id.format);
+  const size_t population = static_cast<size_t>(cfg.num_hidden_layers) * cfg.n_routed_experts +
+      (mtp && !cfg.experts_nvfp4 ? static_cast<size_t>(cfg.num_nextn_predict_layers) * cfg.dspark_n_routed_experts : 0);
+  auto planner_cfg = cache.planner;
+  planner_cfg.reserved_bytes = memory.budget_bytes - memory.cache_slots * memory.cache_slot_bytes;
+  // Validate the entire model's rounded fractional floor before the loader
+  // allocates even its backbone, not just one layer's expert population.
+  expert::ResidencyPlanner planner(planner_cfg, std::vector<expert::ExpertSpec>(population,
+      expert::ExpertSpec{std::vector<uint64_t>(chunks.size(), memory.cache_slot_bytes), 1.0}));
+  cfg.runtime_page_experts = true;
+  cfg.runtime_resident_draft_experts = cfg.experts_nvfp4 && mtp;
+  return cfg;
+}
+}
 
 // ---------------------------------------------------------------------------
 // The shapes.
@@ -84,9 +150,9 @@ int Dsv41Model::tail_ordinal(int layer) const { return tail_ord_[static_cast<siz
 Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint_dir,
                        int max_tokens, int64_t max_cache_tokens, Dsv41Residency residency,
                        BoundaryReducer* boundary, int tp_rank, int tp_world, int max_requests,
-                       bool mtp, int decode_rows, bool serving_logits)
-    : cfg_(cfg),
-      loader_(cfg, checkpoint_dir, tp_rank, tp_world, residency,
+                       bool mtp, int decode_rows, bool serving_logits, const Dsv41ExpertPaging* expert_paging)
+    : cfg_(paging_config(cfg, residency, expert_paging, tp_rank, tp_world, mtp)),
+      loader_(cfg_, checkpoint_dir, tp_rank, tp_world, residency,
               tp_world > 1 ? Dsv41HeadSharding::VocabSharded : Dsv41HeadSharding::Full,
               mtp && residency == Dsv41Residency::Resident),
       world_(tp_world) {
@@ -115,6 +181,15 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   loader_.set_reader_stream(stream_);
   log_memory_ledger("dsv41: loader opened");
   const int H = cfg_.hidden_size;
+  std::shared_ptr<expert::ExpertStore> expert_store;
+  if (expert_paging) {
+    const bool page_drafts = mtp && !cfg_.runtime_resident_draft_experts;
+    std::filesystem::create_directories(expert_paging->image_directory);
+    const auto image = std::filesystem::path(expert_paging->image_directory) /
+        ("tp" + std::to_string(tp_world) + "-rank" + std::to_string(tp_rank) +
+         "-chunk" + std::to_string(expert_paging->chunk_intermediate) + "-draft" + std::to_string(page_drafts) + ".experts");
+    expert_store = loader_.prepare_expert_image(image.string(), expert_paging->chunk_intermediate, page_drafts, expert_paging->io_mode);
+  }
   globals_ = loader_.load_globals();
   embed_sharded_ = globals_.embed_vocab_count < cfg_.vocab_size;
   if (embed_sharded_ && boundary == nullptr)
@@ -128,6 +203,31 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   if (residency == Dsv41Residency::Resident) {
     for (int l = 0; l < (mtp ? cfg_.max_layer() : cfg_.num_hidden_layers); ++l) (void)loader_.load_layer(l);
     loader_.release_sources();
+  }
+  if (expert_paging) {
+    expert_cache_ = std::make_unique<expert::ExpertCache>(expert_store,
+        paging_cache_config(cfg_, tp_rank, tp_world, *expert_paging, mtp),
+        expert::cuda_cache_storage(expert_store->identity(), stream_,
+            paging_cache_config(cfg_, tp_rank, tp_world, *expert_paging, mtp).packed_nvfp4),
+        expert::linux_expert_resource_sampler(expert_paging->image_directory));
+    expert_cache_->initialize();
+    expert_adapt_every_routes_ = expert_paging->adapt_every_routes;
+    expert_cache_map_.resize(static_cast<size_t>(cfg_.max_layer()));
+    for (int l = 0; l < (mtp && !cfg_.runtime_resident_draft_experts ? cfg_.max_layer() : cfg_.num_hidden_layers); ++l)
+      expert_cache_map_[l].resize(static_cast<size_t>(cfg_.is_draft(l) ? cfg_.dspark_n_routed_experts : cfg_.n_routed_experts));
+    const auto& population = expert_cache_->experts();
+    for (size_t e = 0; e < population.size(); ++e)
+      expert_cache_map_[population[e].layer][population[e].expert] = e;
+    // Fold overlap has an all-resident expert-table contract. Paging starts
+    // with the ordinary eager walk and model-stream transfers at boundaries.
+    fold_overlap_ = false;
+    const auto& memory = expert_cache_->memory();
+    DGPP_LOG_INFO("dsv41 expert cache: budget={} cache={}x{} execution={}x{} staging={} unallocated={}",
+        memory.budget_bytes, memory.cache_slots, memory.cache_slot_bytes, memory.execution_slots,
+        memory.execution_slot_bytes, memory.staging_bytes, memory.unallocated_bytes);
+    if (expert_cache_->packed_nvfp4())
+      DGPP_LOG_INFO("dsv41 experts: b12x SM121 W4A16, BF16 activations, FP32 slots, capacity {}, graph/shared lane enabled",
+                    Sm12xMoe::kCapacity);
   }
   log_memory_ledger("dsv41: layers resident, sources released");
   {
@@ -363,6 +463,7 @@ HeadMatrix Dsv41Model::draft_head_matrix() const {
 
 Dsv41Model::~Dsv41Model() {
   cudaStreamSynchronize(stream_);
+  expert_cache_.reset();
   for (cudaEvent_t e : ov_ev_)
     if (e) cudaEventDestroy(e);
   csa2_.reset();
@@ -426,10 +527,11 @@ Dsv41Model::~Dsv41Model() {
 // ---------------------------------------------------------------------------
 // The memory plan.
 // ---------------------------------------------------------------------------
-Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int max_tokens,
+Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg, int max_tokens,
                                                int64_t max_cache_tokens, int tp_rank, int tp_world,
                                                Dsv41Residency residency, int max_requests, bool mtp,
-                                               int decode_rows, bool serving_logits) {
+                                               int decode_rows, bool serving_logits, const Dsv41ExpertPaging* expert_paging) {
+  const auto cfg = paging_config(source_cfg, residency, expert_paging, tp_rank, tp_world, mtp);
   if (max_tokens <= 0) throw std::invalid_argument("plan_memory: max_tokens must be positive");
   if (mtp && (cfg.num_nextn_predict_layers < 1 || cfg.dspark_target_layer_ids.empty()))
     throw std::invalid_argument("plan_memory: mtp needs the DSpark draft stages and target layers");
@@ -443,6 +545,12 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
   const int64_t cache_tokens =
       ((std::max<int64_t>(max_cache_tokens, max_tokens) + kBlockTokens - 1) / kBlockTokens) * kBlockTokens;
   MemoryPlan plan;
+  if (expert_paging) {
+    const auto memory = expert::expert_cache_memory(paging_identity(cfg, tp_rank, tp_world, *expert_paging),
+        paging_cache_config(cfg, tp_rank, tp_world, *expert_paging, mtp));
+    plan.add("expert cache (bounded chunks, reconstruction slots, pinned I/O)",
+             memory.allocated_bytes() - memory.staging_bytes, memory.staging_bytes);
+  }
   plan.context_tokens = std::min<int64_t>(cache_tokens, cfg.max_position_embeddings);
   const size_t M = static_cast<size_t>(max_tokens);
   const size_t R = static_cast<size_t>(max_requests);
@@ -498,13 +606,13 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
   }
   {
     const GlmMoeConfig moe_cfg = cfg.moe_config(static_cast<int>(geo.local_inter), false);
-    const int slots = residency == Dsv41Residency::Resident ? cfg.num_hidden_layers : 0;
+    const int slots = residency == Dsv41Residency::Resident && !expert_paging ? cfg.num_hidden_layers : 0;
     size_t moe_pinned = 0;
     const size_t moe_dev = GlmMoeLayer::scratch_bytes(moe_cfg, max_tokens, rows, slots, &moe_pinned);
     plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
     if (mtp) {
       const GlmMoeConfig draft_cfg = cfg.moe_config(static_cast<int>(geo.local_inter), true);
-      const int draft_slots = residency == Dsv41Residency::Resident ? cfg.num_nextn_predict_layers : 0;
+      const int draft_slots = residency == Dsv41Residency::Resident && !expert_paging ? cfg.num_nextn_predict_layers : 0;
       size_t draft_pinned = 0;
       const size_t draft_dev = GlmMoeLayer::scratch_bytes(draft_cfg, max_tokens, rows, draft_slots, &draft_pinned);
       plan.add("dspark moe scratch (the draft stages' routed chain)", draft_dev, draft_pinned);
@@ -621,7 +729,7 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   else csa2_->set_decode_side(nullptr, nullptr, nullptr);
   if (cfg_.is_draft(r.layer)) {
     if (!draft_moe_) {
-      const int slots = loader_.residency() == Dsv41Residency::Resident ? cfg_.num_nextn_predict_layers : 0;
+      const int slots = loader_.residency() == Dsv41Residency::Resident && !expert_cache_ ? cfg_.num_nextn_predict_layers : 0;
       draft_moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), draft_moe_cfg_, max_tokens_, max_decode_rows_, slots);
     } else {
       draft_moe_->rebind(moe_view(r.moe));
@@ -629,7 +737,7 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
     return;
   }
   if (!moe_) {
-    const int slots = loader_.residency() == Dsv41Residency::Resident ? cfg_.num_hidden_layers : 0;
+    const int slots = loader_.residency() == Dsv41Residency::Resident && !expert_cache_ ? cfg_.num_hidden_layers : 0;
     moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), moe_cfg_, max_tokens_, max_decode_rows_, slots);
   } else {
     moe_->rebind(moe_view(r.moe));
@@ -707,6 +815,7 @@ void Dsv41Model::read_state_snapshot(int req, const uint8_t* s) {
 }
 
 void Dsv41Model::graph_prepare() {
+  if (expert_cache_) throw std::logic_error("Dsv41Model: expert paging requires the eager engine");
   if (loader_.residency() != Dsv41Residency::Resident)
     throw std::logic_error("session_graph_prepare: the decode graph needs a resident stack");
   for (int layer = 0; layer < (mtp_ ? cfg_.max_layer() : cfg_.num_hidden_layers); ++layer) {
@@ -722,6 +831,71 @@ void Dsv41Model::graph_prepare() {
 // ---------------------------------------------------------------------------
 // The DSpark draft (plan D8).
 // ---------------------------------------------------------------------------
+Dsv41Model::Outputs Dsv41Model::session_draft_batch(
+    const std::vector<int>& reqs, const std::vector<std::vector<int64_t>>& tokens) {
+  if (!mtp_ || reqs.empty() || reqs.size() != tokens.size() ||
+      reqs.size() * static_cast<size_t>(cfg_.dspark_block_size) > static_cast<size_t>(max_decode_rows_))
+    throw std::invalid_argument("DSpark draft batch: invalid batch size");
+  int width = 0;
+  for (size_t q = 0; q < reqs.size(); ++q) {
+    const int req = reqs[q];
+    check_req(req, "DSpark draft batch");
+    if (std::find(reqs.begin(), reqs.begin() + q, req) != reqs.begin() + q ||
+        tokens[q].empty() || tokens[q].size() > kSpecRows ||
+        session_pos_[req] <= 0 || mtp_pos_[req] + static_cast<int64_t>(tokens[q].size()) != session_pos_[req])
+      throw std::invalid_argument("DSpark draft batch: invalid request rows");
+    for (int64_t token : tokens[q])
+      if (token < 0 || token >= vocab_size_) throw std::invalid_argument("DSpark draft batch: invalid token");
+    width = std::max(width, static_cast<int>(tokens[q].size()));
+  }
+  const int groups = static_cast<int>(reqs.size());
+  const int total = groups * width;
+  if (total > max_decode_rows_) throw std::invalid_argument("DSpark draft batch: too many accepted rows");
+  for (int q = 0; q < groups; ++q) for (int r = 0; r < width; ++r) {
+    const int at = q * width + r;
+    const bool live = r < static_cast<int>(tokens[q].size());
+    h_req_ids_[at] = reqs[q];
+    h_step_pos_[at] = live ? mtp_pos_[reqs[q]] + r : -1;
+    h_token_[at] = live ? tokens[q][r] : 0;
+  }
+  step_tokens_ = d_tokens_;
+  glm_upload_i32(h_req_ids_, d_req_ids_, total, stream_);
+  glm_upload_i64(h_step_pos_, d_step_pos_, total, stream_);
+  glm_upload_i64(h_token_, d_tokens_, total, stream_);
+  draft_first(reqs.front(), d_tokens_, d_step_pos_, d_req_ids_, total,
+              true, false, groups, groups);
+  if (boundary_) boundary_->settle();
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  for (int q = 0; q < groups; ++q) {
+    mtp_pos_[reqs[q]] += static_cast<int64_t>(tokens[q].size());
+    push_mtp_position(reqs[q]);
+  }
+  Outputs out;
+  out.lm_vocab_begin = lm_vocab_begin_;
+  out.lm_vocab_count = lm_vocab_count_;
+  out.logits.assign(h_tail_logits_, h_tail_logits_ + static_cast<size_t>(groups) * lm_vocab_count_);
+  return out;
+}
+
+Dsv41Model::Outputs Dsv41Model::session_draft_chain_batch(const std::vector<int64_t>& tokens) {
+  if (!mtp_ || tokens.empty() || tokens.size() * static_cast<size_t>(cfg_.dspark_block_size) >
+      static_cast<size_t>(max_decode_rows_))
+    throw std::invalid_argument("DSpark chain batch: invalid size");
+  for (size_t q = 0; q < tokens.size(); ++q) {
+    if (tokens[q] < -1 || tokens[q] >= vocab_size_) throw std::invalid_argument("DSpark chain batch: invalid token");
+    h_token_[q] = tokens[q];
+  }
+  const int groups = static_cast<int>(tokens.size());
+  glm_upload_i64(h_token_, d_tokens_, groups, stream_);
+  draft_chain_row(0, d_tokens_, false, groups, groups);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  Outputs out;
+  out.lm_vocab_begin = lm_vocab_begin_;
+  out.lm_vocab_count = lm_vocab_count_;
+  out.logits.assign(h_tail_logits_, h_tail_logits_ + static_cast<size_t>(groups) * lm_vocab_count_);
+  return out;
+}
+
 void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row, bool capture,
                               int head_rows, int batch_requests) {
   if (head_rows > logits_capacity_rows_)
@@ -769,6 +943,9 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
   }
   draft_first(req, tokens, d_pos, d_req, T, decode_row, capture, head_rows, batch_requests,
                decode_row ? 0 : segment_of(req).row0);
+  // Eager token picks use the host bus after this draft walk. A CUDA
+  // stream drain alone does not retire the transport's outstanding folds.
+  if (!capture && boundary_) boundary_->settle();
 }
 
 void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T,
@@ -1096,6 +1273,8 @@ void Dsv41Model::join_comb() {
 
 // ---- the prefill's fold overlap (model.hpp) -------------------------------------
 void Dsv41Model::set_prefill_fold_overlap(bool on, int min_rows, bool without_reducer) {
+  if (on && expert_cache_)
+    throw std::invalid_argument("set_prefill_fold_overlap: expert paging requires the ordinary eager walk");
   if (min_rows < 2 * kBlockTokens)
     throw std::invalid_argument("set_prefill_fold_overlap: min_rows under two blocks");
   fold_overlap_ = on;
@@ -1472,7 +1651,31 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   mhc_site(cur_, fw, r.ffn_norm, T, rows.decode, decode_prefix);
   if (debug_capture_) cap.x_ffn = grab(x_, static_cast<size_t>(T) * H);
   uint16_t* ffn_out = stage(y_, T, H, rows.capture);
-  if (draft)
+  if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
+    if (rows.capture) throw std::logic_error("Dsv41Model: expert paging cannot execute in a captured walk");
+    auto& moe = draft ? *draft_moe_ : *moe_;
+    const auto& mapping = expert_cache_map_[static_cast<size_t>(layer)];
+    if (rows.decode || draft) {
+      moe.enqueue_paged(x_, ffn_out, T, *expert_cache_, mapping, stream_, MoeExpertKernel::kGemv, rows.trace);
+    } else {
+      // Keep decoder-prefix rows on their GEMV recipe while readers use the
+      // existing tensor-core prefill chain. Each row still executes once.
+      if (decode_prefix)
+        moe.enqueue_paged(x_, ffn_out, decode_prefix, *expert_cache_, mapping, stream_, MoeExpertKernel::kGemv, rows.trace);
+      if (decode_prefix < T) {
+        MoeTraceStaging reader_trace;
+        if (rows.trace) {
+          const size_t offset = static_cast<size_t>(decode_prefix) * moe.config().top_k;
+          reader_trace.ids = rows.trace->ids ? rows.trace->ids + offset : nullptr;
+          reader_trace.weights = rows.trace->weights ? rows.trace->weights + offset : nullptr;
+          reader_trace.biased = rows.trace->biased ? rows.trace->biased + static_cast<size_t>(decode_prefix) * moe.config().n_experts : nullptr;
+        }
+        const size_t hidden_offset = static_cast<size_t>(decode_prefix) * H;
+        moe.enqueue_paged(x_ + hidden_offset, ffn_out + hidden_offset, T - decode_prefix,
+            *expert_cache_, mapping, stream_, MoeExpertKernel::kMma, rows.trace ? &reader_trace : nullptr);
+      }
+    }
+  } else if (draft)
     draft_moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot);
   else if (rows.decode)
     moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot);
@@ -1490,6 +1693,10 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);
   stream_update(ffn_out, T);
+  if (expert_cache_ && expert_cache_->observations() - expert_last_adapt_ >= expert_adapt_every_routes_) {
+    expert_cache_->adapt();
+    expert_last_adapt_ = expert_cache_->observations();
+  }
   if (debug_capture_) debug_sites_.push_back(std::move(cap));
 }
 
@@ -1506,6 +1713,8 @@ bool Dsv41Model::prefill_batch_fits(const RowRun& run) const {
 }
 
 Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
+  if (run.capture && expert_cache_)
+    throw std::logic_error("run_rows: expert paging requires eager execution");
   const int T = run.T, req = run.req;
   if (run.capture && loader_.residency() != Dsv41Residency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
@@ -1664,7 +1873,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // spans) on a multi-rank world, never a capture, a traced or a
   // diagnostic walk; the boundary per walk shape (the bounded decoder
   // re-packs the rows at dec0: its own, if any — the segments are short).
-  const bool overlap_walk = fold_overlap_ && !run.decode && !run.capture && !capture_layers &&
+  const bool overlap_walk = !expert_cache_ && fold_overlap_ && !run.decode && !run.capture && !capture_layers &&
                             debug_teacher_ == nullptr && !traces &&
                             (boundary_ != nullptr || fold_overlap_without_reducer_);
   for (int layer = 0; layer < last_layer; ++layer) {

@@ -304,6 +304,9 @@ struct ServeGraphEngineOf final : ServeGraphEngine {
 struct ServeFamily {
   virtual ~ServeFamily() = default;
   virtual const char* name() const = 0;
+  virtual void set_expert_streaming(const dgpp::expert::PagingOptions&) {
+    throw std::invalid_argument("engine.expert_streaming currently supports only DeepSeek V4.1 native FP4");
+  }
   virtual int64_t vocab_size() const = 0;
   virtual const std::vector<int64_t>& eos_token_ids() const = 0;
   virtual int64_t block_tokens() const = 0;
@@ -757,6 +760,7 @@ struct GlmDsaFamily final : ServeFamily {
 struct Dsv41Family final : ServeFamily {
   dgpp::Dsv41TextConfig cfg;
   std::string ckpt;
+  std::optional<dgpp::Dsv41ExpertPaging> paging;
   std::vector<int64_t> eos;
   std::unique_ptr<dgpp::Dsv41Model> model;
   Dsv41Family(const std::string& checkpoint, int index_topk, int candidate_topk_blocks, int candidate_block_size)
@@ -776,6 +780,10 @@ struct Dsv41Family final : ServeFamily {
                     "checkpoint's {} from {} x {}; engine.index_topk / candidate_topk_blocks / candidate_block_size)",
                     cfg.index_topk, cfg.candidate_topk_blocks, cfg.candidate_block_size, shipped_topk,
                     shipped_blocks, shipped_block);
+  }
+  void set_expert_streaming(const dgpp::expert::PagingOptions& options) override {
+    if (cfg.weights_exl3) throw std::invalid_argument("engine.expert_streaming does not support EXL3 checkpoints");
+    paging = options;
   }
   const char* name() const override { return "deepseek_v41"; }
   int64_t vocab_size() const override { return cfg.vocab_size; }
@@ -809,8 +817,8 @@ struct Dsv41Family final : ServeFamily {
                         bool mtp, int decode_rows) const override {
     return dgpp::Dsv41Model::plan_memory(
         cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
-        fabric ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming, slots,
-        fabric && mtp, decode_rows, /*serving_logits=*/true);
+        (fabric || paging) ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming, slots,
+        fabric && mtp, decode_rows, /*serving_logits=*/true, paging ? &*paging : nullptr);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Dsv41Model::session_snapshot_bytes(cfg, world_, mtp);
@@ -827,9 +835,9 @@ struct Dsv41Family final : ServeFamily {
           "(deepseek-ai/DeepSeek-V4.1-Flash-1017) whose shards hold them (docs/deepseek_v41_flash_exl3_plan.md §1.3)");
     model = std::make_unique<dgpp::Dsv41Model>(
         cfg, ckpt, forward_rows, pool_tokens,
-        fabric ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming, reducer,
+        (fabric || paging) ? dgpp::Dsv41Residency::Resident : dgpp::Dsv41Residency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows,
-        /*serving_logits=*/true);
+        /*serving_logits=*/true, paging ? &*paging : nullptr);
   }
   void destroy_model() override { model.reset(); }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
@@ -1398,7 +1406,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
 void check_memory_plan(
     int rank, const dgpp::MemoryPlan& plan,
     size_t prefix_arena_bytes, size_t engine_bytes, int64_t block_tokens,
-    const std::function<dgpp::MemoryPlan(int64_t)>& plan_at) {
+    const std::function<dgpp::MemoryPlan(int64_t)>& plan_at, bool expert_paging) {
   size_t free_bytes = 0, total_bytes = 0;
   DGPP_CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
   const size_t available = dgpp::host_memory_available_bytes();
@@ -1458,9 +1466,10 @@ void check_memory_plan(
       "rank {}: the configuration needs {} plus {} headroom but this node has {} free — "
       "refusing to allocate (the largest items: {}).{} Lower engine.kv_capacity, "
       "engine.max_concurrency or engine.prefix_cache_gib, or choose a smaller "
-      "engine.kv_dtype.",
+      "engine.kv_dtype.{}",
       rank, gib(static_cast<double>(need)), gib(static_cast<double>(kMemoryHeadroomBytes)),
-      gib(static_cast<double>(budget)), top, hint));
+      gib(static_cast<double>(budget)), top, hint,
+      expert_paging ? " For expert paging, also lower engine.expert_streaming.budget_bytes." : ""));
 }
 
 // The rank-0 serving stack, shared by both worlds: everything above
@@ -1633,7 +1642,24 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   dgpp::serve::EngineWatchdog engine_watchdog(
       *engine->prefill_monitor(), std::chrono::seconds(120), collective_progress);
   DGPP_LOG_INFO("serve: engine progress deadline 120 s (scheduler passes, prefill progress and completed collectives)");
+  engine->release_execution_thread();
   std::thread engine_loop([&] {
+    try {
+      engine->bind_execution_thread();
+    } catch (const std::exception& e) {
+      fail_service(e.what());
+      drained.store(true);
+      return;
+    }
+    struct ReleaseExecutionThread {
+      dgpp::sched::SchedulerEngine* engine;
+      ~ReleaseExecutionThread() {
+        try { engine->release_execution_thread(); }
+        catch (const std::exception& e) {
+          DGPP_LOG_ERROR("serve: engine thread ownership release failed: {}", e.what());
+        }
+      }
+    } release_execution_thread{engine};
     const auto pass = [&] {
       return journal
                  ? service.engine_pass(
@@ -1736,6 +1762,7 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
     std::_Exit(2);
   }
   engine_loop.join();
+  engine->bind_execution_thread();  // orderly teardown returns to startup's thread
   if (oplog) oplog->flush();  // the op stream's tail — the file is the run's
   DGPP_LOG_INFO("serve: stopped cleanly");
   return 0;
@@ -2001,6 +2028,7 @@ int main(int argc, char** argv) {
   int max_connections = 64;
   int world = 1, rank = 0, rendezvous_timeout_ms = 120000;
   bool no_eos = false, decode_graph = false, mtp = false;
+  std::optional<dgpp::expert::PagingOptions> expert_streaming;
   bool runtime_adapters = false;
   bool runtime_adapter_verify_weights = false;
   std::string runtime_adapter_path, runtime_adapter_id;
@@ -2144,6 +2172,7 @@ int main(int argc, char** argv) {
     max_connections = e.max_connections;
     no_eos = e.no_eos;
     decode_graph = e.decode_graph;
+    expert_streaming = e.expert_streaming;
     mtp = e.mtp;
     if (dflash_model.empty()) dflash_model = e.dflash_model;  // the flag wins
     dflash_verify_graph = e.dflash_verify_graph;
@@ -2640,7 +2669,8 @@ int main(int argc, char** argv) {
                    : std::string("off")) +
            (nvme_cache_reuse_binding.empty() ? std::string()
                                              : " nvme_reuse=" + nvme_cache_reuse_binding) +
-           (runtime_adapter_id.empty() ? "" : " runtime_adapter=" + runtime_adapter_id);
+           (runtime_adapter_id.empty() ? "" : " runtime_adapter=" + runtime_adapter_id) +
+           (expert_streaming ? " expert_streaming=" + dgpp::serve::expert_paging_json(*expert_streaming) : "");
   };
   // Dory1.0-4B is a one-rank family (the reference refuses
   // tensor_parallel_size != 1; docs/dory_plan.md §2): refuse a world > 1
@@ -2745,6 +2775,7 @@ int main(int argc, char** argv) {
         ws.queue_limit = queue_limit;
         ws.no_eos = no_eos;
         ws.decode_graph = decode_graph;
+        ws.expert_streaming = expert_streaming;
         ws.mtp = mtp;
         ws.mtp_depth = mtp_depth;
         ws.mtp_schedule = mtp_schedule;
@@ -2871,6 +2902,7 @@ int main(int argc, char** argv) {
         queue_limit = ws.queue_limit;
         no_eos = ws.no_eos;
         decode_graph = ws.decode_graph;
+        expert_streaming = ws.expert_streaming;
         mtp = ws.mtp;
         mtp_depth = ws.mtp_depth;
         mtp_schedule = ws.mtp_schedule;
@@ -3205,18 +3237,30 @@ int main(int argc, char** argv) {
     require(journal_port != fabric_port,
             "--journal-port must differ from --fabric-port");
   }
-  if (mtp && !decode_graph) {
+  if (expert_streaming && (decode_graph || prefill_fold_overlap || runtime_adapters || !dflash_model.empty())) {
+    DGPP_LOG_ERROR("engine.expert_streaming currently requires decode_graph=false, prefill_fold_overlap=false, "
+                   "runtime_adapters=false and no dflash_model");
+    return 2;
+  }
+  if (mtp && !decode_graph && !expert_streaming) {
     DGPP_LOG_ERROR("--mtp currently requires --decode-graph");
     return 1;
+  }
+  if (expert_streaming && mtp && (lookup_draft || lookup_tail)) {
+    DGPP_LOG_ERROR("eager expert-streaming MTP currently requires lookup_draft=false and lookup_tail=0");
+    return 2;
   }
   // The graph world: the fabric, or a world of one with the
   // decode graph — the resident model, the graph engine and MTP on a single
   // Spark over a bus whose collectives are the identity. Without the graph
   // a world of one streams the layers through the eager engine (below).
-  const bool graph_world = world > 1 || decode_graph;
-  if (max_concurrency > dgpp::kPickMaxRequests) {
+  const bool graph_world = world > 1 || decode_graph || expert_streaming.has_value();
+  // The larger fixed pick tables support plain expert-paged batches.
+  // Keep the established slot limit for other model/speculation recipes.
+  const int request_slot_limit = expert_streaming ? dgpp::kPickMaxRequests : 16;
+  if (max_concurrency > request_slot_limit) {
     DGPP_LOG_ERROR("--max-concurrency must be at most {} request slots (got {})",
-                   dgpp::kPickMaxRequests, max_concurrency);
+                   request_slot_limit, max_concurrency);
     return 1;
   }
   // Validate sampling and admission options before constructing the model.
@@ -3278,7 +3322,7 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--stats-interval-s must be >= 0, got {}", stats_interval_s);
     return 2;
   }
-  if (mtp_schedule && !((mtp || !dflash_model.empty()) && decode_graph)) {
+  if (mtp_schedule && !((mtp || !dflash_model.empty()) && (decode_graph || expert_streaming))) {
     DGPP_LOG_ERROR("--mtp-schedule needs --decode-graph with --mtp or a DFlash2 drafter (the scheduled verify depth is a graph-engine feature)");
     return 2;
   }
@@ -3388,6 +3432,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma", index_topk, candidate_topk_blocks,
                     candidate_block_size, activations);
+    if (expert_streaming) family->set_expert_streaming(*expert_streaming);
     if (runtime_adapters) {
       const auto* glm = dynamic_cast<GlmDsaFamily*>(family.get());
       if (!glm) throw std::runtime_error("runtime adapter requires GLM DSA");
@@ -3867,7 +3912,7 @@ int main(int argc, char** argv) {
       };
       try {
         check_memory_plan(rank, plan_at(pool_tokens), prefix_arena_bytes, engine_bytes,
-                          block_tokens, plan_at);
+                          block_tokens, plan_at, expert_streaming.has_value());
         dgpp::log_memory_ledger(std::format("rank {} after the plan check", rank));
       } catch (const std::runtime_error& e) {
         DGPP_LOG_ERROR("{}", e.what());
@@ -4015,7 +4060,7 @@ int main(int argc, char** argv) {
                                 rank, world, /*fabric=*/true, max_concurrency, mtp, decode_rows);
           };
           check_memory_plan(rank, plan_at(pool_tokens), prefix_arena_bytes, engine_bytes,
-                            block_tokens, plan_at);
+                            block_tokens, plan_at, expert_streaming.has_value());
         dgpp::log_memory_ledger(std::format("rank {} after the plan check", rank));
         }
         const auto t_model = std::chrono::steady_clock::now();
@@ -4218,6 +4263,12 @@ int main(int argc, char** argv) {
               dgpp::make_fabric_sample(bus.get(), rank, world, sample_prefix.data, sample_gather.data,
                                        family->vocab_size()),
               &grammar_vocab, prefix_slots);
+          engine->set_prefill_group(expert_streaming.has_value() && prefill_group);
+          if (mtp) engine->configure_eager_mtp(mtp_depth,
+              [&, rank, world](const std::vector<dgpp::sample::Candidate>& rows) {
+                return dgpp::bus_greedy_pick_rows(*bus, rank, world, rows, pick_scratch, 60000);
+              }, mtp_schedule, static_cast<float>(mtp_schedule_row_ms), static_cast<float>(mtp_schedule_base_ms),
+              static_cast<float>(mtp_schedule_lambda), mtp_schedule_min_depth, mtp_schedule_adapt);
           knobs.admission = dgpp::serve::resolve_prefill_policy(
               knobs.admission, *engine, prefill_early_admission_override);
           peer_policy = knobs.admission;
@@ -4333,7 +4384,7 @@ int main(int argc, char** argv) {
                             decode_rows);
       };
       check_memory_plan(0, plan_at(pool_tokens), prefix_arena_bytes, engine_bytes,
-                        block_tokens, plan_at);
+                        block_tokens, plan_at, expert_streaming.has_value());
     }
     const auto t_model = std::chrono::steady_clock::now();
     family->build_model(/*reducer=*/nullptr, /*rank=*/0, /*world=*/1, /*fabric=*/false, forward_rows,

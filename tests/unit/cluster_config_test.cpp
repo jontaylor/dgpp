@@ -1019,3 +1019,25 @@ DGPP_TEST(cluster_config_runtime_adapters_preserve_native_serving_settings) {
             "verification flag is strictly boolean");
   }
 }
+
+DGPP_TEST(cluster_expert_streaming_is_strict_and_requires_supported_eager_recipe) {
+  const std::string json = R"({"model":"fixture","world_size":1,"engine":{
+    "decode_graph":false,"prefill_fold_overlap":false,
+    "expert_streaming":{"policy":"adaptive_fractional_cache","budget_bytes":1073741824,
+      "image_directory":"/ssd/experts","minimum_fraction":0.125}}})";
+  const auto cfg = dgpp::serve::parse_cluster_config(json, "expert-test");
+  require(cfg.engine.expert_streaming.has_value(), "expert streaming configuration retained");
+  require(cfg.engine.expert_streaming->cache.planner.policy == dgpp::expert::Policy::kAdaptiveFractional,
+          "fractional policy selected explicitly");
+  auto speculative = json;
+  speculative.insert(speculative.find("\"decode_graph\""), "\"mtp\":true,");
+  require(dgpp::serve::parse_cluster_config(speculative, "expert-mtp").engine.mtp,
+          "eager expert streaming accepts MTP");
+  for (const auto* incompatible : {"decode_graph", "prefill_fold_overlap"}) {
+    auto bad = json;
+    const auto key = std::string("\"") + incompatible + "\":false";
+    const auto pos = bad.find(key);
+    bad.replace(pos, key.size(), std::string("\"") + incompatible + "\":true");
+    require(refusal(bad).find("expert_streaming") != std::string::npos, "incompatible engine feature refused by name");
+  }
+}

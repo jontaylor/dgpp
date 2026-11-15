@@ -1352,6 +1352,7 @@ void Scheduler::retire(int arrival, Result::Status status,
   // multi-token pass) leaves the model's state past the committed position
   // — the live snapshot cannot be taken there; the rolling entry stands.
   if (r.slot >= 0 && cache_on(r) && r.step_tail == 0 &&
+      engine_->prefix_snapshot_ready(r.slot) &&
       (reason == Result::Reason::kEos || reason == Result::Reason::kSteps)) {
     const int64_t align = std::max<int64_t>(1, prefix_info_.align);
     const int64_t committed =
@@ -2000,6 +2001,7 @@ Scheduler::Meters Scheduler::meters() const {
   m.records = static_cast<int64_t>(requests_.size());
   m.pool_blocks_total = engine_->pool_blocks_total();
   m.pool_blocks_in_use = engine_->pool_blocks_in_use();
+  m.expert_streaming = engine_->expert_paging_metrics();
   m.tokens_generated = tokens_generated_;
   m.reservations_grown = grows_;
   m.requests_shed_pool = pool_sheds_;
@@ -2076,6 +2078,7 @@ void Scheduler::rolling_snapshots() {
   for (size_t i = 0; i < requests_.size(); ++i) {  // arrival order
     Request& r = requests_[i];
     if (r.state != State::kActive || !cache_on(r)) continue;
+    if (!engine_->prefix_snapshot_ready(r.slot)) continue;
     if (std::find(mixed_stepped_.begin(), mixed_stepped_.end(), static_cast<int>(i)) != mixed_stepped_.end()) continue;
     // Committed tokens: the prompt plus every generated token but the last
     // (pending — the next step writes it).

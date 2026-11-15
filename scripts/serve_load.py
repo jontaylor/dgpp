@@ -159,6 +159,32 @@ for _name, _topics in _EXTRA_TOPICS.items():
     CLASSES[_name].extend(_EXTRA_TEMPLATES[_name].format(topic=topic) for topic in _topics)
 PROMPTS.extend(CLASSES["chat"][4:12])
 
+# Preserve the original sixteen tasks, then add independent short prompts
+# for the larger plain expert-streaming batches. Other class corpora retain
+# their existing sixteen-task limit, enforced by phase().
+_WIDE_PROSE_TOPICS = [
+    "the Abbasid Caliphate", "the Ottoman Empire", "the Byzantine Empire",
+    "the Mughal Empire", "the Maurya Empire", "the Gupta Empire",
+    "the Achaemenid Empire", "the Sasanian Empire", "the Hittite kingdom",
+    "the Phoenician cities", "ancient Carthage", "the kingdom of Kush",
+    "the Mali Empire", "the Songhai Empire", "the kingdom of Aksum",
+    "the Swahili city states", "the Aztec Empire", "the Inca Empire",
+    "the Maya cities", "the Mississippian culture", "the Khmer Empire",
+    "the Srivijaya Empire", "the Majapahit Empire", "the Joseon dynasty",
+    "the Tang dynasty", "the Song dynasty", "the Tokugawa shogunate",
+    "the Meiji era", "the Mongol Empire", "the Timurid Empire",
+    "the Safavid dynasty", "the Polish Lithuanian Commonwealth",
+    "the Holy Roman Empire", "the Norman kingdoms", "the Carolingian Empire",
+    "the Viking settlements", "medieval Florence", "the Republic of Genoa",
+    "the Portuguese maritime empire", "the Spanish colonial empire",
+    "the Haitian Revolution", "the Mexican Revolution", "the unification of Italy",
+    "the unification of Germany", "the history of steam engines",
+    "the history of telegraph networks", "the history of vaccination",
+    "the history of aviation",
+]
+CLASSES["prose"].extend(_EXTRA_TEMPLATES["prose"].format(topic=t) for t in _WIDE_PROSE_TOPICS)
+PROMPTS.extend(CLASSES["prose"][16:])
+
 
 def check_corpus():
     """Prompt 0 of each class must still be fabric_mtp_classes.sh's prompt."""
@@ -273,7 +299,7 @@ def phase(host, port, model, c, max_tokens, think, prompt_base, prompts=None, te
     return metrics["wall_tokens_per_s"]
 
 
-def main(*, phase_runner=None, settle=None):
+def main(*, phase_runner=None, settle=None, argv=None):
     # Counter-based clients can reconcile every request group, including warmup
     # and isolation, before starting the next measured phase.
     run_phase = phase if phase_runner is None else phase_runner
@@ -293,11 +319,11 @@ def main(*, phase_runner=None, settle=None):
                          "its prompts from that class alone; 'all' runs every class")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 (default) is greedy; a positive value samples, for the pace at the card's defaults")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     cs = [int(x) for x in args.concurrency.split(",")]
-    if (args.repeat < 1 or args.max_tokens < 1 or args.warm < 0 or not 0 <= args.isolation <= 16
-            or any(c < 1 or c > 16 for c in cs)):
-        ap.error("repeat/max-tokens must be positive; concurrency in [1, 16]; isolation in [0, 16]; warm >= 0")
+    if (args.repeat < 1 or args.max_tokens < 1 or args.warm < 0 or not 0 <= args.isolation <= 64
+            or any(c < 1 or c > 64 for c in cs)):
+        ap.error("repeat/max-tokens must be positive; concurrency in [1, 64]; isolation in [0, 64]; warm >= 0")
     reports = []
     def save():
         if args.json_out:
@@ -312,6 +338,13 @@ def main(*, phase_runner=None, settle=None):
                            "phases": reports}, output, indent=2, allow_nan=False)
     if args.classes:
         check_corpus()
+        names = list(CLASSES) if args.classes == "all" else args.classes.split(",")
+        for n in names:
+            if n not in CLASSES:
+                ap.error(f"unknown class {n!r}; known: {', '.join(CLASSES)}")
+            if max(cs) > len(CLASSES[n]):
+                ap.error(f"class {n!r} has only {len(CLASSES[n])} distinct prompts; "
+                         f"requested concurrency {max(cs)}")
     model = served_model(args.host, args.port)
     print(f"model {model}")
     if settle is not None:
@@ -354,19 +387,17 @@ def main(*, phase_runner=None, settle=None):
             raise SystemExit("transcript isolation failed")
     draw = "greedy" if args.temperature == 0 else f"sampled T={args.temperature}"
     if args.classes:
-        names = list(CLASSES) if args.classes == "all" else args.classes.split(",")
-        for n in names:
-            if n not in CLASSES:
-                raise SystemExit(f"unknown class {n!r}; known: {', '.join(CLASSES)}")
         table = {}
         for n in names:
             base = 0
             for c in cs:
-                rates = [run_phase(args.host, args.port, model, c, args.max_tokens, args.think, base,
-                               CLASSES[n], args.temperature, f"{n} ", reports) for _ in range(args.repeat)]
+                rates = []
+                for _ in range(args.repeat):
+                    rates.append(run_phase(args.host, args.port, model, c, args.max_tokens, args.think, base,
+                                           CLASSES[n], args.temperature, f"{n} ", reports))
+                    save()
                 table[(n, c)] = statistics.median(rates)
                 base += c
-                save()
         print(f"== per-class wall aggregate tokens/s (client wall time: prefill and queueing included — the engine's decode-only rate is timed_load's table), {draw}, max_tokens {args.max_tokens}")
         print("| class | " + " | ".join(f"c={c}" for c in cs) + " |")
         print("|---|" + "---|" * len(cs))

@@ -16,6 +16,7 @@
 // nodes and world_size are mutually exclusive.
 #pragma once
 #include "serve/file_inputs.hpp"
+#include "serve/expert_paging.hpp"
 
 #include <cstdint>
 #include <map>
@@ -273,6 +274,7 @@ struct ClusterConfig {
     bool no_eos = false;
     bool compact_batches = true;
     bool decode_graph = false;
+    std::optional<expert::PagingOptions> expert_streaming;
     bool mtp = false;
     int mtp_depth = 1;  // draft tokens per step (1..7); family-specific limits apply
     bool mtp_depth_set =

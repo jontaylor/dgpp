@@ -15,6 +15,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "models/dsv41/nvfp4_scales.hpp"
 
 namespace dgpp {
 namespace {
@@ -53,8 +54,10 @@ bool is_replicated(const Dsv41ExpectedTensor& e) {
     case Dsv41WeightClass::Vision:
     case Dsv41WeightClass::LmHead:
     case Dsv41WeightClass::SharedExpert:
-    case Dsv41WeightClass::RoutedExpert:
       return false;
+    case Dsv41WeightClass::RoutedExpert:
+      // ModelOpt scalar metadata is read in full by every TP rank.
+      return e.dtype == DType::F32 && e.shape.empty();
   }
   return false;
 }
@@ -196,42 +199,66 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     return load_fp8_col_ranges(base, {{col_start, cols}});
   }
 
-  // ---- MXFP4 pairs (e2m1 pairs + e8m0 per 32) ------------------------------
+  // ---- Native FP4: MX pairs or ModelOpt NV quadruples ---------------------
   struct Fp4Source {
     const Dsv41ExpectedTensor* w;
     const Dsv41ExpectedTensor* s;
     int64_t N, K;
+    int group;
   };
   Fp4Source fp4_source(const std::string& base) {
     Fp4Source f;
     f.w = &expected(base + ".weight");
-    f.s = &expected(base + ".scale");
+    f.group = f.w->dtype == DType::U8 ? kFp4Group : kMxfp4Group;
+    f.s = &expected(base + (f.group == kFp4Group ? ".weight_scale" : ".scale"));
     if (f.w->role != Dsv41TensorRole::Fp4Payload || f.s->role != Dsv41TensorRole::Fp4Scale ||
         f.w->shape.size() != 2 || f.s->shape.size() != 2)
-      fail("'" + base + "' is not an MXFP4 pair");
+      fail("'" + base + "' is not a native FP4 matrix");
     f.N = f.w->shape[0];
     f.K = f.w->shape[1] * 2;
-    fp4_check_cols(f.K, who.c_str(), kMxfp4Group);
-    if (f.s->shape[0] != f.N || f.s->shape[1] != f.K / kMxfp4Group)
-      fail("MXFP4 scale geometry mismatch on " + base);
+    fp4_check_cols(f.K, who.c_str(), f.group);
+    if (f.s->shape[0] != f.N || f.s->shape[1] != f.K / f.group)
+      fail("native FP4 scale geometry mismatch on " + base);
     return f;
   }
-  GlmFp4Matrix alloc_mxfp4(int64_t rows, int64_t cols) {
+  GlmFp4Matrix alloc_fp4(int64_t rows, int64_t cols, int group) {
     GlmFp4Matrix q;
     q.rows = rows;
     q.cols = cols;
-    q.scale_group = kMxfp4Group;
+    q.scale_group = group;
     q.global_scale = nullptr;
     q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols / 2)));
     q.scales = static_cast<const uint8_t*>(
-        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols / kMxfp4Group)));
+        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols / group)));
+    if (group == kFp4Group)
+      q.global_scale = static_cast<const float*>(bump.alloc(sizeof(float)));
     return q;
   }
-  GlmFp4Matrix load_mxfp4_rows(const std::string& base, int64_t row_start, int64_t rows) {
+  void load_fp4_global(const std::string& base, GlmFp4Matrix& q) {
+    if (q.scale_group != kFp4Group) return;
+    const auto& global = expected(base + ".weight_scale_2");
+    const auto& input = expected(base + ".input_scale");
+    if (global.dtype != DType::F32 || !global.shape.empty() ||
+        input.dtype != DType::F32 || !input.shape.empty())
+      fail("NVFP4 global/input scales must be scalar F32 on " + base);
+    if (copy) {
+      const auto& tg = source(global.name);
+      const auto& ti = source(input.name);
+      float factor, activation;
+      std::memcpy(&factor, tg.data, sizeof(float));
+      std::memcpy(&activation, ti.data, sizeof(float));
+      *bump.host(const_cast<float*>(q.global_scale)) = dsv41_nvfp4_inverse_global(factor, activation);
+      consumed(tg);
+      consumed(ti);
+    }
+    note_read(global, sizeof(float));
+    note_read(input, sizeof(float));
+  }
+  GlmFp4Matrix load_fp4_rows(const std::string& base, int64_t row_start, int64_t rows) {
     const Fp4Source f = fp4_source(base);
     check_range(base, row_start, rows, f.N);
-    const size_t pc = static_cast<size_t>(f.K / 2), sc = static_cast<size_t>(f.K / kMxfp4Group);
-    GlmFp4Matrix q = alloc_mxfp4(rows, f.K);
+    const size_t pc = static_cast<size_t>(f.K / 2), sc = static_cast<size_t>(f.K / f.group);
+    GlmFp4Matrix q = alloc_fp4(rows, f.K, f.group);
     if (copy) {
       const TensorInfo& tw = source(f.w->name);
       const TensorInfo& ts = source(f.s->name);
@@ -246,17 +273,18 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     }
     note_read(*f.w, static_cast<size_t>(rows) * pc);
     note_read(*f.s, static_cast<size_t>(rows) * sc);
+    load_fp4_global(base, q);
     return q;
   }
-  GlmFp4Matrix load_mxfp4_cols(const std::string& base, int64_t col_start, int64_t cols) {
+  GlmFp4Matrix load_fp4_cols(const std::string& base, int64_t col_start, int64_t cols) {
     const Fp4Source f = fp4_source(base);
-    fp4_check_cols(cols, who.c_str(), kMxfp4Group);
-    if (col_start % kMxfp4Group != 0)
-      fail("MXFP4 column slice of '" + base + "' must start on a 32-element block boundary");
+    fp4_check_cols(cols, who.c_str(), f.group);
+    if (col_start % f.group != 0)
+      fail("native FP4 column slice of '" + base + "' must start on a scale-block boundary");
     check_range(base, col_start, cols, f.K);
     const size_t pc = static_cast<size_t>(cols / 2), pc_full = static_cast<size_t>(f.K / 2);
-    const size_t sc = static_cast<size_t>(cols / kMxfp4Group), sc_full = static_cast<size_t>(f.K / kMxfp4Group);
-    GlmFp4Matrix q = alloc_mxfp4(f.N, cols);
+    const size_t sc = static_cast<size_t>(cols / f.group), sc_full = static_cast<size_t>(f.K / f.group);
+    GlmFp4Matrix q = alloc_fp4(f.N, cols, f.group);
     if (copy) {
       const TensorInfo& tw = source(f.w->name);
       const TensorInfo& ts = source(f.s->name);
@@ -270,7 +298,7 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
       } else {
         for (int64_t r = 0; r < f.N; ++r) {
           std::memcpy(hp + r * pc, sp + r * pc_full + col_start / 2, pc);
-          std::memcpy(hs + r * sc, ss + r * sc_full + col_start / kMxfp4Group, sc);
+          std::memcpy(hs + r * sc, ss + r * sc_full + col_start / f.group, sc);
         }
       }
       consumed(tw);
@@ -278,6 +306,7 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     }
     note_read(*f.w, static_cast<size_t>(f.N) * pc);
     note_read(*f.s, static_cast<size_t>(f.N) * sc);
+    load_fp4_global(base, q);
     return q;
   }
 
@@ -508,6 +537,8 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     a.kv_norm = load_bf16(p + "kv_norm.weight");
     a.attn_sink = load_f32_range(p + "attn_sink", geo.head_begin, geo.local_heads);
     if (cfg.weights_exl3) {
+      if (cfg.runtime_page_experts)
+        fail("expert paging does not support EXL3 weights");
       a.wq_a_x = load_exl3(p + "wq_a");
       a.wkv_x = load_exl3(p + "wkv");
       a.wq_b_x = load_exl3_rows(p + "wq_b", static_cast<int64_t>(geo.head_begin) * hd,
@@ -604,9 +635,19 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     for (int e = 0; e < E; ++e) {
       const std::string ep = p + "experts." + std::to_string(e) + ".";
       GlmFp4Matrix* t = m.experts.data() + static_cast<size_t>(e) * 3;
-      t[0] = load_mxfp4_rows(ep + "w1", I0, I);  // gate
-      t[1] = load_mxfp4_rows(ep + "w3", I0, I);  // up
-      t[2] = load_mxfp4_cols(ep + "w2", I0, I);  // down
+      if (cfg.runtime_page_experts && !(draft && cfg.runtime_resident_draft_experts)) {
+        // Descriptors only: no routed expert payload enters the layer bump.
+        // A cache execution lease replaces these before a kernel can use it.
+        for (int i = 0; i < 3; ++i) {
+          t[i].rows = i == 2 ? cfg.hidden_size : I;
+          t[i].cols = i == 2 ? I : cfg.hidden_size;
+          t[i].scale_group = cfg.experts_nvfp4 && !cfg.is_draft(layer) ? kFp4Group : kMxfp4Group;
+        }
+        continue;
+      }
+      t[0] = load_fp4_rows(ep + "w1", I0, I);  // gate
+      t[1] = load_fp4_rows(ep + "w3", I0, I);  // up
+      t[2] = load_fp4_cols(ep + "w2", I0, I);  // down
     }
     const std::string sp = p + "shared_experts.";
     m.shared[0] = load_fp8_rows(sp + "w1", S0, S);
@@ -896,8 +937,8 @@ template class ResidentLayerStream<Dsv41LoaderFamily>;
 // ---- the Engram table mapping --------------------------------------------------
 
 Dsv41EngramTableMmap::Dsv41EngramTableMmap(const std::string& path, uint64_t payload_begin,
-                                           uint64_t scale_begin, int64_t rows, int head_dim)
-    : payload_begin_(payload_begin), scale_begin_(scale_begin), rows_(rows), head_dim_(head_dim) {
+                                           uint64_t scale_begin, int64_t rows, int head_dim, bool mxfp4)
+    : payload_begin_(payload_begin), scale_begin_(scale_begin), rows_(rows), head_dim_(head_dim), mxfp4_(mxfp4) {
   if (rows <= 0 || head_dim <= 0 || head_dim % 32 != 0)
     throw std::invalid_argument("Dsv41EngramTableMmap: bad geometry");
   fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -908,9 +949,11 @@ Dsv41EngramTableMmap::Dsv41EngramTableMmap(const std::string& path, uint64_t pay
     throw std::runtime_error("Dsv41EngramTableMmap: fstat " + path);
   }
   len_ = static_cast<size_t>(st.st_size);
-  const uint64_t pend = payload_begin + static_cast<uint64_t>(rows) * head_dim;
-  const uint64_t send = scale_begin + static_cast<uint64_t>(rows) * (head_dim / 32);
-  if (pend > len_ || send > len_) {
+  // Subtract before multiplying: malformed offsets/row counts must not wrap
+  // into a mapping that looks large enough.
+  if (payload_begin > len_ || scale_begin > len_ ||
+      static_cast<uint64_t>(rows) > (len_ - payload_begin) / payload_row_bytes() ||
+      static_cast<uint64_t>(rows) > (len_ - scale_begin) / (head_dim / 32)) {
     ::close(fd_);
     throw std::runtime_error("Dsv41EngramTableMmap: the table runs past the end of " + path);
   }
@@ -932,7 +975,7 @@ Dsv41EngramTableMmap::~Dsv41EngramTableMmap() {
 const uint8_t* Dsv41EngramTableMmap::payload_row(int64_t row) const {
   if (row < 0 || row >= rows_)
     throw std::out_of_range("Dsv41EngramTableMmap: row " + std::to_string(row) + " outside the table");
-  return base_ + payload_begin_ + static_cast<size_t>(row) * head_dim_;
+  return base_ + payload_begin_ + static_cast<size_t>(row) * payload_row_bytes();
 }
 
 const uint8_t* Dsv41EngramTableMmap::scale_row(int64_t row) const {
@@ -952,8 +995,8 @@ void Dsv41EngramTableMmap::gather(const int32_t* ids, int64_t ids_stride, const 
       const int64_t t = pair / rows_local, j = pair - t * rows_local;
       const int32_t id = ids[t * ids_stride + sel[j]];
       uint8_t* d = dst + static_cast<size_t>(pair) * rb;
-      std::memcpy(d, payload_row(id), static_cast<size_t>(head_dim_));
-      std::memcpy(d + head_dim_, scale_row(id), sb);
+      std::memcpy(d, payload_row(id), static_cast<size_t>(payload_row_bytes()));
+      std::memcpy(d + payload_row_bytes(), scale_row(id), sb);
     }
   };
   // Every row's pages asked for up front (the faults in flight together),
@@ -992,7 +1035,21 @@ Dsv41LayerStream::Dsv41LayerStream(const Dsv41TextConfig& cfg, const std::string
                                    bool resident_mtp)
     : ResidentLayerStream<Dsv41LoaderFamily>(cfg, checkpoint_dir, rank, world, residency, head,
                                              resident_mtp) {
-  open_resident_image();
+  // The whole-layer image ABI contains all routed weights. Keep paged
+  // backbones out of that cache namespace until it has an explicit plan key.
+  if (!cfg.runtime_page_experts) open_resident_image();
+}
+
+std::shared_ptr<expert::ExpertStore> Dsv41LayerStream::prepare_expert_image(
+    const std::string& path, uint64_t chunk_intermediate, bool include_draft, expert::IoMode mode) {
+  if (!cfg_.runtime_page_experts || sources_released_)
+    throw std::logic_error("dsv41 loader: prepare expert image requires live paged source mappings");
+  std::ifstream input(std::filesystem::path(checkpoint_dir_) / "config.json", std::ios::binary);
+  if (!input) throw std::runtime_error("dsv41 loader: cannot read expert source config");
+  const std::string config_json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  if (!input.eof() && input.fail()) throw std::runtime_error("dsv41 loader: cannot finish reading expert source config");
+  return dsv41_prepare_expert_image(path, cfg_, config_json, tensors_, rank_, world_,
+                                   chunk_intermediate, include_draft, mode);
 }
 
 void Dsv41LayerStream::set_resident_image_dir(const std::string& dir) { resident_image_dir_storage() = dir; }
@@ -1025,10 +1082,13 @@ const Dsv41EngramTables& Dsv41LayerStream::load_engram_tables() {
     const TensorInfo& ts = *it_s->second;
     if (tw.owner->path() != ts.owner->path())
       throw std::runtime_error("dsv41 loader: an Engram table's payload and scales must share a shard");
-    if (tw.shape.size() != 2 || tw.shape[1] != cfg_.engram_head_dim || tw.shape[0] != cfg_.engram_num_embeddings[i])
+    const int payload_cols = cfg_.engram_head_dim / (cfg_.engram_mxfp4 ? 2 : 1);
+    if (tw.dtype != (cfg_.engram_mxfp4 ? DType::U8 : DType::F8_E4M3) || ts.dtype != DType::F8_E8M0 ||
+        tw.shape != std::vector<int64_t>{cfg_.engram_num_embeddings[i], payload_cols} ||
+        ts.shape != std::vector<int64_t>{cfg_.engram_num_embeddings[i], cfg_.engram_head_dim / 32})
       throw std::runtime_error("dsv41 loader: Engram table geometry mismatch on " + tw.name);
     engram_.tables.push_back(std::make_unique<Dsv41EngramTableMmap>(tw.owner->path(), tw.data_begin, ts.data_begin,
-                                                                    tw.shape[0], cfg_.engram_head_dim));
+                                                                    tw.shape[0], cfg_.engram_head_dim, cfg_.engram_mxfp4));
   }
   engram_loaded_ = true;
   DGPP_LOG_INFO("dsv41 loader: rank {} Engram tables mmap'ed from the checkpoint ({} tables, {:.2f} GiB mapped, "

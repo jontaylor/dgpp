@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -35,10 +37,12 @@
 #include "kernels/hadamard32.hpp"
 #include "kernels/packq_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
+#include "kernels/sm12x_moe.hpp"
 #include "models/glm/moe.hpp"
 #include "models/glm/moe_layer.hpp"
 #include "models/glm/moe_reference.hpp"
 #include "models/quant_matrix.hpp"
+#include "loaders/expert_cache_cuda.hpp"
 #include "scale_gemm_test_helpers.hpp"
 
 namespace {
@@ -3281,5 +3285,305 @@ DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
                                    .c_str(),
                                /*partial_ulps=*/2.5, /*floor_frac=*/2e-2);
     c.free_all();
+  }
+}
+
+
+DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
+  using namespace dgpp::expert;
+  if (!dgpp::sm12x_moe_enabled(5120, 1152, 384, 6)) dgpp::test::skip("optional b12x AOT path disabled");
+  constexpr int H = 5120, I = 1152, E = 384, live = 12, M = dgpp::Sm12xMoe::kCapacity+1;
+  auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true);
+  c.cfg.shared_run_lane_min_rows = 1;
+  c.alloc();
+  struct Cleanup { SmallCase& c; ~Cleanup() { c.free_all(); } } cleanup{c};
+  // Twelve distinct weight sets, with a full target routing domain. Reusing
+  // these source sets bounds fixture RAM without reducing routing geometry.
+  c.expert_mats_fp4.resize(E*3);
+  for (int e = live; e < E; ++e)
+    for (int m = 0; m < 3; ++m) c.expert_mats_fp4[e*3+m] = c.expert_mats_fp4[(e%live)*3+m];
+  c.dev_w.experts_fp4 = c.expert_mats_fp4.data();
+  std::vector<uint16_t> router(E*H, 0);
+  std::copy(c.host_w.router_gate.begin(), c.host_w.router_gate.end(), router.begin());
+  std::vector<float> bias(E, -100.f);
+  std::copy(c.host_w.router_bias.begin(), c.host_w.router_bias.end(), bias.begin());
+  cudaFree(c.d_gate_w); cudaFree(c.d_bias);
+  DGPP_CUDA_OK(cudaMallocManaged(&c.d_gate_w, router.size()*2));
+  DGPP_CUDA_OK(cudaMallocManaged(&c.d_bias, bias.size()*4));
+  std::memcpy(c.d_gate_w, router.data(), router.size()*2);
+  std::memcpy(c.d_bias, bias.data(), bias.size()*4);
+  c.dev_w.router_gate = c.d_gate_w; c.dev_w.router_bias = c.d_bias;
+  c.cfg.n_experts = E;
+  std::string directory = "/tmp/dgpp-b12x-moe-XXXXXX";
+  require(::mkdtemp(directory.data()) != nullptr, "b12x fixture directory");
+  struct Remove { std::string p; ~Remove() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove{directory};
+  StoreIdentity identity;
+  identity.checkpoint_sha256.fill(43); identity.format = Format::kNvfp4;
+  identity.hidden = H; identity.intermediate = I; identity.chunk_intermediate = 64;
+  std::vector<RecordKey> keys;
+  for (uint32_t e = 0; e < E; ++e)
+    for (uint32_t chunk = 0; chunk < I/64; ++chunk) keys.push_back({0, e, chunk, false});
+  const auto image = directory + "/experts.img";
+  ExpertStoreBuilder builder(image, identity, keys);
+  for (size_t r = 0; r < keys.size(); ++r) {
+    std::array<MatrixSource,3> source;
+    for (int m = 0; m < 3; ++m) {
+      auto v = dgpp::glm_moe_host_view_fp4(c.host_w, GlmMoeConfig{.hidden=H,.inter=I,.n_experts=live},
+                                          (keys[r].expert%live)*3+m);
+      const auto n = static_cast<size_t>(v.rows)*v.cols;
+      source[m] = {static_cast<uint64_t>(v.rows), static_cast<uint64_t>(v.cols), Format::kNvfp4,
+                    {v.payload,n/2}, {v.scales,n/16}, v.global_scale};
+    }
+    builder.write(r, pack_chunk(source, keys[r].chunk*64, 64));
+  }
+  builder.finish();
+  auto store = std::make_shared<ExpertStore>(image, identity, keys.size(), IoMode::kDirect);
+  const auto chunk = partition(H,I,1,0,64,Format::kNvfp4).front();
+  const auto full = partition(H,I,1,0,I,Format::kNvfp4).front();
+  cudaStream_t stream = nullptr;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+  struct Stream { cudaStream_t s; ~Stream() { cudaStreamDestroy(s); } } stream_cleanup{stream};
+  GlmMoeLayer layer(c.dev_w,c.cfg,M,8);
+  std::vector<size_t> mapping(E); std::iota(mapping.begin(),mapping.end(),size_t{0});
+  std::vector<uint16_t> expected(6*H), got(6*H);
+  layer.enqueue_decode(c.d_hidden,c.d_out,6,nullptr,stream);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  std::vector<uint16_t> reference(6*H);
+  std::memcpy(reference.data(),c.d_out,reference.size()*2);
+  for (const auto policy : {Policy::kWholeExpert,Policy::kAdaptiveFractional}) {
+    auto config = [&](int experts, int execution_slots = 1) {
+      CacheConfig cfg; cfg.packed_nvfp4 = true;
+      cfg.execution_slots = execution_slots;
+      cfg.reads.staging_budget_bytes = cfg.reads.buffers*chunk.record_bytes;
+      cfg.planner.policy = policy; cfg.planner.minimum_fraction = 0; cfg.planner.cooldown_routes = 0;
+      // Fractional initialization needs one rounded chunk for every expert.
+      // Its pressure case retains that floor so twelve full experts cannot
+      // coexist; its zero-floor hot case can reclaim the cold coverage.
+      const int capacity = policy == Policy::kAdaptiveFractional ? std::max(experts,24) : experts;
+      if (policy == Policy::kAdaptiveFractional && experts == 2) cfg.planner.minimum_fraction = 1./18;
+      cfg.planner.budget_bytes = capacity*(I/64)*chunk.allocation_bytes +
+          execution_slots*2*full.allocation_bytes + cfg.reads.staging_budget_bytes;
+      return cfg;
+    };
+    ExpertCache hot(store,config(live),cuda_cache_storage(identity,stream,true)); hot.initialize();
+    for (int pass = 0; pass < 3; ++pass) {
+      layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      std::memcpy(got.data(),c.d_out,got.size()*2);
+      if (!pass) {
+        expected = got;
+        double error = 0, magnitude = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+          const double a = bf16_bits_to_float(got[i]), b = bf16_bits_to_float(reference[i]);
+          require(std::isfinite(a),"b12x produces finite output");
+          error += (a-b)*(a-b); magnitude += b*b;
+        }
+        require(std::sqrt(error/magnitude) < .003,"b12x remains within the slot reference numerical budget");
+      }
+      else require(got == expected,"b12x cold waves and native captured replay are bitwise identical");
+    }
+    require(hot.stats().native_hits > 0,"b12x fixture executed prepared native hits");
+    const auto before = hot.telemetry();
+    layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(hot.telemetry().file.calls == before.file.calls &&
+              hot.stats().native_packs == before.cache.native_packs,
+            "b12x warm graph performs no expert reads or repacking");
+    ExpertCache pressure(store,config(2),cuda_cache_storage(identity,stream,true)); pressure.initialize();
+    layer.enqueue_paged(c.d_hidden,c.d_out,6,pressure,mapping,stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::memcpy(got.data(),c.d_out,got.size()*2);
+    require(got == expected,"b12x output is independent of residency pressure");
+    {
+      const auto cfg = config(2,4);
+      ExpertCache batched(store,cfg,cuda_cache_storage(identity,stream,true)); batched.initialize();
+      for (int pass = 0; pass < 2; ++pass) {
+        layer.enqueue_paged(c.d_hidden,c.d_out,6,batched,mapping,stream);
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        std::memcpy(got.data(),c.d_out,got.size()*2);
+        require(got == expected,"grouped miss waves preserve one-expert/native arithmetic under churn");
+      }
+      require(batched.stats().peak_execution_slots == 4 && batched.stats().active_execution_slots == 0,
+              "four missing expert reconstructions coexist and retire after grouped execution");
+      layer.enqueue_paged(c.d_hidden,c.d_out,4,hot,mapping,stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      const std::vector<uint16_t> four(c.d_out,c.d_out+4*H);
+      layer.enqueue_paged(c.d_hidden,c.d_out,4,batched,mapping,stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      require(std::equal(four.begin(),four.end(),c.d_out),
+              "four-row verification agrees across grouped misses and native hits");
+      require(batched.memory().allocated_bytes() <= cfg.planner.budget_bytes,
+              "all reconstruction slots and packed companions are charged to the common budget");
+    }
+    // Small prefills use prepared weights directly, including rows beyond
+    // decode scratch capacity. Replay must leave verification bindings intact.
+    layer.enqueue_paged(c.d_hidden,c.d_out,43,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<uint16_t> prefill(c.d_out,c.d_out+43*H);
+    layer.enqueue_paged(c.d_hidden,c.d_out,43,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(std::equal(prefill.begin(),prefill.end(),c.d_out),"prepared prefill replays with its own bounded scratch");
+    // Canonical larger-prefill fallback must safely read and demote prepared
+    // experts; the next verification pass returns to identical arithmetic.
+    layer.enqueue_paged(c.d_hidden,c.d_out,M,hot,mapping,stream,dgpp::MoeExpertKernel::kMma);
+    layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::memcpy(got.data(),c.d_out,got.size()*2);
+    require(got == expected,"canonical prefill leaves prepared verification weights intact");
+    layer.enqueue_paged(c.d_hidden,c.d_out,1,hot,mapping,stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<uint16_t> one(c.d_out,c.d_out+H);
+    layer.enqueue_paged(c.d_hidden,c.d_out,1,pressure,mapping,stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(std::equal(one.begin(),one.end(),c.d_out),"b12x one-row hits and miss waves match");
+    require(hot.memory().allocated_bytes() <= config(live).planner.budget_bytes,"packed scratch stays within cache budget");
+  }
+}
+
+DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
+  using namespace dgpp::expert;
+  for (const int group : {16, 32}) {
+    for (const bool shared_fp4 : {false, true}) {
+      for (const int tokens : {1, 7, 64}) {
+        auto c = make_small_case(8, 128, 128, 2, tokens, 0xCA43 + tokens,
+                                true, shared_fp4, 0, group);
+        c.cfg.shared_run_lane_min_rows = 1;
+        c.alloc();
+        struct Cleanup { SmallCase& c; ~Cleanup() { c.free_all(); } } cleanup{c};
+        std::string pattern = "/tmp/dgpp-paged-moe-XXXXXX";
+        require(::mkdtemp(pattern.data()) != nullptr, "paged test temporary directory");
+        struct Remove {
+          std::string path;
+          ~Remove() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+        } remove{pattern};
+        const auto image = pattern + "/experts.img";
+        StoreIdentity identity;
+        identity.checkpoint_sha256.fill(47);
+        identity.format = group == 32 ? Format::kMxfp4 : Format::kNvfp4;
+        identity.hidden = 128;
+        identity.intermediate = 128;
+        identity.chunk_intermediate = 32;
+        std::vector<RecordKey> keys;
+        for (uint32_t e = 0; e < 8; ++e)
+          for (uint32_t chunk = 0; chunk < 4; ++chunk) keys.push_back({0, e, chunk, false});
+        ExpertStoreBuilder builder(image, identity, keys);
+        for (size_t record = 0; record < keys.size(); ++record) {
+          std::array<MatrixSource, 3> source;
+          for (int m = 0; m < 3; ++m) {
+            const auto v = dgpp::glm_moe_host_view_fp4(c.host_w, c.cfg, keys[record].expert * 3 + m);
+            const auto elements = static_cast<size_t>(v.rows) * v.cols;
+            source[m] = {static_cast<uint64_t>(v.rows), static_cast<uint64_t>(v.cols), identity.format,
+                         {v.payload, elements / 2}, {v.scales, elements / group}, std::nullopt};
+            if (group == 16) source[m].global = v.global_scale;
+          }
+          builder.write(record, pack_chunk(source, keys[record].chunk * 32, 32));
+        }
+        builder.finish();
+        auto store = std::make_shared<ExpertStore>(image, identity, keys.size(), IoMode::kDirect);
+        const auto chunk = partition(128, 128, 1, 0, 32, identity.format).front();
+        const auto full = partition(128, 128, 1, 0, 128, identity.format).front();
+        std::vector<size_t> mapping(8);
+        std::iota(mapping.begin(), mapping.end(), size_t{0});
+        const auto count = static_cast<size_t>(tokens) * c.cfg.hidden;
+        std::vector<uint16_t> expected(count), got(count);
+        cudaStream_t stream = nullptr;
+        DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        struct StreamCleanup {
+          cudaStream_t stream;
+          ~StreamCleanup() { cudaStreamDestroy(stream); }
+        } stream_cleanup{stream};
+        GlmMoeLayer layer(c.dev_w, c.cfg, tokens, /*decode_slots=*/tokens);
+        for (const auto kernel : {dgpp::MoeExpertKernel::kGemv, dgpp::MoeExpertKernel::kMma}) {
+          const char* grouped = std::getenv("DGPP_MOE_FP4_GROUPED_DECODE");
+          const bool grouped_case = grouped && grouped[0] == '1' && !shared_fp4 &&
+              kernel == dgpp::MoeExpertKernel::kGemv && tokens > 1 && tokens <= 16;
+          layer.enqueue(c.d_hidden, c.d_out, tokens, stream, kernel);
+          DGPP_CUDA_OK(cudaDeviceSynchronize());
+          std::memcpy(expected.data(), c.d_out, count * 2);
+          const auto expected_ids = layer.last_ids();
+          const auto expected_weights = layer.last_weights();
+          if (grouped_case) {
+            layer.enqueue_decode(c.d_hidden, c.d_out, tokens, nullptr, stream);
+            DGPP_CUDA_OK(cudaDeviceSynchronize());
+            std::memcpy(expected.data(), c.d_out, count * 2);
+            std::vector<uint16_t> oracle;
+            dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, tokens, oracle);
+            require_within_expert_budget(expected, oracle, "grouped FP4 decode vs oracle");
+          }
+          for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+            CacheConfig cfg;
+            cfg.execution_slots = 1;  // every wave must retire before the next
+            cfg.reads.buffers = 8;
+            cfg.reads.workers = 4;
+            cfg.reads.max_pending = 16;
+            cfg.reads.staging_budget_bytes = 8 * chunk.record_bytes;
+            cfg.planner.policy = policy;
+            cfg.planner.budget_bytes = 16 * chunk.allocation_bytes + full.allocation_bytes + cfg.reads.staging_budget_bytes;
+            cfg.planner.minimum_fraction = 0;
+            cfg.planner.cooldown_routes = 0;
+            ExpertCache cache(store, cfg, cuda_cache_storage(identity, stream));
+            cache.initialize();
+            for (int repeat = 0; repeat < 3; ++repeat) {
+              const auto reads_before = store->stats().calls;
+              const auto counters_before = cache.stats();
+              DGPP_CUDA_OK(cudaMemsetAsync(c.d_out, 0x7F, count * 2, stream));
+              layer.enqueue_paged(c.d_hidden, c.d_out, tokens, cache, mapping, stream, kernel);
+              DGPP_CUDA_OK(cudaDeviceSynchronize());
+              std::memcpy(got.data(), c.d_out, count * 2);
+              require(layer.last_ids() == expected_ids && layer.last_weights() == expected_weights,
+                      "paged GPU segmentation preserves routing getter semantics");
+              require(got == expected, "paged waves must be bitwise the resident complete-expert chain");
+              require(cache.stats().active_execution_slots == 0, "no execution lease survives MoE return");
+              require(cache.stats().demand_admissions > 0 && cache.residency().cache_bytes > 0,
+                      "both policies populate device residency from demand without periodic adaptation");
+              if (tokens == 1 && repeat == 1)
+                require(store->stats().calls == reads_before,
+                        "both policies retain a feasible repeated hot set without file rereads");
+              if (tokens == 1 && repeat == 2) {
+                const auto after = cache.stats();
+                require(after.native_hits > counters_before.native_hits &&
+                            after.native_packs == counters_before.native_packs &&
+                            after.native_layout_copy_bytes == counters_before.native_layout_copy_bytes &&
+                            after.cached_copy_bytes == counters_before.cached_copy_bytes &&
+                            after.staged_copy_bytes == counters_before.staged_copy_bytes &&
+                            after.reconstruction_wall_ns == counters_before.reconstruction_wall_ns &&
+                            after.active_native_leases == 0 && store->stats().calls == reads_before,
+                        "grouped native hot execution performs no reconstruction, layout conversion or file I/O");
+              }
+            }
+            require(cache.memory().allocated_bytes() <= cfg.planner.budget_bytes, "complete expert subsystem budget");
+            // Exercise the resident slot fast path at batched row counts,
+            // then rebind this same MoE executor to a different cache instance.
+            cfg.planner.budget_bytes += 16 * chunk.allocation_bytes;
+            ExpertCache full_cache(store, cfg, cuda_cache_storage(identity, stream));
+            full_cache.initialize();
+            std::vector<uint16_t> graph_expected = expected;
+            for (int repeat = 0; repeat < 5; ++repeat) {
+              if (repeat >= 3) {
+                // Replay the captured recipe with changed inputs/routes, then
+                // restore the input for subsequent policies/kernel variants.
+                for (size_t i = 0; i < count; ++i)
+                  c.d_hidden[i] = c.hidden[i] ^ (repeat == 3 ? 0x8000 : 0);
+                layer.enqueue(c.d_hidden, c.d_out, tokens, stream, kernel);
+                if (grouped_case)
+                  layer.enqueue_decode(c.d_hidden, c.d_out, tokens, nullptr, stream);
+                DGPP_CUDA_OK(cudaDeviceSynchronize());
+                std::memcpy(graph_expected.data(), c.d_out, count * 2);
+              }
+              layer.enqueue_paged(c.d_hidden, c.d_out, tokens, full_cache, mapping, stream, kernel);
+              DGPP_CUDA_OK(cudaDeviceSynchronize());
+              std::memcpy(got.data(), c.d_out, count * 2);
+              if (grouped_case) {
+                std::vector<uint16_t> oracle;
+                dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, tokens, oracle);
+                require_within_expert_budget(got, oracle,
+                    "grouped native paged execution and changed-route graph replay vs oracle");
+              }
+              require(got == graph_expected, "native paged execution and graph replay preserve changed-route output and cache rebinding");
+            }
+          }
+        }
+      }
+    }
   }
 }

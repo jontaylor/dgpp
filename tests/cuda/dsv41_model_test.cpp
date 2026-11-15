@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -20,6 +22,7 @@
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
 #include "dsv41_fixture.hpp"
+#include "engine/eager_engine.hpp"
 #include "kda_test_helpers.hpp"
 #include "models/dsv41/model.hpp"
 
@@ -35,10 +38,12 @@ struct Fixture {
   dgpp::Dsv41TextConfig cfg;
   std::string dir;
 };
-Fixture make_fixture() {
+Fixture make_fixture(bool nvfp4 = false) {
   Fixture fx;
   fx.cfg = dsv41fx::tiny_config();
-  fx.dir = (fs::current_path() / "dsv41_model_fixture").string();
+  fx.cfg.experts_nvfp4 = nvfp4;
+  fx.cfg.engram_mxfp4 = nvfp4;
+  fx.dir = (fs::current_path() / (nvfp4 ? "dsv41_model_nvfp4_fixture" : "dsv41_model_fixture")).string();
   dsv41fx::write_fixture(fx.cfg, fx.dir);
   (void)dsv41fx::fixture_sidecar(fx.cfg, fx.dir);
   return fx;
@@ -607,3 +612,544 @@ DGPP_TEST(dsv41_model_dspark_draft_rows_and_chain_at_world_1) {
 }
 
 int main() { return dgpp::test::run_all(); }
+
+namespace {
+dgpp::Dsv41ExpertPaging fixture_paging(const Fixture& fx, dgpp::expert::Policy policy, bool mtp = false) {
+  using namespace dgpp::expert;
+  const auto format = fx.cfg.experts_nvfp4 ? Format::kNvfp4 : Format::kMxfp4;
+  const auto chunk = partition(fx.cfg.hidden_size, fx.cfg.moe_intermediate_size, 1, 0, 64, format).front();
+  const auto full = partition(fx.cfg.hidden_size, fx.cfg.moe_intermediate_size, 1, 0,
+                              fx.cfg.moe_intermediate_size, format).front();
+  const auto chunks_per_expert = static_cast<size_t>(fx.cfg.moe_intermediate_size) / 64;
+  const auto population = static_cast<size_t>(fx.cfg.num_hidden_layers) * fx.cfg.n_routed_experts +
+      (mtp ? static_cast<size_t>(fx.cfg.num_nextn_predict_layers) * fx.cfg.dspark_n_routed_experts : 0);
+  dgpp::Dsv41ExpertPaging paging;
+  paging.image_directory = (fs::path(fx.dir) / "expert-images").string();
+  paging.chunk_intermediate = 64;
+  paging.adapt_every_routes = 1;
+  paging.cache.execution_slots = 1;
+  paging.cache.reads.buffers = 2;
+  paging.cache.reads.workers = 1;
+  paging.cache.reads.max_pending = 4;
+  paging.cache.reads.staging_budget_bytes = 2 * chunk.record_bytes;
+  paging.cache.planner.policy = policy;
+  paging.cache.planner.minimum_fraction = 0.25;
+  paging.cache.planner.cooldown_routes = 0;
+  paging.cache.planner.budget_bytes = population * chunks_per_expert / 2 * chunk.allocation_bytes +
+    full.allocation_bytes + paging.cache.reads.staging_budget_bytes;
+  return paging;
+}
+}
+
+namespace {
+void check_paged_model_matches_resident(bool nvfp4) {
+  using namespace dgpp::expert;
+  const Fixture fx = make_fixture(nvfp4);
+  const auto prompt = tokens_of(0xCA43, 23, fx.cfg.vocab_size);
+  std::vector<std::vector<float>> expected;
+  {
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                           nullptr, 0, 1, 1, false, 8);
+    expected.push_back(model.session_prefill(0, prompt).logits);
+    for (int i = 0; i < 3; ++i)
+      expected.push_back(model.session_step(0, static_cast<int64_t>(17 + i)).logits);
+  }
+  for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+    auto paging = fixture_paging(fx, policy);
+    const auto plan = dgpp::Dsv41Model::plan_memory(fx.cfg, 96, 512, 0, 1,
+        dgpp::Dsv41Residency::Resident, 1, false, 8, false, &paging);
+    const auto resident_plan = dgpp::Dsv41Model::plan_memory(fx.cfg, 96, 512, 0, 1,
+        dgpp::Dsv41Residency::Resident, 1, false, 8);
+    require(plan.total_bytes() < resident_plan.total_bytes(), "plan replaces full expert population with bounded reservation");
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                           nullptr, 0, 1, 1, false, 8, false, &paging);
+    require(model.expert_cache() && !model.prefill_fold_overlap(), "model owns paging cache and uses eager walk");
+    model.release_execution_thread();
+    std::exception_ptr failure;
+    std::thread serving([&] {
+      try {
+        model.bind_execution_thread();
+        require(model.session_prefill(0, prompt).logits == expected[0], "paged prefill logits bitwise the resident model");
+        for (int i = 0; i < 3; ++i)
+          require(model.session_step(0, static_cast<int64_t>(17 + i)).logits == expected[static_cast<size_t>(i + 1)],
+                  "paged decode logits bitwise the resident model after adaptation");
+        model.release_execution_thread();
+      } catch (...) { failure = std::current_exception(); }
+    });
+    serving.join();
+    if (failure) std::rethrow_exception(failure);
+    model.bind_execution_thread();
+    const auto* cache = model.expert_cache();
+    require(cache->stats().requests && cache->stats().active_execution_slots == 0 &&
+            cache->memory().allocated_bytes() <= paging.cache.planner.budget_bytes,
+            "real model routes run through bounded execution leases");
+  }
+}
+}  // namespace
+
+DGPP_TEST(dsv41_paged_model_matches_resident_prefill_and_decode_within_the_same_byte_budget) {
+  check_paged_model_matches_resident(false);
+}
+
+DGPP_TEST(dsv41_paged_nvfp4_model_matches_native_resident_prefill_and_decode) {
+  check_paged_model_matches_resident(true);
+}
+
+DGPP_TEST(dsv41_paged_nvfp4_model_charges_resident_draft_experts_to_the_budget) {
+  const Fixture fx = make_fixture(true);
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  auto descriptors = fx.cfg;
+  descriptors.runtime_page_experts = true;
+  uint64_t draft_bytes = 0;
+  for (int layer = fx.cfg.num_hidden_layers; layer < fx.cfg.max_layer(); ++layer)
+    draft_bytes += dgpp::Dsv41LayerStream::layer_bytes(fx.cfg, layer) -
+        dgpp::Dsv41LayerStream::layer_bytes(descriptors, layer);
+  {
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                          nullptr, 0, 1, 1, true, 8, false, &paging);
+    require(model.expert_cache()->memory().budget_bytes + draft_bytes == paging.cache.planner.budget_bytes,
+            "resident draft experts and main cache share the configured byte budget");
+    for (const auto& expert : model.expert_cache()->experts())
+      require(!expert.draft, "NVFP4 cache reuses the main-only image");
+  }
+  paging.cache.planner.budget_bytes = draft_bytes;
+  bool refused = false;
+  try {
+    (void)dgpp::Dsv41Model::plan_memory(fx.cfg, 96, 512, 0, 1,
+        dgpp::Dsv41Residency::Resident, 1, true, 8, false, &paging);
+  } catch (const std::invalid_argument& e) {
+    refused = std::string(e.what()).find("budget cannot cover resident DSpark") != std::string::npos;
+  }
+  require(refused, "insufficient draft budget fails before allocation");
+}
+
+DGPP_TEST(dsv41_paged_eager_adapter_batches_plain_decode_and_preserves_slot_state) {
+  using namespace dgpp::expert;
+  const Fixture fx = make_fixture();
+  const std::vector<std::vector<int64_t>> prompts{
+      tokens_of(43, 23, fx.cfg.vocab_size), tokens_of(47, 17, fx.cfg.vocab_size)};
+  const auto pick = [](const dgpp::DecodeOutputs& out) -> int32_t {
+    require(!out.logits.empty(), "batch pick has host logits");
+    for (const auto value : out.logits) require(std::isfinite(value), "finite batch logits");
+    return out.lm_vocab_begin + static_cast<int32_t>(
+        std::max_element(out.logits.begin(), out.logits.end()) - out.logits.begin());
+  };
+  std::vector<int32_t> opening(2);
+  std::vector<std::vector<std::vector<int32_t>>> expected;
+  std::vector<std::vector<int>> order;
+  int32_t reopened = -1, scalar = -1;
+  {
+    dgpp::Dsv41Model reference(fx.cfg, fx.dir, 96, 1024, dgpp::Dsv41Residency::Resident,
+                               nullptr, 0, 1, 2, false, 8);
+    require(reference.eager_plain_decode_batch_capacity() == 1, "resident eager default is preserved");
+    for (int slot = 0; slot < 2; ++slot) opening[slot] = pick(reference.session_prefill(slot, prompts[slot]));
+    auto pending = opening;
+    for (int step = 0; step < 6; ++step) {
+      order.push_back(step % 2 ? std::vector<int>{1, 0} : std::vector<int>{0, 1});
+      const auto& slots = order.back();
+      std::vector<std::vector<int64_t>> feeds{{pending[slots[0]]}, {pending[slots[1]]}};
+      std::vector<int> offsets;
+      const auto outputs = reference.session_verify_batch(slots, feeds, &offsets);
+      std::vector<std::vector<int32_t>> committed;
+      for (size_t i = 0; i < slots.size(); ++i) {
+        reference.session_rollback(slots[i], 1, 1, offsets[i]);
+        pending[slots[i]] = pick(outputs[i]);
+        committed.push_back({pending[slots[i]]});
+      }
+      expected.push_back(std::move(committed));
+    }
+    reference.session_close(0); reference.session_close(1);
+    reopened = pick(reference.session_prefill(0, prompts[1]));
+    scalar = pick(reference.session_step(0, reopened));
+  }
+  for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+    auto paging = fixture_paging(fx, policy);
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 1024, dgpp::Dsv41Residency::Resident,
+                           nullptr, 0, 1, 2, false, 8, false, &paging);
+    dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 2, pick);
+    engine.set_prefill_group(true);
+    require(engine.prefill_group_span_limit() == 96, "paging exposes grouped prefill workspace");
+    require(engine.decode_batch_capacity() == 2, "paging exposes the native two-row decode walk");
+    for (int slot = 0; slot < 2; ++slot)
+      require(engine.prefill(slot, prompts[slot]) == opening[slot], "opening token matches resident reference");
+    const auto requests = model.expert_cache()->stats().requests;
+    for (const auto& invalid : {std::vector<int>{0, 0}, std::vector<int>{0, 2}, std::vector<int>{0, 1, 0}}) {
+      bool rejected = false;
+      try { (void)engine.step_batch(invalid); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      require(rejected, "invalid batches are refused before model work");
+    }
+    require(model.expert_cache()->stats().requests == requests, "invalid batches do not advance cache/model state");
+    for (size_t step = 0; step < order.size(); ++step) {
+      require(engine.step_batch(order[step]) == expected[step], "batched greedy picks match resident batch oracle");
+      for (int slot = 0; slot < 2; ++slot)
+        require(model.session_position(slot) == static_cast<int64_t>(prompts[slot].size() + step + 1),
+                "each slot advances exactly one position per batch");
+    }
+    engine.close(0); engine.close(1);
+    require(engine.prefill(0, prompts[1]) == reopened, "closed slot can be reused");
+    require(engine.step_batch({0}) == std::vector<std::vector<int32_t>>{{scalar}},
+            "single-slot batch retains the scalar kernel path");
+    engine.close(0);
+    require(engine.prefill_group({0, 1}, {&prompts[0], &prompts[1]}) == opening,
+            "warm grouped paging retains each request's opening token");
+    require(engine.step_batch(order[0]) == expected[0], "warm group retains batched decode state");
+    engine.close(0); engine.close(1);
+    require(model.expert_cache()->stats().active_execution_slots == 0, "batched execution retires all leases");
+  }
+}
+
+// Identical operation sequences isolate paging from row-shape and state effects.
+DGPP_TEST(dsv41_paged_model_preserves_group_mixed_rollback_prefix_and_slot_reuse) {
+  using namespace dgpp::expert;
+  const Fixture fx = make_fixture();
+  const auto a = tokens_of(0xB17, 23, fx.cfg.vocab_size);
+  const auto b = tokens_of(0xB18, 9, fx.cfg.vocab_size);
+  const auto long_prompt = tokens_of(0xB19, 256, fx.cfg.vocab_size);
+  for (const bool bounded : {false, true}) {
+    const auto run = [&](const dgpp::Dsv41ExpertPaging* paging) {
+      dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 2048, dgpp::Dsv41Residency::Resident,
+                            nullptr, 0, 1, 3, false, 8, false, paging);
+      model.set_prefill_bounded(bounded);
+      std::vector<std::vector<float>> transcript;
+      const auto save = [&](const auto& outputs) {
+        for (const auto& output : outputs) transcript.push_back(output.logits);
+      };
+      save(model.session_prefill_group({0, 1}, {&a, &b}));
+      std::vector<int> offsets;
+      save(model.session_verify_batch({0, 1}, {{3, 4, 5}, {6, 7}}, &offsets));
+      model.session_rollback(0, 1, 3, offsets[0]);
+      model.session_rollback(1, 1, 2, offsets[1]);
+      transcript.push_back(model.session_step(0, 11).logits);
+      transcript.push_back(model.session_step(1, 12).logits);
+      model.session_close(1);
+      auto cursor = model.session_prefill_begin(1, long_prompt, 280, 128);
+      while (cursor.next != cursor.end) {
+        save(model.session_prefill_verify(cursor, 128, {0}, {{13}}));
+        model.session_rollback(0, 1, 1);
+      }
+      transcript.push_back(cursor.output.logits);
+      const size_t bytes = model.session_snapshot_bytes();
+      void* snapshot = nullptr;
+      DGPP_CUDA_OK(cudaMalloc(&snapshot, bytes));
+      struct Free { void* p; ~Free() { (void)cudaFree(p); } } cleanup{snapshot};
+      const auto meta = model.session_snapshot(1, snapshot);
+      model.session_attach(2, snapshot, meta);
+      const auto original = model.session_step(1, 17).logits;
+      const auto attached = model.session_step(2, 17).logits;
+      require(original == attached, "prefix attach preserves the paged model state bitwise");
+      transcript.push_back(original);
+      transcript.push_back(attached);
+      model.session_release_snapshot(meta);
+      model.session_close(2);
+      transcript.push_back(model.session_prefill(2, b).logits);
+      if (paging) require(model.expert_cache()->stats().active_execution_slots == 0,
+                          "mixed and prefix operations retire all weight leases");
+      return transcript;
+    };
+    const auto expected = run(nullptr);
+    for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+      auto paging = fixture_paging(fx, policy);
+      require(run(&paging) == expected,
+              "paging is bitwise resident across grouped/mixed prefill, rollback, prefix attach and slot reuse");
+    }
+  }
+}
+
+// Model-level DSpark qualification; serving MTP still requires an engine gate.
+void check_paged_dspark(bool nvfp4) {
+  using namespace dgpp::expert;
+  const Fixture fx = make_fixture(nvfp4);
+  const auto prompt = tokens_of(0xD8, 40, fx.cfg.vocab_size);
+  const int B = fx.cfg.dspark_block_size, V = fx.cfg.vocab_size;
+  const auto run = [&](const dgpp::Dsv41ExpertPaging* paging) {
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                          nullptr, 0, 1, 1, true, B + 1, false, paging);
+    std::vector<std::vector<float>> transcript;
+    const auto pre = model.session_prefill(0, prompt);
+    transcript.push_back(pre.logits);
+    std::vector<int64_t> fed{argmax(pre.logits.data(), static_cast<size_t>(V))};
+    auto draft = model.session_draft(0, fed);
+    transcript.push_back(draft.logits);
+    for (int i = 0; i < B - 1; ++i) {
+      const auto token = argmax(draft.logits.data(), static_cast<size_t>(V));
+      fed.push_back(token);
+      draft = model.session_draft_chain(0, token, i, i == 0, i == B - 2);
+      transcript.push_back(draft.logits);
+    }
+    fed.push_back(argmax(draft.logits.data(), static_cast<size_t>(V)));
+    const auto verified = model.session_verify(0, fed);
+    transcript.push_back(verified.logits);
+    // A fixed acceptance cut exercises rollback independently of random argmax ties.
+    model.session_rollback(0, 1, B + 1);
+    const auto next = argmax(verified.logits.data(), static_cast<size_t>(V));
+    draft = model.session_draft(0, {next});
+    transcript.push_back(draft.logits);
+    transcript.push_back(model.session_draft_chain(0,
+        argmax(draft.logits.data(), static_cast<size_t>(V)), 0, true, false).logits);
+    if (paging) {
+      bool draft_population = false;
+      for (const auto& expert : model.expert_cache()->experts()) draft_population |= expert.draft;
+      require(draft_population == !nvfp4 && model.expert_cache()->stats().active_execution_slots == 0,
+              "paged population follows the main/draft format and retires its leases");
+    }
+    model.session_close(0);
+    return transcript;
+  };
+  const auto expected = run(nullptr);
+  for (const auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+    auto paging = fixture_paging(fx, policy, true);
+    require(run(&paging) == expected, "DSpark main/draft/chain/verify/rollback logits are bitwise resident");
+  }
+}
+
+DGPP_TEST(dsv41_paged_model_dspark_block_chain_verify_and_rollback_are_bitwise_resident) {
+  check_paged_dspark(false);
+}
+DGPP_TEST(dsv41_paged_nvfp4_model_dspark_block_chain_verify_and_rollback_are_bitwise_resident) {
+  check_paged_dspark(true);
+}
+
+DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
+  using namespace dgpp::text;
+  const Fixture fx = make_fixture(true);
+  const int vocab_size = fx.cfg.vocab_size;
+  constexpr int think_open = 480, think_close = 481, dsml = 482, eos = 511;
+  std::vector<std::string> texts(static_cast<size_t>(vocab_size), "x");
+  for (int b = 0; b < 256; ++b) texts[b] = std::string(1, static_cast<char>(b));
+  texts[think_open] = "<think>";
+  texts[think_close] = "</think>";
+  texts[dsml] = "｜DSML｜";
+  texts[eos] = "";
+  ChatMarkers markers;
+  markers.think_open = {think_open, "<think>"};
+  markers.think_close = {think_close, "</think>"};
+  markers.dsml = {dsml, "｜DSML｜"};
+  GrammarVocab vocab(std::move(texts), markers, {eos}, vocab_size, eos);
+  std::vector<GrammarSpec> constraints(2);
+  constraints[0].mode = GrammarSpec::Mode::kJson;
+  constraints[0].json_schema = R"({"const":{"path":"/home/jon/dgpp","ok":true}})";
+  constraints[1].mode = GrammarSpec::Mode::kAuto;
+  GrammarTool tool;
+  tool.name = "list_directory";
+  constraints[1].tools.push_back(tool);
+  const std::vector<std::vector<int64_t>> prompts{{65, 66, 67}, {68, 69, 70}};
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 1024, dgpp::Dsv41Residency::Resident,
+                        nullptr, 0, 1, 2, true, 16, false, &paging);
+  dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 2,
+      dgpp::make_w1_pick(vocab_size), dgpp::make_w1_sample(vocab_size), &vocab);
+  std::vector<std::vector<int32_t>> expected(2), actual(2);
+  for (int req = 0; req < 2; ++req) {
+    engine.configure_constraint(req, constraints[req]);
+    expected[req].push_back(engine.prefill(req, prompts[req]));
+    engine.reserve(req, 128);
+    while (expected[req].size() < 80 && expected[req].back() != eos)
+      expected[req].push_back(engine.step(req).at(0));
+    engine.close(req);
+  }
+  bool force_first = true;
+  engine.configure_eager_mtp(3, [&](const std::vector<dgpp::sample::Candidate>& rows) {
+    std::vector<int32_t> picks;
+    for (const auto& row : rows) picks.push_back(row.id);
+    if (force_first) {
+      require(rows.size() == 2, "first draft stacks both constrained requests");
+      picks = {think_close, expected[1].at(1)};
+      force_first = false;
+    }
+    return picks;
+  });
+  for (int req = 0; req < 2; ++req) {
+    engine.configure_constraint(req, constraints[req]);
+    actual[req].push_back(engine.prefill(req, prompts[req]));
+    engine.reserve(req, 128);
+  }
+  const auto first = engine.step_batch({0, 1});
+  require(first[0].size() == 1, "forbidden JSON proposal is rejected without poisoning the live grammar");
+  require(first[1].size() >= 2, "tool-enabled prose accepts predictions");
+  for (int req = 0; req < 2; ++req)
+    actual[req].insert(actual[req].end(), first[req].begin(), first[req].end());
+  for (int iteration = 0;; ++iteration) {
+    std::vector<int> reqs;
+    for (int req : {0, 1}) if (actual[req].size() < expected[req].size()) reqs.push_back(req);
+    if (reqs.empty()) break;
+    if (iteration % 3 == 0 && reqs.size() > 1) reqs.resize(1);
+    const auto fresh = engine.step_batch(reqs);
+    for (size_t i = 0; i < reqs.size(); ++i)
+      actual[reqs[i]].insert(actual[reqs[i]].end(), fresh[i].begin(), fresh[i].end());
+  }
+  for (int req = 0; req < 2; ++req) {
+    actual[req].resize(expected[req].size());
+    require(actual[req] == expected[req], "constrained speculation matches ordinary masked greedy tokens");
+    GrammarState check(&vocab, constraints[req], false);
+    for (auto token : actual[req]) {
+      require(check.allows(token), "every committed token satisfies its live grammar");
+      check.advance(token);
+    }
+    const auto acceptance = static_cast<dgpp::sched::SchedulerEngine&>(engine).mtp_acceptance(req);
+    require(acceptance.attempts[0] > 0 && acceptance.accepts[0] > 0,
+            "both constrained requests actually speculate and accept drafts");
+    require(engine.prefix_snapshot_ready(req), "speculation keeps draft state ready for prefix snapshots");
+    engine.close(req);
+  }
+}
+
+DGPP_TEST(dsv41_paged_eager_stale_draft_skips_optional_snapshot) {
+  const Fixture fx = make_fixture(true);
+  const auto prompt = tokens_of(0x5A9, 253, fx.cfg.vocab_size);
+  const auto pick = dgpp::make_w1_pick(fx.cfg.vocab_size);
+  std::vector<int32_t> expected;
+  {
+    dgpp::Dsv41Model reference(fx.cfg, fx.dir, 256, 1024, dgpp::Dsv41Residency::Resident,
+                              nullptr, 0, 1, 1, false, 8);
+    expected.push_back(pick(reference.session_prefill(0, prompt)));
+    for (int i = 0; i < 7; ++i)
+      expected.push_back(pick(reference.session_step(0, expected.back())));
+  }
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 1024, dgpp::Dsv41Residency::Resident,
+                        nullptr, 0, 1, 1, true, 8, false, &paging);
+  dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 1, pick, nullptr, nullptr, 2);
+  const std::vector<int64_t> boundaries{129};
+  dgpp::sched::SchedulerEngine::PrefixPrefill plan;
+  plan.boundaries = &boundaries;
+  plan.snap_slot = 0;
+  plan.snap_position = 128;
+  require(engine.prefill_cached(0, prompt, &plan) == expected[0] && plan.snap_taken,
+          "MTP prefill retains a valid prompt snapshot");
+  require(engine.prefix_snapshot_ready(0), "prefill has current draft state");
+  engine.reserve(0, prompt.size() + 8);
+  bool crossed = false;
+  for (int i = 0; i < 7; ++i) {
+    require(engine.step(0) == std::vector<int32_t>{expected[i + 1]},
+            "ordinary decoding with MTP enabled preserves target output");
+    require(!engine.prefix_snapshot_ready(0), "unused draft state makes live snapshots unavailable");
+    if (model.session_position(0) % model.session_snapshot_align() == 0) {
+      crossed = true;
+      require(model.session_draft_position(0) < model.session_position(0) - 1,
+              "snapshot boundary reproduces the stale draft condition");
+    }
+  }
+  require(crossed && engine.prefix_position(0) == 128,
+          "crossing alignment preserves the valid prompt snapshot");
+  engine.close(0);
+  dgpp::sched::SchedulerEngine::PrefixPrefill reuse;
+  reuse.boundaries = &boundaries;
+  reuse.attach_slot = 0;
+  reuse.attach_position = 128;
+  require(engine.prefill_cached(0, prompt, &reuse) == expected[0] && engine.prefix_snapshot_ready(0),
+          "cached follow-up restores valid target and draft state");
+  engine.close(0);
+}
+
+DGPP_TEST(dsv41_paged_eager_dspark_batches_and_matches_plain_greedy) {
+  using namespace dgpp::expert;
+  struct PendingBoundary : dgpp::BoundaryReducer {
+    bool pending = false;
+    void reduce(uint16_t*, int, int) override { pending = true; }
+    bool stream_ordered() const override { return true; }
+    void settle() override { pending = false; }
+  };
+  for (bool nvfp4 : {false, true}) {
+    const Fixture fx = make_fixture(nvfp4);
+    const std::vector<std::vector<int64_t>> prompts{
+        tokens_of(43, 23, fx.cfg.vocab_size), tokens_of(47, 17, fx.cfg.vocab_size)};
+    const auto pick = dgpp::make_w1_pick(fx.cfg.vocab_size);
+    std::vector<std::vector<int32_t>> expected(2);
+    {
+      dgpp::Dsv41Model reference(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                                nullptr, 0, 1, 2, false, 16);
+      for (int req = 0; req < 2; ++req) {
+        auto& ids = expected[req];
+        ids.push_back(pick(reference.session_prefill(req, prompts[req])));
+        for (int t = 1; t < 30; ++t) ids.push_back(pick(reference.session_step(req, ids.back())));
+        reference.session_close(req);
+      }
+    }
+    for (auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+      auto paging = fixture_paging(fx, policy, true);
+      PendingBoundary boundary;
+      dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                            nullptr, 0, 1, 2, true, 16, false, &paging);
+      model.set_boundary(&boundary);
+      dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 2, pick);
+      // Force only the first draft blocks to the known target tokens. The
+      // verify still uses actual target logits, exercising all-accept commits
+      // before naturally generated drafts exercise rejection and rollback.
+      std::vector<int32_t> forced;
+      for (int start : {1, 7}) for (int c = 0; c < 5; ++c) for (int req : {0, 1})
+        forced.push_back(expected[req][start + c]);
+      size_t forced_at = 0;
+      engine.configure_eager_mtp(5, [&](const std::vector<dgpp::sample::Candidate>& rows) {
+        require(!boundary.pending, "draft collectives settle before host token picks");
+        if (rows.size() <= 2 && forced_at < forced.size()) {
+          std::vector<int32_t> ids(forced.begin() + forced_at, forced.begin() + forced_at + rows.size());
+          forced_at += rows.size();
+          return ids;
+        }
+        std::vector<int32_t> ids;
+        for (const auto& row : rows) ids.push_back(row.id);
+        return ids;
+      });
+      require(engine.max_tokens_per_step() == 6 && engine.decode_batch_capacity() == 2,
+              "DSpark advertises block reservations and batched capacity");
+      std::vector<std::vector<int32_t>> actual(2);
+      for (int req = 0; req < 2; ++req) {
+        actual[req].push_back(engine.prefill(req, prompts[req]));
+        engine.reserve(req, prompts[req].size() + 40);
+      }
+      bool rejected = false;
+      try { (void)engine.step_batch({0, 0}); } catch (const std::invalid_argument&) { rejected = true; }
+      require(rejected && forced_at == 0, "invalid batches do not draft or mutate requests");
+      const auto first = engine.step_batch({0, 1});
+      require(first[0].size() == 6 && first[1].size() == 6, "both forced draft blocks are fully accepted");
+      for (int req = 0; req < 2; ++req) actual[req].insert(actual[req].end(), first[req].begin(), first[req].end());
+      engine.configure_eager_mtp(5, [](const std::vector<dgpp::sample::Candidate>& rows) {
+        std::vector<int32_t> ids;
+        for (const auto& row : rows) ids.push_back(row.id);
+        return ids;
+      }, true, 8, 28, 100, 1, false);
+      int iteration = 0;
+      while (actual[0].size() < 24 || actual[1].size() < 24) {
+        std::vector<int> reqs;
+        for (int req : (iteration++ % 2 ? std::vector<int>{0, 1} : std::vector<int>{1, 0}))
+          if (actual[req].size() < 24) reqs.push_back(req);
+        const auto fresh = engine.step_batch(reqs);
+        if (iteration > 1) for (const auto& ids : fresh)
+          require(ids.size() <= 2, "confidence scheduling shortens verification to one draft");
+        for (size_t i = 0; i < reqs.size(); ++i)
+          actual[reqs[i]].insert(actual[reqs[i]].end(), fresh[i].begin(), fresh[i].end());
+      }
+      for (int req = 0; req < 2; ++req) {
+        actual[req].resize(24);
+        require(std::equal(actual[req].begin(), actual[req].end(), expected[req].begin()),
+                "batched DSpark transcript equals plain greedy across accepts and rejects");
+        const auto acceptance = static_cast<dgpp::sched::SchedulerEngine&>(engine).mtp_acceptance(req);
+        require(acceptance.depth == 5 && acceptance.accepts[4] >= 1, "per-request acceptance includes full draft block");
+        engine.close(req);
+      }
+      require(static_cast<dgpp::sched::SchedulerEngine&>(engine).mtp_acceptance().accepts[4] >= 2,
+              "global acceptance survives slot retirement");
+      require(engine.prefill(0, prompts[0]) == expected[0][0], "DSpark slot can be reused");
+      const auto fresh = engine.step(0);
+      require(std::equal(fresh.begin(), fresh.end(), expected[0].begin() + 1), "reused slot drafts from its new prompt");
+      engine.close(0);
+      int scheduled_picks = 0;
+      engine.configure_eager_mtp(5, [&](const std::vector<dgpp::sample::Candidate>& rows) {
+        if (rows.size() == 1) ++scheduled_picks;
+        std::vector<int32_t> ids;
+        for (const auto& row : rows) ids.push_back(row.id);
+        return ids;
+      }, true, 8, 28, 1e-30f, 1, false);
+      require(engine.prefill(0, prompts[0]) == expected[0][0], "scheduled slot reopens");
+      DGPP_CUDA_OK(cudaMemsetAsync(const_cast<float*>(model.device_confidence()), 0xff,
+                                  model.confidence_rows() * sizeof(float), model.stream()));
+      const auto scheduled = engine.step(0);
+      require(scheduled_picks == 10,
+              "scheduling reads freshly produced chain confidences, ignoring poisoned future rows");
+      require(std::equal(scheduled.begin(), scheduled.end(), expected[0].begin() + 1),
+              "scheduled full-depth output equals ordinary greedy");
+      engine.close(0);
+    }
+  }
+}

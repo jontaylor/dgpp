@@ -17,7 +17,11 @@
 // Route traces use caller-owned pinned staging and asynchronous copies.
 // Read them after the model stream completes; see MoeTraceStaging and
 // models/glm/trace.hpp.
+#include <array>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <span>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -26,6 +30,8 @@
 #include "models/glm/moe.hpp"
 
 namespace dgpp {
+class Sm12xMoe;
+namespace expert { class ExpertCache; }
 
 // Caller-owned PINNED staging for enqueue_decode's async route copies:
 // the decode step's D2H copies land here mid-step (stream-ordered, no
@@ -108,6 +114,14 @@ class GlmMoeLayer {
   void enqueue(const uint16_t* hidden, uint16_t* out, int tokens,
                cudaStream_t stream,
                MoeExpertKernel kernel = MoeExpertKernel::kGemv);
+  // Eager reconstruction baseline: compact routing readback, bounded expert
+  // waves, existing complete-expert kernels and the same final ordered sum.
+  // cache_experts maps this layer's route IDs to the global cache population.
+  // No CUDA graph capture; the cache must own this exact execution stream.
+  void enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
+                     expert::ExpertCache& cache, std::span<const size_t> cache_experts,
+                     cudaStream_t stream, MoeExpertKernel kernel = MoeExpertKernel::kGemv,
+                     MoeTraceStaging* trace = nullptr);
   // The host path with the fp32 chain handed back UNROUNDED (out
   // [tokens, hidden] f32) — the Qwen MoE continues it with its BF16 shared
   // expert and rounds once after (models/qwen/moe_layer.hpp).
@@ -243,14 +257,16 @@ class GlmMoeLayer {
   void copy_route_trace(MoeTraceStaging* trace, int tokens, cudaStream_t stream, int output_row = 0);
   // enqueue()/enqueue_f32(): exactly one of out_bf16 / out_f32 is set.
   void enqueue_host(const uint16_t* hidden, uint16_t* out_bf16, float* out_f32,
-                    int tokens, cudaStream_t stream, MoeExpertKernel kernel);
+                    int tokens, cudaStream_t stream, MoeExpertKernel kernel,
+                    expert::ExpertCache* cache = nullptr, std::span<const size_t> cache_experts = {});
   void accumulate_grouped(uint16_t* out_bf16, float* out_f32, int shared_row0, int tokens,
                           cudaStream_t stream);
   // enqueue_decode / enqueue_decode_f32: exactly one of out_bf16 (the
   // full chain with the shared expert) / out_f32 (the routed chain) is set.
   void enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                            float* out_f32, int tokens, MoeTraceStaging* trace,
-                           cudaStream_t stream, int table_slot, bool accumulate = true);
+                           cudaStream_t stream, int table_slot, bool accumulate = true,
+                           const MoeExpertView* paged_table = nullptr);
   // The eager paths' expert-table upload: fills the ring's next pinned
   // entry with every routed expert's three views (and the shared expert's
   // three after them when with_shared) and copies it to d_dst on stream —
@@ -270,7 +286,8 @@ class GlmMoeLayer {
                             const MoeSegment* shared_seg, int tokens,
                             size_t rows_total, cudaStream_t stream,
                             const MoeTile* tiles = nullptr,
-                            const int32_t* tile_count = nullptr, int tile_cap = 0);
+                            const int32_t* tile_count = nullptr, int tile_cap = 0,
+                            bool execute_shared = true);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;
@@ -367,6 +384,28 @@ class GlmMoeLayer {
   // upload per MoE layer per step buys lifetime correctness with zero
   // cleverness; the graph era bakes the tables in properly.
   MoeExpertView* d_expert_views_ = nullptr;  // [n_experts * 3]
+
+  // One persistent table per paged layer, even when this executor is
+  // rebound across layers. Only selected native addresses need checking.
+  struct PagedDecodeGraph {
+    cudaGraphExec_t exec = nullptr;
+    const uint16_t* hidden = nullptr;
+    uint16_t* out = nullptr;
+    std::array<uint64_t, 18> shared_signature{};
+  };
+  struct PagedBindings {
+    uint64_t cache_identity = 0;
+    bool valid = false;
+    MoeExpertView* device = nullptr;
+    std::vector<GlmFp4Matrix> views;
+    std::vector<const uint8_t*> addresses;
+    std::map<int, PagedDecodeGraph> decode_graphs;
+  };
+  std::map<size_t, PagedBindings> paged_bindings_;
+  std::unique_ptr<Sm12xMoe> sm12x_moe_;
+  void enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
+      cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
+      std::span<const int> active_experts);
 
   // host staging
   std::vector<int32_t> h_ids_;

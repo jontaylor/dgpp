@@ -452,6 +452,7 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.model);
   out += ",\"ckpt\":";
   append_json_string(&out, s.checkpoint);
+  if (s.expert_streaming) out += ",\"xp\":" + expert_paging_json(*s.expert_streaming);
   if (!s.runtime_adapter_id.empty()) {
     out += ",\"runtime_adapter_id\":";
     append_json_string(&out, s.runtime_adapter_id);
@@ -708,6 +709,7 @@ JournalRecord decode_journal_line(std::string_view line) {
   if (op == "settings") {
     rec.settings = true;
     WorldSettings& s = rec.world_settings;
+    if (const auto* xp = v.find("xp")) s.expert_streaming = parse_expert_paging(*xp, "journal");
     if (const auto* adapter = v.find("runtime_adapter_id")) {
       if (!adapter->is_string() || adapter->as_string().size() != 64 ||
           adapter->as_string().find_first_not_of("0123456789abcdef") != std::string_view::npos)

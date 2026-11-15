@@ -58,10 +58,13 @@ struct Fixture {
   std::vector<uint8_t> bytes(const std::string& name) const { return dsv41fx::fixture_bytes(expected(name)); }
 };
 
-Fixture write_fixture() {
+Fixture write_fixture(bool mxfp4_engram = false, bool nvfp4_experts = false) {
   Fixture fx;
   fx.cfg = dsv41fx::tiny_config();
-  fx.dir = (fs::current_path() / "dsv41_loader_fixture").string();
+  fx.cfg.engram_mxfp4 = mxfp4_engram;
+  fx.cfg.experts_nvfp4 = nvfp4_experts;
+  fx.dir = (fs::current_path() / (nvfp4_experts ? "dsv41_loader_nvfp4_fixture" :
+      mxfp4_engram ? "dsv41_loader_mxfp4_engram_fixture" : "dsv41_loader_fixture")).string();
   dsv41fx::write_fixture(fx.cfg, fx.dir);
   fx.table = dgpp::dsv41_expected_text_tensors(fx.cfg);
   return fx;
@@ -301,6 +304,56 @@ DGPP_TEST(dsv41_loader_slices_every_class_byte_exact_at_worlds_1_2_4) {
   }
 }
 
+DGPP_TEST(dsv41_loader_nvfp4_native_slices_metadata_and_mxfp4_draft) {
+  const Fixture fx = write_fixture(false, true);
+  for (const int world : {1, 2, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      Dsv41LayerStream loader(fx.cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Streaming,
+          world > 1 ? dgpp::Dsv41HeadSharding::VocabSharded : dgpp::Dsv41HeadSharding::Full, true);
+      const int64_t start = rank * fx.cfg.moe_intermediate_size / world;
+      const int64_t count = fx.cfg.moe_intermediate_size / world;
+      for (const int layer : {0, fx.cfg.num_hidden_layers}) {
+        const auto before = loader.source_bytes_read();
+        const auto& loaded = loader.load_layer(layer);
+        require(loaded.bytes == Dsv41LayerStream::layer_bytes(fx.cfg, layer, rank, world),
+                "NVFP4 allocation formula equals constructed layout");
+        require(loader.source_bytes_read() - before ==
+                Dsv41LayerStream::planned_layer_source_bytes(fx.cfg, layer, rank, world),
+                "NVFP4 payload, scales and both scalar reads match source plan");
+        for (int expert = 0; expert < loaded.moe.n_experts; ++expert) {
+          const std::string prefix = dgpp::dsv41_layer_prefix(fx.cfg, layer) + "ffn.experts." +
+              std::to_string(expert) + ".";
+          for (int matrix = 0; matrix < 3; ++matrix) {
+            const auto& q = loaded.moe.expert(expert, matrix);
+            const std::string base = prefix + (matrix == 0 ? "w1" : matrix == 1 ? "w3" : "w2");
+            if (layer == fx.cfg.num_hidden_layers) {
+              check_mxfp4(fx, q, base, matrix != 2, start, count, "native MX draft");
+              continue;
+            }
+            const auto& weight = fx.expected(base + ".weight");
+            const int64_t rows = weight.shape[0], cols = weight.shape[1] * 2;
+            require(q.scale_group == 16 && !q.mxfp4() && q.global_scale, "NVFP4 native descriptor");
+            if (matrix != 2) {
+              require(q.rows == count && q.cols == cols, "NV gate/up geometry");
+              expect_device_equals(q.payload, host_rows(fx.bytes(base + ".weight"), cols / 2, start, count), "NV code rows");
+              expect_device_equals(q.scales, host_rows(fx.bytes(base + ".weight_scale"), cols / 16, start, count), "NV scale rows");
+            } else {
+              require(q.rows == rows && q.cols == count, "NV down geometry");
+              expect_device_equals(q.payload, host_cols(fx.bytes(base + ".weight"), rows, cols / 2, start / 2, count / 2), "NV code columns");
+              expect_device_equals(q.scales, host_cols(fx.bytes(base + ".weight_scale"), rows, cols / 16, start / 16, count / 16), "NV scale columns");
+            }
+            float source_factor;
+            const auto bytes = fx.bytes(base + ".weight_scale_2");
+            std::memcpy(&source_factor, bytes.data(), sizeof(source_factor));
+            expect_device_equals(q.global_scale, f32_bytes({1.0f / source_factor}), "NV exact reciprocal descriptor");
+          }
+        }
+        loader.release_layer();
+      }
+    }
+  }
+}
+
 DGPP_TEST(dsv41_loader_globals_slices) {
   const Fixture fx = write_fixture();
   const size_t H2 = static_cast<size_t>(fx.cfg.hidden_size) * 2;
@@ -335,11 +388,12 @@ DGPP_TEST(dsv41_loader_globals_slices) {
   Dsv41LayerStream::set_embed_vocab_sharded(false);
 }
 
-DGPP_TEST(dsv41_loader_engram_tables_mmap_and_gather) {
-  const Fixture fx = write_fixture();
+void check_engram_tables_mmap_and_gather(bool mxfp4) {
+  const Fixture fx = write_fixture(mxfp4);
   const Dsv41TextConfig& cfg = fx.cfg;
   const int L = static_cast<int>(cfg.engram_layer_ids.size()), G = cfg.engram_max_ngram_size - 1, Hh = cfg.engram_n_heads;
-  const int row_bytes = cfg.engram_head_dim + cfg.engram_head_dim / 32;
+  const int payload_bytes = cfg.engram_head_dim / (mxfp4 ? 2 : 1);
+  const int row_bytes = payload_bytes + cfg.engram_head_dim / 32;
   for (const int world : {1, 4}) {
     for (int rank = 0; rank < world; ++rank) {
       Dsv41LayerStream s(fx.cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Resident,
@@ -359,7 +413,7 @@ DGPP_TEST(dsv41_loader_engram_tables_mmap_and_gather) {
       for (int li = 0; li < L; ++li) {
         const auto& tab = *t.tables[static_cast<size_t>(li)];
         require(tab.rows() == cfg.engram_num_embeddings[static_cast<size_t>(li)] && tab.head_dim() == cfg.engram_head_dim &&
-                    tab.row_bytes() == row_bytes,
+                    tab.row_bytes() == row_bytes && tab.mxfp4() == mxfp4,
                 "table rows");
         for (int tk = 0; tk < tokens; ++tk)
           for (int c = 0; c < G * Hh; ++c)
@@ -373,9 +427,9 @@ DGPP_TEST(dsv41_loader_engram_tables_mmap_and_gather) {
         for (int j = 0; j < t.rows_local(); ++j) {
           const int32_t id = ids[static_cast<size_t>(tk) * ids_stride + t.sel[static_cast<size_t>(j)]];
           const uint8_t* got = staged.data() + (static_cast<size_t>(tk) * t.rows_local() + j) * row_bytes;
-          require(std::memcmp(got, payload.data() + static_cast<size_t>(id) * cfg.engram_head_dim, cfg.engram_head_dim) == 0,
+          require(std::memcmp(got, payload.data() + static_cast<size_t>(id) * payload_bytes, payload_bytes) == 0,
                   "gathered payload row");
-          require(std::memcmp(got + cfg.engram_head_dim, scales.data() + static_cast<size_t>(id) * (cfg.engram_head_dim / 32),
+          require(std::memcmp(got + payload_bytes, scales.data() + static_cast<size_t>(id) * (cfg.engram_head_dim / 32),
                               cfg.engram_head_dim / 32) == 0,
                   "gathered scale row");
         }
@@ -395,6 +449,30 @@ DGPP_TEST(dsv41_loader_engram_tables_mmap_and_gather) {
       require(t.mapped_bytes() > 0, "mapped bytes reported");
     }
   }
+}
+
+DGPP_TEST(dsv41_loader_engram_tables_mmap_and_gather) {
+  check_engram_tables_mmap_and_gather(false);
+}
+
+DGPP_TEST(dsv41_loader_mxfp4_engram_tables_mmap_and_gather) {
+  check_engram_tables_mmap_and_gather(true);
+}
+
+DGPP_TEST(dsv41_loader_engram_mapping_refuses_overflow_and_truncation) {
+  const fs::path path = fs::current_path() / "dsv41_engram_invalid_mapping.bin";
+  { std::ofstream f(path, std::ios::binary); f << std::string(272, '\0'); }
+  for (const bool mxfp4 : {false, true}) {
+    for (int which = 0; which < 4; ++which) {
+      bool refused = false;
+      try {
+        dgpp::Dsv41EngramTableMmap table(path.string(), which == 0 ? UINT64_MAX : 0,
+            which == 1 ? UINT64_MAX : 264, which == 2 ? INT64_MAX : 2, 256, mxfp4);
+      } catch (const std::runtime_error&) { refused = true; }
+      require(refused, "overflowed offsets, huge row counts and truncated rows are refused for both table formats");
+    }
+  }
+  fs::remove(path);
 }
 
 DGPP_TEST(dsv41_loader_resident_mode_and_image_round_trip) {
@@ -867,4 +945,37 @@ DGPP_TEST(dsv41_loader_exl3_refuses_inexact_natives_and_a_pack_without_its_k_map
               std::string(e.what()).find("bf16-exact") != std::string::npos;
   }
   require(refused, "exl3: an f16 native that is not bf16-exact is refused naming the tensor");
+}
+
+DGPP_TEST(dsv41_paged_loader_keeps_backbone_and_expert_geometry_without_expert_allocations) {
+  const Fixture fx = write_fixture();
+  auto cfg = fx.cfg;
+  cfg.runtime_page_experts = true;
+  for (const int world : {1, 2, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      Dsv41LayerStream loader(cfg, fx.dir, rank, world, dgpp::Dsv41Residency::Resident,
+          world > 1 ? dgpp::Dsv41HeadSharding::VocabSharded : dgpp::Dsv41HeadSharding::Full, true);
+      for (int l = 0; l < cfg.max_layer(); ++l) {
+        const auto before = loader.source_bytes_read();
+        const auto& layer = loader.load_layer(l);
+        require(layer.moe.router && layer.moe.router_bias && layer.moe.shared[0].payload,
+                "router, shared expert and backbone still resident");
+        require(layer.bytes < Dsv41LayerStream::layer_bytes(fx.cfg, l, rank, world),
+                "paged layer allocation excludes routed payloads");
+        require(loader.source_bytes_read() - before < Dsv41LayerStream::planned_layer_source_bytes(fx.cfg, l, rank, world),
+                "backbone loading never first reads every expert");
+        for (int e = 0; e < layer.moe.n_experts; ++e) {
+          for (int m = 0; m < 3; ++m) {
+            const auto& matrix = layer.moe.expert(e, m);
+            require(!matrix.payload && !matrix.scales && !matrix.global_scale,
+                    "nonresident descriptor has no executable weight pointers");
+            require(matrix.rows == (m == 2 ? cfg.hidden_size : cfg.moe_intermediate_size / world) &&
+                    matrix.cols == (m == 2 ? cfg.moe_intermediate_size / world : cfg.hidden_size) && matrix.scale_group == 32,
+                    "descriptor preserves rank-local MXFP4 geometry");
+          }
+        }
+      }
+      require(loader.image_layers_captured() == 0, "paged backbone never pollutes whole-layer image namespace");
+    }
+  }
 }

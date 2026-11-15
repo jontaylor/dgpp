@@ -403,6 +403,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "runtime_adapter_path")
           e.runtime_adapter_path = expand_home(text(x, ek, what));
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
+        else if (p.key == "expert_streaming") {
+          e.expert_streaming = parse_expert_paging(x, what + ".engine");
+          e.expert_streaming->image_directory = expand_home(e.expert_streaming->image_directory);
+        }
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
         else if (p.key == "dflash_weights") {
@@ -607,6 +611,14 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
        !c.engine.expert_tile_list || c.engine.expert_gemm_pair ||
        c.engine.collective_transport != "write"))
     fail(what, "engine.runtime_adapters requires the default expert/prefill/transport recipe");
+  if (c.engine.expert_streaming &&
+      (c.engine.decode_graph || c.engine.prefill_fold_overlap ||
+       c.engine.runtime_adapters || !c.engine.dflash_model.empty()))
+    fail(what, "engine.expert_streaming requires decode_graph=false, prefill_fold_overlap=false, "
+               "runtime_adapters=false and no dflash_model");
+  if (c.engine.expert_streaming && c.engine.mtp &&
+      (c.engine.lookup_draft || c.engine.lookup_tail))
+    fail(what, "engine.expert_streaming MTP requires lookup_draft=false and lookup_tail=0");
   return c;
 }
 

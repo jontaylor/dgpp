@@ -3037,6 +3037,26 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, m.record_tokens);
   out.append(",\"pool_blocks_total\":");
   append_json_int(&out, m.pool_blocks_total);
+  if (m.expert_streaming) {
+    const auto& x = *m.expert_streaming;
+    out.append(",\"expert_streaming\":{\"policy\":");
+    append_json_string(&out, x.policy == expert::Policy::kWholeExpert ? "whole_expert_cache" : "adaptive_fractional_cache");
+    out.append(",\"io_mode\":");
+    append_json_string(&out, x.io_mode == expert::IoMode::kDirect ? "direct" : "buffered");
+    out.append(",\"file_read_bytes\":");
+    append_json_uint(&out, x.file.returned_bytes);
+    out.append(",\"file_read_calls\":");
+    append_json_uint(&out, x.file.calls);
+    out.append(",\"budget_bytes\":");
+    append_json_uint(&out, x.memory.budget_bytes);
+    out.append(",\"allocated_bytes\":");
+    append_json_uint(&out, x.memory.allocated_bytes());
+    out.append(",\"resident_chunks\":");
+    append_json_uint(&out, x.resident_chunks);
+    out.append(",\"total_chunks\":");
+    append_json_uint(&out, x.total_chunks);
+    out.push_back('}');
+  }
   out.append(",\"pool_blocks_in_use\":");
   append_json_int(&out, m.pool_blocks_in_use);
   out.append(",\"prefilling\":");

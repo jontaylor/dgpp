@@ -145,6 +145,40 @@ add_library(dgpp_loaders STATIC
 target_link_libraries(dgpp_loaders PUBLIC dgpp_core)
 dgpp_set_common(dgpp_loaders)
 
+# Shared expert-paging geometry and policy planning: host-only, no CUDA calls.
+add_library(dgpp_expert_residency STATIC
+  src/loaders/expert_pressure.cpp
+  src/loaders/expert_residency.cpp
+  src/loaders/expert_store.cpp
+  src/loaders/expert_read_queue.cpp
+  src/loaders/expert_cache.cpp)
+target_link_libraries(dgpp_expert_residency PUBLIC Threads::Threads)
+dgpp_set_common(dgpp_expert_residency)
+
+add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu)
+target_link_libraries(dgpp_moe_fp4_pack PUBLIC CUDA::cudart)
+dgpp_set_common(dgpp_moe_fp4_pack)
+
+set(DGPP_B12X_AOT_DIR "" CACHE PATH "Optional b12x SM121 AOT header, object and CUDA dialect runtime archive directory")
+add_library(dgpp_sm12x_moe STATIC src/kernels/sm12x_moe.cpp)
+target_link_libraries(dgpp_sm12x_moe PUBLIC dgpp_moe_fp4_pack CUDA::cudart)
+if(DGPP_B12X_AOT_DIR)
+  target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_raw_fp32.o")
+  target_include_directories(dgpp_sm12x_moe SYSTEM PRIVATE "${DGPP_B12X_AOT_DIR}")
+  target_link_libraries(dgpp_sm12x_moe PUBLIC "${DGPP_B12X_AOT_DIR}/libcuda_dialect_runtime_static.a" CUDA::cuda_driver)
+  target_compile_definitions(dgpp_sm12x_moe PRIVATE DGPP_HAVE_B12X_AOT=1)
+endif()
+dgpp_set_common(dgpp_sm12x_moe)
+
+add_library(dgpp_expert_cache_cuda STATIC src/loaders/expert_cache_cuda.cpp)
+target_link_libraries(dgpp_expert_cache_cuda PUBLIC dgpp_expert_residency dgpp_moe_fp4_pack CUDA::cudart)
+dgpp_set_common(dgpp_expert_cache_cuda)
+
+# Mechanism diagnostic with optional existing expert GEMV arithmetic.
+add_executable(expert_replay_bench apps/expert_replay_bench.cpp)
+target_link_libraries(expert_replay_bench PRIVATE dgpp_expert_cache_cuda dgpp_kernels)
+dgpp_set_common(expert_replay_bench)
+
 # The host-side rope tables (kernels/rope_scaling.hpp): the YaRN builder the
 # DeepSeek-V4.1 CSA2 layers and the Qwen QSA rope share. Host-only, so the
 # unit gate links it without dragging the CUDA kernels in.
@@ -487,10 +521,14 @@ dgpp_set_common(dgpp_models_dsv41)
 # The DeepSeek-V4.1-Flash loader (docs/deepseek_v41_flash_plan.md G3): the
 # ResidentLayerStream family, the fp8 / MXFP4 slice builders, the Engram
 # table mappings.
+add_library(dgpp_dsv41_expert_image STATIC src/models/dsv41/expert_image.cpp)
+target_link_libraries(dgpp_dsv41_expert_image PUBLIC dgpp_models_dsv41 dgpp_expert_residency OpenSSL::Crypto)
+dgpp_set_common(dgpp_dsv41_expert_image)
+
 add_library(dgpp_models_dsv41_loader STATIC
   src/models/dsv41/loader.cpp)
 target_include_directories(dgpp_models_dsv41_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_dsv41_loader PUBLIC dgpp_models_dsv41 dgpp_loaders CUDA::cudart dgpp_device_ranges)
+target_link_libraries(dgpp_models_dsv41_loader PUBLIC dgpp_models_dsv41 dgpp_loaders CUDA::cudart dgpp_device_ranges dgpp_dsv41_expert_image)
 dgpp_set_common(dgpp_models_dsv41_loader)
 
 # The CSA2 attention layer and its caches (plan G4).
@@ -802,7 +840,7 @@ set_tests_properties(qwen35_image_prefill_test qwen35_mixed_image_prefill_test
 add_library(dgpp_models_moe STATIC
   src/models/glm/moe_layer.cpp)
 target_include_directories(dgpp_models_moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_moe PUBLIC dgpp_models_glm dgpp_kernels)
+target_link_libraries(dgpp_models_moe PUBLIC dgpp_models_glm dgpp_kernels dgpp_expert_cache_cuda dgpp_sm12x_moe)
 dgpp_set_common(dgpp_models_moe)
 
 add_library(dgpp_models_glm_loader STATIC
@@ -1233,6 +1271,7 @@ add_library(dgpp_serve STATIC
   src/serve/qwen_vision_frontend.cpp
   src/serve/file_inputs.cpp
   src/serve/cluster_config.cpp
+  src/serve/expert_paging.cpp
   src/serve/nvme_cache_check.cpp
   src/serve/http_server.cpp
   src/serve/generation_service.cpp
@@ -1241,7 +1280,7 @@ add_library(dgpp_serve STATIC
   src/serve/prometheus.cpp
   src/serve/rank_metrics.cpp)
 target_link_libraries(dgpp_serve
-  PUBLIC dgpp_core dgpp_models_glm dgpp_loaders dgpp_net Threads::Threads)
+  PUBLIC dgpp_core dgpp_models_glm dgpp_loaders dgpp_net dgpp_expert_residency Threads::Threads)
 if(DGPP_ENABLE_VIDEO)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(DGPP_FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
@@ -1322,6 +1361,39 @@ target_link_libraries(scheduler_test PRIVATE dgpp_models_glm Threads::Threads)
 dgpp_set_common(scheduler_test)
 add_test(NAME scheduler_test COMMAND scheduler_test)
 
+add_executable(expert_residency_test tests/host/expert_residency_test.cpp)
+target_link_libraries(expert_residency_test PRIVATE dgpp_expert_residency)
+dgpp_set_common(expert_residency_test)
+add_test(NAME expert_residency_test COMMAND expert_residency_test)
+
+add_executable(expert_store_test tests/host/expert_store_test.cpp)
+target_link_libraries(expert_store_test PRIVATE dgpp_expert_residency)
+dgpp_set_common(expert_store_test)
+add_test(NAME expert_store_test COMMAND expert_store_test)
+
+add_executable(expert_read_queue_test tests/host/expert_read_queue_test.cpp)
+target_link_libraries(expert_read_queue_test PRIVATE dgpp_expert_residency)
+dgpp_set_common(expert_read_queue_test)
+add_test(NAME expert_read_queue_test COMMAND expert_read_queue_test)
+set_tests_properties(expert_read_queue_test PROPERTIES TIMEOUT 45)
+
+add_executable(dsv41_expert_image_test tests/host/dsv41_expert_image_test.cpp)
+target_link_libraries(dsv41_expert_image_test PRIVATE dgpp_dsv41_expert_image)
+dgpp_set_common(dsv41_expert_image_test)
+add_test(NAME dsv41_expert_image_test COMMAND dsv41_expert_image_test)
+set_tests_properties(dsv41_expert_image_test PROPERTIES TIMEOUT 45)
+
+add_executable(expert_paging_test tests/host/expert_paging_test.cpp src/serve/expert_paging.cpp)
+target_link_libraries(expert_paging_test PRIVATE dgpp_loaders)
+dgpp_set_common(expert_paging_test)
+add_test(NAME expert_paging_test COMMAND expert_paging_test)
+
+add_executable(expert_cache_test tests/host/expert_cache_test.cpp)
+target_link_libraries(expert_cache_test PRIVATE dgpp_expert_residency)
+dgpp_set_common(expert_cache_test)
+add_test(NAME expert_cache_test COMMAND expert_cache_test)
+set_tests_properties(expert_cache_test PROPERTIES TIMEOUT 45)
+
 add_executable(shutdown_watchdog_test tests/host/shutdown_watchdog_test.cpp)
 target_link_libraries(shutdown_watchdog_test PRIVATE Threads::Threads)
 dgpp_set_common(shutdown_watchdog_test)
@@ -1366,6 +1438,9 @@ add_test(NAME script_reports_test
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/script_reports_test.py)
 add_test(NAME portability_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/portability_test.py)
+add_test(NAME dsv41_dump_check_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/dsv41_dump_check_test.py)
+set_tests_properties(dsv41_dump_check_test PROPERTIES LABELS "host;python")
 add_test(NAME timed_load_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/timed_load_test.py)
 add_test(NAME serve_campaign_test
@@ -2260,7 +2335,7 @@ add_executable(dsv41_load_check apps/dsv41_load_check.cpp)
 target_link_libraries(dsv41_load_check PRIVATE dgpp_models_dsv41_loader dgpp_loaders CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_load_check)
 # The per-layer dump on the real checkpoint for the torch cross-check.
-add_executable(dsv41_forward_check apps/dsv41_forward_check.cpp)
+add_executable(dsv41_forward_check apps/dsv41_forward_check.cpp src/serve/expert_paging.cpp)
 target_link_libraries(dsv41_forward_check PRIVATE dgpp_models_dsv41_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dsv41_forward_check)
 
@@ -2543,6 +2618,12 @@ target_link_libraries(fp4_gemv_test PRIVATE dgpp_kernels dgpp_loaders CUDA::cuda
 dgpp_set_common(fp4_gemv_test)
 add_test(NAME fp4_gemv_test COMMAND fp4_gemv_test)
 set_tests_properties(fp4_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
+
+add_executable(moe_fp4_pack_test tests/cuda/moe_fp4_pack_test.cpp)
+target_link_libraries(moe_fp4_pack_test PRIVATE dgpp_moe_fp4_pack CUDA::cudart)
+dgpp_set_common(moe_fp4_pack_test)
+add_test(NAME moe_fp4_pack_test COMMAND moe_fp4_pack_test)
+set_tests_properties(moe_fp4_pack_test PROPERTIES SKIP_RETURN_CODE 2)
 
 add_executable(packq_gemv_test tests/cuda/packq_gemv_test.cu tests/cuda/packq_gemv_checkpoint.cpp)
 target_include_directories(packq_gemv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -2935,7 +3016,7 @@ set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
 set_tests_properties(heretic_launcher_host heretic_worker_host heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
-  site_env_test script_reports_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
+  site_env_test script_reports_test dsv41_dump_check_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
 if(TARGET dgpp_bus)
   set_tests_properties(heretic_distributed_host PROPERTIES LABELS "host;python" TIMEOUT 60)
   set_tests_properties(heretic_distributed_int8 heretic_distributed_m346 PROPERTIES LABELS "gpu;rdma")

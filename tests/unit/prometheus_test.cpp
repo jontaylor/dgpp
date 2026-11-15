@@ -49,6 +49,21 @@ DGPP_TEST(prometheus_histogram_rejectsBadBounds) {
   }
 }
 
+DGPP_TEST(prometheus_stepHistogram_boundsLongStorageStalls) {
+  Histogram h(dgpp::serve::prom::step_buckets());
+  for (double seconds : {15.0, 90.0, 650.0}) h.observe(seconds);
+  Writer w("");
+  w.histogram("step_seconds", "Step time.", h);
+  const auto out = w.take();
+  require(out.find("step_seconds_bucket{le=\"10\"} 0\n") != std::string::npos,
+          "original ten-second boundary remains available");
+  require(out.find("step_seconds_bucket{le=\"15\"} 1\n") != std::string::npos &&
+              out.find("step_seconds_bucket{le=\"120\"} 2\n") != std::string::npos,
+          "long storage stalls retain finite upper bounds");
+  require(out.find("step_seconds_bucket{le=\"+Inf\"} 3\n") != std::string::npos,
+          "larger stalls still reconcile in overflow");
+}
+
 DGPP_TEST(prometheus_writer_rendersFamiliesOnce) {
   Writer w("model_name=\"m\"");
   w.counter("x_total", "An x.", uint64_t{18446744073709551615ull}, "kind=\"a\"");

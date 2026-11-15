@@ -37,7 +37,53 @@ std::string refusal(const std::string& text) {
 
 bool has(const std::string& msg, const char* needle) { return msg.find(needle) != std::string::npos; }
 
+std::string nvfp4_config() {
+  std::string layers;
+  for (int l = 0; l < 40; ++l) {
+    if (l) layers += ',';
+    layers += "\"layers." + std::to_string(l) + ".ffn.experts\":{\"group_size\":16,\"quant_algo\":\"NVFP4\"}";
+  }
+  return config_json("\"expert_dtype\": \"fp4\"", R"json("expert_dtype": "fp4",
+    "moe_quant_algo":"NVFP4", "quant_algo":"MIXED_PRECISION", "group_size":16,
+    "producer":{"name":"modelopt","version":"dsv4-nvfp4-experts"},
+    "quantized_layers":{)json" + layers + R"json(},
+    "config_groups":{"group_0":{"targets":["Linear"],
+      "weights":{"group_size":16,"num_bits":4,"type":"float","dynamic":false},
+      "input_activations":{"group_size":16,"num_bits":4,"type":"float","dynamic":false}}},
+    "engram_embed_quant":"mxfp4", "engram_embed_block_size":32,
+    "engram_embed_scale_dtype":"ue8m0", "engram_embed_layers":[1,14])json");
+}
+
 }  // namespace
+
+DGPP_TEST(dsv41_config_recognizes_modelopt_nvfp4_main_and_mxfp4_draft_engram) {
+  const auto cfg = parse(nvfp4_config());
+  require(cfg.experts_nvfp4 && cfg.engram_mxfp4 && !cfg.weights_exl3, "native NV main and packed MX Engram selected");
+  require(cfg.fp4_block_size == 32 && cfg.fp8_block_size == 32, "MX draft and dense block sizes remain independent");
+  require(!parse(config_json()).experts_nvfp4 && !parse(config_json()).engram_mxfp4, "release defaults preserved");
+}
+
+DGPP_TEST(dsv41_config_refuses_ambiguous_modelopt_layouts) {
+  const auto mutate = [](const std::string& from, const std::string& to) {
+    auto text = nvfp4_config();
+    const auto pos = text.find(from);
+    require(pos != std::string::npos, "NV fixture mutation anchor");
+    text.replace(pos, from.size(), to);
+    return text;
+  };
+  for (const auto& change : std::vector<std::pair<std::string, std::string>>{
+      {"\"group_size\":16", "\"group_size\":32"},
+      {"\"group_size\":16", "\"group_size\":16.5"},
+      {"dsv4-nvfp4-experts", "unknown"},
+      {"layers.39.ffn.experts", "mtp.0.ffn.experts"},
+      {"\"dynamic\":false", "\"dynamic\":true"},
+      {"\"num_bits\":4", "\"num_bits\":8"},
+      {"\"engram_embed_layers\":[1,14]", "\"engram_embed_layers\":[1]"},
+      {"\"engram_embed_layers\":[1,14]", "\"engram_embed_layers\":[1.5,14]"},
+      {"\"engram_embed_block_size\":32", "\"engram_embed_block_size\":16"},
+      {"\"engram_embed_quant\":\"mxfp4\"", "\"engram_embed_quant\":\"fp8\""}})
+    require(!refusal(mutate(change.first, change.second)).empty(), "ambiguous NV declaration must fail");
+}
 
 DGPP_TEST(dsv41_config_parses_the_release) {
   using dgpp::Dsv41LayerMode;

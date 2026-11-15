@@ -12,7 +12,10 @@ ignored); the doc carries the cells.
   serve_campaign.py run --config deploy/cluster_<model>_<quant>_w<n>.example.json --out benchmarks/results/<label>
                         [--bin build-release/dgpp-serve] [--port 18081]
                         [--phases serving,prefill,context,quality,api,transcripts,plain]
-                        [--mode NAME="<knobs>" ...] [--no-swap-scope] [--dry-run]
+                        [--mode NAME="<knobs>" ...] [--phase-timeout PHASE=SECONDS ...]
+                        [--no-swap-scope] [--dry-run]
+  serve_campaign.py run --config LOCAL_PAGING.json --out benchmarks/results/paging --compare-experts
+                        [--comparison-repeats 2]  # A/B/B/A, only policy changes
   serve_campaign.py summarize DIR                     every cell, labelled
   serve_campaign.py rows DIR --label "Qwen3.8-27B FP8" --nodes 1 --options "DFlash2 drafter, ..."
                                                       the doc's table rows for this deployment
@@ -47,9 +50,11 @@ streams identical at teardown. Ranks run in the launcher's swap-limited scopes
 
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import json
+import math
 import os
 import pathlib
 import shlex
@@ -64,6 +69,47 @@ PREFILL_TARGETS = (512, 2048, 8192, 32768)
 PHASES = ("serving", "prefill", "context", "quality", "api", "transcripts", "plain")
 
 
+def workload(a):
+    """Record focused diagnostics separately from the standard benchmark rows."""
+    focused = getattr(a, "streaming_focused", False)
+    if focused and set(a.phases.split(",")) != {"serving", "prefill"}:
+        raise ValueError("--streaming-focused requires --phases serving,prefill")
+    return {"profile": "streaming-focused" if focused else "standard",
+            "warm_windows": 3 if focused else 1, "warm_window_max_tokens": 32,
+            "serving_max_tokens": 64 if focused else 256,
+            "serving_repeat": 2 if focused else 3,
+            "serving_concurrency": "1,2,4" if focused else None,
+            "prefill_targets": [512, 2048] if focused else list(PREFILL_TARGETS),
+            "prefill_repeat": 2 if focused else 3}
+
+PHASE_TIMEOUTS = {"serving": 3600, "prefill": 3600, "context": 21600,
+                  "quality": 14400, "api": 3600, "transcripts": 3600,
+                  "plain": 10800, "mode": 3600}
+
+
+def phase_timeouts(overrides):
+    """Resolve explicit client deadlines without changing the benchmark workload."""
+    result = dict(PHASE_TIMEOUTS)
+    seen = set()
+    for spec in overrides or []:
+        name, sep, seconds = spec.partition("=")
+        if not sep or name not in result or not seconds.isascii() or not seconds.isdecimal():
+            raise ValueError("phase timeout must be PHASE=SECONDS with a known phase and positive integer seconds")
+        value = int(seconds)
+        if value <= 0 or name in seen:
+            raise ValueError("phase timeouts must be positive and specified once per phase")
+        result[name] = value
+        seen.add(name)
+    return result
+
+
+def quality_request_timeout(args):
+    value = float(getattr(args, "quality_request_timeout", 900))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("quality request timeout must be finite and positive")
+    return value
+
+
 # ---- running ---------------------------------------------------------------------------------------------
 
 def utcnow():
@@ -72,7 +118,7 @@ def utcnow():
 
 def run(args, path, env, timeout=3600, check=True):
     """Run one command with its stdout+stderr in `path` and a receipt beside it."""
-    receipt = {"command": [str(a) for a in args], "started": utcnow()}
+    receipt = {"command": [str(a) for a in args], "started": utcnow(), "timeout_seconds": timeout}
     print(receipt["started"][11:19], path.name, flush=True)
     with path.open("w") as f:
         try:
@@ -130,7 +176,52 @@ def plain_deployment(cfg):
 PROBE = ("import hashlib,json,pathlib,sys;st=json.loads(pathlib.Path(sys.argv[1]).read_text());p=pathlib.Path('/proc')/str(st['pid']);"
          "s=dict(l.split(':',1) for l in (p/'status').read_text().splitlines() if ':' in l);"
          "print(json.dumps(dict(pid=st['pid'],sha=hashlib.sha256((p/'exe').read_bytes()).hexdigest(),"
-         "swap_kib=int(s['VmSwap'].split()[0]),rss_kib=int(s['VmRSS'].split()[0]))))")
+         "swap_kib=int(s['VmSwap'].split()[0]),rss_kib=int(s['VmRSS'].split()[0]),hwm_kib=int(s['VmHWM'].split()[0]))))")
+
+
+EXPERT_PROBE = r"""
+import json, os, pathlib, sys, time, urllib.request
+image_directory = os.path.expanduser(sys.argv[1])
+result = {"sampled_unix": time.time(), "image_directory": image_directory,
+          "io_attribution": "Whole block-device/partition counters include competing I/O; not expert-only attribution."}
+try:
+    dev = os.stat(image_directory).st_dev
+    block = pathlib.Path('/sys/dev/block') / f'{os.major(dev)}:{os.minor(dev)}'
+    values = [int(x) for x in (block / 'stat').read_text().split()]
+    result['block'] = {"name": block.resolve().name, "read_operations": values[0],
+                       "read_bytes": values[2] * 512, "read_milliseconds": values[3]}
+except (OSError, ValueError, IndexError) as e:
+    result['block'] = {"unknown": str(e)}
+if sys.argv[2]:
+    try:
+        result['prometheus'] = urllib.request.urlopen(sys.argv[2], timeout=5).read().decode()
+    except (OSError, ValueError) as e:
+        result['prometheus_error'] = str(e)
+else:
+    result['prometheus_error'] = 'Peer metrics disabled; configure ports.metrics for all-rank counters.'
+print(json.dumps(result))
+"""
+
+
+def source_fingerprint():
+    """Include uncommitted source files in the experiment's source identity."""
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                              check=True, capture_output=True, text=True).stdout.strip()
+    names = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                           cwd=ROOT, check=True, capture_output=True).stdout.split(b"\0")
+    digest = hashlib.sha256()
+    for name in sorted(set(names) - {b""}):
+        path = ROOT / os.fsdecode(name)
+        if path.is_symlink():
+            content = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            content = path.read_bytes()
+        elif not path.exists():
+            content = b"DELETED"
+        else:
+            raise ValueError(f"unsupported source entry: {path}")
+        digest.update(name + b"\0" + hashlib.sha256(content).digest())
+    return {"revision": revision, "tree_sha256": digest.hexdigest()}
 
 
 class Boot:
@@ -155,6 +246,7 @@ class Boot:
         (self.d / "binary.sha256").write_text(self.sha + "\n")
         (self.d / "source.txt").write_text(
             subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout)
+        (self.d / "source-identity.json").write_text(json.dumps(source_fingerprint(), indent=2))
         extra = [f"--knobs={self.knobs}"] if self.knobs else []  # one token: a knob that starts with -- is otherwise read as the next option
         run(self.launcher("up", extra), self.d / "up.log", self.env, timeout=1800)
         resolved = json.loads((self.world / "cluster.resolved.json").read_text())
@@ -174,6 +266,23 @@ class Boot:
             if p.returncode:
                 raise RuntimeError(f"rank {rank} snapshot failed: {p.stderr[-400:]}")
             out.append(dict(rank=rank, host=host, **json.loads(p.stdout)))
+        paging = self.cfg.get("engine", {}).get("expert_streaming")
+        if paging:
+            samples = []
+            for rank, host in enumerate(cfg["nodes"]):
+                if rank == 0:
+                    url = f"http://127.0.0.1:{self.port}/metrics/prometheus"
+                else:
+                    metrics_port = cfg.get("ports", {}).get("metrics", 0)
+                    url = f"http://{host}:{metrics_port}/metrics/prometheus" if metrics_port else ""
+                command = ["python3", "-c", EXPERT_PROBE, paging["image_directory"], url]
+                if rank:
+                    command = ["ssh", "-o", "BatchMode=yes", cfg["ssh_user"] + "@" + host, shlex.join(command)]
+                sample = subprocess.run(command, text=True, capture_output=True, timeout=60)
+                if sample.returncode:
+                    raise RuntimeError(f"rank {rank} expert instrumentation failed: {sample.stderr[-400:]}")
+                samples.append(dict(rank=rank, host=host, **json.loads(sample.stdout)))
+            (self.d / f"expert-{label}.json").write_text(json.dumps(samples, indent=2))
         (self.d / f"nodes-{label}.json").write_text(json.dumps(out, indent=2))
         bad = [x for x in out if x["sha"] != self.sha or x["swap_kib"] != 0]
         if bad:
@@ -197,58 +306,163 @@ class Boot:
         self.status["opstreams_match"] = match
 
 
+EXPERT_POLICIES = ("whole_expert_cache", "adaptive_fractional_cache")
+
+
+def compare_experts(a):
+    selected_workload = workload(a)
+    """Alternate paired boots from one frozen template, varying only policy.
+
+    This schedules ordinary serving campaigns. Synthetic routing locality and
+    physical block-device attribution require their own evidence and are not
+    inferred from these rows.
+    """
+    timeouts = phase_timeouts(getattr(a, "phase_timeout", []))
+    quality_timeout = quality_request_timeout(a)
+    cfg = deployment_from(a.config, a.port)
+    engine = cfg.get("engine", {})
+    paging = engine.get("expert_streaming")
+    if not isinstance(paging, dict) or paging.get("policy") not in EXPERT_POLICIES:
+        raise ValueError("expert comparison requires engine.expert_streaming in the template")
+    if "initial_fraction" in paging:
+        raise ValueError("omit initial_fraction for comparison: only policy may differ between legs")
+    if engine.get("decode_graph", False) or engine.get("prefill_fold_overlap", True) or drafts(engine):
+        raise ValueError("expert comparison requires eager execution, no fold overlap and no drafts")
+    if a.mode:
+        raise ValueError("expert comparison does not combine policy and decode-mode changes")
+    if not 1 <= a.comparison_repeats <= 20:
+        raise ValueError("comparison repeats must be in [1, 20]")
+    shared = copy.deepcopy(cfg)
+    del shared["engine"]["expert_streaming"]["policy"]
+    frozen = json.dumps(shared, sort_keys=True, separators=(",", ":"))
+    order = [policy for repeat in range(a.comparison_repeats)
+             for policy in (EXPERT_POLICIES if repeat % 2 == 0 else EXPERT_POLICIES[::-1])]
+    plan = {"shared_config_sha256": hashlib.sha256(frozen.encode()).hexdigest(),
+            "template": str(pathlib.Path(a.config).resolve()), "started": utcnow(),
+            "order": order, "phases": a.phases, "workload": selected_workload,
+            "phase_timeouts_seconds": timeouts, "quality_request_timeout_seconds": quality_timeout, "legs": [],
+            "limitations": ["Natural serving routes; no controlled locality replay.",
+                            "Block counters include competing I/O; expert-only physical attribution requires an idle-device control.",
+                            "Each leg performs the campaign warmup; not a cold-cache mechanism benchmark."]}
+    if a.dry_run:
+        print(json.dumps(plan, indent=2))
+        return 0
+    plan["source"] = source_fingerprint()
+    plan["binary_sha256"] = hashlib.sha256(pathlib.Path(a.bin).read_bytes()).hexdigest()
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=False)
+    receipt = out / "comparison.json"
+    receipt.write_text(json.dumps(plan, indent=2))
+    try:
+        for i, policy in enumerate(order):
+            if source_fingerprint() != plan["source"] or \
+                    hashlib.sha256(pathlib.Path(a.bin).read_bytes()).hexdigest() != plan["binary_sha256"]:
+                raise RuntimeError("source or binary changed during the policy comparison")
+            leg_cfg = copy.deepcopy(cfg)
+            leg_cfg["engine"]["expert_streaming"]["policy"] = policy
+            config = out / f"input-{i:02d}-{policy}.json"
+            config.write_text(json.dumps(leg_cfg, indent=2))
+            leg = copy.copy(a)
+            leg.compare_experts = False
+            leg.config = str(config)
+            leg.out = str(out / f"leg-{i:02d}-{policy}")
+            leg.label = a.label or pathlib.Path(a.config).stem
+            result = run_campaign(leg)
+            if source_fingerprint() != plan["source"] or \
+                    hashlib.sha256(pathlib.Path(a.bin).read_bytes()).hexdigest() != plan["binary_sha256"]:
+                raise RuntimeError("source or binary changed during a policy leg")
+            status = json.loads((pathlib.Path(leg.out) / "status.json").read_text())
+            valid = result == 0 and status.get("ok") and status.get("opstreams_match")
+            plan["legs"].append({"policy": policy, "directory": leg.out,
+                                  "returncode": result, "valid": bool(valid)})
+            receipt.write_text(json.dumps(plan, indent=2))
+            if not valid:
+                raise RuntimeError(f"expert comparison leg {i} failed its campaign or operation-stream gate")
+        plan["ok"] = True
+    except Exception as e:
+        plan.update(ok=False, error=str(e))
+    plan["finished"] = utcnow()
+    receipt.write_text(json.dumps(plan, indent=2))
+    return 0 if plan["ok"] else 1
+
+
 def run_campaign(a):
+    if getattr(a, "compare_experts", False):
+        return compare_experts(a)
+    selected_workload = workload(a)
+    timeouts = phase_timeouts(getattr(a, "phase_timeout", []))
+    quality_timeout = quality_request_timeout(a)
     env = scoped_env(a.no_swap_scope)
     out = pathlib.Path(a.out)
     cfg = deployment_from(a.config, a.port)
     engine = cfg["engine"]
+    if getattr(a, "streaming_focused", False) and not engine.get("expert_streaming"):
+        raise ValueError("--streaming-focused requires expert streaming")
     phases = set(a.phases.split(","))
     unknown = phases - set(PHASES)
     if unknown:
         raise SystemExit(f"unknown phases {sorted(unknown)}; known: {', '.join(PHASES)}")
     slots = int(engine.get("max_concurrency", 8))
     label = a.label or pathlib.Path(a.config).name.replace(".example.json", "").replace(".json", "")
-    status = {"config": a.config, "label": label, "started": utcnow(), "phases": sorted(phases)}
+    status = {"config": a.config, "label": label, "started": utcnow(), "phases": sorted(phases),
+              "workload": selected_workload,
+              "phase_timeouts_seconds": timeouts, "quality_request_timeout_seconds": quality_timeout}
     port = str(a.port)
     kw = dict(binary=a.bin)
+    server_timings = ["--server-timings"] if engine.get("expert_streaming") else []
 
     boot = Boot(out, cfg, env, **kw)
     host = boot.host
     if a.dry_run:
+        print("phase timeouts (seconds):", json.dumps(timeouts, sort_keys=True))
+        print("quality HTTP read timeout (seconds):", quality_timeout)
+        print("workload:", json.dumps(selected_workload, sort_keys=True))
         print("launcher:", " ".join(shlex.quote(str(c)) for c in boot.launcher("up", [])))
         print(f"clients against {host}:{port}; phases {sorted(phases)}; plain boot {'yes' if drafts(engine) else 'not needed'}; modes {a.mode or []}")
         return 0
     try:
         boot.up()
+        if selected_workload["warm_windows"] > 1:
+            # Fixed, identical exposure under both policies. Preserve each
+            # window's counters; a fixed warmup is not proof of convergence.
+            boot.snapshot("warm-0")
+            for window in range(1, selected_workload["warm_windows"]):
+                run(["python3", "scripts/serve_bench.py", host, port,
+                     str(selected_workload["warm_window_max_tokens"]), f"warm-{window}"],
+                    out / f"warm-{window}.log", env)
+                boot.snapshot(f"warm-{window}")
         if "serving" in phases:
-            concurrencies = "1,2,4,8,16" if slots >= 16 else "1,2,4,8"
+            concurrencies = selected_workload["serving_concurrency"] or ("1,2,4,8,16" if slots >= 16 else "1,2,4,8")
             run(["python3", "scripts/timed_load.py", host, port, "--concurrency", concurrencies, "--classes", "all",
-                 "--max-tokens", "256", "--repeat", "3", "--json-out", out / "decode.json"], out / "decode.log", env)
+                 "--max-tokens", str(selected_workload["serving_max_tokens"]), "--repeat", str(selected_workload["serving_repeat"]),
+                 *server_timings, "--json-out", out / "decode.json"], out / "decode.log", env, timeout=timeouts["serving"])
         if "prefill" in phases:
-            run(["python3", "scripts/serve_prefill_probe.py", host, port, *map(str, PREFILL_TARGETS), "--repeat", "3",
+            run(["python3", "scripts/serve_prefill_probe.py", host, port, *map(str, selected_workload["prefill_targets"]),
+                 "--repeat", str(selected_workload["prefill_repeat"]),
                  "--no-think", "--tag", f"campaign-{label}-{status['started'][:19]}", "--json-out", out / "prefill.json"],
-                out / "prefill.log", env)
+                out / "prefill.log", env, timeout=timeouts["prefill"])
         if "context" in phases:
             py = ROOT / ".venv/bin/python"
             run([str(py) if py.exists() else "python3", "scripts/serve_context_matrix.py", host, port, "--model", cfg["model"],
                  "--tag", f"ctx-{label}-{status['started'][:19]}", "--json-out", out / "context.json"], out / "context.log", env,
-                timeout=6 * 3600)
+                timeout=timeouts["context"])
         if "quality" in phases:
             run(["python3", "scripts/serve_eval.py", host, port, "--out", out / "eval", "--tasks", "humaneval,gsm8k,extract",
-                 "--limit", "300", "--concurrency", str(slots), "--allow-code-execution", "--data", "data"], out / "eval.log", env,
-                timeout=4 * 3600)
+                 "--limit", "300", "--concurrency", str(slots), "--allow-code-execution",
+                 "--request-timeout", str(quality_timeout), "--data", "data"], out / "eval.log", env,
+                timeout=timeouts["quality"])
         if "api" in phases:
             from cluster_doctor import cache_root, cached_snapshot
             from site_env import cache_environment
             tokenizer = cached_snapshot(cfg["model"], cache_root(cache_environment())) / "tokenizer.json"
             run(["python3", "scripts/serve_api_check.py", host, port, "--tokenizer", tokenizer],
-                out / "api.log", env, check=False)
+                out / "api.log", env, timeout=timeouts["api"], check=False)
         if "transcripts" in phases:
             run(["python3", "scripts/serve_load.py", host, port, "--concurrency", "1", "--classes", "all", "--repeat", "3",
-                 "--max-tokens", "256", "--json-out", out / "transcripts_default.json"], out / "transcripts_default.log", env)
+                 "--max-tokens", "256", "--json-out", out / "transcripts_default.json"], out / "transcripts_default.log", env, timeout=timeouts["transcripts"])
             # The isolation check exits nonzero when the texts differ: a result, not a failure.
             run(["python3", "scripts/serve_load.py", host, port, "--concurrency", "1", "--repeat", "1", "--max-tokens", "256",
-                 "--isolation", str(slots), "--json-out", out / "isolation.json"], out / "isolation.log", env, check=False)
+                 "--isolation", str(slots), "--json-out", out / "isolation.json"], out / "isolation.log", env, timeout=timeouts["transcripts"], check=False)
         boot.status["ok"] = True
     except Exception as e:  # noqa: BLE001 — record, tear down, continue to the other boots
         boot.status["ok"] = False
@@ -265,7 +479,7 @@ def run_campaign(a):
                 plain.up()
                 run(["python3", "scripts/serve_load.py", host, port, "--concurrency", "1", "--classes", "all", "--repeat", "3",
                      "--max-tokens", "256", "--json-out", out / "plain" / "transcripts_plain.json"], out / "plain" / "transcripts_plain.log",
-                    env, timeout=3 * 3600)
+                    env, timeout=timeouts["plain"])
                 plain.status["ok"] = True
             except Exception as e:  # noqa: BLE001
                 plain.status["ok"] = False
@@ -283,7 +497,7 @@ def run_campaign(a):
         try:
             mode.up()
             run(["python3", "scripts/timed_load.py", host, port, "--concurrency", "1", "--classes", "all", "--max-tokens", "256",
-                 "--repeat", "3", "--json-out", out / "modes" / name / "decode.json"], out / "modes" / name / "decode.log", env)
+                 "--repeat", "3", "--json-out", out / "modes" / name / "decode.json"], out / "modes" / name / "decode.log", env, timeout=timeouts["mode"])
             mode.status["ok"] = True
         except Exception as e:  # noqa: BLE001
             mode.status["ok"] = False
@@ -435,6 +649,9 @@ def summarize(d):
 def rows(d, label, nodes, options):
     """The doc's rows for this deployment, in table order; the author fills the model label and options once."""
     d = pathlib.Path(d)
+    status_path = d / "status.json"
+    if status_path.exists() and json.loads(status_path.read_text()).get("workload", {}).get("profile", "standard") != "standard":
+        raise ValueError("focused streaming diagnostics cannot produce standard benchmark rows")
     head = f"| {label} | {nodes} | {options} |"
     cfg = json.loads((d / "deployment.json").read_text()) if (d / "deployment.json").exists() else {}
     e = cfg.get("engine", {})
@@ -505,8 +722,18 @@ def main():
     r.add_argument("--port", type=int, default=18081)
     r.add_argument("--label", default=None)
     r.add_argument("--phases", default=",".join(PHASES))
+    r.add_argument("--streaming-focused", action="store_true",
+                   help="explicit diagnostic profile: serving C1/C2/C4, five classes, 2 repeats, 64-token cap; cold prefill 512/2K twice; requires --phases serving,prefill; not standard benchmark rows")
+    r.add_argument("--quality-request-timeout", type=float, default=900,
+                   help="HTTP read timeout per quality reply, including retries; independent of phase deadline (default 900 seconds)")
+    r.add_argument("--phase-timeout", action="append", metavar="PHASE=SECONDS",
+                   help="override a phase client timeout (repeatable); same deadlines for both policies; workload unchanged")
     r.add_argument("--mode", action="append", metavar='NAME="<knobs>"', help="an extra decode-mode boot: the C1 sweep under these knobs")
     r.add_argument("--no-swap-scope", action="store_true", help="do not run the ranks in the launcher's swap-limited scopes")
+    r.add_argument("--compare-experts", action="store_true",
+                   help="paired policy campaigns from one expert-streaming template; alternating A/B then B/A")
+    r.add_argument("--comparison-repeats", type=int, default=2,
+                   help="policy pairs with alternating order (default 2 yields A/B/B/A)")
     r.add_argument("--dry-run", action="store_true", help="print the launcher command for this leg and exit")
     s = sub.add_parser("summarize")
     s.add_argument("dir")

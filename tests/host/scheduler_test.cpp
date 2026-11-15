@@ -3192,6 +3192,61 @@ DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAt
   require(m.prefix_hits == 1 && m.prefix_tokens_saved == 24, "the second turn hit at 24");
 }
 
+DGPP_TEST(scheduler_prefixCache_staleDraftSkipsOptionalSnapshotsAndRetainsReusableState) {
+  class LaggingDraftEngine : public FakeEngine {
+   public:
+    explicit LaggingDraftEngine(int stale_after)
+        : FakeEngine(1, 100, 4), stale_after_(stale_after) {}
+    int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
+      steps_ = 0;
+      return FakeEngine::prefill(req, prompt);
+    }
+    std::vector<int32_t> step(int req) override {
+      ++steps_;
+      return FakeEngine::step(req);
+    }
+    bool prefix_snapshot_ready(int) const override { return steps_ < stale_after_; }
+    void prefix_snapshot(int req, int slot, int64_t position) override {
+      require(prefix_snapshot_ready(req), "stale draft cannot be snapshotted");
+      FakeEngine::prefix_snapshot(req, slot, position);
+    }
+    void prefix_arm_hop(int req, int slot, int64_t position) override {
+      require(prefix_snapshot_ready(req), "stale draft cannot arm a snapshot hop");
+      FakeEngine::prefix_arm_hop(req, slot, position);
+    }
+   private:
+    int steps_ = 0;
+    int stale_after_;
+  };
+  // Four tokens end aligned at retire; eight also cross a rolling boundary.
+  // A later lag preserves the rolling snapshot taken before state went stale.
+  for (const int length : {4, 8}) for (const int stale_after : {1, 4}) {
+    if (length == 4 && stale_after == 4) continue;
+    LaggingDraftEngine engine(stale_after);
+    engine.set_prefix_arena(4, 4);
+    engine.set_step_tokens_max(2);
+    engine.arm(0, {31, 32, 33, 34, 35, 36, 37, 38}, length);
+    engine.arm(0, {41}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(21);
+    sched.submit(make_cached_request("a", prompt, {5, 13}, length));
+    sched.run_to_completion();
+    require(sched.find("a")->steps_done == length, "generation completes across alignment");
+    const bool kept_rolling = length == 8 && stale_after == 4;
+    require(sched.meters().prefix_rolling == (kept_rolling ? 1 : 0),
+            "only snapshots with current draft state are taken");
+    auto next = prompt;
+    next.insert(next.end(), sched.find("a")->generated.begin(), sched.find("a")->generated.end());
+    next.push_back(200);
+    next.push_back(201);
+    sched.submit(make_cached_request("b", next, {5, 13, 26}, 1));
+    sched.run_to_completion();
+    require(sched.meters().prefix_hits == 1 &&
+                sched.meters().prefix_tokens_saved == (kept_rolling ? 24 : 12),
+            "valid prompt and earlier rolling entries remain reusable");
+  }
+}
+
 DGPP_TEST(scheduler_prefixCache_retireAtAnAlignedPositionSnapshotsTheLiveState) {
   // GIVEN a 21-token prompt whose answer ends at the cap after four tokens:
   // committed positions 21, 22, 23 — never aligned before the cap — and 24

@@ -124,6 +124,8 @@ def main():
                 self.directory, self.status = directory, {}
             def up(self):
                 self.directory.mkdir()
+            def snapshot(self, label):
+                pass
             def down(self):
                 self.status["opstreams_match"] = True
         for slots, wanted in ((8, "1,2,4,8"), (16, "1,2,4,8,16")):
@@ -138,6 +140,151 @@ def main():
             command = run.call_args.args[0]
             assert command[command.index("--concurrency") + 1] == wanted, command
             assert command[command.index("--repeat") + 1] == "3", command
+        # Reject bad deadlines before creating a boot or touching hardware.
+        for override in ("serving=0", "serving=-1", "serving=1.5", "other=10",
+                         "serving=inf", "serving", "serving=１２"):
+            args.phase_timeout = [override]
+            with patch.object(sc, "Boot") as boot:
+                try:
+                    sc.run_campaign(args)
+                    raise AssertionError(f"accepted invalid timeout {override}")
+                except ValueError:
+                    pass
+                boot.assert_not_called()
+        args.phase_timeout = ["serving=10", "serving=20"]
+        try:
+            sc.run_campaign(args)
+            raise AssertionError("accepted duplicate timeout")
+        except ValueError:
+            pass
+        # Extended deadlines reach the clients; benchmark requests remain standard.
+        cfg["model"] = "fixture"
+        cfg["engine"]["expert_streaming"] = {"policy": "whole_expert_cache"}
+        (d / "deployment.json").write_text(json.dumps(cfg))
+        args.out = str(d / "extended-run")
+        args.phases = "serving,prefill,context,quality,transcripts"
+        args.phase_timeout = ["serving=28800", "transcripts=7200"]
+        args.quality_request_timeout = 7200
+        with patch.object(sc, "Boot", FakeBoot), patch.object(sc, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            assert sc.run_campaign(args) == 0
+        calls = {call.args[1].name: call for call in run.call_args_list}
+        for name, deadline in (("decode.log", 28800), ("prefill.log", 3600),
+                               ("context.log", 21600), ("eval.log", 14400),
+                               ("transcripts_default.log", 7200), ("isolation.log", 7200)):
+            assert calls[name].kwargs["timeout"] == deadline, name
+        quality_command = calls["eval.log"].args[0]
+        assert quality_command[quality_command.index("--request-timeout") + 1] == "7200.0"
+        command = calls["decode.log"].args[0]
+        assert "--server-timings" in command
+        assert command[command.index("--max-tokens") + 1] == "256"
+        assert command[command.index("--repeat") + 1] == "3"
+        status = json.loads((pathlib.Path(args.out) / "status.json").read_text())
+        assert status["phase_timeouts_seconds"]["serving"] == 28800
+        assert status["quality_request_timeout_seconds"] == 7200
+        # The bounded streaming profile preserves the default suite and cannot
+        # accidentally publish shorter runs as standard benchmark rows.
+        args.streaming_focused = True
+        args.phases = "serving,prefill"
+        args.out = str(d / "focused-run")
+        with patch.object(sc, "Boot", FakeBoot), patch.object(sc, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            assert sc.run_campaign(args) == 0
+        calls = {call.args[1].name: call for call in run.call_args_list}
+        assert "warm-1.log" in calls and "warm-2.log" in calls
+        decode_command = calls["decode.log"].args[0]
+        assert decode_command[decode_command.index("--max-tokens") + 1] == "64"
+        assert decode_command[decode_command.index("--repeat") + 1] == "2"
+        assert decode_command[decode_command.index("--concurrency") + 1] == "1,2,4"
+        prefill_command = calls["prefill.log"].args[0]
+        assert prefill_command[4:6] == ["512", "2048"]
+        try:
+            sc.rows(args.out, "fixture", 2, "focused")
+            raise AssertionError("focused diagnostics published as standard rows")
+        except ValueError:
+            pass
+        args.phases = "serving,quality"
+        with patch.object(sc, "Boot") as boot:
+            try:
+                sc.run_campaign(args)
+                raise AssertionError("focused profile accepted quality phase")
+            except ValueError:
+                pass
+            boot.assert_not_called()
+        comparison_template = d / "comparison-template.json"
+        comparison_cfg = {"model": "fixture", "world_size": 2, "engine": {
+            "decode_graph": False, "prefill_fold_overlap": False, "mtp": False,
+            "expert_streaming": {"policy": "whole_expert_cache", "budget_bytes": 123456,
+                                  "image_directory": "/ssd/fixture"}}}
+        comparison_template.write_text(json.dumps(comparison_cfg))
+        binary = d / "fixture-binary"
+        binary.write_bytes(b"immutable executable")
+        args = SimpleNamespace(config=str(comparison_template), out=str(d / "comparison"),
+                               port=18081, phases="serving,prefill", no_swap_scope=False, label="fixture",
+                               bin=str(binary), dry_run=False, mode=None, compare_experts=True,
+                               comparison_repeats=2, phase_timeout=["serving=28800"], quality_request_timeout=7200)
+        observed = []
+        def leg_run(leg):
+            assert sc.phase_timeouts(leg.phase_timeout)["serving"] == 28800
+            assert sc.quality_request_timeout(leg) == 7200
+            observed.append(json.loads(pathlib.Path(leg.config).read_text()))
+            path = pathlib.Path(leg.out)
+            path.mkdir()
+            (path / "status.json").write_text(json.dumps({"ok": True, "opstreams_match": True}))
+            return 0
+        with patch.object(sc, "run_campaign", side_effect=leg_run):
+            assert sc.compare_experts(args) == 0
+        policies = [x["engine"]["expert_streaming"].pop("policy") for x in observed]
+        assert policies == [sc.EXPERT_POLICIES[0], sc.EXPERT_POLICIES[1],
+                            sc.EXPERT_POLICIES[1], sc.EXPERT_POLICIES[0]], policies
+        assert all(x == observed[0] for x in observed), "only policy may vary"
+        receipt = json.loads((d / "comparison/comparison.json").read_text())
+        assert receipt["phase_timeouts_seconds"]["serving"] == 28800
+        assert receipt["quality_request_timeout_seconds"] == 7200
+        assert receipt["ok"] and len(receipt["legs"]) == 4 and receipt["source"]["tree_sha256"]
+        # A failed operation-stream gate stops comparison before another boot.
+        args.out = str(d / "invalid-comparison")
+        def bad_leg(leg):
+            result = leg_run(leg)
+            (pathlib.Path(leg.out) / "status.json").write_text(json.dumps({"ok": True, "opstreams_match": False}))
+            return result
+        with patch.object(sc, "run_campaign", side_effect=bad_leg) as mocked:
+            assert sc.compare_experts(args) == 1 and mocked.call_count == 1
+        # A changing binary invalidates the leg rather than silently comparing builds.
+        args.out = str(d / "mutating-comparison")
+        def mutating_leg(leg):
+            result = leg_run(leg)
+            binary.write_bytes(b"replacement executable")
+            return result
+        with patch.object(sc, "run_campaign", side_effect=mutating_leg) as mocked:
+            assert sc.compare_experts(args) == 1 and mocked.call_count == 1
+        args.dry_run = True
+        args.out = str(d / "dry-comparison")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert sc.compare_experts(args) == 0
+        assert not pathlib.Path(args.out).exists(), "dry-run must not launch or write a campaign"
+        comparison_cfg["engine"]["expert_streaming"]["initial_fraction"] = 0.5
+        comparison_template.write_text(json.dumps(comparison_cfg))
+        try:
+            sc.compare_experts(args)
+            raise AssertionError("a B-only setting would violate the single-variable comparison")
+        except ValueError:
+            pass
+    # The shipped image path uses ~, interpreted on each serving host. The
+    # device probe must resolve that same path before choosing block counters.
+    buf = io.StringIO()
+    with patch.dict(os.environ, {"HOME": "/home/probe-fixture"}), \
+            patch.object(sys, "argv", ["probe", "~/.cache/dgpp/experts", ""]), \
+            patch.object(os, "stat", return_value=SimpleNamespace(st_dev=os.makedev(259, 2))) as stat, \
+            patch.object(pathlib.Path, "resolve", return_value=pathlib.Path("/sys/devices/fixture/nvme0n1p2")), \
+            patch.object(pathlib.Path, "read_text", return_value="7 0 11 13"), \
+            contextlib.redirect_stdout(buf):
+        exec(sc.EXPERT_PROBE, {})
+    stat.assert_called_once_with("/home/probe-fixture/.cache/dgpp/experts")
+    probe = json.loads(buf.getvalue())
+    assert probe["image_directory"] == "/home/probe-fixture/.cache/dgpp/experts"
+    assert probe["block"] == {"name": "nvme0n1p2", "read_operations": 7,
+                              "read_bytes": 5632, "read_milliseconds": 13}, probe
     print("serve_campaign_test: ok")
 
 

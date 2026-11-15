@@ -71,8 +71,11 @@
 #include "models/dsv41/loader.hpp"
 #include "models/glm/mhc.hpp"
 #include "models/glm/moe_layer.hpp"
+#include "loaders/expert_cache.hpp"
 
 namespace dgpp {
+
+using Dsv41ExpertPaging = expert::PagingOptions;
 
 class Dsv41Model : public SessionModel<Dsv41Model> {
  public:
@@ -91,7 +94,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
              int64_t max_cache_tokens, Dsv41Residency residency = Dsv41Residency::Streaming,
              BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
              int max_requests = 1, bool mtp = false, int decode_rows = 0,
-             bool serving_logits = false);
+             bool serving_logits = false, const Dsv41ExpertPaging* expert_paging = nullptr);
   ~Dsv41Model();
   Dsv41Model(const Dsv41Model&) = delete;
   Dsv41Model& operator=(const Dsv41Model&) = delete;
@@ -101,7 +104,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
                                 int64_t max_cache_tokens, int tp_rank = 0, int tp_world = 1,
                                 Dsv41Residency residency = Dsv41Residency::Streaming,
                                 int max_requests = 1, bool mtp = false, int decode_rows = 0,
-                                bool serving_logits = false);
+                                bool serving_logits = false, const Dsv41ExpertPaging* expert_paging = nullptr);
 
   // The prefill mode (plan §1.8, D8): `exact` runs the forty layers over
   // every prompt row (the parity mode); `bounded` (the production default)
@@ -166,6 +169,9 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   static void set_default_prefill_fold_overlap(bool on) { s_default_prefill_fold_overlap = on; }
   void set_prefill_fold_overlap(bool on, int min_rows = kFoldOverlapMinRows, bool without_reducer = false);
   bool prefill_fold_overlap() const { return fold_overlap_; }
+  const expert::ExpertCache* expert_cache() const { return expert_cache_.get(); }
+  void release_execution_thread() { if (expert_cache_) expert_cache_->release_execution_thread(); }
+  void bind_execution_thread() { if (expert_cache_) expert_cache_->bind_execution_thread(); }
   uint64_t debug_overlap_async_folds() const { return overlap_async_folds_; }
   // The lm head's 12-bit companion (engine.bf16_weights): tests read its counters.
   const Bf12Companions& bf12_companions() const { return bf12_; }
@@ -193,6 +199,13 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // aggregate past six streams, where the step's fixed costs (collectives,
   // the small kernels) amortize over more rows; kDecodeRowsMax bounds it.
   static constexpr int decode_rows_cap() { return 96; }
+  // Paging can reuse each loaded expert across all decode rows in one walk.
+  // Opt in through the eager adapter only after its plain batch path is used;
+  // resident/streaming defaults and speculative execution retain their recipes.
+  static constexpr bool kEagerMtp = true;
+  int eager_plain_decode_batch_capacity() const {
+    return expert_cache_ && !mtp_enabled() ? max_decode_rows() : 1;
+  }
   // The group prefill (session_prefill_group): a span's longest prompt —
   // each span fits the walk. Bounded prefill packs the spans' final
   // windows into decoder space before projecting their last rows.
@@ -234,6 +247,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   static constexpr bool kVerifyConfidence = true;
   int confidence_rows() const { return cfg_.dspark_block_size; }
   const float* device_confidence() const { return conf_; }
+  // Eager batch: confidence rows are indexed by compact batch position.
+  Outputs session_draft_batch(const std::vector<int>& reqs,
+                              const std::vector<std::vector<int64_t>>& tokens);
+  Outputs session_draft_chain_batch(const std::vector<int64_t>& tokens);
   const uint16_t* draft_hidden_rows() const { return main_gather_; }
   void snapshot_chain_state(int) {}
   void restore_chain_state(int) {}
@@ -411,6 +428,9 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
 
   Dsv41TextConfig cfg_;
   Dsv41LayerStream loader_;
+  std::unique_ptr<expert::ExpertCache> expert_cache_;
+  std::vector<std::vector<size_t>> expert_cache_map_;
+  uint64_t expert_adapt_every_routes_ = 0, expert_last_adapt_ = 0;
   CublasLtGemm gemm_;
   // The draft head's screen (kernels/draft_head.hpp): built from the served
   // head at construction under engine.draft_head; answers a decode draft's

@@ -13,7 +13,7 @@ def read_completion(response, clock=time.perf_counter, on_update=None):
         raise RuntimeError(f"HTTP {response.status}: {response.read(1024)!r}")
     buf = b""
     stamps, text = [], []
-    usage, finish, done = None, None, False
+    usage, timings, finish, done = None, None, None, False
     while True:
         chunk = response.read1(65536)
         if not chunk:
@@ -36,6 +36,8 @@ def read_completion(response, clock=time.perf_counter, on_update=None):
                 raise RuntimeError(f"stream error: {obj['error']}")
             if obj.get("usage") is not None:
                 usage = obj["usage"]
+            if obj.get("timings") is not None:
+                timings = obj["timings"]
             for choice in obj.get("choices", []):
                 delta = choice.get("delta", {})
                 content = (delta.get("reasoning_content") or "") + (delta.get("content") or "")
@@ -51,7 +53,7 @@ def read_completion(response, clock=time.perf_counter, on_update=None):
     tokens = (usage or {}).get("completion_tokens")
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
         raise RuntimeError("benchmark requires a positive usage.completion_tokens count")
-    return {"status": response.status, "finish": finish, "usage": usage,
+    return {"status": response.status, "finish": finish, "usage": usage, "timings": timings,
             "first": stamps[0] if stamps else None, "last": stamps[-1] if stamps else None,
             "chunks": len(stamps), "tokens": tokens, "text": "".join(text),
             "update_gaps_ms": [(b - a) * 1000 for a, b in zip(stamps, stamps[1:])]}

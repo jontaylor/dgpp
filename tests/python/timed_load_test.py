@@ -24,6 +24,43 @@ def snapshot(prompts=10, tokens=100, **changes):
             "prompt_tokens_computed": 500, **changes}
 
 
+def histogram(name, values, label=""):
+    return "\n".join(f'{name}_bucket{{{label}le="{bound}"}} {value}'
+                     for bound, value in zip(("0.01", "1", "+Inf"), values)) + "\n"
+
+
+class HistogramTest(unittest.TestCase):
+    def test_exact_brackets_and_overflow_with_multiple_cache_series(self):
+        name = "ttft"
+        before = histogram(name, [4, 6, 9], 'prefix_cache="hit",') + histogram(name, [1, 2, 3], 'prefix_cache="miss",')
+        after = histogram(name, [5, 7, 10], 'prefix_cache="hit",') + histogram(name, [2, 4, 6], 'prefix_cache="miss",')
+        result = timed_load.histogram_quantiles(before, after, name, 4)
+        self.assertEqual(result["count"], 4)
+        self.assertEqual(result["p50"]["upper_inclusive_seconds"], .01)
+        self.assertEqual(result["p95"], {"lower_exclusive_seconds": 1.,
+                         "upper_inclusive_seconds": None, "right_censored": True})
+        self.assertEqual(result["p95"], result["p99"])
+        empty = timed_load.histogram_quantiles(before, before, name, 0)
+        self.assertIsNone(empty["p50"])
+        reset = histogram(name, [3, 5, 8], 'prefix_cache="hit",') + histogram(name, [4, 6, 8], 'prefix_cache="miss",')
+        with self.assertRaisesRegex(RuntimeError, "delta/count mismatch"):
+            timed_load.histogram_quantiles(before, reset, name, 4)
+
+
+    def test_invalid_snapshots_and_unmatched_work_are_rejected(self):
+        before = histogram("h", [4, 6, 9])
+        invalid = ["", histogram("h", [3, 5, 8]), histogram("h", [6, 7, 10]),
+                   histogram("h", [5, 6, 10]) + histogram("h", [5, 6, 10]),
+                   histogram("h", [5, 6, 10]).replace('le="1"', 'le="2"'),
+                   histogram("h", [5, 6, 10]).replace('le="+Inf"', 'le="NaN"'),
+                   histogram("h", [5, 4, 10])]
+        for after in invalid:
+            with self.subTest(after=after), self.assertRaises((RuntimeError, ValueError)):
+                timed_load.histogram_quantiles(before, after, "h", 1)
+        with self.assertRaisesRegex(RuntimeError, "count mismatch"):
+            timed_load.histogram_quantiles(before, histogram("h", [5, 7, 10]), "h", 2)
+
+
 class ReconciliationTest(unittest.TestCase):
     def setUp(self):
         self.now = 0.
@@ -173,6 +210,13 @@ def serving_fixture(delayed):
         def do_GET(self):
             if self.path == "/v1/models":
                 value = {"data": [{"id": "fixture"}]}
+            elif self.path == "/metrics/prometheus":
+                with lock:
+                    m = state["current"]
+                    text = histogram("dgpp_time_to_first_token_seconds", [m["prompts_prefilled"]] * 3)
+                    text += histogram("dgpp_inter_token_latency_seconds", [m["tokens_generated"] - m["prompts_prefilled"]] * 3)
+                self.reply("text/plain", text.encode())
+                return
             elif self.path == "/v1/metrics":
                 with lock:
                     meters = state["current"].copy()
@@ -233,6 +277,23 @@ class TimedLoadCliTest(unittest.TestCase):
             self.assertEqual(len(state["requests"]), 5)
             self.assertEqual([p["class"] for p in report["phases"]], ["mixed", "mixed"])
             self.assertEqual([p["engine"]["tokens_per_s"] for p in report["phases"]], [500, 500])
+
+    def test_per_phase_server_histograms_reconcile_c1_and_c4(self):
+        with tempfile.TemporaryDirectory() as directory, serving_fixture(delayed=True) as (port, state):
+            output = Path(directory) / "timings.json"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/timed_load.py"), "127.0.0.1", str(port),
+                "--server-timings", "--warm", "1", "--concurrency", "1,4", "--max-tokens", "8",
+                "--json-out", str(output)], cwd=directory, text=True, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            phases = json.loads(output.read_text())["phases"]
+            self.assertEqual(len(state["requests"]), 6)
+            for phase, c in zip(phases, (1, 4)):
+                self.assertEqual(phase["server_ttft_quantile_brackets"]["count"], c)
+                self.assertEqual(phase["server_itl_quantile_brackets"]["count"], 7 * c)
+                self.assertEqual(phase["server_itl_quantile_brackets"]["p99"]["upper_inclusive_seconds"], .01)
+                self.assertIn("prometheus_before", phase)
+                self.assertEqual(phase["engine"]["tokens_per_s"], 500)
 
     def test_warmup_isolation_repeated_classes_preserve_work(self):
         scripts = [ROOT / "scripts/serve_load.py", ROOT / "scripts/timed_load.py"]

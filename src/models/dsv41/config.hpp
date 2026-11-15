@@ -97,6 +97,10 @@ struct Dsv41TextConfig {
 
   // --- MoE ------------------------------------------------------------------
   int moe_intermediate_size = 2304;
+  // Internal loading plan, never parsed from checkpoint JSON. Set only by
+  // the model's explicit expert-paging constructor option.
+  bool runtime_page_experts = false;
+  bool runtime_resident_draft_experts = false;
   int n_routed_experts = 384;
   int n_shared_experts = 1;
   int num_experts_per_tok = 6;
@@ -115,6 +119,9 @@ struct Dsv41TextConfig {
   int engram_head_dim = 256;
   int64_t engram_pad_token_id = 2;
   int engram_compressed_vocab_size = 99092;
+  // Source table encoding, independent of the routed expert format. The
+  // ModelOpt NVFP4 checkpoint packs Engram rows as MXFP4 with E8M0/32 scales.
+  bool engram_mxfp4 = false;
 
   // --- DSpark (plan §1.7) -----------------------------------------------
   int num_nextn_predict_layers = 3;
@@ -128,6 +135,10 @@ struct Dsv41TextConfig {
   // --- weight formats ----------------------------------------------------
   int fp8_block_size = 32;   // one e8m0 scale per 32x32 block of a dense fp8 matrix
   int fp4_block_size = 32;   // one e8m0 scale per 32 codes along K of an fp4 matrix
+  // ModelOpt main experts use NVFP4; its excluded draft experts stay MXFP4.
+  // Recognized by the checkpoint parser. Native model integration uses BF16
+  // activations; checkpoint numerical qualification is a separate gate.
+  bool experts_nvfp4 = false;
   // The EXL3 trellis pack (2026-10-22, docs/deepseek_v41_flash_exl3_plan.md
   // §1, §4): quantization_config.quant_method "exl3" with the mul1
   // codebook — every projection, expert, head and draft matrix an EXL3

@@ -881,6 +881,40 @@ DGPP_TEST(dsv41_engines_loopback_world_2_graph_matches_eager) {
   require(o.bb.size() == 10 && o.bc.size() == 8, "the batched transcripts' lengths");
 }
 
+DGPP_TEST(dsv41_eager_group_prefill_preserves_slot_transcripts) {
+  const auto cfg = dsv41fx::tiny_config();
+  const std::string dir = "dsv41_eager_group_fixture";
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  Dsv41Model model(cfg, dir, 128, 512, Dsv41Residency::Resident, nullptr, 0, 1, 3);
+  EagerEngineAdapter<Dsv41Model> engine(&model, 3, [](const dgpp::DecodeOutputs& out) {
+    return static_cast<int32_t>(std::max_element(out.logits.begin(), out.logits.end()) - out.logits.begin());
+  });
+  const std::vector<std::vector<int64_t>> prompts = {
+      smoke_tokens(cfg, 11, 123), smoke_tokens(cfg, 23, 456), smoke_tokens(cfg, 17, 789)};
+  require(engine.prefill_group_span_limit() == 0, "grouping is opt-in for eager callers");
+  engine.set_prefill_group(true);
+  require(engine.prefill_group_span_limit() == 128 && engine.prefill_group_total_limit() == 128,
+          "grouped prefill advertises model workspace limits");
+  for (bool bounded : {false, true}) {
+    model.set_prefill_bounded(bounded);
+    std::vector<std::vector<int32_t>> expected;
+    for (int req = 0; req < 3; ++req) expected.push_back(solo(engine, req, prompts[req], 3));
+    const auto firsts = engine.prefill_group({0, 1, 2}, {&prompts[0], &prompts[1], &prompts[2]});
+    require(firsts.size() == 3, "one first token per grouped request");
+    for (int req = 0; req < 3; ++req) {
+      require(firsts[req] == expected[req][0], "grouped first token matches isolated request");
+      engine.reserve(req, prompts[req].size() + 4);
+      for (int step = 0; step < 3; ++step)
+        require(engine.step(req) == std::vector<int32_t>{expected[req][step + 1]},
+                "grouped prefill preserves each slot's subsequent decode");
+      engine.close(req);
+    }
+  }
+  engine.set_prefill_group(false);
+  require(engine.prefill_group_span_limit() == 0, "grouping can be disabled");
+}
+
 int main() {
   // DGPP_TEST_DRAFT_SCREEN=N: every case drafts through the head screen
   // (kernels/draft_head.hpp) with an N-block candidate cap; every gate

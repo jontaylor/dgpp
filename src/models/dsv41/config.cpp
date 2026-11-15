@@ -120,6 +120,62 @@ bool strictly_increasing(const std::vector<int>& v) {
 
 // --- the quantization contract --------------------------------------------
 
+void parse_modelopt_nvfp4(const minijson::Value& qc, Dsv41TextConfig& c) {
+  const auto reject_nv = [](std::string_view why) { reject("quantization_config.moe_quant_algo", why); };
+  const auto equals_int = [](const minijson::Value& object, std::string_view key, int value) {
+    const auto& field = require(object, key);
+    return field.is_number() && field.as_double() == static_cast<double>(value);
+  };
+  if (optional_string(qc, "moe_quant_algo", "") != "NVFP4" ||
+      optional_string(qc, "quant_algo", "") != "MIXED_PRECISION" ||
+      !equals_int(qc, "group_size", 16))
+    reject_nv("only the ModelOpt mixed-precision NVFP4 main-expert layout with group_size 16 is implemented");
+  const auto& producer = require(qc, "producer");
+  if (!producer.is_object() || optional_string(producer, "name", "") != "modelopt" ||
+      optional_string(producer, "version", "") != "dsv4-nvfp4-experts")
+    reject_nv("unrecognized ModelOpt producer layout");
+  require_absent(qc, "kv_cache_quant_algo", "checkpoint KV quantization is not implemented");
+  const auto& layers = require(qc, "quantized_layers");
+  if (!layers.is_object() || layers.members().size() != static_cast<size_t>(c.num_hidden_layers))
+    reject_nv("quantized_layers must name every main expert layer and no draft or dense layer");
+  for (int l = 0; l < c.num_hidden_layers; ++l) {
+    const auto& layer = require(layers, std::format("layers.{}.ffn.experts", l));
+    if (!layer.is_object() || optional_string(layer, "quant_algo", "") != "NVFP4" ||
+        !equals_int(layer, "group_size", 16))
+      reject_nv("each main expert layer must use NVFP4 group_size 16");
+  }
+  const auto& groups = require(qc, "config_groups");
+  if (!groups.is_object() || groups.members().size() != 1)
+    reject_nv("expected a single ModelOpt configuration group");
+  const auto& group = require(groups, "group_0");
+  if (!group.is_object()) reject_nv("group_0 must be an object");
+  for (const auto* kind : {"weights", "input_activations"}) {
+    const auto& format = require(group, kind);
+    if (!format.is_object() || !equals_int(format, "group_size", 16) ||
+        !equals_int(format, "num_bits", 4) || optional_string(format, "type", "") != "float" ||
+        !require(format, "dynamic").is_bool() || require(format, "dynamic").as_bool())
+      reject_nv("expected static float4 group_size 16 calibration metadata");
+  }
+  // These are source-format declarations; execution keeps BF16 activations.
+  // Never apply the calibrated activation scale as another weight factor.
+  const auto& targets = require(group, "targets");
+  if (!targets.is_array() || targets.items().size() != 1 || !targets.items()[0].is_string() ||
+      targets.items()[0].as_string() != "Linear")
+    reject_nv("expected the ModelOpt Linear target");
+  const auto& engram_layers = require(qc, "engram_embed_layers");
+  if (optional_string(qc, "engram_embed_quant", "") != "mxfp4" ||
+      !equals_int(qc, "engram_embed_block_size", 32) ||
+      optional_string(qc, "engram_embed_scale_dtype", "") != "ue8m0" ||
+      !engram_layers.is_array() || engram_layers.items().size() != c.engram_layer_ids.size())
+    reject("quantization_config.engram_embed_quant", "expected MXFP4/E8M0 per-32 on exactly the configured Engram layers");
+  for (size_t i = 0; i < c.engram_layer_ids.size(); ++i)
+    if (!engram_layers.items()[i].is_number() ||
+        engram_layers.items()[i].as_double() != static_cast<double>(c.engram_layer_ids[i]))
+      reject("quantization_config.engram_embed_layers", "layer IDs must be exact integers");
+  c.experts_nvfp4 = true;
+  c.engram_mxfp4 = true;
+}
+
 void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
   const minijson::Value* qc = root.find("quantization_config");
   if (!qc || qc->is_null())
@@ -158,13 +214,16 @@ void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
            std::format("the fp8 kernels take the release's 32x32 grid, got [{}, {}]", br, bc));
   c.fp8_block_size = br;
   c.fp4_block_size = 32;  // the release's MXFP4 block (convert.py fp4_block_size)
-  // A re-packed checkpoint (the community NVFP4 casts) declares its
-  // encoding under other keys; none of them is the format this loader reads.
+  // Preserve the MX group for drafts; NV main experts are selected separately.
   require_absent(*qc, "expert_block_size", "an NVFP4 expert re-pack is not the release format the loader reads");
   require_absent(*qc, "expert_scale_fmt", "an NVFP4 expert re-pack is not the release format the loader reads");
   require_absent(*qc, "engram_dtype", "a re-packed Engram table is not the release format the loader reads");
-  require_absent(*qc, "moe_quant_algo", "a modelopt NVFP4 cast is not the release format the loader reads");
-  require_absent(*qc, "config_groups", "a compressed-tensors layout is not the release format the loader reads");
+  if (const auto* algo = qc->find("moe_quant_algo"); algo && !algo->is_null()) {
+    parse_modelopt_nvfp4(*qc, c);
+  } else {
+    require_absent(*qc, "config_groups", "an unrecognized compressed-tensors layout is not implemented");
+    require_absent(*qc, "engram_embed_quant", "packed Engram tables require the recognized ModelOpt layout");
+  }
 }
 
 // exl3_k_map.json (the serving kit's schema, shipped by the pack): the
@@ -604,6 +663,9 @@ GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft) const {
   m.routed_scaling_factor = routed_scaling_factor;
   m.norm_topk_prob = norm_topk_prob;
   m.swiglu_limit = swiglu_limit;
+  // Keep FP8 shared-expert registers out of the paged routed FP4 kernels.
+  // Both streams fork/rejoin within the expert-only graph.
+  if (runtime_page_experts) m.shared_run_lane_min_rows = 1;
   m.router_mode = scoring_func == "sigmoid" ? MoeRouterMode::SigmoidBias : MoeRouterMode::SqrtSoftplusBias;
   m.exl3_experts = weights_exl3;  // the rotated-row copies the EXL3 kernels read (models/glm/moe.hpp)
   GlmMoeConfig::validate_config(m);

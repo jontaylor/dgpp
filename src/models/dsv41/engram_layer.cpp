@@ -54,7 +54,7 @@ size_t Dsv41EngramLayer::staging_bytes(const Dsv41TextConfig& cfg, int world, in
   const size_t L = cfg.engram_layer_ids.size();
   const size_t entries = static_cast<size_t>(cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads;
   const size_t rows_local = static_cast<size_t>(cfg.engram_max_ngram_size - 1) * (cfg.engram_n_heads / world);
-  const size_t row_bytes = static_cast<size_t>(cfg.engram_head_dim) + cfg.engram_head_dim / 32;
+  const size_t row_bytes = static_cast<size_t>(cfg.engram_head_dim / (cfg.engram_mxfp4 ? 2 : 1)) + cfg.engram_head_dim / 32;
   // Both channels: the walk's own and the chunk-ahead prestage's (its ids
   // hold the prefix rows too).
   return static_cast<size_t>(max_tokens) * L * entries * 4 + L * static_cast<size_t>(max_tokens) * rows_local * row_bytes +
@@ -83,6 +83,9 @@ Dsv41EngramLayer::Dsv41EngramLayer(const Dsv41TextConfig& cfg, const Dsv41Engram
   if (tables.head_dim != cfg.engram_head_dim || tables.heads != cfg.engram_n_heads ||
       tables.ngrams != cfg.engram_max_ngram_size - 1)
     throw std::invalid_argument("Dsv41EngramLayer: the tables' geometry disagrees with the config");
+  for (const auto& table : tables.tables)
+    if (!table || table->head_dim() != cfg.engram_head_dim || table->mxfp4() != cfg.engram_mxfp4)
+      throw std::invalid_argument("Dsv41EngramLayer: table encoding/width disagrees with the config");
   entries_ = (cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads;
   // The hash constants.
   const size_t L = static_cast<size_t>(layers_);
@@ -326,7 +329,7 @@ void Dsv41EngramLayer::embed(int table_index, int rows, cudaStream_t stream) {
   uint8_t* d_staged = nullptr;
   DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_staged), use_pre_ ? pre_staged_ : staged_, 0));
   dsv41_engram_gather_staged_bf16(d_staged + static_cast<size_t>(table_index) * staged_layer_bytes_, rows,
-                                  tables_.rows_local(), cfg_.engram_head_dim, e_, stream);
+                                  tables_.rows_local(), cfg_.engram_head_dim, e_, stream, cfg_.engram_mxfp4);
 }
 
 void Dsv41EngramLayer::project(const Dsv41EngramLayerWeights& w, int rows, uint16_t* kv_dst, cudaStream_t stream,

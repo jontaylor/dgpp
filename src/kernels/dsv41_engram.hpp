@@ -74,9 +74,12 @@ void dsv41_engram_context_rows(const int64_t* tokens, int rows, const int32_t* r
 // e8m0 scales (one per 32 elements), as the host gathered them out of the
 // mmap'ed table (pinned memory is fine); out [n, rows_local * head_dim]
 // bf16 = bf16(e4m3(p) x 2^(s - 127)), exact for every finite scale (an
-// e4m3 value has 4 significant bits). head_dim % 32 == 0.
+// e4m3 value has 4 significant bits). With mxfp4=true the payload is instead
+// head_dim/2 bytes of E2M1 pairs, low nibble first, followed by the same E8M0
+// scales. MXFP4 conversion preserves signed zero, subnormals and NaN scales.
+// head_dim % 32 == 0.
 void dsv41_engram_gather_staged_bf16(const uint8_t* staged, int n, int rows_local, int head_dim,
-                                     uint16_t* out, cudaStream_t stream);
+                                     uint16_t* out, cudaStream_t stream, bool mxfp4 = false);
 
 // The gate and the stream update (the reference's Engram.forward): for
 // every token t and stream i (hc of them),
