@@ -542,3 +542,54 @@ anchor after the workload switch, not a separate long steady-state campaign.
 Both ranks stayed at zero swap. Given the warm decode loss and changed outputs,
 depth two is not selected. Depths one/five and speculation off were not repeated
 on this latest configuration. No general optimal-depth claim is made.
+
+## Bulk binding lookup
+
+Implementation `ee09ba71` retains a smaller optimization to the measured
+publication cost without adding dirty tracking. `ExpertCache::prepared_addresses`
+validates ownership once for a batch, validates every index before writing any
+output, and returns the same borrowed prepared pointers as individual lookups.
+The DSV4.1 publisher uses one batch per layer: 40 ownership mutex acquisitions
+instead of 15,360 per rebuild. Backend pointer publication, full table clearing,
+all pointer-field writes, full upload and publication-before-resume ordering
+remain intact. No bindings are cached across mutations by this API.
+
+Bulk lookup is the default. `DGPP_EXPERT_BULK_BINDINGS=0` retains the individual
+lookup control for diagnostics. The 28 host cache tests passed, including bulk
+versus scalar comparisons through randomized packing, eviction, relocation and
+fractional demotion; wrong-thread access; size/index validation; no partial
+output on an invalid index; and explicit null entries for unprepared experts.
+
+A paired scalar/bulk run used publication profiling in both arms and the same
+binary on both ranks, SHA-256
+`9272694e941958be6d7dc88bdfed3a6b61c46852521a6b1c0c56fabfdbefb486`.
+It contains `ee09ba71` changes built before commit and stamped with parent
+`1cb6dc8e`. Each arm restarted, ran the four-request prefix-enabled tool loop,
+then three small recomputations. Eight workers, fixed initial load costs,
+decay 65536, horizon 8192 and fixed speculative depth three were unchanged.
+Peer log analysis selects the latest replay-counter epoch because the remote
+stage log can contain earlier process runs.
+
+Across the three continuations, rank 0 CPU table-building time fell from
+1178.754 to 506.408 ms; rank 1 fell from 1269.529 to 527.186 ms, a 57–59%
+reduction. Calls were identical between arms: 4299 on rank 0 and 4440 on rank 1.
+Mean CPU build time fell from 274/286 to 118/119 microseconds per publication.
+Copy submission/wait remained approximately 94–101 ms per rank. Total publication
+fell from 3.90/4.17% to 1.91/1.98% of the enclosing target walk on ranks 0/1.
+These overlapping rank clocks are not summed into a latency prediction.
+
+The instrumented service-level continuation total fell from 41.167 to 39.844
+seconds. Summed prefill was 5.422 versus 5.313 seconds and engine decode was
+35.616 versus 34.395 seconds. Cold initial prefill was 38.490 versus 38.647
+seconds. At the final zero-read small anchor, prefill was 1.616 versus 1.604
+seconds and decode was 52.55 versus 51.98 tokens/s. That anchor still made one
+publication in each arm during preparation; it is not the later zero-publication
+steady-state anchor from the earlier attribution run.
+
+All seven normalized outputs, usage and acceptance records matched. Expert read
+bytes were identical (47.01 GiB per rank across continuations), and both ranks
+stayed at zero swap. These are instrumented diagnostics, not an uninstrumented
+campaign throughput claim. The direct CPU reduction, preserved pointer semantics
+and unchanged output justify retaining the bulk lookup. Profiling and the
+comparison override are removed from the live deployment, leaving default bulk
+publication enabled. Incremental dirty tables remain unimplemented.

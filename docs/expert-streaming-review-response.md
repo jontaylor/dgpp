@@ -655,9 +655,12 @@ not measurements from the live Sparks or instructions to implement every idea.
   all entries and synchronizes the service stream. An unchanged revision exits
   immediately. Opt-in timing measured publication at about 3–4% of target
   walk time per rank in the tool continuations, mostly CPU rebuilding; a fully
-  warm anchor published nothing. Dirty publication is deferred behind reducing
-  decode misses. Any eventual dirty set must include removals and relocations,
-  not only admissions. See the publication attribution in the chunk-direct doc.
+  warm anchor published nothing. A subsequent bulk-lookup change reduced CPU
+  rebuilding by 57–59% without dirty tracking and is enabled by default. It
+  reduces ownership checks from 15,360 to 40 per publication while rebuilding
+  every entry. Dirty publication remains deferred; any future dirty set must
+  include removals and relocations. See the attribution and bulk-lookup results
+  in the chunk-direct doc.
 - **Ready prefill groups: partially investigated, no serving win.** The newer
   opt-in ready-prefix experiment was correct but did not improve the matched
   serving sequence, and is disabled. It preserves order and does not run
