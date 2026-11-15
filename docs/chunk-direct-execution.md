@@ -205,3 +205,62 @@ partially warm tool workload without consuming more memory or changing outputs.
 Long-output decode, abrupt topic shifts and a wider request mix remain open.
 Independent readiness for chunk-direct prefill is also still unimplemented;
 the existing ready-expert executor currently serves the reconstructed B12x path.
+
+## Ready-prefix prefill experiment
+
+`DGPP_EXPERT_READY_PREFILL=1` enables an optional scheduling change, requiring
+chunk-direct NVFP4 prefill to be eligible. After acquiring an expert, the CPU
+checks whether every missing chunk of the next expert has a completed read
+ticket. If not, it submits the acquired prefix immediately instead of waiting
+for the rest of the wave. Existing demand lookahead continues to feed reads.
+Native-only groups keep their larger grouping. This changes launch grouping,
+not expert selection, weights, activation precision or accumulation order.
+
+The readiness query neither consumes tickets nor changes residency; acquisition
+still propagates failed reads. Existing staging-reader fences and execution
+leases protect launched work. A readiness result is only a hint: a subsequent
+cache admission can evict weights before acquisition. The planner must still
+perform normal acquisition checks.
+
+This is deliberately an ordered prefix scheduler. It does not jump past an
+unready expert to run arbitrary later experts, execute individual chunks as
+they arrive, or remove the first expert's acquisition wait. Smaller groups can
+also reduce GPU efficiency, so readiness alone is not evidence of a speedup.
+
+The host cache suite includes a completed-ticket readiness test. The
+checkpoint-sized B12x paging fixture increases its test-only staging pool to
+256 buffers when this flag is set, allowing multi-expert chunk-direct waves;
+the usual 64-buffer fixture would cap those waves at one expert. The generic
+paged-wave fixture still covers fallback execution and bitwise accumulation,
+but its 32-wide chunks do not exercise chunk-direct eligibility.
+
+The ready-prefix experiment remains **disabled in production**. A focused
+five-request comparison used the cache-history sequence above with decay 65536
+and identical binary SHA-256
+`ecb2bc043318e04da6c075e0dcad5d82f562ecdb33d06bbe9709b111249bad84`
+on both ranks in both arms. Its implementation is `9de2eef1` (the executable
+was built from those changes before commit, stamped with parent `dde78285`).
+Only the ready-prefix environment flag differed between arms.
+
+Cold prefill was 41.109 seconds disabled and 40.660 enabled. Summed prefill
+for the four warmed long requests was 63.246 versus 64.403 seconds; summed
+engine decode time was 11.383 versus 11.831 seconds. Their per-request engine
+decode rates were 18.28/16.40/16.83/16.90 versus 17.48/15.64/16.46/16.23 tokens/s.
+Service-level elapsed time summed to 74.797 versus 76.422 seconds. Expert
+reads averaged across ranks totaled 92.02 versus 93.22 GiB. This single paired
+sequence establishes no useful improvement; the small differences do not
+isolate scheduling cost from cache-population and timing variation.
+
+All five normalized outputs, usage and speculative acceptance matched, prefix
+cached-token counts stayed zero and both ranks stayed at zero swap. The enabled
+candidate's subsequent fully warm 2,209-token anchor settled at 1.429 seconds
+prefill and 52.62 decode tokens/s with zero expert reads. This is a warm anchor,
+not a fresh paired small-prompt comparison. These results are diagnostics, not
+campaign rows. Production retains longer cache history and chunk-direct, with
+ready-prefix scheduling off. Arbitrary ready-expert execution and a scheduler
+that balances ready-group size against GPU work remain unimplemented.
+
+Validation passed: all 28 host cache tests, the generic paged-wave GPU fixture,
+and the checkpoint-sized B12x paging fixture with chunk-direct, ready-prefix,
+GPU scatter and resident-first enabled. The latter checks bitwise prefill
+agreement with canonical execution and confirms discontiguous chunk reads.

@@ -3360,7 +3360,10 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       CacheConfig cfg; cfg.packed_nvfp4 = true;
       cfg.execution_slots = execution_slots;
       if (std::getenv("DGPP_EXPERT_CHUNK_DIRECT")) {
-        cfg.reads.buffers = 64; cfg.reads.max_pending = 64; cfg.reads.workers = 4;
+        // Ready-prefix scheduling needs room for more than one 18-chunk
+        // expert per wave; 64 staging slots cap chunk-direct waves at one.
+        cfg.reads.buffers = std::getenv("DGPP_EXPERT_READY_PREFILL") ? 256 : 64;
+        cfg.reads.max_pending = cfg.reads.buffers; cfg.reads.workers = 4;
       }
       cfg.reads.staging_budget_bytes = cfg.reads.buffers*chunk.record_bytes;
       cfg.planner.policy = policy; cfg.planner.minimum_fraction = 0; cfg.planner.cooldown_routes = 0;
