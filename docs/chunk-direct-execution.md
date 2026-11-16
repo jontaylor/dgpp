@@ -1502,3 +1502,28 @@ tokens/s. Response content, usage and speculative acceptance matched, and
 captured process swap was zero on both ranks. This single ordered comparison
 is a focused diagnostic, not a benchmark campaign or proof of a regression.
 The prototype was removed and the prior serving configuration restored.
+
+## B12x host-upload buffer ring
+
+An opt-in prototype replaced the single pinned host packet used by B12x
+`prepare()` with an eight-buffer ring. It waited for an upload only before
+reusing that buffer; device packet updates remained ordered on the execution
+stream. The control used the first buffer only. Both modes reserved the same
+ring, so this comparison does not measure the additional pinned-memory cost
+against the prior binary. The checkpoint-shaped B12x paging fixture passed
+with independent completion and the candidate enabled.
+
+The same binary on both ranks, SHA-256
+`62ee0971000e98f736f3a1e36aff5b02c76517c6c69973c354ea39fccf8aee40`, ran
+control then candidate on the four-request prefix-enabled tool sequence and
+three 2209-token recomputations. This is a focused diagnostic, not a benchmark
+campaign row. Cold prefill was 38.477 versus 38.600 seconds and the three
+continuation wall times totaled 37.854 versus 38.220 seconds. Both ranks read
+109.950 GiB initially and 47.009 GiB across continuations in each arm. On the
+final zero-read recomputation, prefill was 1.595 versus 1.612 seconds and
+decode was 52.58 versus 52.71 tokens/s. Response content, usage and speculative
+acceptance matched; captured swap was zero on both ranks.
+
+The screen found no useful improvement; it does not establish that upload
+synchronization is never material in other workloads. The prototype was
+removed and the prior service binary and settings restored.
