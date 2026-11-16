@@ -1481,6 +1481,40 @@ upper-bound opportunities for this particular immediate-next-visit predictor,
 not measurements of serving speed or a rejection of other prediction methods.
 The result does not justify implementing this predictor on the tested stream.
 
+## Lossless compression feasibility screen
+
+A read-only sample from rank 0's local NVFP4 expert image tested whether
+record-level lossless compression might reduce miss traffic. Four 8 MiB image
+slices compressed to approximately 85.3–85.6% of their original size with
+Zstandard level 1. A separate 64-record check excluded on-disk padding and
+confirmed about 14% reduction after rounding each compressed record to a 4 KiB
+direct-I/O extent. Single-thread decompression in that check reached roughly
+954 MiB/s; this is a local microtest, not a serving or physical bandwidth
+measurement.
+
+A 512-record prototype sampled experts across the image, checked each
+compression/decompression round trip, and read with eight direct-I/O workers.
+Zstandard reduced 272 MiB to 233.8 MiB, but its read-and-decompress timings
+were slower than raw reads in this small test. The raw records came from
+scattered image offsets while compressed records were in a compact temporary
+file, so those timings do not isolate codec overhead or predict serving.
+
+LZ4 reduced the same 272 MiB to 253.0 MiB after 4 KiB alignment. A second
+screen wrote both raw and compressed records to compact temporary files, flushed
+them, warmed each path once and alternated order across four direct-I/O pairs.
+Raw reads took 38.80–39.07 ms; compressed reads plus decompression took
+36.61–38.22 ms. Those files were unlinked temporary files on rank 0's local
+SSD, and every sampled record passed a byte-for-byte round trip. This small
+screen does not include serving, GPU or Engram contention, cache admission,
+both ranks, or a larger working set. It does not establish a serving speedup.
+
+No image format or serving configuration changed. A complete separately
+compressed image would require substantially more local disk than the
+approximately 17/22 GiB free on ranks 0/1 at the time. A bounded overlay or
+other incremental conversion would be needed to test serving without replacing
+the existing images. The limited isolated LZ4 result is a candidate for such a
+test, not evidence that the conversion is worthwhile.
+
 ## Direct admission of packed decode misses
 
 `DGPP_EXPERT_DIRECT_NATIVE_ADMISSION=1` enables an optimization for whole-expert
