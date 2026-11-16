@@ -1254,3 +1254,35 @@ The prototype was removed and the prior serving binary and settings restored.
 It does not rule out a more efficient mutation-driven dirty list, but the
 previous publication profile and this result do not justify retaining this
 particular implementation.
+
+## Reconstruction wave capacity: twelve versus twenty-four slots
+
+The earlier RAM trade changed several settings together. This configuration-only
+screen isolates execution-slot capacity more closely: the control uses twelve
+slots and the candidate uses twenty-four. The candidate's per-rank expert
+budget increased by 238,897,152 bytes, exactly twelve 19,908,096-byte slots,
+to keep the resident expert capacity unchanged. Staging remains at 256 buffers
+and eight read workers; chunk-direct, fixed depth three and the million-token
+context remain enabled. Both arms use the same deployed binary, SHA-256
+`0323d7a0658a82cdf6f57d4151c11073bd31e26ad95454fd85b1949451b651d3`
+(source based on `99aaa7c8` plus a disabled combined-wait experiment).
+
+Each fresh process served the prefix-enabled four-request tool sequence and
+three 2209-token recomputations. Cold initial prefill was 38.540 versus 39.834
+seconds for twelve versus twenty-four slots. The three continuation wall times
+summed to 38.314 versus 41.373 seconds; their engine decode intervals summed to
+33.107 versus 35.815 seconds. Per-rank expert reads were identical: 109.950 GiB
+for the initial request and 47.009 GiB across the continuations. Both arms had
+186,462 resident chunks at the captured post-request boundaries.
+
+The three repeated-prompt prefills were 7.843, 2.870 and 1.602 seconds with
+twelve slots, versus 13.593, 3.827 and 1.603 seconds with twenty-four. The
+third repeat had zero expert reads on both ranks, and decoded at 52.69 versus
+52.79 tokens/s. All normalized responses, usage and speculative acceptance
+matched; both ranks had zero swap at captured boundaries.
+
+This is a single-order focused diagnostic, not a campaign row. The result does
+not identify the cause of the slower miss-heavy requests or establish behavior
+at other concurrency levels. It provides no reason to spend the additional
+memory on twenty-four slots for this workload, so the twelve-slot configuration
+was restored.
