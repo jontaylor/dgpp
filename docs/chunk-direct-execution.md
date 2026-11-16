@@ -1680,3 +1680,34 @@ boundaries. The reverse-order continuation result did not reproduce the first
 pair's apparent improvement. The prototype was removed and the previous
 service binary and settings restored; the experiment does not establish a
 meaningful serving gain or a general conclusion about kernel fusion.
+
+## Decode probation and layer quotas: fixed-route screens
+
+Two offline cache screens used rank 0's existing 14,040-event demand trace
+from the four-request tool sequence and three short recomputations. These are
+approximate grouped-demand simulations with fixed observed routes and free
+per-event staging, not serving measurements. They use the recorded equal-sized
+whole-expert capacity and the existing global-frequency ranking; they do not
+reproduce every admission, staging or timing detail. The replay control read
+109.950 GiB initially and 47.009 GiB across continuations; the three short
+recomputations read 33.385, 6.275 and zero GiB.
+
+One candidate delayed admission of a missing decode expert until it had been
+selected twice within a recent window. Windows of 80, 320, 1,280 and 5,120
+grouped events produced 65.145, 60.298, 55.862 and 53.686 GiB respectively
+across continuations. The two shorter windows also retained reads on the final
+short recomputation. This particular two-touch rule is not a promising
+implementation candidate for the observed sequence.
+
+A second candidate gave newly missed decode experts a bounded probationary
+area and promoted them to the main population on a later hit. At capacities of
+64, 256, 1,024 and 2,048 experts, continuation reads were 56.693, 47.327,
+47.607 and 47.766 GiB. The 256-expert candidate's three short recomputations
+read 34.244, 9.366 and zero GiB; larger probation areas had not reached a
+zero-read third repeat. This does not rule out other scan-resistant policies.
+
+An equal per-layer quota also lost on this trace: it read 191.129 GiB initially
+and 59.187 GiB in continuations. Minimum per-layer allocations from 160 to
+250 experts did not improve continuation traffic; higher floors also delayed
+adaptation on the short recomputations. These simple allocations do not test a
+learned, uneven allocation across layers. No serving code or settings changed.
