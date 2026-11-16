@@ -1824,3 +1824,32 @@ Its fast path must still support graph replay. Check actual scale values on
 admission and fall back for unsupported data. Validate real partially warm
 tool continuations first, with fresh-process cold and fully warm controls.
 No serving code or deployment setting changed in this screen.
+
+### Scale expansion and unsupported-value detection screen
+
+A separate unintegrated CUDA prototype packed four byte-wide scales into a
+16-bit word, set a device flag when any scale had a nonzero low three bits or
+the high bit set, and expanded compact values back to byte-wide scales. On
+Spark-1, it round-tripped synthetic supported values byte-for-byte for buffers
+equal to one, six and twelve complete experts' scale arrays. It also correctly
+classified every possible single byte value from 0 through 255, including
+unsupported low bits and high bits. Unsupported values must take an uncompressed
+fallback; the prototype's compact output for them is not valid.
+
+In repeated synthetic expansion timing, one expert took about 4.1–4.7 us, six
+about 10.3–10.4 us and twelve about 66.5–70.9 us. These are isolated kernels
+over contiguous arrays, not individually addressed cache entries or captured
+serving graphs. They do not include validation-flag handoff, allocations,
+pointer publication, kernel scheduling, memory contention or end-to-end
+execution, so they do not establish a speedup or a production cost estimate.
+
+The prepared execution bindings already carry separate weight and scale
+pointers, so a design can in principle leave prepared weights in place and
+bind expanded scales separately. The current publisher and cache interface,
+however, derive all pointers from one contiguous prepared expert, while the
+allocator budgets fixed-size slots. A useful implementation therefore still
+needs mixed-size accounting, a way to detect unsupported values without a
+per-admission GPU-to-CPU synchronization, safe scale-buffer lifetimes across
+graph execution, and eviction or relocation invalidation. This prototype is
+not connected to serving and does not implement the required fallback. No
+deployment setting was changed.
