@@ -1286,3 +1286,43 @@ not identify the cause of the slower miss-heavy requests or establish behavior
 at other concurrency levels. It provides no reason to spend the additional
 memory on twenty-four slots for this workload, so the twelve-slot configuration
 was restored.
+
+## Independent decode-miss completion on the current configuration
+
+The earlier independent-completion screen used four readers, sixteen staging
+buffers and twenty-four execution slots. The deployment now uses eight readers,
+256 buffers and twelve slots. A same-binary follow-up compared grouped misses
+with `DGPP_MOE_ASYNC_MISSES=1` under those current settings. The binary on both
+ranks was SHA-256
+`0323d7a0658a82cdf6f57d4151c11073bd31e26ad95454fd85b1949451b651d3`
+(source based on `99aaa7c8` plus a disabled combined-wait experiment). The
+option changes small-batch miss servicing; it retains bounded staging and
+ordered final accumulation. Expert capacity, direct I/O, million-token context,
+chunk-direct prefill and depth-three speculation were unchanged.
+
+Each arm restarted and ran the same prefix-enabled four-request tool sequence
+and three 2209-token recomputations. A control-first pair was followed by a
+candidate-first pair. These are focused diagnostics, not benchmark campaign
+rows or evidence across concurrency levels.
+
+| Measurement | Control-first: grouped / independent | Candidate-first: grouped / independent |
+| --- | --- | --- |
+| Initial cold prefill | 38.562 / 38.652 s | 38.720 / 38.998 s |
+| Three continuation wall times, summed | 40.400 / 38.043 s | 41.559 / 38.169 s |
+| Three continuation engine decode times, summed | 34.899 / 33.080 s | 35.996 / 33.302 s |
+| Third short recomputation prefill | 1.601 / 1.604 s | 1.642 / 1.605 s |
+| Third short recomputation decode | 50.76 / 52.84 tok/s | 52.72 / 52.26 tok/s |
+
+Each rank read 109.950 GiB for the initial request and 47.009 GiB across
+continuations in every arm. The three short recomputations read 33.385, 6.275
+and zero GiB per rank. Normalized messages, usage and speculative acceptance
+matched across all arms; both ranks had zero swap at captured boundaries. The
+initial cold decode times were 2.614 / 2.377 seconds in the first pair and
+2.637 / 3.038 seconds in the reverse-order pair, so a cold decode improvement
+is not established.
+
+Independent completion improved the measured partially warm continuations in
+both orders while preserving the zero-read warm anchor. It is enabled for this
+Spark deployment via `DGPP_MOE_ASYNC_MISSES=1`. The tests do not establish a
+general throughput gain, a concurrent-serving result or the exact contribution
+of I/O overlap versus launch scheduling.
