@@ -1481,6 +1481,46 @@ upper-bound opportunities for this particular immediate-next-visit predictor,
 not measurements of serving speed or a rejection of other prediction methods.
 The result does not justify implementing this predictor on the tested stream.
 
+## Direct admission of packed decode misses
+
+`DGPP_EXPERT_DIRECT_NATIVE_ADMISSION=1` enables an optimization for whole-expert
+independent decode misses. When an admitted expert was wholly absent and an
+aligned free cache extent is available, the cache publishes it directly in the
+prepared native layout. If the execution callback already packed the expert,
+the CUDA backend copies that packed payload into the cache; otherwise it packs
+the live canonical execution slot. Fragmented space, partial admissions and
+fractional residency retain the existing chunk path. Cache publication and
+GPU reader/write fences remain ordered. No expert budget or model arithmetic
+changes. The setting is opt-in and enabled in the tested deployment.
+
+A checkpoint-shaped B12x GPU fixture with independent miss completion verifies
+that direct admission is exercised, copies a prepared execution payload, and
+preserves output across cold misses, resident graph reuse and cache pressure.
+The 28 host cache tests also passed. This is not a broad quality evaluation.
+
+Two opposite-order same-binary comparisons used SHA-256
+`242a2cab726077dcf78e7c200b12a956dfca38e4ff48f64ef5f42743c846f64b`
+on both ranks, eight readers, fixed depth three and the existing memory budget.
+Each fresh process served the prefix-enabled four-request tool sequence and
+three 2209-token recomputations. These are focused diagnostics, not benchmark
+campaign rows. The control-first pair's three continuation wall times totaled
+39.308 versus 36.853 seconds; the candidate-first pair totaled 38.262 versus
+37.139 seconds for control versus candidate. Their summed engine decode times
+were 33.937 versus 31.958 seconds and 33.281 versus 32.249 seconds. Cold
+prefill was 39.834 versus 38.541 seconds in the first pair and 38.514 versus
+38.612 seconds in the second; the decode-only change does not explain the
+first pair's cold difference, so it is not attributed to the optimization.
+
+Both ranks read 109.950 GiB initially and 47.009 GiB across continuations in
+every arm. The final recomputation read zero expert bytes, with control versus
+candidate prefill 1.621 versus 1.601 seconds and decode 52.87 versus 52.92
+tokens/s in the first pair; the reverse pair was 1.602 versus 1.599 seconds
+and 52.52 versus 52.52 tokens/s. Normalized messages, usage and speculative
+acceptance matched, and captured swap was zero on both ranks. These limited
+comparisons support a modest improvement for this tool sequence, not a general
+throughput claim. The earlier direct-admission prototype repacked from canonical
+scratch and did not show a consistent gain across two orderings.
+
 ## Previous-layer decode prediction replay
 
 A separate causal fixed-route screen trained expert co-occurrence counts from

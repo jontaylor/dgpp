@@ -74,6 +74,9 @@ class ExpertCacheStorage {
   virtual void move_cache_slot(size_t, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual void native_to_execution(size_t, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual void execution_to_native(size_t, size_t) { throw std::logic_error("native cache unsupported"); }
+  // Copy an already prepared execution payload to a native cache extent.
+  // Return false without mutation when the backend lacks this operation.
+  virtual bool packed_execution_to_native(size_t, size_t) { return false; }
   virtual void unpack_native_chunk(size_t, const StoreRecord&, size_t) { throw std::logic_error("native cache unsupported"); }
   virtual bool accepts_execution_context(const void*) const { return false; }
   virtual uint64_t completion_wait_ns() const { return 0; }
@@ -146,6 +149,7 @@ struct CacheStats {
   uint64_t reconstruction_wall_ns = 0;
   uint64_t cached_copy_bytes = 0, staged_copy_bytes = 0, execution_zero_bytes = 0;
   uint64_t native_hits = 0, native_packs = 0, native_unpacks = 0;
+  uint64_t direct_native_packed_copies = 0;
   uint64_t direct_native_hits = 0, canonical_unpacks = 0, canonical_unpack_bytes = 0;
   uint64_t canonical_unpack_enqueue_ns = 0, completion_wait_ns = 0;
   uint64_t native_layout_wall_ns = 0, native_layout_copy_bytes = 0;

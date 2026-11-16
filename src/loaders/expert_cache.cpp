@@ -84,7 +84,7 @@ struct ExpertCacheState {
   std::vector<size_t> slot_records, native_start, native_holes, free_positions;
   std::vector<size_t> record_owner;
   std::vector<uint64_t> expert_record_bytes;
-  std::vector<bool> execution_busy;
+  std::vector<bool> execution_busy, execution_packed;
   size_t next_execution_slot = 0;
   std::vector<std::vector<std::shared_ptr<const ReadLease>>> direct_reads;
   size_t direct_staging_count() const {
@@ -450,6 +450,7 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   s.native_start.assign(s.experts.size(), absent);
   for (size_t slot = 0; slot < m.cache_slots; ++slot) s.add_free_slot(slot);
   s.execution_busy.resize(cfg.execution_slots, false);
+  s.execution_packed.resize(cfg.execution_slots, false);
   s.direct_reads.resize(cfg.execution_slots);
   for (auto& reads : s.direct_reads) reads.reserve(chunks.size());
   s.pending_copies.reserve(cfg.reads.buffers);
@@ -773,6 +774,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       for (size_t j = 0; j < count; ++j) {
         const size_t e = selected[base+j];
         jobs.push_back({base+j, e, j});
+        s.execution_packed[j] = false;
         s.storage->begin_execution(j);
         s.counters.execution_zero_bytes += s.storage->execution_zero_bytes_per_begin();
         size_t hits = 0;
@@ -871,15 +873,56 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
         const auto previous = s.planner->current().chunks;
         if (plan.chunks[job.expert] <= previous[job.expert]) continue;
         s.evict(plan, fractional ? capacity : job.slot);
-        for (size_t c = previous[job.expert]; c < plan.chunks[job.expert]; ++c) {
-          const auto r = s.experts[job.expert].records[c];
-          if (s.free_slots.empty()) throw std::logic_error("expert cache: ready admission slot missing");
-          const size_t slot = s.free_slots.back();
-          s.storage->unpack_native_chunk(job.slot, s.store->records()[r], slot);
-          s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
-          s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
+        // A wholly missing expert can be retained directly in the prepared
+        // layout when eviction freed an aligned whole-expert extent. Its
+        // canonical reconstruction is still live in this execution slot.
+        // Fall back to independent chunk retention for fragmented space and
+        // for all partial-residency admissions.
+        static const bool direct_native_admission = [] {
+          const char* value = std::getenv("DGPP_EXPERT_DIRECT_NATIVE_ADMISSION");
+          return value && std::atoi(value) != 0;
+        }();
+        const auto& records = s.experts[job.expert].records;
+        size_t native_first = absent;
+        if (direct_native_admission && s.config.packed_nvfp4 && !fractional &&
+            previous[job.expert] == 0 && plan.chunks[job.expert] == records.size()) {
+          for (const size_t first : s.free_slots) {
+            if (first % records.size() || first + records.size() > s.slot_records.size()) continue;
+            bool free = true;
+            for (size_t c = 0; c < records.size(); ++c)
+              free &= s.free_positions[first + c] != absent;
+            if (free) { native_first = first; break; }
+          }
         }
-        s.storage->order_mutations();
+        if (native_first != absent) {
+          if (!s.execution_packed[job.slot] ||
+              !s.storage->packed_execution_to_native(job.slot, native_first)) {
+            s.storage->execution_to_native(job.slot, native_first);
+          } else {
+            ++s.counters.direct_native_packed_copies;
+          }
+          s.storage->order_mutations();
+          for (size_t c = 0; c < records.size(); ++c) {
+            const auto r = records[c];
+            const size_t slot = native_first + c;
+            s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
+            s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
+          }
+          s.native_start[job.expert] = native_first;
+          ++s.prepared_revision;
+          ++s.counters.native_packs;
+          s.counters.native_layout_copy_bytes += s.full.allocation_bytes;
+        } else {
+          for (size_t c = previous[job.expert]; c < plan.chunks[job.expert]; ++c) {
+            const auto r = records[c];
+            if (s.free_slots.empty()) throw std::logic_error("expert cache: ready admission slot missing");
+            const size_t slot = s.free_slots.back();
+            s.storage->unpack_native_chunk(job.slot, s.store->records()[r], slot);
+            s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
+            s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
+          }
+          s.storage->order_mutations();
+        }
         s.planner->commit_admission(job.expert, plan);
         s.count_transition(plan, previous);
         ++s.counters.demand_admissions;
@@ -1049,7 +1092,11 @@ const uint8_t* ExpertExecutionLease::packed_data() const {
   state_->check();
   if (!state_->config.packed_nvfp4) throw std::logic_error("expert cache: packed layout is disabled");
   if (native_data_) return native_data_;
-  try { return state_->storage->packed_execution_data(slot_); }
+  try {
+    const auto* data = state_->storage->packed_execution_data(slot_);
+    state_->execution_packed[slot_] = true;
+    return data;
+  }
   catch (...) { state_->counters.poisoned = true; throw; }
 }
 void ExpertExecutionLease::release() {

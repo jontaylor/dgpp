@@ -3411,6 +3411,16 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
       std::memcpy(got.data(),c.d_out,got.size()*2);
       if (!pass) {
+        const char* direct = std::getenv("DGPP_EXPERT_DIRECT_NATIVE_ADMISSION");
+        const char* async = std::getenv("DGPP_MOE_ASYNC_MISSES");
+        if (policy == Policy::kWholeExpert && direct && std::atoi(direct) && async && std::atoi(async)) {
+          size_t prepared = 0;
+          for (const auto id : layer.last_ids()) prepared += hot.prepared_address(mapping.at(id)) != nullptr;
+          require(prepared > 0 && hot.stats().native_packs > 0,
+                  "direct native admission publishes a prepared expert after a cold miss");
+          require(hot.stats().direct_native_packed_copies > 0,
+                  "direct native admission reuses a packed execution payload");
+        }
         expected = got;
         double error = 0, magnitude = 0;
         for (size_t i = 0; i < got.size(); ++i) {

@@ -213,6 +213,17 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         execution_ + execution_slot * memory_.execution_slot_bytes, memory_.execution_slot_bytes,
         cudaMemcpyDeviceToDevice, copy_stream_));
   }
+  bool packed_execution_to_native(size_t execution_slot, size_t first) override {
+    if (!packed_nvfp4_) return false;
+    check_native(execution_slot, first);
+    for (size_t c = 0; c < layouts_.size(); ++c) wait_cache(first+c);
+    Transfer transfer(*this);
+    const size_t bytes = moe_fp4_packed_bytes(identity_.hidden, identity_.intermediate / identity_.world);
+    DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + first * memory_.cache_slot_bytes,
+        execution_ + execution_slot * memory_.execution_slot_bytes + full_.allocation_bytes,
+        bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+    return true;
+  }
   void unpack_native_chunk(size_t execution_slot, const StoreRecord& record, size_t cache_slot) override {
     check_execution(execution_slot);
     check_cache(cache_slot);
