@@ -1711,3 +1711,36 @@ and 59.187 GiB in continuations. Minimum per-layer allocations from 160 to
 250 experts did not improve continuation traffic; higher floors also delayed
 adaptation on the short recomputations. These simple allocations do not test a
 learned, uneven allocation across layers. No serving code or settings changed.
+
+## Small router-weight screen
+
+An opt-in diagnostic captured rank 0's target prefill expert IDs and router
+weights for the prefix-enabled four-request tool sequence followed by two
+2,209-token recomputations. It synchronized the route stream to copy the
+weights, so its timings are not performance results. The 380 captured calls
+covered 598,920 token-layer rows and 3,593,520 routed assignments. They include
+large initial-prefill chunks and shorter warmish continuation/recomputation
+chunks; no fully resident third recomputation or decode-graph weights were
+captured. Router weights and routes are workload data, not benchmark artifacts
+to commit.
+
+For each row, the screen divided each selected expert's weight by the sum of
+the six routed weights. The smallest selected expert averaged 11.81% of that
+routed sum. Hypothetically dropping every assignment below 5% would remove
+0.112% of assignments and 0.026% of routed weight per row on average. Grouping
+by each captured prefill call, 0.441% of the distinct expert demands would then
+have no remaining rows. A 10% cutoff would remove 5.591% of assignments and
+2.897% of the routed weight per row on average, with 4.679% of distinct
+prefill-call expert demands disappearing. These percentages are aggregate
+opportunity bounds for this trace: they do not distinguish resident from
+missing experts, measure execution time, or account for the shared expert.
+
+As an additional proxy only, grouping adjacent prefill rows in fours would
+eliminate 0.113% and 5.592% of distinct four-row expert demands at the 5% and
+10% thresholds respectively. Those groups are not the actual speculative
+verification routes, and the lost router weight is not a model-quality metric.
+No expert was actually dropped and no quality change was measured. The small
+threshold gives too little apparent headroom on this prefill sample to justify
+implementing the approximation; a larger cutoff or decode-specific policy
+would require separate route, quality and serving evidence. The diagnostic
+instrumentation was removed and the previous server restored.
