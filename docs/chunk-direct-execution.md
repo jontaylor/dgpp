@@ -2279,3 +2279,40 @@ increased native-pack counts during the continuations, indicating its path was
 exercised, but did not improve elapsed time in this one ordering. This does not
 rule out an improvement for a different allocation or workload. Whole-expert
 caching remains the selected deployment.
+
+### Carrying decode popularity into prefill admissions
+
+A temporary prototype applied the existing separately aged decode popularity
+history to **prefill** demand-admission scores as well as decode admission
+scores. Its prefill boost was 16, while the deployed decode boost stayed at 16;
+periodic planning, observation and budgets were unchanged. Decode history ages
+only on decode selections, so this can protect an old decode working set during
+an extended prefill. A planner test verified that a short prefill could protect
+an earlier decode resident, while a sufficiently sustained new demand could
+still replace it. The standard planner suite passed with the candidate disabled.
+The prototype was removed after the serving screen.
+
+The control-first focused comparison used the same binary on both ranks,
+SHA-256 `82f3505c30331f73e36734e38a03563d11463b2782d448776aa882886c4cdd52`
+(source `1e5125ea` plus the prototype), and changed only the prefill boost.
+Both arms used whole-expert caching, eight readers, the selected budget and
+fixed depth three. Each fresh process ran the four-request prefix-enabled tool
+sequence and three 2,209-token uncached recomputations. This is a diagnostic,
+not a benchmark campaign row.
+
+| Measurement | Control | Prefill decode boost 16 |
+| --- | ---: | ---: |
+| Initial prefill | 38.747 s | 38.567 s |
+| Three continuation wall times, summed | 33.908 s | 34.044 s |
+| Three continuation decode intervals, summed | 29.014 s | 28.965 s |
+| Continuation expert reads per rank | 42.612 GiB | 43.526 GiB |
+| Recomputed short-prefill times | 7.794 / 2.864 / 1.608 s | 6.336 / 4.987 / 4.797 s |
+| Third short recomputation reads per rank | 0 GiB | 22.123 GiB |
+| Third short recomputation decode | 52.77 tok/s | 52.44 tok/s |
+
+Initial-request reads were 109.950 GiB per rank in both arms. Normalized
+outputs, usage and speculative acceptance matched; captured process swap was
+zero on both ranks. This particular boost did not improve the normal tool loop
+and held back prefill adaptation after the workload switch. Its third repeat
+was not fully resident, so the decode rates are not a matched zero-read anchor.
+The result does not rule out a differently aged or bounded cross-phase policy.
