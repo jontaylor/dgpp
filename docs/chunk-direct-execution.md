@@ -977,3 +977,33 @@ whole-system `Cached` was about 2.93/3.08 GiB on ranks 0/1 for direct versus
 not that the extra cache held useful expert records. The tested buffered path
 was slower despite that increase. Direct I/O was restored; different cache
 sizes, explicit page-cache policies and other workloads remain untested.
+
+## Single-donor whole-expert admission screen
+
+Implementation `73a11363` tested a single-pass donor selection when every whole
+expert has the same allocation size and the cache lacks room for a demanded
+expert. In that case one eviction suffices, so the path selects the same
+minimum density and expert-ID tie break without constructing the general heap.
+Unequal expert sizes, fractional residency and nonfinite candidate scores
+fell back to the existing path. A randomized 1500-step comparison against the
+general heap covered varying costs, cooldown, ties and workload shifts; the
+22 planner and 28 cache tests passed on Spark-1. The candidate was selected
+only with `DGPP_EXPERT_SINGLE_DONOR=1`.
+
+A focused serving screen used identical binary SHA-256
+`bb5a51289cc38a323c35754259d65523cf734c9f6ef8de3bdbc5bc0e6e2e2a0e`
+(built before `73a11363`, stamped with parent `12290b9a`) on both ranks. The
+heap control ran first; both arms restarted before the four-request
+prefix-enabled tool sequence and three small recomputations. This is a single
+serving diagnostic, not a campaign row.
+
+Cold prefill was 38.708 versus 38.660 seconds. Continuation wall time was
+40.706 versus 40.595 seconds, with summed prefill 5.363 versus 5.371 seconds
+and engine decode 35.228 versus 35.090 seconds. Both read 47.009 GiB per rank.
+On the third small recomputation both ranks read no expert bytes; prefill was
+1.615 versus 1.610 seconds and decode 52.54 versus 52.45 tokens/s. All seven
+normalized outputs, usage and read volumes matched, as did tool-loop
+acceptance; processes had zero swap at recorded boundaries. These timings do
+not demonstrate a meaningful serving benefit, nor do they independently
+measure planner CPU time. The candidate is removed and the existing planner
+is restored; the running binary contains the now-disabled experimental path.
