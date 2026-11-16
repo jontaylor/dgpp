@@ -1224,3 +1224,33 @@ candidates predicted zero reads on the third small recomputation. Initial
 request reads were 109.950 GiB in each case. These results give no reason to
 implement this particular recent-use bonus, and do not rule out other admission
 policies or workloads. No serving settings changed.
+
+## Incremental binding publication screen
+
+An opt-in prototype compared each expert's prepared address against the last
+published address and rebuilt only changed entries, uploading each changed
+layer's table. Its first publication initialized every layer; address removal
+cleared both projection bindings. The existing service-stream synchronization
+and publication-before-graph-resume dependency were retained. It still scanned
+all expert addresses; this was a changed-layer upload experiment, not a cache
+mutation-driven dirty list. The full-table control and prototype ran in one
+binary, SHA-256 `2ed00508b0944417da4e3c7fa670dc6f902738694b4e9da85c1b5f1a517ea74a`,
+built from `8c01cf2c` plus the prototype.
+
+A focused single-order comparison restarted for each arm, ran the same
+prefix-enabled four-request tool sequence and three 2209-token recomputations.
+Cold initial prefill was 38.495 versus 38.630 seconds for full versus
+incremental publication. The three continuation wall times summed to 40.010
+versus 40.615 seconds; their summed engine decode times were 34.476 versus
+35.141 seconds. Each rank read 47.009 GiB across continuations in both arms.
+On the third short recomputation, both ranks read zero expert bytes; prefill
+was 1.598 versus 1.606 seconds and decode was 52.99 versus 51.40 tokens/s.
+All normalized outputs, usage and speculative acceptance matched, and both
+ranks had zero swap at the captured boundaries.
+
+This is a focused diagnostic, not a campaign result. The single comparison
+shows no improvement and cannot establish the cause of the timing difference.
+The prototype was removed and the prior serving binary and settings restored.
+It does not rule out a more efficient mutation-driven dirty list, but the
+previous publication profile and this result do not justify retaining this
+particular implementation.
