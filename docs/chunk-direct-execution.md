@@ -2206,3 +2206,37 @@ usage and speculative acceptance matched, and captured swap was zero.
 The smaller pool did not improve this single-request screen, so the prototype
 was removed and the 16-worker-per-table configuration restored. This does not
 establish the effect of reduced thread count under concurrent serving.
+
+### Fractional residency on the current serving path
+
+A candidate-first focused comparison revisited adaptive fractional residency
+using the current production binary, SHA-256
+`985c5e118dacd69eb4181074a0dfe0022d182fdaa437a1d605b83be9946249e0`,
+with decode admission boost 16, parallel small Engram gathers, eight readers
+and the same overall expert budget. Fractional residency used a zero minimum
+and an initial fraction of 0.05, rounded to one chunk per expert; whole-expert
+caching started empty. Both used 12 configured execution slots, although the
+fractional ready-miss path reserves one of them for its own operations. Direct
+native admission of fully absent misses applies only to the whole-expert path.
+This is a comparison of the deployed implementations, not an isolated cache
+policy comparison or a benchmark campaign row.
+
+Each fresh process ran the same prefix-enabled four-request tool sequence and
+three short recomputations. Whole versus fractional initial prefill was 42.683
+versus 37.584 seconds, but fractional had already read 7.969 GiB of expert
+chunks per rank before the first request, versus zero for whole-expert. First
+request expert reads were 109.950 versus 104.629 GiB per rank; the first
+request timing therefore excludes different startup work and does not
+establish a cold-start improvement.
+
+The three continuation wall times totalled 35.141 versus 36.409 seconds;
+engine decode totalled 29.766 versus 30.943 seconds. Each rank read 42.611
+versus 42.605 GiB of expert data across those continuations. The third short
+recomputation read zero expert bytes on both ranks, with prefill 1.613 versus
+1.608 seconds and decode 52.80 versus 52.61 tokens/s. Normalized choices, usage
+and speculative acceptance matched, and captured swap was zero on both ranks.
+
+Fractional residency reached the fully warm state but did not improve this
+warmish sequence. The whole-expert configuration remains selected. The single
+ordering and distinct startup/execution paths limit causal attribution; this
+does not rule out other initial allocations or fractional implementations.
