@@ -69,6 +69,49 @@ struct Fixture {
 };
 }  // namespace
 
+DGPP_TEST(expert_read_queue_classifies_nvfp4_scales_without_changing_record_bytes) {
+  Fixture f;
+  const auto path = (f.dir / "nvfp4.img").string();
+  StoreIdentity id; id.format = Format::kNvfp4;
+  id.checkpoint_sha256.fill(23);
+  id.hidden = 64; id.intermediate = 64; id.chunk_intermediate = 64;
+  const std::vector<RecordKey> keys{{0,0,0,false}, {0,1,0,false}, {0,2,0,false}};
+  std::vector<uint8_t> codes(64*64/2, 77), scales(64*64/16, 72);
+  std::array<MatrixSource,3> source{{{64,64,Format::kNvfp4,codes,scales,1.f},
+                                     {64,64,Format::kNvfp4,codes,scales,1.f},
+                                     {64,64,Format::kNvfp4,codes,scales,1.f}}};
+  ExpertStoreBuilder writer(path,id,keys);
+  auto exact = pack_chunk(source,0,64);
+  writer.write(0,exact);
+  auto low = exact; low.bytes[low.layout.up.scales_offset+3] |= 1;
+  writer.write(1,low);
+  auto high = exact; high.bytes[high.layout.down.scales_offset+7] |= 128;
+  writer.write(2,high);
+  writer.finish();
+  auto store = std::make_shared<ExpertStore>(path,id,keys.size(),IoMode::kBuffered);
+  ReadQueueConfig cfg; cfg.buffers=1; cfg.workers=1; cfg.max_pending=2;
+  cfg.staging_budget_bytes=store->records()[0].layout.record_bytes;
+  cfg.scan_nvfp4_scales=true;
+  ExpertReadQueue queue(store,cfg);
+  for (size_t i=0;i<keys.size();++i) {
+    auto ticket=queue.request(i);
+    const auto lease=ready(ticket);
+    require(lease->scale_compactibility() == (i ? ScaleCompactibility::kUnsupported : ScaleCompactibility::kExact),
+            "unsupported scale bits cannot enter a compact representation");
+    const auto& expected = i==0 ? exact : i==1 ? low : high;
+    require(std::equal(expected.bytes.begin(),expected.bytes.end(),lease->bytes().begin()),
+            "scale classification preserves the original staged record");
+  }
+  cfg.scan_nvfp4_scales=false;
+  ExpertReadQueue disabled(store,cfg);
+  require(ready(disabled.request(0))->scale_compactibility()==ScaleCompactibility::kUnknown,
+          "disabled scan never implies compactibility");
+  cfg.scan_nvfp4_scales=true;
+  ExpertReadQueue other_format(f.store,cfg);
+  require(ready(other_format.request(0))->scale_compactibility()==ScaleCompactibility::kUnknown,
+          "MXFP4 is never classified as NVFP4");
+}
+
 DGPP_TEST(expert_read_queue_coalesces_concurrent_consumers_without_duplicate_reads) {
   Fixture f;
   auto cfg = f.config();

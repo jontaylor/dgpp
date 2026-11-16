@@ -1873,3 +1873,23 @@ storage nor demonstrates a RAM or serving improvement. It also synchronizes
 before using the test's invalid-value flag, which is not a proposed admission
 path. Production prefill, real checkpoint values, eviction safety and
 warm/cold end-to-end performance remain to be addressed before deployment.
+
+### Classifying staged scales without a GPU round trip
+
+The read queue now supports an internal, default-off `scan_nvfp4_scales`
+option. After a successful read, the worker checks the three scale spans and
+publishes `kExact` only if every byte has its high bit and low three bits
+clear. Unsupported NVFP4 data is reported as `kUnsupported`; disabled scans
+and other formats report `kUnknown`. The original staged record is unchanged,
+and the classification shares its immutable lease and completion lifetime.
+No serving configuration currently enables or consumes the classification.
+
+The Spark-1 queue suite passed with exact scales, unsupported low and high bits,
+disabled scans and MXFP4. A separate read-only screen of 512 evenly spaced
+records on each local rank image found no unsupported records. CPU time inside
+the scale scan, excluding reads and queue overhead, was approximately 3.04 and
+2.96 microseconds per chunk on ranks 0 and 1 respectively (about 55 and 53
+microseconds when multiplied by 18 chunks). This sample does not establish
+complete checkpoint coverage, and this timing is not a serving measurement.
+The cache must still aggregate all chunks for an expert and preserve a full
+uncompressed fallback whenever the status is unknown or unsupported.

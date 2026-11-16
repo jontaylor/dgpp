@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -13,6 +14,25 @@
 #include <utility>
 
 namespace dgpp::expert {
+namespace {
+bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout) {
+  for (const auto* matrix : {&layout.gate, &layout.up, &layout.down}) {
+    if (matrix->scales_offset > data.size() || matrix->scales_bytes > data.size() - matrix->scales_offset)
+      throw std::logic_error("expert read queue: scale span outside record");
+    const auto scales = data.subspan(matrix->scales_offset, matrix->scales_bytes);
+    uint64_t invalid = 0;
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= scales.size(); i += sizeof(uint64_t)) {
+      uint64_t word;
+      std::memcpy(&word, scales.data() + i, sizeof(word));
+      invalid |= word;
+    }
+    if (invalid & UINT64_C(0x8787878787878787)) return false;
+    for (; i < scales.size(); ++i) if (scales[i] & 0x87) return false;
+  }
+  return true;
+}
+}  // namespace
 struct ReadPool {
   std::mutex mutex;
   std::condition_variable available;
@@ -206,6 +226,9 @@ struct ReadQueueImpl {
         if (abandoned) std::rethrow_exception(cancelled());
         auto buffer = std::span<uint8_t>(static_cast<uint8_t*>(pool->buffers[lease->slot_].get()), lease->size_);
         store->read(job->record, buffer);
+        if (config.scan_nvfp4_scales && store->identity().format == Format::kNvfp4)
+          lease->scale_compactibility_ = compactible_scales(buffer, store->records()[job->record].layout)
+              ? ScaleCompactibility::kExact : ScaleCompactibility::kUnsupported;
       } catch (...) { failure = std::current_exception(); }
       {
         std::lock_guard lock(mutex);

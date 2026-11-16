@@ -14,12 +14,17 @@
 namespace dgpp::expert {
 struct ReadPool;
 
+// A compressed representation is exact only for bytes with no high bit or
+// low three bits. Unknown includes non-NVFP4 records and disabled scans.
+enum class ScaleCompactibility { kUnknown, kExact, kUnsupported };
+
 class ReadLease {
  public:
   ~ReadLease();
   ReadLease(const ReadLease&) = delete;
   ReadLease& operator=(const ReadLease&) = delete;
   std::span<const uint8_t> bytes() const;
+  ScaleCompactibility scale_compactibility() const { return scale_compactibility_; }
 
  private:
   friend struct ReadQueueImpl;
@@ -27,6 +32,7 @@ class ReadLease {
   std::shared_ptr<ReadPool> pool_;
   size_t slot_, size_;
   bool active_ = false;
+  ScaleCompactibility scale_compactibility_ = ScaleCompactibility::kUnknown;
 };
 
 class ReadTicket {
@@ -51,6 +57,7 @@ struct ReadQueueConfig {
   size_t buffers = 2, workers = 1, max_pending = 8;
   uint64_t staging_budget_bytes = 0;
   uint64_t prefetch_bytes = 0;  // queued + active speculative record bytes
+  bool scan_nvfp4_scales = false;  // opt-in; file workers scan completed immutable reads
 };
 struct ReadQueueStats {
   uint64_t accepted = 0, coalesced = 0, promoted = 0, refused = 0;
