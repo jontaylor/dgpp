@@ -1624,3 +1624,28 @@ acceptance matched; captured swap was zero on both ranks.
 The screen found no useful improvement; it does not establish that upload
 synchronization is never material in other workloads. The prototype was
 removed and the prior service binary and settings restored.
+
+## Direct packing of staged decode chunks: not selected
+
+A prototype writes each wholly missing NVFP4 expert chunk directly from its
+staging buffer into the B12x packed layout, reconstructing canonical weights
+only for a fallback that needs them. The checkpoint-shaped GPU fixture passed
+with both direct native admission enabled and disabled, including pressure and
+graph replay. The host cache tests also passed.
+
+A focused two-rank serving screen did not complete: the control's cold
+24,317-token prefill took 38.500 seconds, and its three tool continuations
+took 37.269 seconds combined. On the candidate's first request, prefill
+completed but the captured decode graph stalled and the service reported CUDA
+error 719 after approximately 60 seconds. The kernel log recorded Xid 43.
+The direct cause has not been established. There is no candidate throughput
+result, and the isolated fixture is insufficient evidence that this path is
+safe for the full serving graph. A shorter 2,209-token cold request did
+complete with the candidate. On the long request, an opt-in event marker
+showed the transfer stream reached the queued pack kernel while the service
+stream was idle. Reducing the kernel block size from 256 to 64 threads did not
+remove the stall. The marker does not establish whether the kernel started;
+the scheduling hypothesis remains unproven. The prototype was removed and
+the previous binary and configuration restored. Revisit only with a concrete
+way to resolve the stall and compare cold, partially warm, and fully warm
+serving paths.
