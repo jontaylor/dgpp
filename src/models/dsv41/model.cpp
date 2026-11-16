@@ -49,7 +49,6 @@ struct Dsv41Model::PagedGraphs {
   uint64_t published_revision = 0;
   bool profile_publish = false;
   bool bulk_publish = true;
-  bool combine_service_wait = false;
   uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
   uint64_t publish_bytes = 0, profiled_walk_ns = 0;
   explicit PagedGraphs(int n) : layers(n) {
@@ -57,8 +56,6 @@ struct Dsv41Model::PagedGraphs {
     profile_publish = profile && std::atoi(profile) != 0;
     const char* bulk = std::getenv("DGPP_EXPERT_BULK_BINDINGS");
     bulk_publish = !bulk || std::atoi(bulk) != 0;
-    const char* combine = std::getenv("DGPP_EXPERT_COMBINE_SERVICE_WAIT");
-    combine_service_wait = combine && std::atoi(combine) != 0;
     prepare_moe_fp4_pack();
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
@@ -76,13 +73,8 @@ struct Dsv41Model::PagedGraphs {
     if (service) (void)cudaStreamDestroy(service);
   }
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
-               int hidden, int inter, bool wait_if_unchanged = false) {
-    if (published_revision == cache.prepared_revision()) {
-      // A serviced miss can leave the binding revision unchanged. Its output
-      // still has to complete before the graph's demand gate is released.
-      if (wait_if_unchanged) DGPP_CUDA_OK(cudaStreamSynchronize(service));
-      return;
-    }
+               int hidden, int inter) {
+    if (published_revision == cache.prepared_revision()) return;
     const auto started = profile_publish ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
     std::fill_n(host_tables, layers * words, uint64_t{0});
@@ -1908,12 +1900,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
                             p.service, MoeExpertKernel::kGemv);
-        if (!p.combine_service_wait) DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
-        // Publication copies after the miss work on the same stream and
-        // synchronizes before returning. If no table changed it must still
-        // wait for the serviced output before releasing the graph gate.
-        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size,
-                  cfg_.moe_intermediate_size / world_, p.combine_service_wait);
+        DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
+        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
         ++p.misses; accounted = l + 1;
         __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
         break;
