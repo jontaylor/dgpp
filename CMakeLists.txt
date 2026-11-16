@@ -1388,6 +1388,10 @@ target_link_libraries(expert_paging_test PRIVATE dgpp_loaders)
 dgpp_set_common(expert_paging_test)
 add_test(NAME expert_paging_test COMMAND expert_paging_test)
 
+add_executable(paged_binding_table_test tests/host/paged_binding_table_test.cpp)
+dgpp_set_common(paged_binding_table_test)
+add_test(NAME paged_binding_table_test COMMAND paged_binding_table_test)
+
 add_executable(expert_cache_test tests/host/expert_cache_test.cpp)
 target_link_libraries(expert_cache_test PRIVATE dgpp_expert_residency)
 dgpp_set_common(expert_cache_test)

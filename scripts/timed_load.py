@@ -5,7 +5,8 @@ Requires an otherwise idle server. Accept an idle snapshot only when its
 prompt/token deltas equal the completed requests' usage, with a five-second
 deadline. Polling is outside the client and engine timing intervals.
 Use --server-timings to record and validate per-phase server histogram
-brackets for TTFT and inter-token p50/p95/p99 (one token per decode pass).
+brackets for TTFT and token-delivery-pass p50/p95/p99. Speculation can
+deliver several tokens per pass.
 Prometheus reads run outside client/engine timing intervals.
 Arguments and JSON fields are the same as serve_load, plus each phase's
 engine counters and decode tokens/s. Warmup and isolation are reconciled too.
@@ -81,7 +82,10 @@ def prometheus_snapshot(host, port):
 
 
 def histogram_quantiles(before, after, name, expected):
-    """Nearest-rank brackets from cumulative server buckets; never interpolate."""
+    """Nearest-rank server histogram brackets without interpolation.
+
+    Use observed counts when expected is None (multi-token delivery passes).
+    """
     def buckets(text):
         series = {}
         for line in text.splitlines():
@@ -129,8 +133,9 @@ def histogram_quantiles(before, after, name, expected):
         for bound, count in delta.items():
             counts[bound] = counts.get(bound, 0) + count
     values = [value for _, value in sorted(counts.items())]
-    if any(value < 0 for value in values) or values != sorted(values) or counts[math.inf] != expected:
+    if any(value < 0 for value in values) or values != sorted(values) or (expected is not None and counts[math.inf] != expected):
         raise RuntimeError(f"histogram delta/count mismatch: {name}; expected {expected}, got {counts}")
+    expected = counts[math.inf]
     result = {"count": expected, "definition": "nearest-rank server histogram brackets; no interpolation"}
     for pct in (50, 95, 99):
         result[f"p{pct}"] = None
@@ -183,7 +188,14 @@ class TimedLoad:
             result["server_ttft_quantile_brackets"] = histogram_quantiles(
                 hist_before, hist_after, "dgpp_time_to_first_token_seconds", len(result["requests"]))
             result["server_itl_quantile_brackets"] = histogram_quantiles(
-                hist_before, hist_after, "dgpp_inter_token_latency_seconds", tokens)
+                hist_before, hist_after, "dgpp_inter_token_latency_seconds", None)
+            # The server observes one gap per request's token-delivery pass,
+            # not per output token: MTP may deliver several tokens together.
+            gaps = result["server_itl_quantile_brackets"]
+            minimum = sum(r["tokens"] > 1 for r in result["requests"])
+            if not minimum <= gaps["count"] <= tokens:
+                raise RuntimeError("token-delivery histogram count outside completed-work bounds")
+            gaps["observation_unit"] = "request token-delivery pass"
             result["prometheus_before"] = hist_before
             result["prometheus_after"] = hist_after
         if reports is not None:
@@ -211,7 +223,7 @@ def decode_table(rates):
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--server-timings", action="store_true",
-                        help="validate per-phase TTFT/inter-token histograms (requires one token per decode pass)")
+                        help="validate per-phase TTFT and token-delivery-pass histograms (supports speculation)")
     options, remaining = parser.parse_known_args()
     load = TimedLoad(server_timings=options.server_timings)
     serve_load.main(phase_runner=load.phase, settle=load.settle, argv=remaining)

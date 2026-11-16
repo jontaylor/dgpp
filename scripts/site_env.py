@@ -11,6 +11,18 @@ import shlex
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+# Non-secret execution switches retained by the measured NVFP4 deployment.
+DEPLOYMENT_ENV_KEYS = (
+    "DGPP_MOE_B12X", "DGPP_MOE_FP4_GROUPED_DECODE",
+    "DGPP_EXPERT_GPU_SCATTER", "DGPP_EXPERT_VERIFY_RECORDS",
+    "DGPP_MOE_ASYNC_MISSES", "DGPP_EXPERT_DEMAND_LOOKAHEAD",
+    "DGPP_EXPERT_DIRECT_NATIVE_ADMISSION", "DGPP_EXPERT_EARLY_DEMAND",
+    "DGPP_EXPERT_READY_WORKER", "DGPP_ENGRAM_DIRECT",
+    "DGPP_ENGRAM_PARALLEL_SMALL", "DGPP_EXPERT_GPU_PAGING",
+    "DGPP_EXPERT_GROUP_READS", "DGPP_MOE_RESIDENT_FIRST",
+    "DGPP_EXPERT_CHUNK_DIRECT",
+)
+
 SITE_KEYS = (
     "DGPP_NODES", "DGPP_SSH_USER", "DGPP_CLUSTER_CONFIG",
     "DGPP_HTTP_PORT", "DGPP_FABRIC_PORT", "DGPP_JOURNAL_PORT",
@@ -35,6 +47,8 @@ NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP
     # with the same setting on every rank.
     "DGPP_BUS_TIMELINE", "DGPP_BUS_TIMELINE_DUMP", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
+SITE_KEYS += DEPLOYMENT_ENV_KEYS
+NODE_KEYS += DEPLOYMENT_ENV_KEYS
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",
     "DGPP_JOURNAL_PORT": "29971", "DGPP_LOG_DIR": "~/dgpp/log",
@@ -153,9 +167,16 @@ def deployment(path):
         raise ValueError("deployment config must be an object")
     if set(cfg) & {"nodes", "ssh_user"}:
         raise ValueError("move nodes and ssh_user out of the deployment JSON into .env; use world_size")
-    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "ports", "tokenizer", "nvme_cache"}
+    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http", "ports", "tokenizer", "nvme_cache", "environment"}
     if unknown:
         raise ValueError("unknown deployment keys: " + ", ".join(sorted(unknown)))
+    execution_env = cfg.get("environment", {})
+    if not isinstance(execution_env, dict) or set(execution_env) - set(DEPLOYMENT_ENV_KEYS):
+        raise ValueError("environment may only contain supported deployment execution switches")
+    for key, value in execution_env.items():
+        allowed = ("0", "1", "2") if key == "DGPP_EXPERT_READY_WORKER" else ("0", "1")
+        if not isinstance(value, str) or value not in allowed:
+            raise ValueError(f"invalid deployment execution switch {key}: expected {allowed}")
     nvme = cfg.get("nvme_cache", {})
     if not isinstance(nvme, dict) or set(nvme) - {"enabled", "path", "capacity_gib", "min_tokens",
                                                    "chunk_mib", "max_ops", "reserve_gib", "persist",
@@ -322,7 +343,7 @@ def server_config(cfg):
     """Keep launcher-only policy out of the engine's strict JSON schema."""
     return {**cfg, "node_env": [
         {key: value for key, value in env.items()
-         if key not in ("DGPP_NO_SWAP", "DGPP_RESIDENT_CACHE_VERIFY")}
+         if key not in ("DGPP_NO_SWAP", "DGPP_RESIDENT_CACHE_VERIFY", *DEPLOYMENT_ENV_KEYS)}
         for env in cfg["node_env"]]}
 
 
@@ -354,7 +375,8 @@ def resolve_config(path, values=None):
         if metrics in (cfg["ports"]["fabric"], cfg["ports"]["journal"]):
             raise ValueError("ports.metrics must differ from the fabric and journal ports")
         cfg["ports"]["metrics"] = metrics
-    cfg["node_env"] = node_environments(values, cfg["nodes"])
+    execution_env = cfg.pop("environment", {})
+    cfg["node_env"] = [{**execution_env, **node} for node in node_environments(values, cfg["nodes"])]
     return cfg
 
 

@@ -47,6 +47,16 @@ class HistogramTest(unittest.TestCase):
             timed_load.histogram_quantiles(before, reset, name, 4)
 
 
+    def test_speculative_pass_count_is_independent_of_output_tokens(self):
+        name = "dgpp_inter_token_latency_seconds"
+        result = timed_load.histogram_quantiles(
+            histogram(name, [4, 6, 9]), histogram(name, [5, 8, 12]), name, None)
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["p50"]["upper_inclusive_seconds"], 1.)
+        with self.assertRaisesRegex(RuntimeError, "delta/count mismatch"):
+            timed_load.histogram_quantiles(
+                histogram(name, [4, 6, 9]), histogram(name, [3, 8, 12]), name, None)
+
     def test_invalid_snapshots_and_unmatched_work_are_rejected(self):
         before = histogram("h", [4, 6, 9])
         invalid = ["", histogram("h", [3, 5, 8]), histogram("h", [6, 7, 10]),
@@ -155,6 +165,30 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in reports[0].items() if k != "engine"}, report)
         self.assertEqual(reports[0]["engine"]["decode_tokens"], 1276)
         self.assertEqual(reports[0]["engine"]["tokens_per_s"], 638)
+
+    def test_speculative_phase_accepts_fewer_gaps_than_tokens_but_checks_bounds(self):
+        def phase(*args):
+            args[-1].append({"concurrency": 4, "requests": self.requests})
+        ttft = "dgpp_time_to_first_token_seconds"
+        itl = "dgpp_inter_token_latency_seconds"
+        before = histogram(ttft, [0, 0, 0]) + histogram(itl, [0, 0, 0])
+        for count in (4, 0, 1277):
+            with self.subTest(gaps=count):
+                self.reads(self.before, self.done)
+                after = histogram(ttft, [4, 4, 4]) + histogram(itl, [count, count, count])
+                reports = []
+                with patch.object(timed_load.serve_load, "phase", side_effect=phase), \
+                     patch.object(timed_load, "prometheus_snapshot", side_effect=[before, after]), \
+                     redirect_stdout(io.StringIO()):
+                    load = timed_load.TimedLoad(server_timings=True)
+                    if count == 4:
+                        load.phase("host", 1, "model", 4, 320, False, 0, reports=reports)
+                        self.assertEqual(reports[0]["server_itl_quantile_brackets"]["count"], 4)
+                        self.assertEqual(reports[0]["engine"]["decode_tokens"], 1276)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "completed-work bounds"):
+                            load.phase("host", 1, "model", 4, 320, False, 0, reports=reports)
+                        self.assertEqual(reports, [])
 
     def test_foreign_work_between_phases_is_not_silently_absorbed(self):
         load = timed_load.TimedLoad()

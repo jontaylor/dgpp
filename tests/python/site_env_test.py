@@ -318,6 +318,53 @@ class SiteEnvTest(unittest.TestCase):
             site_env.resolve_config(self.config, self.values())
         self.assertIn("only 4", str(error.exception))
 
+    def test_deployment_execution_environment_reaches_both_ranks(self):
+        cfg = json.loads(self.config.read_text())
+        cfg["environment"] = {"DGPP_EXPERT_CHUNK_DIRECT": "1", "DGPP_EXPERT_READY_WORKER": "2"}
+        self.config.write_text(json.dumps(cfg))
+        resolved = site_env.resolve_config(self.config, self.values())
+        self.assertNotIn("environment", resolved)
+        for node in resolved["node_env"]:
+            self.assertEqual(node["DGPP_EXPERT_CHUNK_DIRECT"], "1")
+            self.assertEqual(node["DGPP_EXPERT_READY_WORKER"], "2")
+        staged = site_env.server_config(resolved)
+        for node in staged["node_env"]:
+            self.assertNotIn("DGPP_EXPERT_CHUNK_DIRECT", node)
+            self.assertNotIn("DGPP_EXPERT_READY_WORKER", node)
+        overridden = site_env.resolve_config(self.config, self.values(DGPP_EXPERT_CHUNK_DIRECT="0"))
+        self.assertTrue(all(n["DGPP_EXPERT_CHUNK_DIRECT"] == "0" for n in overridden["node_env"]))
+
+    def test_deployment_execution_environment_is_applied_by_launcher(self):
+        cfg = json.loads(self.config.read_text())
+        cfg["environment"] = {"DGPP_EXPERT_CHUNK_DIRECT": "1", "DGPP_EXPERT_READY_WORKER": "2"}
+        self.config.write_text(json.dumps(cfg))
+        module = runpy.run_path(str(ROOT / "scripts/dgpp-cluster"))
+        args = argparse.Namespace(config=str(self.config), log_dir=str(self.root / "logs"), knobs="")
+        with patch.dict(os.environ, self.environ, clear=True):
+            cluster = module["Cluster"](args)
+            Path(cluster.log_dir).mkdir(parents=True, exist_ok=True)
+            with patch.object(module["cluster_process"], "launch") as launch:
+                launch.return_value.pid = 12345
+                cluster.boot_head()
+                self.assertEqual(launch.call_args.args[4]["DGPP_EXPERT_READY_WORKER"], "2")
+                self.assertEqual(launch.call_args.args[4]["DGPP_EXPERT_CHUNK_DIRECT"], "1")
+            with patch.object(module["subprocess"], "run") as remote:
+                remote.return_value.returncode = 0
+                cluster.spawn_peer(1, "peer1")
+                command = shlex.split(remote.call_args.args[0][-1])
+                self.assertIn("DGPP_EXPERT_READY_WORKER=2", command)
+                self.assertIn("DGPP_EXPERT_CHUNK_DIRECT=1", command)
+
+    def test_deployment_execution_environment_rejects_unknown_and_invalid_values(self):
+        cfg = json.loads(self.config.read_text())
+        for env in ({"HF_TOKEN": "secret"}, {"DGPP_EXPERT_CHUNK_DIRECT": "$(command)"},
+                    {"DGPP_EXPERT_READY_WORKER": "3"}, {"DGPP_EXPERT_CHUNK_DIRECT": True}, []):
+            with self.subTest(environment=env):
+                cfg["environment"] = env
+                self.config.write_text(json.dumps(cfg))
+                with self.assertRaises(ValueError):
+                    site_env.resolve_config(self.config, self.values())
+
     def test_all_deployment_examples_resolve_without_site_fields(self):
         for path in (ROOT / "deploy").glob("*.example.json"):
             with self.subTest(path=path.name):

@@ -12,12 +12,15 @@ with the fixed prefill budgets listed per row, not a current default
 deployment. The Qwen3.8-Flash-Next QAD row (2026-10-14), the six
 Qwen3.8-27B rows (2026-10-16), the Swift 1.5 two-node row (2026-10-17),
 the FP4-Local row (2026-10-21), and MiniMax (2026-11-05) are measured with the adaptive defaults.
+The two-Spark NVFP4 streaming row is measured with its explicit 4,096-token
+prefill quantum and the deployment recorded below.
 The measurements behind that change are in
 [PR #112](https://github.com/HawkBearPig/dgpp/pull/112). When defaults
 change again, keep each row's recorded configuration with its numbers.
 
 | Measurement set | Date (UTC) | Source revision | Scope |
 |---|---|---|---|
+| DeepSeek-V4.1-Flash-1017 NVFP4 streaming, two nodes | 2026-11-16 | `f87df92bce06281df61be66de09daf37dd249b76` (binary `ced82f672d3d438006b464f01d39f9b0cda0da8a0fcff76ec4d8896f1c0bf958`) | Production configuration, now encoded in the NVFP4 streaming template and its environment defaults: one serving/prefill campaign, 20:55–21:31 UTC; five classes at C1/C2/C4/C8/C16, three repetitions with 256-token caps; twelve uncached prefill probes. Both ranks had zero process swap before and after, matching binaries and operation streams, an otherwise idle benchmark fabric, and production restored at the end. The benchmark client includes the speculative token-delivery histogram correction; the server binary is unchanged. Quality, long context, API and plain/speculative equivalence were not evaluated in this campaign. |
 | MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `a40e587a8608` (binary `718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`) | One shipped-template campaign (18:34–20:18 UTC): native DSpark with adaptive verification and eight slots, five classes at C1/C2/C4/C8, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases plus capped-response retries, API and transcript isolation, and fresh plain/full-seven C1 controls. All four boots ran the recorded binary with zero swap on every rank (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. Replaces the earlier sixteen-slot plain template's row set. |
 | GLM-5.3-Flash NVFP4/FP8, four nodes | 2026-10-29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `8216f398` (documentation commits only beyond the build) | The four-node template as shipped, every row from one `serve_campaign.py run` (00:59 to 01:51 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix through 512K on the 768K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Every rank at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 and 2026-10-13 rows, which ran with fixed prefill budgets and kept only the C1 decode rate |
 | GLM-5.3-Flash NVFP4/FP8, two nodes | 2026-10-28/29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `acd81cf1` (documentation commits only beyond the build) | The two-node template as shipped, every row from one `serve_campaign.py run` (23:21 to 00:15 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to the 160K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Both ranks at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 row, which ran with fixed prefill budgets and kept only its C1 decode rate |
@@ -97,6 +100,7 @@ underlying quadratic cold-prefill work remains (see the
 
 | Model / weights | Nodes | Options | C1 decode tok/s | C2 decode tok/s | C4 decode tok/s | C8 decode tok/s | Cold prefill s: ~2K / ~8K / ~32K |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V4.1-Flash-1017 NVFP4 streaming | 2 | whole-expert cache, fixed MTP3, 1M compressed KV, 16 slots | 28.9–42.0 | 40.7–68.0 | 43.5–77.8 | 52.5–91.1 | 3.703 / 7.800 / 22.545 |
 | MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 28.8–48.2 | 42.1–66.1 | 59.0–83.0 | 85.7–99.7 | 2.176 / 7.816 / 33.341 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 31.2–36.7 | 44.8–49.1 | 59.7–65.3 | 58.4–61.7 | 2.217 / 7.142 / 29.634 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 30.7–36.1 | — | — | — | 1.976 / 8.178 / 35.025 |
@@ -149,6 +153,7 @@ Request wall throughput, the service-level view: total completed output over the
 
 | Model / weights | Nodes | Options | C1 wall tok/s | C2 wall tok/s | C4 wall tok/s | C8 wall tok/s |
 | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V4.1-Flash-1017 NVFP4 streaming | 2 | whole-expert cache, fixed MTP3, 1M compressed KV, 16 slots | 26.1–36.8 | 37.0–60.7 | 40.7–70.1 | 50.0–84.6 |
 | MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 27.0–42.8 | 39.6–61.4 | 56.3–77.4 | 79.5–92.5 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 30.1–35.2 | 43.3–47.1 | 57.9–63.1 | 57.7–60.8 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 29.6–34.6 | 43.1–46.9 | 44.7–48.1 | 44.5–47.2 |
@@ -311,6 +316,54 @@ a row exactly.
 | DeepSeek-V4 | 0731 checkpoint with DSpark; BF16 cache rows hold the release's FP8-quantized values. No selectable KV format |
 | Qwen 27B | DFlash2 drafter and FP8 head; native MTP modes are measured separately |
 
+## Two-Spark NVFP4 streaming measurement (2026-11-16)
+
+The [NVFP4 streaming template](../deploy/cluster_deepseek-v4.1-flash-1017_nvfp4-streaming_w2.example.json)
+now records the engine settings and execution environment used by this campaign.
+These rows describe the `f87df92b` binary above; subsequent implementation
+changes are not measured by these results. The template retains the 1,048,576-token
+KV pool, 16 request slots, fixed depth-three speculation, 256 staging buffers,
+eight I/O workers and twelve execution slots. The expert subsystem budget is
+107,242,240,000 bytes per rank, including scratch and staging; retained expert
+capacity is smaller. Site addresses, checkpoint paths and credentials stay in
+site configuration. No quality result is implied by these performance rows.
+
+C16 aggregate decode throughput (tokens/s; median of three):
+
+| Prose | Code | JSON | Math | Chat |
+| ---: | ---: | ---: | ---: | ---: |
+| 63.4 | 79.4 | 87.5 | 88.0 | 62.1 |
+
+The C16 service-level wall rate ranges from 59.7 to 82.2 output tokens/s across
+class medians; it includes prefill and queueing, unlike the decode table.
+
+Uncached-prompt prefill, three distinct prefixes per target:
+
+| Target | Actual prompt tokens | Median engine seconds | Median input tokens/s |
+| ---: | --- | ---: | ---: |
+| 512 | 516–523 | 2.037 | 253 |
+| 2,048 | 2,064–2,097 | 3.703 | 564 |
+| 8,192 | 8,283–8,317 | 7.800 | 1,062 |
+| 32,768 | 33,386–33,467 | 22.545 | 1,484 |
+
+Every prefill probe reported zero cached prompt tokens. The expert cache was
+already exercised by the preceding decode sweep; these figures do not measure
+an empty expert cache. Input tokens/s is calculated per request from actual
+computed tokens and engine prefill time, then summarized by the median.
+
+Reproduce only these performance phases, without starting quality or
+long-context evaluations:
+
+```bash
+python3 scripts/serve_campaign.py run \
+  --config deploy/cluster_deepseek-v4.1-flash-1017_nvfp4-streaming_w2.example.json \
+  --bin build-spark-cross/dgpp-serve --phases serving,prefill \
+  --out benchmarks/results/nvfp4-streaming-release
+```
+
+Stop production for the measurement window and restore it once after the
+campaign. A newer binary requires a fresh measurement and source/hash record.
+
 ## Workload and timing
 
 | Setting | Serving / decode modes | Long context |
@@ -372,6 +425,7 @@ Engine tokens/s, greedy; median of three repetitions.
 
 | Model / weights | Nodes | Options | Prose | Code | JSON | Math | Chat |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V4.1-Flash-1017 NVFP4 streaming | 2 | whole-expert cache, fixed MTP3, 1M compressed KV, 16 slots | 30.9 | 36.3 | 42.0 | 39.5 | 28.9 |
 | MiniMax-M3.1-Flash NVFP4/MXFP8 | 4 | native activations, DSpark adaptive 1/3/5/7, 2M NVFP4 KV, 8 slots | 33.3 | 37.5 | 41.7 | 48.2 | 28.8 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 34.9 | 36.6 | 36.7 | 35.3 | 31.2 |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 34.2 | 36.0 | 36.1 | 34.8 | 30.7 |

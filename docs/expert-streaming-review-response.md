@@ -681,3 +681,40 @@ transfer-stream ownership should not be reimplemented. W4A4 remains disabled
 because its earlier serving screen was slower and changed acceptance. The
 context and precision settings remain unchanged. These conclusions do not
 claim that cache policy or storage alone explains all remaining latency.
+
+## Deployment reproducibility and binding publication (2026-11-16)
+
+The NVFP4 two-Spark template now records the engine settings and execution
+switches of the `f87df92b` deployment. Launcher-owned `environment` defaults
+apply to every rank; site and exported overrides remain available. The
+[benchmark record](benchmarks.md#two-spark-nvfp4-streaming-measurement-2026-11-16)
+publishes the completed serving/prefill campaign, including its binary hash,
+zero-swap and operation-stream checks. Quality, long-context and speculative
+versus plain equivalence were not evaluated by that performance campaign.
+
+Binding publication now compares native base addresses, rebuilding only changed
+expert entries and transferring only changed layers. Adjacent changed layers
+share a transfer. First publication initializes the whole device table, and
+null addresses clear both projections on eviction. All addresses are still
+scanned when the cache revision changes; this is not a per-expert mutation
+journal. The existing service-stream fence remains because pointer equality
+alone does not establish completion of earlier payload mutations. A standalone
+host regression covers initialization, unchanged bindings, relocation,
+eviction and multiple changed experts. This implementation has no new serving
+performance measurement and is not included in the `f87df92b` throughput rows.
+
+Per-expert batched scatter remains unimplemented. The reconstruction backend
+currently submits each chunk and attaches staging-buffer completion to that
+submission. Combining chunks requires preserving those buffer lifetimes and
+independent completion/readiness; simply postponing their launches could
+release source buffers early or serialize reads behind a complete expert.
+This needs a separate backend change and a focused serving comparison before
+replacing the current streaming path. No speedup is claimed for it here.
+
+Existing cold-prefill device-counter captures are documented in
+[the prefetch opportunity analysis](chunk-direct-execution.md#prefetch-opportunity-live-io-gaps-and-absent-expert-forecasts).
+The 56–58% device-accounted busy fractions are observations from those requests,
+not a measurement of peak drive bandwidth. Cache capacity alone does not
+predict bytes read, and a high GPU busy fraction does not establish that
+warm speculative verification has reached a performance floor. The MXFP4
+format comparison remains unrun on matched deployments.

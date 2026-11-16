@@ -1,4 +1,5 @@
 #include "models/dsv41/model.hpp"
+#include "models/dsv41/paged_binding_table.hpp"
 #include "kernels/sm12x_moe.hpp"
 #include "kernels/expert_demand.hpp"
 #include "kernels/moe_fp4_pack.hpp"
@@ -51,6 +52,7 @@ struct Dsv41Model::PagedGraphs {
   Graph* capturing = nullptr;
   uint64_t passes = 0, misses = 0;
   uint64_t published_revision = 0;
+  std::vector<int> changed_layers;
   bool profile_publish = false;
   bool bulk_publish = true;
   uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
@@ -62,12 +64,14 @@ struct Dsv41Model::PagedGraphs {
     profile_publish = profile && std::atoi(profile) != 0;
     const char* bulk = std::getenv("DGPP_EXPERT_BULK_BINDINGS");
     bulk_publish = !bulk || std::atoi(bulk) != 0;
+    changed_layers.reserve(n);
     prepare_moe_fp4_pack();
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     DGPP_CUDA_OK(cudaHostAlloc(&demands, n * sizeof(ExpertDemand), cudaHostAllocMapped));
     DGPP_CUDA_OK(cudaHostAlloc(&host_tables, n * words * sizeof(uint64_t), cudaHostAllocDefault));
     DGPP_CUDA_OK(cudaMalloc(&tables, n * words * sizeof(uint64_t)));
+    std::fill_n(host_tables, n * words, uint64_t{0});
     if (const char* prefix = std::getenv("DGPP_EXPERT_LAYER_TRACE"); prefix && *prefix) {
       layer_trace.open(std::string(prefix) + ".r" + std::to_string(rank) + ".p" +
                        std::to_string(getpid()) + ".bin", std::ios::binary);
@@ -90,34 +94,46 @@ struct Dsv41Model::PagedGraphs {
     if (published_revision == cache.prepared_revision()) return;
     const auto started = profile_publish ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
-    std::fill_n(host_tables, layers * words, uint64_t{0});
+    const bool first = published_revision == 0;
+    uint64_t transferred = 0;
     std::array<const uint8_t*, experts> addresses;
+    changed_layers.clear();
     for (int l = 0; l < layers; ++l) {
       if (bulk_publish) cache.prepared_addresses(mapping[l], addresses);
-      for (int e = 0; e < experts; ++e) {
-        const auto* address = bulk_publish ? addresses[e] : cache.prepared_address(mapping[l][e]);
-        if (!address) continue;
-        const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
-        auto* table = host_tables + l * words;
-        table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
-        table[e*3+1] = reinterpret_cast<uintptr_t>(p.s13);
-        table[e*3+2] = reinterpret_cast<uintptr_t>(p.g13);
-        table[experts*3+e*3] = reinterpret_cast<uintptr_t>(p.w2);
-        table[experts*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
-        table[experts*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
-      }
+      else for (int e = 0; e < experts; ++e) addresses[e] = cache.prepared_address(mapping[l][e]);
+      const bool changed = dsv41_detail::update_paged_binding_table(
+          std::span<uint64_t>(host_tables + l * words, words), addresses,
+          [hidden, inter](const uint8_t* address) {
+            const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
+            return std::array<uint64_t, 6>{reinterpret_cast<uintptr_t>(p.w13),
+                reinterpret_cast<uintptr_t>(p.s13), reinterpret_cast<uintptr_t>(p.g13),
+                reinterpret_cast<uintptr_t>(p.w2), reinterpret_cast<uintptr_t>(p.s2),
+                reinterpret_cast<uintptr_t>(p.g2)};
+          }, first);
+      if (changed) changed_layers.push_back(l);
     }
     const auto built = profile_publish ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
-    DGPP_CUDA_OK(cudaMemcpyAsync(tables, host_tables, layers * words * sizeof(uint64_t),
-                                cudaMemcpyHostToDevice, service));
+    // Adjacent dirty layers share a transfer. Unchanged layers retain the
+    // previous device table; the first publication initializes every layer.
+    for (size_t i = 0; i < changed_layers.size();) {
+      const int begin = changed_layers[i++];
+      int end = begin + 1;
+      while (i < changed_layers.size() && changed_layers[i] == end) { ++i; ++end; }
+      const size_t bytes = (end - begin) * words * sizeof(uint64_t);
+      DGPP_CUDA_OK(cudaMemcpyAsync(tables + begin * words, host_tables + begin * words,
+                                  bytes, cudaMemcpyHostToDevice, service));
+      transferred += bytes;
+    }
+    // Revision changes may also enqueue payload mutations. Preserve their
+    // visibility to consumers even when the final pointer values are unchanged.
     DGPP_CUDA_OK(cudaStreamSynchronize(service));
     if (profile_publish) {
       ++publish_calls;
       publish_build_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(built-started).count();
       publish_transfer_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now()-built).count();
-      publish_bytes += layers * words * sizeof(uint64_t);
+      publish_bytes += transferred;
     }
     published_revision = cache.prepared_revision();
   }
