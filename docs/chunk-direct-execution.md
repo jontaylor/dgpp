@@ -1036,3 +1036,50 @@ The comparison shows no meaningful gain on this workload, so the crossover
 switch was removed and the default restored. The deployed binary still contains
 the disabled experimental switch until the next rebuild. Other shapes and
 concurrent workloads were not evaluated.
+
+## Whole-expert demand traffic bound
+
+The opt-in `DGPP_EXPERT_DEMAND_TRACE=/path/prefix` diagnostic records the
+initial residency and every grouped cache observation, including native graph
+hits and repeated token selections. Files are suffixed with rank, process and
+cache identity. Tracing is disabled by default; when enabled it flushes after
+each event, so timings from this mode are diagnostic only. Trace files expose
+expert routes and should be handled as workload data, not committed results.
+
+`python3 scripts/expert_demand_bound.py TRACE` computes an offline lower bound
+for equal-sized whole experts. It deduplicates each layer/batch's demands and
+grants the oracle future knowledge and unlimited free staging within each
+batch; at each boundary it retains the experts needed soonest. The starting
+residency comes from the trace. The script rejects partial starting residency
+and unequal expert geometry. `--start-ns`/`--end-ns` select a Unix-nanosecond
+window; a noninitial window requires `--free-initial`, which grants an ideal
+starting cache for free. This makes the window result more optimistic still.
+The bound is not an implementable cache policy, a prediction of latency, or
+proof that a particular number of reads can be avoided. It ignores staging
+limits and loading order, and fixes the observed routes and outputs.
+
+An instrumented fresh-process run used binary SHA-256
+`1ceeec1ee162f2a3df7cf286a4998e293e354d99453dfbf4cd2b93666365fc08`
+(source based on `e63e5926`, with the diagnostic trace added), eight workers,
+direct I/O, and the existing cache and depth-three settings. Each rank had
+15,360 equally sized experts and room for 10,359 full experts; initial residency
+was empty. The four-request prefix-enabled tool sequence and three short
+recomputations generated 14,040 observed batches per rank. The two ranks had
+matching route-bound totals and actual expert-read bytes in these windows.
+
+The initial request read 109.950 GiB per rank, versus 108.932 GiB for the
+relaxed oracle. The following three continuations read 47.009 GiB per rank.
+For those continuations alone, an oracle given a perfect starting cache for
+free has a 10.076 GiB lower bound. Over the entire initial request plus
+continuations, starting from the actual empty cache, the lower bound is
+129.831 GiB per rank versus 156.959 GiB read. The 27.128 GiB difference is an
+upper bound on the traffic reduction available under these relaxed assumptions,
+not a demonstrated saving. The short recomputation sequence read 33.385,
+6.275 and then zero GiB per rank, demonstrating adaptation to that workload.
+The zero-read third request is a warm anchor, not evidence about long-context
+or concurrent requests. Processes remained at zero swap at captured boundaries.
+
+This result makes cache allocation worth further work, especially across
+continuations, but does not establish that the rejected history variants or a
+future-aware allocation are practical improvements. The trace override was
+removed and the normal service configuration restored after the capture.

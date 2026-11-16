@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -11,6 +13,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <unistd.h>
 
 namespace dgpp::expert {
 namespace {
@@ -96,6 +99,10 @@ struct ExpertCacheState {
   std::map<size_t, QueuedRead> prefetched;
   CacheStats counters;
   uint64_t prepared_revision = 1;
+  // Optional diagnostics. The engine thread owns this stream; it is never
+  // touched by I/O workers or allocated in the normal serving configuration.
+  std::unique_ptr<std::ofstream> demand_trace;
+  bool demand_trace_header = false;
   bool observed_for_adaptation = false;
   bool all_observed_full = true;
   ResourcePressureSampler resource_sampler;
@@ -115,6 +122,34 @@ struct ExpertCacheState {
   }
   void expert_index(size_t e) const {
     if (e >= experts.size()) throw std::out_of_range("expert cache: expert index");
+  }
+  void trace_demand(std::span<const size_t> selected, bool prefill) {
+    if (!demand_trace) return;
+    auto& out = *demand_trace;
+    auto word = [&](uint64_t value) {
+      out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    if (!demand_trace_header) {
+      // Little-endian 64-bit words: magic, version, capacity in cache slots,
+      // expert count, then (draft, layer, expert, chunk count, resident chunks,
+      // record bytes) per expert. Slots have a uniform charge in this cache.
+      word(0x31444e414d454744ULL); // DGEMAND1 in little endian
+      word(1); word(memory.cache_slots); word(experts.size());
+      const auto& resident = planner->current().chunks;
+      for (size_t e = 0; e < experts.size(); ++e) {
+        word(experts[e].draft); word(experts[e].layer); word(experts[e].expert);
+        word(experts[e].records.size()); word(resident[e]); word(expert_record_bytes[e]);
+      }
+      demand_trace_header = true;
+    }
+    // Each event is one layer/batch observation, including cache hits and
+    // repeated routed selections. The reader groups IDs for fetch accounting.
+    word(prefill); word(selected.size());
+    word(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count()));
+    for (const auto e : selected) word(e);
+    out.flush();
+    if (!out) throw std::runtime_error("expert cache: failed to write demand trace");
   }
   bool background_allowed() {
     if (resource_sampler) pressure = resource_sampler();
@@ -423,6 +458,12 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   s.storage = factory(m, spans);
   if (!s.storage || s.storage->memory() != m)
     throw std::invalid_argument("expert cache: backend reservation disagrees with the memory plan");
+  if (const char* prefix = std::getenv("DGPP_EXPERT_DEMAND_TRACE"); prefix && *prefix) {
+    const auto path = std::string(prefix) + ".r" + std::to_string(id.rank) +
+        ".p" + std::to_string(::getpid()) + ".c" + std::to_string(s.binding_identity) + ".bin";
+    s.demand_trace = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
+    if (!*s.demand_trace) throw std::runtime_error("expert cache: cannot open demand trace");
+  }
 }
 ExpertCache::~ExpertCache() = default;
 const CacheMemory& ExpertCache::memory() const { return state_->memory; }
@@ -444,6 +485,7 @@ void ExpertCache::observe(std::span<const size_t> selected, bool prefill) {
   auto& s = *state_;
   s.check();
   s.planner->observe(selected, prefill);
+  s.trace_demand(selected, prefill);
   s.observed_for_adaptation |= !selected.empty();
   for (const auto e : selected)
     s.all_observed_full &= s.planner->current().chunks[e] == s.experts[e].records.size();
