@@ -1809,6 +1809,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                        const int32_t* tile_count, int tile_cap, bool execute_shared,
                                        int activation_row, int activation_rows) {
   const int H = static_cast<int>(cfg_.hidden);
+  static const int fp4_small_rows = [] {
+    const char* value = std::getenv("DGPP_MOE_FP4_SMALL_ROWS");
+    return value ? std::clamp(std::atoi(value), 16, 64) : 16;
+  }();
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
   const bool exl3 = w_.exl3();
@@ -1969,7 +1973,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                       which, out, I_max, n, H, stream, d_rows_, fp4_group,
-                                      mr <= 16 ? 16 : 64);
+                                      mr <= fp4_small_rows ? 16 : 64);
     else if (mma)
       launch_moe_grouped_mma_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                   which, out, I_max, n, H, stream, d_rows_);
@@ -2025,7 +2029,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                      2, d_down_, H, H, k, stream, nullptr, fp4_group,
-                                     mr <= 16 ? 16 : 64);
+                                     mr <= fp4_small_rows ? 16 : 64);
     else if (mma)
       launch_moe_grouped_mma_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                  2, d_down_, H, H, k, stream);
