@@ -1967,3 +1967,34 @@ is not a useful speedup for the observed warmish workload. The temporary
 cache integration was removed and the previous production binary and settings
 were restored. The separately tested representation and read classification
 remain available for a substantially different design.
+
+### Compact overflow: readiness and promotion follow-up
+
+Two fixes were tested on the temporary prototype. Lookahead and prefetch now
+recognised compact-resident experts rather than reading them unnecessarily;
+ordinary acquisition also allowed popular compact hits to be promoted back to
+native residency. The checkpoint-shaped B12x fixture passed reconstruction,
+read suppression, promotion and independent-completion eviction checks.
+
+A candidate-first same-binary serving screen used SHA-256
+`36678d34f7b67d4dccad5b83f4dbb597210b876f8f8e90e74bbe6defb6d842e1`
+with 1,000 compact slots versus zero. These are focused diagnostics, not
+benchmark campaign rows. The same prefix-enabled four-request tool sequence
+was followed by three short recomputations.
+
+| Measurement | Control | Compact with promotion |
+| --- | ---: | ---: |
+| Initial 24,317-token prefill | 38.554 s | 38.536 s |
+| Three continuation wall times, summed | 37.172 s | 39.209 s |
+| Three continuation engine decode intervals, summed | 32.268 s | 33.658 s |
+| Continuation expert reads, per rank | 47.009 GiB | 47.747 GiB |
+| Third short recomputation prefill | 1.605 s | 3.977 s |
+| Third short recomputation decode | 52.70 tok/s | 38.69 tok/s |
+| Third short recomputation expert reads, per rank | 0 GiB | 12.822 GiB |
+
+Normalized choices, tool arguments, usage and speculative acceptance matched;
+captured swap was zero on both ranks. The promotion change did not recover the
+warm working set or improve the tool sequence. The integration was removed and
+the original serving configuration restored. This result does not rule out a
+different compact-cache design; it does not demonstrate a serving benefit from
+this one.
