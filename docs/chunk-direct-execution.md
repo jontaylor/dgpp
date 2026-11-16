@@ -1402,3 +1402,42 @@ kernel's exact constraint or rule out all other vector layouts. A coalescing
 implementation should use a proven contiguous staging layout or establish an
 alternative, while preserving individual chunk lifetime and CUDA registration
 semantics. No serving code or configuration changed.
+
+## Coalesced adjacent expert reads: serving screen
+
+A temporary opt-in prototype allocated one contiguous host staging slab,
+registered it once with CUDA and kept separate logical leases and completion
+fences for every record. A worker opportunistically combined up to four queued,
+physically adjacent records into one read when neighboring staging slots were
+immediately free; it did not wait for a batch to form. It preserved per-record
+checksum validation and trace events, demand priority, bounded staging and
+individual ticket completion. The control used separate staging allocations
+and individual reads. Both used independent decode-miss completion, eight
+readers, 256 staging buffers, twelve execution slots, the same expert budget,
+one-million-token context and depth-three speculation.
+
+The expert-store, read-queue and cache suites passed with coalescing enabled,
+including a test that forced four queued records to share one syscall and
+verified that their leases remained independent. The B12x paging arithmetic and
+paged-prefill GPU fixtures also passed. A same-binary serving screen, SHA-256
+`cc7928c34e120a00034a5414dc15ff7401dbeb58904817e93db1eb5ab346e186`
+(source based on `27fc3aa7` plus the prototype), ran control first and candidate
+second. Each fresh process served the same prefix-enabled four-request tool
+sequence and three 2209-token recomputations. This is a focused single-order
+diagnostic, not a benchmark campaign row.
+
+Initial cold prefill was 38.537 versus 39.247 seconds. The three continuation
+wall times totaled 37.874 versus 38.118 seconds; engine decode intervals totaled
+32.915 versus 33.158 seconds. Rank 0's expert read syscalls fell from 211,932
+to 63,989 for the initial request and from 90,612 to 28,257 across the three
+continuations. Both ranks read the same expert bytes: 109.950 GiB initially and
+47.009 GiB across continuations. The third short recomputation read zero expert
+bytes on both ranks, with prefill 1.592 versus 1.601 seconds and decode 52.80
+versus 52.85 tokens/s. Normalized messages, usage and speculative acceptance
+matched; both ranks had zero swap at captured boundaries.
+
+The large reduction in syscall count did not translate to a serving gain in
+this comparison. The prototype was removed and the prior serving binary and
+configuration restored. This does not establish the cause of the result or
+rule out other batching widths, storage devices, workloads or scheduling
+approaches; no further width sweep was run.
