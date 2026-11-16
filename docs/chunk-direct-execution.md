@@ -2535,3 +2535,41 @@ prose results were mixed and the code result is capped. Fixed depth three
 remains selected until a broader completed-task comparison establishes a
 better overall tradeoff. The original production configuration and service
 were restored after the screens.
+
+### Depth four: completed code-review follow-up
+
+A candidate-first follow-up used the same binary and configuration as the
+preceding depth-four screen, but raised the response cap to 4,096 tokens. Each
+fresh process served the initial prefix-enabled 24,317-token tool request,
+then the same Python cache-helper review twice, followed by four short uncached
+recomputations. This is a focused single-order comparison of one task, not a
+benchmark campaign or a general quality evaluation.
+
+| Measurement | Fixed depth three | Fixed depth four |
+| --- | ---: | ---: |
+| Initial prefill | 39.402 s | 38.775 s |
+| First code response wall / decode | 66.63 s / 28.18 tok/s | 95.90 s / 30.06 tok/s |
+| Repeated code response wall / decode | 55.44 s / 32.67 tok/s | 85.70 s / 32.80 tok/s |
+| Code output tokens per response | 1,788 | 2,786 |
+| Code-response expert reads per rank, total | 92.683 GiB | 124.780 GiB |
+| Fourth short recomputation prefill / decode | 1.441 s / 52.29 tok/s | 1.443 s / 56.55 tok/s |
+
+All four code responses ended normally. The final short recomputation read
+zero expert bytes on both ranks for both depths, with zero captured process
+swap on each rank. The initial prompt reused zero prefix tokens; initial
+request expert reads per rank were 109.950 and 109.474 GiB respectively,
+including the subsequent decode work. Responses differed by depth and were
+identical between the two repeats at each depth. Depth three incorrectly stated
+that the supplied helper evicts on a hit when the cache is merely full; the
+code tests `len(cache) > 3`. Depth four correctly qualified that issue as
+requiring an already over-capacity cache, but also characterized FIFO rather
+than LRU as a defect without an LRU requirement and raised re-entrancy concerns
+without evidence about the caller. These observations do not establish general
+quality or explain the different output lengths.
+
+Depth four's first code decode rate was higher, but its much longer answer
+increased completed wall time and expert traffic in this example; on the
+repeated task the decode rates were essentially equal. Its zero-read short
+anchor remained faster. The contrast does not justify changing the deployment
+from depth three, and neither this one ordering nor one task rules out a depth
+four advantage elsewhere. The original serving configuration was restored.
