@@ -2348,3 +2348,47 @@ outputs, usage and speculative acceptance matched; captured process swap was
 zero on both ranks. This single ordering did not show a meaningful gain from
 removing the hint; it does not establish performance for other shapes or
 hardware. The prior kernel and selected serving configuration were restored.
+
+### Confidence scheduling at depth three on the current serving path
+
+The current deployment's fixed depth three was compared with its existing
+confidence scheduler enabled at the same maximum depth and default scheduling
+parameters. The scheduler can stop drafting early and verify fewer rows. Both
+arms used the deployed binary, SHA-256
+`985c5e118dacd69eb4181074a0dfe0022d182fdaa437a1d605b83be9946249e0`,
+whole-expert policy, the same cache budget, eight readers, the selected Engram
+settings and one-million-token context. These are focused diagnostics, not
+benchmark campaign rows or a general quality evaluation.
+
+In a control-first screen, each fresh process ran the four-request
+prefix-enabled tool sequence with 256-token continuation caps, followed by
+three 2,209-token uncached recomputations. Initial prefill was 38.578 seconds
+fixed versus 38.655 scheduled, and each rank read 109.950 GiB. The three
+continuations totaled 33.738 versus 32.641 seconds wall, and 42.612 versus
+39.987 GiB expert reads per rank. Their output text changed and all three hit
+the cap. The final recomputation read zero expert bytes on both ranks in both
+arms; prefill was 1.606 versus 1.593 seconds and decode was 52.83 versus
+52.74 tokens/s. The short tool call and recomputation messages matched.
+
+A second, candidate-first screen restarted each arm for the same tool sequence
+with 1,024-token continuation caps. The following are service-level times and
+engine decode rates, not matched-token execution timings:
+
+| Continuation | Fixed: wall / decode rate / output tokens | Scheduled: wall / decode rate / output tokens |
+| --- | --- | --- |
+| Prose | 18.816 s / 24.34 tok/s / 413 | 16.032 s / 25.96 tok/s / 369 |
+| Code | 39.869 s / 27.87 tok/s / 1,024 | 37.599 s / 29.32 tok/s / 1,024 |
+| Repeated prose | 16.808 s / 25.51 tok/s / 413 | 13.704 s / 27.86 tok/s / 369 |
+
+Both prose outputs finished; both code outputs reached the cap. Each rank read
+83.308 versus 65.714 GiB over the three continuations. The initial prefill was
+38.705 versus 38.582 seconds and both ranks read 109.950 GiB. The initial tool
+response matched; generated continuations and speculative acceptance differed.
+Both processes had zero captured swap on both ranks.
+
+Scheduling is a promising performance option on this sample, but the shorter
+prose output contributes to its lower wall time and its changed responses and
+routes prevent attribution to kernel speed alone. The limited completed prose
+sample and capped code response do not establish general task quality or a
+robust deployment win. Fixed depth three remains selected; different scheduling
+parameters and broader completed-task workloads remain untested.
