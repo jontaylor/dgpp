@@ -1926,3 +1926,44 @@ scales to the captured six-row graph; its outputs matched the normal prepared
 path bit-for-bit. These are execution fixtures, not serving timings. The real
 cache still uses its original fixed-size slots and does not yet call these
 functions, so there is no memory saving or serving change in this revision.
+
+### Compact overflow serving screen: not selected
+
+A temporary whole-expert prototype reserved 1,000 compact prepared slots
+inside the existing expert budget, reducing the ordinary native cache by the
+same bytes. It scanned scale bytes on read and admitted only fully verified
+evicted native experts to the compact tier. A compact hit expanded scales into
+the already reserved execution scratch and unpacked the expert without a file
+read. The ordinary uncompressed path handled unknown or unsupported values.
+Compact entries used an LRU replacement order; both ordinary acquisition and
+independent decode-miss completion could use them. The Spark-1 B12x fixture
+confirmed a byte-exact compact reconstruction and a hit without a file read.
+
+One control-first, same-binary two-rank serving screen compared this candidate
+with the compact tier disabled. Both arms used binary SHA-256
+`f70547da87a7e993b7d2e34b1f625e870b9a2b014379e72a0fe09a14986340d7`, built
+from `31a2c65f` plus the temporary changes. The four-request prefix-enabled
+tool sequence and three short recomputations are focused diagnostics, not
+benchmark campaign rows.
+
+| Measurement | Control | Compact overflow |
+| --- | ---: | ---: |
+| Initial 24,317-token prefill | 38.638 s | 39.834 s |
+| Three tool-continuation wall times, summed | 37.040 s | 39.877 s |
+| Three continuation engine decode intervals, summed | 32.129 s | 33.418 s |
+| Continuation expert reads, per rank | 47.009 GiB | 48.459 GiB |
+| Third short recomputation prefill | 1.595 s | 4.831 s |
+| Third short recomputation decode | 52.82 tok/s | 42.21 tok/s |
+| Third short recomputation expert reads, per rank | 0 GiB | 12.740 GiB |
+
+The candidate registered 2,557 compact hits per rank across the continuations,
+but also performed many compact admissions and replacements. The changed
+allocation and LRU behavior produced more continuation reads and did not
+converge to the control's zero-read short repeat. Normalized messages, tool
+arguments, usage and speculative acceptance matched; both ranks remained at
+zero swap at captured boundaries. This comparison does not identify the exact
+cause or rule out other tier policies. It does show that this implementation
+is not a useful speedup for the observed warmish workload. The temporary
+cache integration was removed and the previous production binary and settings
+were restored. The separately tested representation and read classification
+remain available for a substantially different design.
