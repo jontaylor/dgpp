@@ -1326,3 +1326,29 @@ both orders while preserving the zero-read warm anchor. It is enabled for this
 Spark deployment via `DGPP_MOE_ASYNC_MISSES=1`. The tests do not establish a
 general throughput gain, a concurrent-serving result or the exact contribution
 of I/O overlap versus launch scheduling.
+
+## Reader count with independent decode-miss completion
+
+The previous reader-count screen used grouped miss execution. A configuration-only
+follow-up compared eight and twelve readers with
+`DGPP_MOE_ASYNC_MISSES=1` enabled in both arms, leaving the 256 staging buffers,
+twelve execution slots, resident budget, million-token context and depth-three
+speculation unchanged. Both used binary SHA-256
+`0323d7a0658a82cdf6f57d4151c11073bd31e26ad95454fd85b1949451b651d3`
+(source based on `99aaa7c8` plus a disabled combined-wait experiment). This
+single-order focused diagnostic is not a benchmark campaign row.
+
+Each fresh process served the prefix-enabled four-request tool sequence and
+three 2209-token recomputations. Cold initial prefill was 39.137 versus 38.875
+seconds with eight versus twelve readers. The three continuation wall times
+summed to 37.929 versus 37.213 seconds; engine decode intervals summed to 32.943
+versus 32.242 seconds. Each rank read 109.950 GiB initially and 47.009 GiB over
+the continuations in both arms. The third short recomputation had zero expert
+reads per rank, 1.600 versus 1.603 seconds of prefill and 52.73 versus 52.86
+decode tokens/s. Normalized messages, usage and speculative acceptance matched;
+both ranks had zero swap at the captured boundaries.
+
+The 0.716-second continuation difference is small relative to timing variation
+across fresh processes in earlier screens; this one ordered pair does not
+establish a reliable gain or explain the effect of extra readers. Eight readers
+were restored. Independent decode-miss completion remains enabled.
