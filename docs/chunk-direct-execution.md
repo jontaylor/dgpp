@@ -2494,3 +2494,44 @@ both ranks. One code response reached its cap.
 The wall-time difference is too small in this single ordering to establish an
 improvement, and total reads increased slightly. Multiplier 4 remains selected;
 this does not establish that 4 is optimal for other workloads.
+
+### Fixed speculative depth four on the current cache path
+
+The deployed fixed depth three was compared with fixed depth four using the
+same binary on both ranks, SHA-256
+`e163306747831667813d601306ad38a68827a75cea118706751c75cb3307b8d6`.
+Both used decode-history multiplier four, decode admission boost 16, eight
+readers, independent misses and the existing expert budget. A control-first
+pair was followed by a candidate-first pair. Each fresh process served the
+same prefix-enabled four-request tool sequence with 1,024-token continuation
+caps, followed by uncached 2,209-token recomputations. The reverse-order pair
+used four recomputations to reach a zero-read anchor in both arms. These are
+focused diagnostics, not benchmark campaign rows.
+
+| Measurement | Depth three, control-first / reverse | Depth four, control-first / reverse |
+| --- | --- | --- |
+| Initial 24,317-token prefill | 38.891 / 39.804 s | 38.632 / 38.669 s |
+| First prose continuation decode | 24.28 / 23.82 tok/s | 23.54 / 23.63 tok/s |
+| Code continuation decode | 27.70 / 27.20 tok/s | 28.45 / 28.90 tok/s |
+| Repeated prose continuation decode | 29.26 / 28.56 tok/s | 28.34 / 28.82 tok/s |
+| Continuation expert reads per rank | 78.919 / 78.919 GiB | 71.242 / 71.242 GiB |
+| Fourth short recomputation decode | — / 52.61 tok/s | — / 56.51 tok/s |
+| Fourth short recomputation prefill | — / 1.426 s | — / 1.437 s |
+
+The final reverse-order short recomputation read zero expert bytes on both
+ranks for both depths. In the first pair, the third repeat read zero bytes at
+depth three but 0.289 GiB per rank at depth four, so its decode rates are not
+a zero-read comparison. Initial prefill had zero prefix tokens reused; initial
+expert reads per rank were 109.950 GiB at depth three and 109.474 GiB at four,
+including the different subsequent decode work in the request. Both ranks had
+zero captured swap throughout.
+
+Depth four produced different continuation text and routes: prose used 389
+output tokens versus 413, while the code continuation reached its 1,024-token
+cap in both modes. Thus the measured rates are useful workload observations,
+not a same-output execution comparison or a completed-code quality result.
+The zero-read short tool request favored depth four, but the partially warm
+prose results were mixed and the code result is capped. Fixed depth three
+remains selected until a broader completed-task comparison establishes a
+better overall tradeoff. The original production configuration and service
+were restored after the screens.
