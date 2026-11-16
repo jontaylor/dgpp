@@ -63,6 +63,29 @@ DGPP_TEST(dsv41_config_recognizes_modelopt_nvfp4_main_and_mxfp4_draft_engram) {
   require(!parse(config_json()).experts_nvfp4 && !parse(config_json()).engram_mxfp4, "release defaults preserved");
 }
 
+DGPP_TEST(dsv41_config_native_mxfp4_can_reuse_explicit_packed_engram) {
+  const std::string metadata = R"json("expert_dtype":"fp4",
+    "engram_embed_quant":"mxfp4", "engram_embed_block_size":32,
+    "engram_embed_scale_dtype":"ue8m0", "engram_embed_layers":[1,14])json";
+  const auto text = config_json("\"expert_dtype\": \"fp4\"", metadata);
+  const auto cfg = parse(text);
+  require(!cfg.experts_nvfp4 && cfg.engram_mxfp4, "native experts and packed tables are independent");
+  for (const auto& change : std::vector<std::pair<std::string, std::string>>{
+      {"\"mxfp4\"", "\"fp8\""},
+      {"\"engram_embed_block_size\":32", "\"engram_embed_block_size\":16"},
+      {"\"ue8m0\", \"engram_embed_layers\"", "\"e4m3\", \"engram_embed_layers\""},
+      {"[1,14]", "[14,1]"}, {"[1,14]", "[1.5,14]"}, {"[1,14]", "[1]"}}) {
+    auto bad = text;
+    const auto pos = bad.find(change.first);
+    require(pos != std::string::npos, "packed Engram mutation anchor");
+    bad.replace(pos, change.first.size(), change.second);
+    require(!refusal(bad).empty(), "invalid packed Engram declaration refused");
+  }
+  require(!refusal(config_json("\"expert_dtype\": \"fp4\"",
+      "\"expert_dtype\":\"fp4\", \"engram_embed_block_size\":32")).empty(),
+      "partial metadata cannot silently select original FP8 tables");
+}
+
 DGPP_TEST(dsv41_config_refuses_ambiguous_modelopt_layouts) {
   const auto mutate = [](const std::string& from, const std::string& to) {
     auto text = nvfp4_config();

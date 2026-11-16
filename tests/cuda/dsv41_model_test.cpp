@@ -695,32 +695,34 @@ DGPP_TEST(dsv41_paged_nvfp4_model_matches_native_resident_prefill_and_decode) {
   check_paged_model_matches_resident(true);
 }
 
-DGPP_TEST(dsv41_paged_nvfp4_model_charges_resident_draft_experts_to_the_budget) {
-  const Fixture fx = make_fixture(true);
-  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
-  auto descriptors = fx.cfg;
-  descriptors.runtime_page_experts = true;
-  uint64_t draft_bytes = 0;
-  for (int layer = fx.cfg.num_hidden_layers; layer < fx.cfg.max_layer(); ++layer)
-    draft_bytes += dgpp::Dsv41LayerStream::layer_bytes(fx.cfg, layer) -
-        dgpp::Dsv41LayerStream::layer_bytes(descriptors, layer);
-  {
-    dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
-                          nullptr, 0, 1, 1, true, 8, false, &paging);
-    require(model.expert_cache()->memory().budget_bytes + draft_bytes == paging.cache.planner.budget_bytes,
-            "resident draft experts and main cache share the configured byte budget");
-    for (const auto& expert : model.expert_cache()->experts())
-      require(!expert.draft, "NVFP4 cache reuses the main-only image");
+DGPP_TEST(dsv41_paged_model_charges_resident_draft_experts_to_the_budget) {
+  for (bool nvfp4 : {false, true}) {
+    const Fixture fx = make_fixture(nvfp4);
+    auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+    auto descriptors = fx.cfg;
+    descriptors.runtime_page_experts = true;
+    uint64_t draft_bytes = 0;
+    for (int layer = fx.cfg.num_hidden_layers; layer < fx.cfg.max_layer(); ++layer)
+      draft_bytes += dgpp::Dsv41LayerStream::layer_bytes(fx.cfg, layer) -
+          dgpp::Dsv41LayerStream::layer_bytes(descriptors, layer);
+    {
+      dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                            nullptr, 0, 1, 1, true, 8, false, &paging);
+      require(model.expert_cache()->memory().budget_bytes + draft_bytes == paging.cache.planner.budget_bytes,
+              "resident draft experts and main cache share the configured byte budget");
+      for (const auto& expert : model.expert_cache()->experts())
+        require(!expert.draft, "both formats reuse the main-only image");
+    }
+    paging.cache.planner.budget_bytes = draft_bytes;
+    bool refused = false;
+    try {
+      (void)dgpp::Dsv41Model::plan_memory(fx.cfg, 96, 512, 0, 1,
+          dgpp::Dsv41Residency::Resident, 1, true, 8, false, &paging);
+    } catch (const std::invalid_argument& e) {
+      refused = std::string(e.what()).find("budget cannot cover resident DSpark") != std::string::npos;
+    }
+    require(refused, "insufficient draft budget fails before allocation");
   }
-  paging.cache.planner.budget_bytes = draft_bytes;
-  bool refused = false;
-  try {
-    (void)dgpp::Dsv41Model::plan_memory(fx.cfg, 96, 512, 0, 1,
-        dgpp::Dsv41Residency::Resident, 1, true, 8, false, &paging);
-  } catch (const std::invalid_argument& e) {
-    refused = std::string(e.what()).find("budget cannot cover resident DSpark") != std::string::npos;
-  }
-  require(refused, "insufficient draft budget fails before allocation");
 }
 
 DGPP_TEST(dsv41_paged_eager_adapter_batches_plain_decode_and_preserves_slot_state) {
@@ -890,8 +892,8 @@ void check_paged_dspark(bool nvfp4) {
     if (paging) {
       bool draft_population = false;
       for (const auto& expert : model.expert_cache()->experts()) draft_population |= expert.draft;
-      require(draft_population == !nvfp4 && model.expert_cache()->stats().active_execution_slots == 0,
-              "paged population follows the main/draft format and retires its leases");
+      require(!draft_population && model.expert_cache()->stats().active_execution_slots == 0,
+              "both formats keep drafts resident and retire target execution leases");
     }
     model.session_close(0);
     return transcript;

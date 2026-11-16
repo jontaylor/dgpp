@@ -788,3 +788,28 @@ The 31-test host cache suite and five-test CUDA packing/scatter suite pass on
 Spark-1. CUDA coverage includes mixed mapped/device sources, pitched copies,
 padding/guards, graph replay and repeated-global ordering. The launcher,
 benchmark client and campaign Python suites also pass.
+
+### Preparing a matched MXFP4 deployment
+
+The MXFP4 streaming template now uses the NVFP4 template's engine settings,
+cache budget, fixed depth-three speculation and execution switches. Native
+MXFP4 checkpoints can explicitly declare packed MXFP4 Engram tables using
+`engram_embed_quant: "mxfp4"`, `engram_embed_block_size: 32`,
+`engram_embed_scale_dtype: "ue8m0"` and the exact `engram_embed_layers` list.
+The loader continues to validate the actual tensors. This allows the comparison
+to retain the same packed Engram data rather than introducing the upstream
+checkpoint's larger FP8 tables as a second variable. An unmodified upstream
+checkpoint still selects its original FP8 tables.
+
+Both formats now keep DSpark draft experts resident when expert paging is
+selected. Their allocation is subtracted from the configured expert budget
+before sizing the target cache; the expert image contains target layers only.
+Model tests cover budget refusal and bitwise resident/paged draft, verify,
+rollback, tool and JSON constraint behavior for both formats.
+
+This preparation does not give MXFP4 the NVFP4-specific b12x prepared-expert,
+GPU paging and chunk-direct execution paths. A serving comparison therefore
+measures the available implementations, not an isolated prediction from the
+4.25-versus-4.5-bit weight ratio. Cache capacity, miss/read counters, prefill and
+decode must be reported separately. No MXFP4 serving speedup has yet been
+established on the current implementation.

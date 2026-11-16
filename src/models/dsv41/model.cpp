@@ -156,7 +156,7 @@ expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, in
   auto cache = paging.cache;
   cache.packed_nvfp4 = cfg.experts_nvfp4 && sm12x_moe_enabled(cfg.hidden_size,
       cfg.moe_intermediate_size / world, cfg.n_routed_experts, cfg.num_experts_per_tok);
-  if (cfg.experts_nvfp4 && mtp) {
+  if (mtp) {
     auto resident = cfg, descriptors = cfg;
     resident.runtime_page_experts = false;
     descriptors.runtime_page_experts = true;
@@ -188,8 +188,7 @@ Dsv41TextConfig paging_config(const Dsv41TextConfig& source, Dsv41Residency resi
   const auto cache = paging_cache_config(cfg, rank, world, *paging, mtp);
   const auto memory = expert::expert_cache_memory(id, cache);
   const auto chunks = expert::partition(id.hidden, id.intermediate, id.world, id.rank, id.chunk_intermediate, id.format);
-  const size_t population = static_cast<size_t>(cfg.num_hidden_layers) * cfg.n_routed_experts +
-      (mtp && !cfg.experts_nvfp4 ? static_cast<size_t>(cfg.num_nextn_predict_layers) * cfg.dspark_n_routed_experts : 0);
+  const size_t population = static_cast<size_t>(cfg.num_hidden_layers) * cfg.n_routed_experts;
   auto planner_cfg = cache.planner;
   planner_cfg.reserved_bytes = memory.budget_bytes - memory.cache_slots * memory.cache_slot_bytes;
   // Validate the entire model's rounded fractional floor before the loader
@@ -197,7 +196,7 @@ Dsv41TextConfig paging_config(const Dsv41TextConfig& source, Dsv41Residency resi
   expert::ResidencyPlanner planner(planner_cfg, std::vector<expert::ExpertSpec>(population,
       expert::ExpertSpec{std::vector<uint64_t>(chunks.size(), memory.cache_slot_bytes), 1.0}));
   cfg.runtime_page_experts = true;
-  cfg.runtime_resident_draft_experts = cfg.experts_nvfp4 && mtp;
+  cfg.runtime_resident_draft_experts = mtp;
   return cfg;
 }
 }

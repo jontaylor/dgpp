@@ -120,6 +120,23 @@ bool strictly_increasing(const std::vector<int>& v) {
 
 // --- the quantization contract --------------------------------------------
 
+void parse_packed_engram(const minijson::Value& qc, Dsv41TextConfig& c) {
+  const auto& layers = require(qc, "engram_embed_layers");
+  const auto integer_equals = [&](std::string_view key, int value) {
+    const auto& field = require(qc, key);
+    return field.is_number() && field.as_double() == value;
+  };
+  if (optional_string(qc, "engram_embed_quant", "") != "mxfp4" ||
+      !integer_equals("engram_embed_block_size", 32) ||
+      optional_string(qc, "engram_embed_scale_dtype", "") != "ue8m0" ||
+      !layers.is_array() || layers.items().size() != c.engram_layer_ids.size())
+    reject("quantization_config.engram_embed_quant", "expected MXFP4/E8M0 per-32 on exactly the configured Engram layers");
+  for (size_t i = 0; i < c.engram_layer_ids.size(); ++i)
+    if (!layers.items()[i].is_number() || layers.items()[i].as_double() != c.engram_layer_ids[i])
+      reject("quantization_config.engram_embed_layers", "layer IDs must be exact integers");
+  c.engram_mxfp4 = true;
+}
+
 void parse_modelopt_nvfp4(const minijson::Value& qc, Dsv41TextConfig& c) {
   const auto reject_nv = [](std::string_view why) { reject("quantization_config.moe_quant_algo", why); };
   const auto equals_int = [](const minijson::Value& object, std::string_view key, int value) {
@@ -162,18 +179,8 @@ void parse_modelopt_nvfp4(const minijson::Value& qc, Dsv41TextConfig& c) {
   if (!targets.is_array() || targets.items().size() != 1 || !targets.items()[0].is_string() ||
       targets.items()[0].as_string() != "Linear")
     reject_nv("expected the ModelOpt Linear target");
-  const auto& engram_layers = require(qc, "engram_embed_layers");
-  if (optional_string(qc, "engram_embed_quant", "") != "mxfp4" ||
-      !equals_int(qc, "engram_embed_block_size", 32) ||
-      optional_string(qc, "engram_embed_scale_dtype", "") != "ue8m0" ||
-      !engram_layers.is_array() || engram_layers.items().size() != c.engram_layer_ids.size())
-    reject("quantization_config.engram_embed_quant", "expected MXFP4/E8M0 per-32 on exactly the configured Engram layers");
-  for (size_t i = 0; i < c.engram_layer_ids.size(); ++i)
-    if (!engram_layers.items()[i].is_number() ||
-        engram_layers.items()[i].as_double() != static_cast<double>(c.engram_layer_ids[i]))
-      reject("quantization_config.engram_embed_layers", "layer IDs must be exact integers");
+  parse_packed_engram(qc, c);
   c.experts_nvfp4 = true;
-  c.engram_mxfp4 = true;
 }
 
 void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
@@ -222,7 +229,11 @@ void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
     parse_modelopt_nvfp4(*qc, c);
   } else {
     require_absent(*qc, "config_groups", "an unrecognized compressed-tensors layout is not implemented");
-    require_absent(*qc, "engram_embed_quant", "packed Engram tables require the recognized ModelOpt layout");
+    if (qc->find("engram_embed_quant")) parse_packed_engram(*qc, c);
+    else {
+      for (const auto* key : {"engram_embed_block_size", "engram_embed_scale_dtype", "engram_embed_layers"})
+        require_absent(*qc, key, "packed Engram metadata requires engram_embed_quant");
+    }
   }
 }
 

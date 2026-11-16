@@ -462,3 +462,13 @@ rest of a read wave. One focused pair reduced the three tool-continuation wall
 times by about 1.2%, with matching responses, expert reads and acceptance; this
 is a small preliminary serving gain. The earlier full benchmark campaign used
 batching off. Set `DGPP_EXPERT_BATCH_SCATTER=0` for the sequential-scatter control.
+
+The MXFP4 streaming template now matches the current NVFP4 engine settings and
+expert budget. To hold Engram constant in a format comparison, a local MXFP4
+checkpoint overlay may reuse the NVFP4 checkpoint's packed Engram shards and
+explicitly declare their four `engram_embed_*` metadata fields; see the
+[comparison preparation](../docs/expert-streaming-review-response.md#preparing-a-matched-mxfp4-deployment).
+Serving reads should use local SSD files for both the expert image and Engram.
+Draft experts are resident and charged to the expert budget in both formats.
+NVFP4-specific b12x/GPU-paging/chunk-direct paths remain format-specific; matching
+configuration switches does not establish identical kernel execution.
