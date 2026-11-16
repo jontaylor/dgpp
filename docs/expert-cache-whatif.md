@@ -9,6 +9,9 @@ For a prefetch-only comparison that preserves actual deployed retention, see
 [staging-only prefetch replay](expert-staging-prefetch.md). It adds an optional
 residency-delta capture and keeps all persistent cache decisions frozen.
 
+For measured routing-to-read scheduling intervals, see
+[exact-routing handoff timing](expert-router-window.md).
+
 ## Inputs and invocation
 
 The existing `DGPP_EXPERT_DEMAND_TRACE` and `DGPP_EXPERT_READ_TRACE` environment
