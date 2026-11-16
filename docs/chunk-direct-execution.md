@@ -1853,3 +1853,23 @@ per-admission GPU-to-CPU synchronization, safe scale-buffer lifetimes across
 graph execution, and eviction or relocation invalidation. This prototype is
 not connected to serving and does not implement the required fallback. No
 deployment setting was changed.
+
+### Prepared graph with separately expanded scales
+
+The optional `DGPP_TEST_MIXED_SCALES=1` branch of the checkpoint-shaped B12x
+paging fixture now exercises the prepared graph with separate scale buffers.
+It limits the synthetic source scales to exactly representable values, packs
+and expands the prepared scales, and publishes the expanded scale pointers
+alongside the original prepared weight and global pointers. The same captured
+six-row graph produced bitwise-identical output and no host miss service, for
+both whole-expert and fractional policy fixtures. The ordinary fixture also
+passed with the option absent, preserving its arbitrary synthetic scale data.
+Both were run on Spark-1 with `DGPP_MOE_B12X=1`.
+
+This establishes that this graph's B12x binding format can consume separate
+scale buffers without changing its computed output. The fixture allocates both
+the original and expanded scales; it neither implements mixed-size cache
+storage nor demonstrates a RAM or serving improvement. It also synchronizes
+before using the test's invalid-value flag, which is not a proposed admission
+path. Production prefill, real checkpoint values, eviction safety and
+warm/cold end-to-end performance remain to be addressed before deployment.

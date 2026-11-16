@@ -63,6 +63,21 @@ using dgpp::GlmMoeRouterRef;
 using dgpp::GlmQuantMatrix;
 using scale_gemm_test::require;
 
+// Test-only prototype: compact scales, rejecting unsupported device values.
+__global__ void hybrid_pack_scales(const uint32_t* in, uint16_t* out, unsigned* invalid, size_t words) {
+  const size_t j = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+  if (j >= words) return;
+  const uint32_t a = in[j];
+  if (a & 0x87878787u) atomicOr(invalid, 1u);
+  out[j] = ((a>>3)&0xf) | ((a>>7)&0xf0) | ((a>>11)&0xf00) | ((a>>15)&0xf000);
+}
+__global__ void hybrid_expand_scales(const uint16_t* in, uint32_t* out, size_t words) {
+  const size_t j = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+  if (j >= words) return;
+  const uint32_t x = in[j];
+  out[j] = ((x&0xf)<<3) | ((x&0xf0)<<7) | ((x&0xf00)<<11) | ((x&0xf000)<<15);
+}
+
 int bf16_ulps(uint16_t a, uint16_t b) {
   auto key = [](uint16_t v) -> int32_t {
     return (v & 0x8000u) ? -static_cast<int32_t>(v & 0x7FFFu)
@@ -3328,6 +3343,8 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
   if (!dgpp::sm12x_moe_enabled(5120, 1152, 384, 6)) dgpp::test::skip("optional b12x AOT path disabled");
   constexpr int H = 5120, I = 1152, E = 384, live = 12, M = 256;
   auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true);
+  const bool mixed_scale_screen = std::getenv("DGPP_TEST_MIXED_SCALES") != nullptr;
+  if (mixed_scale_screen) for (auto& scale : c.host_w.fp4_scales) scale &= 0x78;
   c.cfg.shared_run_lane_min_rows = 1;
   c.alloc();
   struct Cleanup { SmallCase& c; ~Cleanup() { c.free_all(); } } cleanup{c};
@@ -3467,13 +3484,32 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       auto cold = std::make_unique<ExpertCache>(store,config(2,4),cuda_cache_storage(identity,service,true));
       cold->initialize();
       std::vector<uint64_t> bindings(E*6);
+      bool split_scales = false;
+      uint8_t *compact_scales = nullptr, *expanded_scales = nullptr;
+      unsigned* invalid_scales = nullptr;
+      constexpr size_t s13 = size_t(H)*I/8, s2 = size_t(H)*I/16, scales = s13+s2;
       auto publish = [&] {
         std::fill(bindings.begin(),bindings.end(),0);
         for (int e=0;e<E;++e) {
           auto* address=hot.prepared_address(e);
           if (!address) continue;
-          const auto v=dgpp::moe_fp4_packed_view(const_cast<uint8_t*>(address),H,I);
+          auto v=dgpp::moe_fp4_packed_view(const_cast<uint8_t*>(address),H,I);
           bindings[e*3]=reinterpret_cast<uintptr_t>(v.w13);
+          if (split_scales) {
+            require(e < live, "mixed-scale fixture has sufficient expansion slots");
+            auto* compressed = compact_scales+size_t(e)*scales/2;
+            auto* expanded = expanded_scales+size_t(e)*scales;
+            for (int part=0;part<2;++part) {
+              const size_t bytes = part ? s2 : s13, offset = part ? s13 : 0;
+              const auto* source = part ? v.s2 : v.s13;
+              const unsigned blocks = static_cast<unsigned>((bytes/4+255)/256);
+              hybrid_pack_scales<<<blocks,256,0,service>>>(reinterpret_cast<const uint32_t*>(source),
+                  reinterpret_cast<uint16_t*>(compressed+offset/2),invalid_scales,bytes/4);
+              hybrid_expand_scales<<<blocks,256,0,service>>>(reinterpret_cast<const uint16_t*>(compressed+offset/2),
+                  reinterpret_cast<uint32_t*>(expanded+offset),bytes/4);
+            }
+            v.s13 = expanded; v.s2 = expanded+s13;
+          }
           bindings[e*3+1]=reinterpret_cast<uintptr_t>(v.s13);
           bindings[e*3+2]=reinterpret_cast<uintptr_t>(v.g13);
           bindings[E*3+e*3]=reinterpret_cast<uintptr_t>(v.w2);
@@ -3528,6 +3564,24 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream));
       std::memcpy(expected.data(),c.d_out,expected.size()*2);
+      if (mixed_scale_screen) {
+        DGPP_CUDA_OK(cudaMalloc(&compact_scales,live*scales/2));
+        DGPP_CUDA_OK(cudaMalloc(&expanded_scales,live*scales));
+        DGPP_CUDA_OK(cudaMalloc(&invalid_scales,sizeof(unsigned)));
+        DGPP_CUDA_OK(cudaMemsetAsync(invalid_scales,0,sizeof(unsigned),service));
+        split_scales = true;
+        publish();
+        unsigned invalid = 0;
+        DGPP_CUDA_OK(cudaMemcpy(&invalid,invalid_scales,sizeof(invalid),cudaMemcpyDeviceToHost));
+        require(invalid == 0,"mixed-scale fixture contains only supported values");
+        *demand={};
+        DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        std::memcpy(got.data(),c.d_out,got.size()*2);
+        require(got==expected,"captured b12x graph accepts separately expanded exact scales");
+        require(!demand->serviced,"split scales remain resident graph hits");
+        cudaFree(invalid_scales);cudaFree(expanded_scales);cudaFree(compact_scales);
+      }
       cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);cudaEventDestroy(done);
       cold.reset();
       cudaStreamDestroy(service);cudaFree(table);cudaFreeHost(demand);
