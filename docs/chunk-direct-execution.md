@@ -2052,3 +2052,37 @@ The difference is too small to establish a serving benefit; the stronger
 weight also did not reduce reads on this sequence. Boost 16 remains selected.
 This single screen does not establish that the two weights behave identically
 on other workloads.
+
+### Parallel small Engram gathers
+
+`DGPP_ENGRAM_PARALLEL_SMALL=1` gives each direct Engram row cache a persistent
+16-worker pool. Gathers of at most 256 rows still use the serial path when
+fewer than two requested rows are absent; otherwise the existing hash-set
+shards are processed concurrently. Large gathers retain their prior execution
+path. The cache lock serializes callers and each shard retains its own buffers;
+output offsets preserve request order. This adds 32 worker threads per rank for
+the two-table deployment. The default remains off.
+
+The Spark-1 direct-row cache suite passed with the option enabled and disabled,
+including concurrent small gathers, warm reuse and failed reads. Two focused
+same-binary, two-rank screens used SHA-256
+`985c5e118dacd69eb4181074a0dfe0022d182fdaa437a1d605b83be9946249e0`,
+decode admission boost 16 and the existing expert budget. Fresh processes ran
+the prefix-enabled four-request tool sequence and three short recomputations;
+these are diagnostics, not benchmark campaign rows.
+
+| Measurement | Candidate-first: serial / parallel | Control-first: serial / parallel |
+| --- | --- | --- |
+| Initial prefill | 38.672 / 38.671 s | 38.578 / 38.753 s |
+| Three continuation wall times, summed | 35.495 / 33.660 s | 35.319 / 33.725 s |
+| Three continuation decode intervals, summed | 30.588 / 28.791 s | 30.378 / 28.839 s |
+| Continuation expert reads, per rank | 42.611 / 42.611 GiB | 42.611 / 42.611 GiB |
+| Third short recomputation prefill | 1.605 / 1.609 s | 1.611 / 1.613 s |
+| Third short recomputation decode | 52.90 / 52.84 tok/s | 52.75 / 52.45 tok/s |
+
+Both ranks had zero expert reads on the final repeat and zero swap at captured
+boundaries. Normalized outputs, usage and speculative acceptance matched.
+The results support selecting the option for this deployment's tested tool
+sequence; they do not quantify long-running memory cost, other workloads or
+concurrent-serving throughput. The exact contribution of overlapping storage
+reads versus other host scheduling effects was not isolated.

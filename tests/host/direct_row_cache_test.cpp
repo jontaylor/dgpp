@@ -50,12 +50,27 @@ DGPP_TEST(direct_rows_propagate_short_read_without_publishing_a_cache_hit) {
   Fixture f;
   dgpp::DirectRowCache cache(f.path,f.payload,f.scales,f.rows,f.pb,f.sb);
   std::filesystem::resize_file(f.path,0);
-  int32_t id=42,select=0;std::array<uint8_t,136> out{};
+  std::array<int32_t,2> ids{42,43}; int32_t select=0;std::array<uint8_t,272> out{};
   for(int i=0;i<2;++i){bool failed=false;
-    try{cache.gather(&id,1,&select,1,1,out.data());}catch(const std::runtime_error&){failed=true;}
+    try{cache.gather(ids.data(),1,&select,1,ids.size(),out.data());}catch(const std::runtime_error&){failed=true;}
     require(failed,"truncated input throws on every attempted row read");
   }
   require(cache.stats().hits==0,"failed row never becomes a cache hit");
+}
+
+DGPP_TEST(direct_rows_small_gathers_preserve_order_and_reuse_under_concurrency) {
+  Fixture f;
+  dgpp::DirectRowCache cache(f.path,f.payload,f.scales,f.rows,f.pb,f.sb);
+  std::vector<int32_t> ids(192);
+  for (size_t i=0;i<ids.size();++i) ids[i]=i%5 ? (i*113)%f.rows : 17;
+  std::vector<uint8_t> a(ids.size()*(f.pb+f.sb)), b(a.size());
+  const int32_t select=0;
+  std::jthread x([&]{cache.gather(ids.data(),1,&select,1,ids.size(),a.data());});
+  std::jthread y([&]{cache.gather(ids.data(),1,&select,1,ids.size(),b.data());});
+  x.join(); y.join(); f.check(ids,a); f.check(ids,b);
+  const auto reads=cache.stats().reads;
+  for (int i=0;i<10;++i) cache.gather(ids.data(),1,&select,1,ids.size(),a.data());
+  f.check(ids,a); require(cache.stats().reads==reads,"repeated small gathers reuse cached rows");
 }
 
 int main() { return dgpp::test::run_all(); }

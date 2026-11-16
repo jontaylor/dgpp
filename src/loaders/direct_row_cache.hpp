@@ -5,11 +5,13 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -51,9 +53,31 @@ class DirectRowCache {
       if (::posix_memalign(&p, kBlock, kBlock)) throw std::bad_alloc();
       block.data.reset(static_cast<uint8_t*>(p));
     }
-    fd_ = fd; guard.fd = -1;
+    fd_ = fd;
+    const char* parallel = std::getenv("DGPP_ENGRAM_PARALLEL_SMALL");
+    if (parallel && std::atoi(parallel) != 0) {
+      for (size_t w = 0; w < kWorkers; ++w) {
+        threads_.emplace_back([this, w](std::stop_token stop) {
+          uint64_t seen = 0;
+          std::unique_lock lock(pool_mutex_);
+          while (pool_ready_.wait(lock, stop, [&] { return generation_ != seen; })) {
+            seen = generation_;
+            lock.unlock();
+            pool_job_(w);
+            lock.lock();
+            if (--pending_ == 0) pool_done_.notify_one();
+          }
+        });
+      }
+    }
+    guard.fd = -1;
   }
-  ~DirectRowCache() { if (fd_ >= 0) ::close(fd_); }
+  ~DirectRowCache() {
+    for (auto& thread : threads_) thread.request_stop();
+    pool_ready_.notify_all();
+    threads_.clear();
+    if (fd_ >= 0) ::close(fd_);
+  }
   DirectRowCache(const DirectRowCache&) = delete;
   DirectRowCache& operator=(const DirectRowCache&) = delete;
   Stats stats() const { return {reads_.load(), bytes_.load(), hits_.load(), misses_.load()}; }
@@ -82,7 +106,26 @@ class DirectRowCache {
         }
       } catch (...) { errors[w] = std::current_exception(); }
     };
-    if (total <= 256) {
+    size_t missing = 0;
+    if (total <= 256 && !threads_.empty()) {
+      for (const auto& jobs : requests) {
+        for (const auto& job : jobs) {
+          const size_t first = set(job.row)*kWays;
+          if (std::find(tags_.begin()+first, tags_.begin()+first+kWays, job.row) == tags_.begin()+first+kWays &&
+              ++missing == 2) break;
+        }
+        if (missing == 2) break;
+      }
+    }
+    if (total <= 256 && missing >= 2) {
+      std::unique_lock pool_lock(pool_mutex_);
+      pool_job_ = work;
+      pending_ = kWorkers;
+      ++generation_;
+      pool_ready_.notify_all();
+      pool_done_.wait(pool_lock, [&] { return pending_ == 0; });
+      pool_job_ = {};
+    } else if (total <= 256) {
       for (size_t w = 0; w < kWorkers; ++w) work(w);
     } else {
       // jthread also joins already-created workers if thread creation fails.
@@ -146,5 +189,11 @@ class DirectRowCache {
   std::array<Worker, kWorkers> workers_;
   std::mutex mutex_;
   std::atomic<uint64_t> reads_{0}, bytes_{0}, hits_{0}, misses_{0};
+  std::mutex pool_mutex_;
+  std::condition_variable_any pool_ready_, pool_done_;
+  std::function<void(size_t)> pool_job_;
+  uint64_t generation_ = 0;
+  size_t pending_ = 0;
+  std::vector<std::jthread> threads_;
 };
 }  // namespace dgpp
