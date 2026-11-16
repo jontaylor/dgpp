@@ -135,7 +135,7 @@ class ResidencyPlanner {
     uint64_t changed = 0;
     bool has_changed = false;
   };
-  struct DecodeHistory { double accesses = 0; uint64_t updated = 0; };
+  struct DecodeHistory { double accesses = 0; };
   uint64_t prefix_bytes(size_t expert, size_t chunks) const;
   size_t minimum_chunks(size_t expert) const;
   double frequency(size_t expert) const;
@@ -152,7 +152,8 @@ class ResidencyPlanner {
   std::vector<size_t> history_groups_;
   std::vector<double> group_epochs_;
   double history_epoch_ = 0;
-  uint64_t decode_epoch_ = 0;
+  double decode_scale_ = 1;
+  double decode_decay_ = 1;
   bool last_prefill_ = false;
   ResidencyPlan current_;
   uint64_t epoch_ = 0;

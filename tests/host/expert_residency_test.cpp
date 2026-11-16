@@ -62,6 +62,17 @@ DGPP_TEST(expert_decode_admission_boost_is_phase_specific) {
   refuses([&] { boosted.decode_admission_boost = -1; ResidencyPlanner invalid(boosted, equal_experts(2, 1)); });
 }
 
+DGPP_TEST(expert_decode_admission_boost_survives_history_rebases) {
+  auto c = config(Policy::kWholeExpert, 100);
+  c.decode_admission_boost = 16;
+  c.decay_routes = 2;
+  ResidencyPlanner p(c, equal_experts(2, 1));
+  p.observe(std::vector<size_t>{0});
+  p.commit_admission(0, p.propose_admission(0));
+  p.observe(std::vector<size_t>(200, 1));
+  require(p.propose_admission(1).chunks[1] == 1, "new decode demand replaces stale history after rebases");
+}
+
 DGPP_TEST(expert_partition_matches_dsv41_tp_slices_and_format_bytes) {
   for (uint64_t world : {1, 2, 4}) {
     uint64_t total = 0;
