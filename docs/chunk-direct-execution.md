@@ -2611,3 +2611,101 @@ not direct estimates of avoided I/O: many popular experts may already be
 resident, prefill batches fetch an expert only once, and speculative prefetch
 can compete with demanded reads. Evaluate any policy with actual missing
 experts, useful lead time, unused bytes and end-to-end serving latency.
+
+### Prefetch opportunity: live I/O gaps and absent-expert forecasts
+
+Two diagnostic captures on the Sparks separate storage headroom from prediction
+quality. Both retain whole-expert caching, eight readers, the selected expert
+budget, fixed depth three, decode admission boost 16 and history multiplier
+four. Each fresh process runs the prefix-enabled four-request tool sequence
+with 1,024-token continuation caps, then four uncached short recomputations.
+These are diagnostics, not campaign rows or a completed-task quality comparison.
+
+The first capture uses the existing production binary SHA-256
+`e163306747831667813d601306ad38a68827a75cea118706751c75cb3307b8d6`, successful
+expert-read start/end tracing, demand tracing, and approximately 2 ms samples
+of each node's NVMe block-device counters. Expert-read gaps exclude leading and
+trailing idle time outside the first/last expert reads. Whole-device measurements
+also include Engram and other I/O; sampled quiet intervals require zero I/O in
+progress at both endpoints and no intervening completed reads or writes.
+Request envelopes come from external snapshots and include small telemetry
+margins. Disk accounting is approximate and is not a command-level trace.
+
+| Request | Expert reads per rank | Expert-read union time, ranks 0 / 1 | Median internal gap, ranks 0 / 1 | Device-accounted busy fraction, ranks 0 / 1 |
+| --- | ---: | ---: | ---: | ---: |
+| Cold initial tool request | 109.950 GiB | 23.13 / 23.61 s | 0.199 / 0.217 ms | 56 / 58% |
+| Prose continuation | 23.561 GiB | 5.27 / 5.35 s | 4.14 / 4.16 ms | 25 / 26% |
+| Code continuation | 44.077 GiB | 9.78 / 9.78 s | 4.66 / 4.68 ms | 23 / 22% |
+| Repeated prose continuation | 11.281 GiB | 2.62 / 2.57 s | 5.94 / 5.91 ms | 15 / 14% |
+
+Device samples found about 7.8, 18.6 and 8.8–8.9 seconds in quiet runs of at
+least 5 ms across those continuations on each node. This establishes storage
+headroom in these requests, not time removable from their latency. Cold prefill
+was 38.515 seconds. The final short recomputations read zero expert bytes on
+both ranks; their presence of idle storage does not create useful prefetch
+opportunities when the required experts are already resident.
+
+Causal popularity rankings computed using observations available 1.7 ms before
+each actual read put fewer than 1% of the continuation's read bytes in a layer's
+top twenty experts. The popular experts are mostly served by the existing cache.
+This statistic does not score a predictor that filters out current residents.
+
+A second capture therefore adds `DGPP_EXPERT_PREFETCH_SHADOW=PREFIX`. It records
+up to three historically popular *absent* experts one, two and four layers ahead
+at host observation points, excluding experts with queued lookahead records.
+It uses either cumulative all-phase selection counts or cumulative decode-only
+counts. It does not submit reads, reserve staging, admit experts or alter the
+planner. Its rank/process files contain the ten-u64 records documented in
+`scripts/expert_prefetch_shadow.py`. With the option unset, no history vectors
+or output streams are allocated. The 29-test host cache suite passed with the
+option both disabled and enabled.
+
+The diagnostic binary, built from `144da58f` plus the optional shadow recorder,
+has SHA-256 `c00ae08cb423c921fec43f0a50c56e417aab5187c703a304dd43e3d440f6456e`.
+Both ranks reproduced the first capture's continuation read volumes, normalized
+messages, usage and acceptance, and reached zero-read warm repeats. Captured
+process swap was zero on both ranks in both captures. Cold prefill was 38.346
+seconds. For the three warmish continuations, both ranks produced these same
+prediction outcomes:
+
+| History, four layers ahead | Forecast offers | Needed on next layer visit and actually read | Precision |
+| --- | ---: | ---: | ---: |
+| All-phase, top one absent | 24,440 | 69 | 0.28% |
+| Decode-only, top one absent | 19,080 | 116 | 0.61% |
+| All-phase, top three absent | 73,316 | 220 | 0.30% |
+| Decode-only, top three absent | 57,110 | 296 | 0.52% |
+
+These are repeated forecast offers, not reads actually issued or independent
+trials. Wrong forecasts might be reused on later visits under another policy;
+that holding-time and staging tradeoff is not modeled here. One- and two-layer
+lookahead also had low precision. Their adjacent-layer useful forecasts often
+arrived less than 1.7 ms before the actual read began. Host-accounted observations
+and read starts are not GPU layer boundaries or exact routing deadlines.
+
+Granting each correct top-three decode-only forecast its own retrospective
+1.7 ms expert-read gap before the actual demand read, four-layer lookahead found
+192–195 whole-expert opportunities per rank, representing 1.79–1.82 GiB versus
+78.919 GiB actually read across continuations. This optimistic feasibility test
+can double-book a gap, ignores other device I/O and staging constraints, and
+uses the later read-start time as its deadline. It neither predicts a speedup
+nor excludes partial prefetch opportunities. On the final fully warm request,
+the top-one four-layer rule still made 468 offers per history mode per rank,
+with zero needed reads: blind issuance would add work to a zero-read workload.
+
+The evidence supports investigating a stronger, confidence-gated predictor of
+missing demand before enabling speculative I/O or sacrificing resident capacity.
+It does not support deploying these simple cumulative-popularity rules. The
+original production binary and configuration were restored; diagnostic tracing
+and sampling were removed from the serving processes.
+
+Reusable analysis commands:
+
+```bash
+python3 scripts/expert_io_opportunity.py READ_TRACE --windows WINDOWS.json --disk-samples DISK.jsonl
+python3 scripts/expert_prefetch_shadow.py --shadow SHADOW_TRACE --demand DEMAND_TRACE --reads READ_TRACE --start-ns START --end-ns END
+```
+
+The first command uses only the standard library. The second requires NumPy.
+Windows contain `name`, inclusive `start_ns` and exclusive `end_ns`; disk samples
+contain `[Unix_ns, *Linux_block_device_stat_fields]`. All traces and generated
+plots, summaries and logs remain untracked.

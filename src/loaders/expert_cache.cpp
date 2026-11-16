@@ -107,6 +107,12 @@ struct ExpertCacheState {
   // touched by I/O workers or allocated in the normal serving configuration.
   std::unique_ptr<std::ofstream> demand_trace;
   bool demand_trace_header = false;
+  // Diagnostic only: rank absent upcoming experts without submitting I/O or
+  // changing admission. Histories contain only observations already seen.
+  std::unique_ptr<std::ofstream> prefetch_shadow;
+  std::vector<std::vector<size_t>> shadow_layers;
+  std::vector<uint64_t> shadow_all, shadow_decode;
+  uint64_t shadow_sequence = 0;
   bool observed_for_adaptation = false;
   bool all_observed_full = true;
   ResourcePressureSampler resource_sampler;
@@ -154,6 +160,55 @@ struct ExpertCacheState {
     for (const auto e : selected) word(e);
     out.flush();
     if (!out) throw std::runtime_error("expert cache: failed to write demand trace");
+  }
+  void trace_prefetch_shadow(std::span<const size_t> selected, bool prefill) {
+    if (!prefetch_shadow) return;
+    ++shadow_sequence;
+    if (selected.empty()) return;
+    const auto layer = experts[selected.front()].layer;
+    for (auto e : selected) {
+      if (experts[e].draft || experts[e].layer != layer) return;
+    }
+    for (auto e : selected) {
+      ++shadow_all[e];
+      if (!prefill) ++shadow_decode[e];
+    }
+    const auto timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    const auto& resident = planner->current().chunks;
+    for (const unsigned distance : {1u, 2u, 4u}) {
+      const auto target = static_cast<size_t>(layer) + distance;
+      if (target >= shadow_layers.size()) continue;
+      for (unsigned mode = 0; mode < 2; ++mode) {
+        const auto& history = mode ? shadow_decode : shadow_all;
+        std::array<size_t, 3> best{absent, absent, absent};
+        auto better = [&](size_t a, size_t b) {
+          return b == absent || history[a] > history[b] ||
+              (history[a] == history[b] && experts[a].expert < experts[b].expert);
+        };
+        for (const auto e : shadow_layers[target]) {
+          if (!history[e] || resident[e] == experts[e].records.size()) continue;
+          // Already queued reads are not new speculative opportunities.
+          if (std::any_of(experts[e].records.begin(), experts[e].records.end(),
+                          [&](size_t r) { return prefetched.contains(r); })) continue;
+          for (size_t rank = 0; rank < best.size(); ++rank) {
+            if (!better(e, best[rank])) continue;
+            for (size_t j = best.size() - 1; j > rank; --j) best[j] = best[j-1];
+            best[rank] = e;
+            break;
+          }
+        }
+        for (size_t rank = 0; rank < best.size() && best[rank] != absent; ++rank) {
+          const auto e = best[rank];
+          // Ten little-endian u64 fields, one record per offered expert.
+          const uint64_t record[]{timestamp, shadow_sequence, layer, target, distance,
+                                  mode, rank + 1, experts[e].expert, history[e], uint64_t(prefill)};
+          prefetch_shadow->write(reinterpret_cast<const char*>(record), sizeof(record));
+        }
+      }
+    }
+    prefetch_shadow->flush();
+    if (!*prefetch_shadow) throw std::runtime_error("expert cache: failed to write prefetch shadow trace");
   }
   bool background_allowed() {
     if (resource_sampler) pressure = resource_sampler();
@@ -473,6 +528,19 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
     s.demand_trace = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
     if (!*s.demand_trace) throw std::runtime_error("expert cache: cannot open demand trace");
   }
+  if (const char* prefix = std::getenv("DGPP_EXPERT_PREFETCH_SHADOW"); prefix && *prefix) {
+    const auto path = std::string(prefix) + ".r" + std::to_string(id.rank) +
+        ".p" + std::to_string(::getpid()) + ".bin";
+    s.prefetch_shadow = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
+    if (!*s.prefetch_shadow) throw std::runtime_error("expert cache: cannot open prefetch shadow trace");
+    s.shadow_all.resize(s.experts.size());
+    s.shadow_decode.resize(s.experts.size());
+    for (size_t e = 0; e < s.experts.size(); ++e) {
+      if (s.experts[e].draft) continue;
+      if (s.shadow_layers.size() <= s.experts[e].layer) s.shadow_layers.resize(s.experts[e].layer + 1);
+      s.shadow_layers[s.experts[e].layer].push_back(e);
+    }
+  }
 }
 ExpertCache::~ExpertCache() = default;
 const CacheMemory& ExpertCache::memory() const { return state_->memory; }
@@ -507,6 +575,7 @@ void ExpertCache::observe(std::span<const size_t> selected, bool prefill) {
   s.check();
   s.planner->observe(selected, prefill);
   s.trace_demand(selected, prefill);
+  s.trace_prefetch_shadow(selected, prefill);
   s.observed_for_adaptation |= !selected.empty();
   for (const auto e : selected)
     s.all_observed_full &= s.planner->current().chunks[e] == s.experts[e].records.size();
