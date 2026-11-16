@@ -4,6 +4,11 @@
 namespace dgpp {
 namespace {
 constexpr int E = 384, K = 6, M = 64, B = 8;
+__global__ void layer_stamp_kernel(uint64_t* stamp) {
+  unsigned long long now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  *stamp = now;
+}
 __device__ uint32_t load_system(const uint32_t* p) {
   uint32_t v;
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -67,6 +72,10 @@ __global__ void packet_kernel(uint8_t* packet, const uint64_t* table,
     for (int j = 0; j < rows*K; ++j) if (ids[j] == e) routes[at++] = j;
   }
 }
+}
+void launch_expert_layer_stamp(uint64_t* stamp, cudaStream_t stream) {
+  layer_stamp_kernel<<<1,1,0,stream>>>(stamp);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 void launch_expert_demand(const int32_t* ids, const uint64_t* table,
                          ExpertDemand* demand, int rows, cudaStream_t stream) {

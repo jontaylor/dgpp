@@ -2709,3 +2709,58 @@ The first command uses only the standard library. The second requires NumPy.
 Windows contain `name`, inclusive `start_ns` and exclusive `end_ns`; disk samples
 contain `[Unix_ns, *Linux_block_device_stat_fields]`. All traces and generated
 plots, summaries and logs remain untracked.
+
+### Decode layer duration by actual expert loads (November 16)
+
+A focused diagnostic added graph-compatible GPU timestamp markers at target
+layer boundaries, with demanded-file-byte and completed-record deltas around
+each serviced layer. Unlike host demand observations or file-read intervals,
+these spans include the whole layer's main-stream work, communication,
+dependencies and exposed paging wait. They exclude draft generation, graph
+setup, the output head and sampling. One marker kernel per boundary adds
+diagnostic overhead; these are not uninstrumented campaign throughput rows.
+
+The production configuration was unchanged: two Sparks, NVFP4 whole-expert
+caching, fixed speculative depth three, four target rows with top-six routing,
+and the full KV reservation. Source was `608a6270` plus the opt-in layer timing
+instrumentation; the captured binary SHA256 was
+`6c0a6ce55d221d9f09ab5d6d9345af6923ce122bcfc73d5637b348abd9f6648c`
+on both ranks, each with zero process swap. No speculative reads were enabled.
+
+Across the three tool-request continuations after the initial 24,317-token
+request, all 27,360 layer visits had four target rows. Rank-zero results:
+
+| Whole experts loaded for this layer | Visits | Mean layer ms | Median ms | p90 ms | Share of target-layer time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Zero | 21,954 | 1.567 | 1.482 | 1.960 | 54.6% |
+| One | 4,476 | 4.740 | 4.673 | 5.347 | 33.7% |
+| Two or more | 930 | 7.931 | 7.427 | 10.215 | 11.7% |
+
+The last group averaged 2.243 loaded experts. Rank-one means were respectively
+1.555, 4.732 and 7.924 ms; do not add the two ranks' durations. All pass/layer
+identities and load bytes matched across ranks. Every load was a whole
+10,027,008-byte local shard, comprising eighteen 557,056-byte records; completed
+record deltas independently matched those demanded bytes. Counts match the
+earlier demand/read capture, and continuation outputs and acceptance matched.
+
+Thus the 19.8% of layer visits needing reads consumed 45.4% of measured
+target-layer time. This is time in miss-containing layers, **not** a claim that
+45.4% is removable I/O overhead. Layer identity, context and expert reuse can
+also affect the means. Miss cost remains material during ordinary decode;
+prefill is a separate priority, especially initial long prompts. This diagnostic
+does not allocate all complete-request latency to either component or establish
+a prefetch speedup. The original production binary and configuration were
+restored once after the capture.
+
+To collect another capture, set `DGPP_EXPERT_LAYER_TRACE` to a writable path
+prefix on both ranks. The server appends rank/PID and writes eight-u64 records
+described by the analyzer. Analyze each rank separately:
+
+```bash
+python3 scripts/expert_layer_timing.py LAYER_TRACE --expert-bytes 10027008 --windows WINDOWS.json
+```
+
+Windows use inclusive `start_ns` and exclusive `end_ns` against the pass-end
+Unix timestamp. The analyzer reports each target width separately and rejects
+partial-expert reads rather than silently rounding them into whole-expert bins.
+With tracing disabled there are no marker kernels or timing-file writes.

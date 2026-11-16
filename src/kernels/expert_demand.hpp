@@ -12,6 +12,8 @@ struct alignas(64) ExpertDemand {
 };
 void launch_expert_demand(const int32_t* ids, const uint64_t* table,
                          ExpertDemand* demand, int rows, cudaStream_t stream);
+// Opt-in graph-compatible diagnostic; timestamps use the GPU nanosecond clock.
+void launch_expert_layer_stamp(uint64_t* stamp, cudaStream_t stream);
 void launch_expert_route_packet(uint8_t* packet, const uint64_t* table,
                                const int32_t* ids, const ExpertDemand* demand,
                                int rows, cudaStream_t stream);

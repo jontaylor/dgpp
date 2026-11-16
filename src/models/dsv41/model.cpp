@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <numeric>
 #include <map>
 #include <thread>
@@ -51,7 +53,9 @@ struct Dsv41Model::PagedGraphs {
   bool bulk_publish = true;
   uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
   uint64_t publish_bytes = 0, profiled_walk_ns = 0;
-  explicit PagedGraphs(int n) : layers(n) {
+  uint64_t* layer_stamps = nullptr;
+  std::ofstream layer_trace;
+  explicit PagedGraphs(int n, int rank) : layers(n) {
     const char* profile = std::getenv("DGPP_EXPERT_PROFILE_PUBLISH");
     profile_publish = profile && std::atoi(profile) != 0;
     const char* bulk = std::getenv("DGPP_EXPERT_BULK_BINDINGS");
@@ -62,6 +66,12 @@ struct Dsv41Model::PagedGraphs {
     DGPP_CUDA_OK(cudaHostAlloc(&demands, n * sizeof(ExpertDemand), cudaHostAllocMapped));
     DGPP_CUDA_OK(cudaHostAlloc(&host_tables, n * words * sizeof(uint64_t), cudaHostAllocDefault));
     DGPP_CUDA_OK(cudaMalloc(&tables, n * words * sizeof(uint64_t)));
+    if (const char* prefix = std::getenv("DGPP_EXPERT_LAYER_TRACE"); prefix && *prefix) {
+      layer_trace.open(std::string(prefix) + ".r" + std::to_string(rank) + ".p" +
+                       std::to_string(getpid()) + ".bin", std::ios::binary);
+      if (!layer_trace) throw std::runtime_error("cannot open expert layer trace");
+      DGPP_CUDA_OK(cudaHostAlloc(&layer_stamps, (n+1) * sizeof(uint64_t), cudaHostAllocMapped));
+    }
   }
   ~PagedGraphs() {
     if (service) (void)cudaStreamSynchronize(service);
@@ -69,6 +79,7 @@ struct Dsv41Model::PagedGraphs {
     if (tables) (void)cudaFree(tables);
     if (host_tables) (void)cudaFreeHost(host_tables);
     if (demands) (void)cudaFreeHost(demands);
+    if (layer_stamps) (void)cudaFreeHost(layer_stamps);
     if (done) (void)cudaEventDestroy(done);
     if (service) (void)cudaStreamDestroy(service);
   }
@@ -1819,7 +1830,7 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
 }
 
 bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
-  if (!paged_graphs_) paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers);
+  if (!paged_graphs_) paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers, rank_);
   auto& p = *paged_graphs_;
   const std::array<uint64_t,7> key{static_cast<uint64_t>(T), static_cast<uint64_t>(rows.num_requests),
       static_cast<uint64_t>(rows.snapshots), reinterpret_cast<uintptr_t>(rows.req_ids),
@@ -1846,8 +1857,12 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       if (boundary_) { boundary_->graph_segment_begin(g.variant); recording = true; }
       DGPP_CUDA_OK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       capturing = true; paged_graph_capture_ = true; p.capturing = &g;
-      for (int l = 0; l < p.layers; ++l) enqueue_layer(loader_.load_layer(l), l, T, rows);
+      for (int l = 0; l < p.layers; ++l) {
+        if (p.layer_stamps) launch_expert_layer_stamp(p.layer_stamps + l, stream_);
+        enqueue_layer(loader_.load_layer(l), l, T, rows);
+      }
       join_comb();
+      if (p.layer_stamps) launch_expert_layer_stamp(p.layer_stamps + p.layers, stream_);
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
@@ -1875,6 +1890,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
                                                  : std::chrono::steady_clock::time_point{};
   p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
   int accounted = 0;
+  std::vector<uint64_t> layer_bytes, layer_reads;
+  if (p.layer_stamps) { layer_bytes.resize(p.layers); layer_reads.resize(p.layers); }
   auto account = [&](int end) {
     for (; accounted < end; ++accounted) {
       if (p.demands[accounted].serviced) continue;
@@ -1898,9 +1915,15 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
         // admissions and shared-expert overlap. The paused GPU skips its
         // own expert output when this service has supplied it.
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
+        const auto bytes_before = p.layer_stamps ? expert_cache_->stats().demand_bytes : 0;
+        const auto reads_before = p.layer_stamps ? expert_cache_->read_stats().completed : 0;
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
                             p.service, MoeExpertKernel::kGemv);
         DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
+        if (p.layer_stamps) {
+          layer_bytes[l] = expert_cache_->stats().demand_bytes - bytes_before;
+          layer_reads[l] = expert_cache_->read_stats().completed - reads_before;
+        }
         p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
         ++p.misses; accounted = l + 1;
         __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
@@ -1918,6 +1941,20 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       expert_cache_->adapt(); expert_last_adapt_ = expert_cache_->observations();
     }
     ++p.passes;
+    if (p.layer_stamps) {
+      const uint64_t unix_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      // Eight u64 per row: pass, target rows, layer, GPU start/end ns,
+      // demanded file bytes, completed record reads, pass-end Unix ns.
+      // Adjacent markers include all main-stream dependencies and paging
+      // waits. Never subtract clocks between devices or sum rank durations.
+      for (int l = 0; l < p.layers; ++l) {
+        const uint64_t record[]{p.passes, static_cast<uint64_t>(T), static_cast<uint64_t>(l),
+            p.layer_stamps[l], p.layer_stamps[l+1], layer_bytes[l], layer_reads[l], unix_ns};
+        p.layer_trace.write(reinterpret_cast<const char*>(record), sizeof(record));
+      }
+      p.layer_trace.flush();
+    }
     if (p.profile_publish) {
       p.profiled_walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now()-profile_started).count();
