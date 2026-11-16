@@ -1384,3 +1384,21 @@ speculative acceptance matched; both ranks had zero swap at captured boundaries.
 No meaningful serving improvement was observed, and launch grouping frequency
 was not measured. The prototype was removed and the prior binary and serving
 configuration restored. Independent completion remains enabled.
+
+## Separately aligned staging and adjacent direct reads
+
+The earlier adjacent-read screen found that a four-record `preadv` succeeded
+with slices of a contiguous mapping but failed with separately mapped buffers.
+A follow-up tested whether separate mappings would work when every destination
+base was aligned to the Spark's 64 KiB host page size. On each rank, four
+independent anonymous mappings were overallocated, sliced to 64 KiB-aligned
+addresses and passed to one direct `preadv` for four adjacent 557,056-byte
+records in the local expert image. Both ranks returned `EINVAL`; no throughput
+measurement or serving request was involved.
+
+Alignment of each separate base alone is therefore insufficient for this
+specific grouped-read layout on the tested systems. This does not isolate the
+kernel's exact constraint or rule out all other vector layouts. A coalescing
+implementation should use a proven contiguous staging layout or establish an
+alternative, while preserving individual chunk lifetime and CUDA registration
+semantics. No serving code or configuration changed.
