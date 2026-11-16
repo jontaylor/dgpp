@@ -1649,3 +1649,34 @@ the scheduling hypothesis remains unproven. The prototype was removed and
 the previous binary and configuration restored. Revisit only with a concrete
 way to resolve the stall and compare cold, partially warm, and fully warm
 serving paths.
+
+## Fused packing of reconstructed experts
+
+An opt-in prototype combined the four NVFP4 code and scale packing kernels
+and the global-scale copy into one kernel, reading the existing canonical GPU
+reconstruction. It left staging and cache admission unchanged. The
+checkpoint-shaped packing round trip and B12x paging fixture passed, including
+graph replay and cache pressure.
+
+Two opposite-order focused comparisons used the same binary on both ranks,
+SHA-256 `f48203131ad723263cc88fb9b3d5fb36f46ed149a4029bdf167d57f078eae73c`,
+built from `82d0ef24` plus the prototype. Each fresh process ran the four-request
+prefix-enabled tool sequence and three 2,209-token recomputations. These are
+diagnostic comparisons, not benchmark campaign rows.
+
+| Measurement | Candidate-first: control / fused | Control-first: control / fused |
+| --- | --- | --- |
+| Initial cold prefill | 42.611 / 39.143 s | 38.578 / 39.193 s |
+| Three continuation wall times, summed | 38.631 / 36.843 s | 37.323 / 37.272 s |
+| Three continuation engine decode times, summed | 33.153 / 31.974 s | 32.426 / 32.334 s |
+| Third short recomputation prefill | 1.598 / 1.655 s | 1.601 / 1.664 s |
+| Third short recomputation decode | 52.72 / 52.56 tok/s | 52.48 / 52.49 tok/s |
+
+Each rank read 109.950 GiB initially and 47.009 GiB across continuations in
+every arm. The third recomputation had zero expert reads on both ranks.
+Normalized messages, tool arguments, usage and speculative acceptance
+matched within each pair, and both ranks had zero swap at the captured
+boundaries. The reverse-order continuation result did not reproduce the first
+pair's apparent improvement. The prototype was removed and the previous
+service binary and settings restored; the experiment does not establish a
+meaningful serving gain or a general conclusion about kernel fusion.
