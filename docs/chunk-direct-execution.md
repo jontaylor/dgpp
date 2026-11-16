@@ -2132,3 +2132,28 @@ speculative acceptance matched, with zero swap at captured boundaries.
 The comparison found no useful serving improvement. The option was removed
 and the previously selected binary restored; other large-gather shapes and
 concurrency levels remain untested.
+
+### Doubling the Engram row cache
+
+A temporary option doubled each direct Engram table's row-cache slots, adding
+about 72.4 MiB per rank for this checkpoint while leaving expert capacity
+unchanged. The Spark-1 direct-row cache tests passed with both capacities.
+One candidate-first, same-binary screen used SHA-256
+`9d3be8059ff0a26464d4a36aa22c1cd48bffed9352c2c59c401be7e37f3b0e63`
+and the same prefix-enabled tool sequence and three short recomputations. This
+is a focused diagnostic, not a benchmark campaign row.
+
+Initial prefill was 38.658 seconds with the existing cache versus 38.545 with
+the larger cache. Three continuation wall times totalled 33.723 versus 33.887
+seconds; engine decode totalled 28.766 versus 28.949 seconds. Expert reads
+were 42.611 GiB per rank in each arm. Rank 0 process reads minus expert reads
+were approximately 0.135 versus 0.133 GiB across continuations; this residual
+includes other process I/O and is not an exact Engram read counter. On the
+third short recomputation, both ranks read zero expert bytes; prefill was
+1.606 versus 1.611 seconds and decode was 52.82 versus 52.77 tokens/s.
+Normalized responses, usage and speculative acceptance matched, and captured
+swap was zero on both ranks.
+
+This sequence did not benefit from the extra row-cache memory. The prototype
+was removed and the prior serving binary restored. Different prompt reuse and
+longer workloads may have different cache working sets.
