@@ -1481,6 +1481,29 @@ upper-bound opportunities for this particular immediate-next-visit predictor,
 not measurements of serving speed or a rejection of other prediction methods.
 The result does not justify implementing this predictor on the tested stream.
 
+## Previous-layer decode prediction replay
+
+A separate causal fixed-route screen trained expert co-occurrence counts from
+earlier consecutive decode-layer visits, then used the immediately preceding
+layer's selected experts to rank currently nonresident experts in the next
+layer. Counts were updated only after evaluating each prediction; prefill
+events and nonconsecutive layers broke the input sequence. This tests one
+simple online predictor, not a learned router or a serving implementation.
+
+On the saved three tool continuations, both rank traces gave the same result.
+The approximate whole-expert replay counted 3,443 decode misses per rank,
+3,356 of them at consecutive-layer transitions. Offering the top one
+prediction per eligible visit made 8,713 offers, of which 676 were actually
+demanded in the next layer. Offering the top three made 24,538 offers for 900
+hits; six made 45,453 offers for 965 hits. A confidence cutoff based on the
+training co-occurrence fraction offered 28 predictions and hit 20 at 5%; a
+10% cutoff offered none. These figures assume every offer can be made for
+free, without affecting cache contents, staging, storage bandwidth or timing.
+They neither establish useful prefetch lead time nor translate directly into
+latency. The low coverage at the conservative cutoff and low precision without
+it do not justify deploying this predictor on the tested sequence. Other
+predictors and workloads remain untested.
+
 ## Independent-miss copy versus read wait
 
 An opt-in prototype changed independent decode-miss scheduling to wait for a
