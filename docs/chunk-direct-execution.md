@@ -1165,3 +1165,42 @@ The single comparison did not demonstrate a serving improvement and cannot
 attribute the timing difference to the wait alone. The candidate and override
 were removed, and the prior service configuration restored. The current binary
 contains the disabled experiment until its next rebuild.
+
+## 8192-token prefill workspace versus expert-cache capacity
+
+The production configuration uses a 4096-token prefill quantum. An attempt
+to raise initial, idle and idle-floor budgets to 8192 while retaining the
+existing 107,242,240,000-byte per-rank expert budget was rejected by the
+startup memory preflight: rank 0's plan required 116.60 GiB plus the configured
+4.00 GiB headroom against approximately 118.30 GiB available. No serving
+request ran at that configuration.
+
+A second attempt traded 3.5 GiB of the expert budget per rank for the larger
+workspace, keeping the million-token context and other serving settings. It
+was compared with the preceding 4096-token control on the same binary,
+SHA-256 `0323d7a0658a82cdf6f57d4151c11073bd31e26ad95454fd85b1949451b651d3`
+(source based on `99aaa7c8` plus the disabled combined-wait experiment). The
+control ran first; each fresh process served the same four-request prefix-enabled
+tool sequence and three 2209-token recomputations. This is a focused diagnostic,
+not a campaign result or an isolated test of prefill quantum at equal capacity.
+
+Cold initial prefill was 38.627 versus 38.666 seconds, with expert reads of
+109.950 versus 110.753 GiB per rank. Across the three continuations, wall time
+was 37.898 versus 43.669 seconds; summed prefill was 5.134 versus 6.330 seconds
+and engine decode 32.607 versus 37.200 seconds. Expert reads rose from 47.009
+to 56.040 GiB per rank.
+
+The third short recomputation was a zero-read warm anchor under the original
+configuration: 1.602-second prefill and 53.01 decode tokens/s. The traded
+configuration still read 17.220 GiB per rank on that repeat, with 3.742-second
+prefill and 26.30 decode tokens/s; its eventual all-resident steady state was
+not established. Both processes remained at zero swap at captured boundaries,
+and all seven normalized messages and usage records matched, as did tool-loop
+acceptance. At the final snapshot, system MemAvailable was approximately
+4.11/4.34 GiB for the control and 4.35/4.35 GiB for the traded configuration.
+
+This memory trade was not retained: the tested normal continuations and short
+recomputations were slower, while cold prefill did not improve. The result does
+not isolate the effect of 8192 rows at unchanged expert capacity or establish
+performance for concurrent or longer-context requests. The 4096-token budgets
+and original expert capacity were restored.
