@@ -2108,3 +2108,27 @@ usage and acceptance matched, and captured swap was zero on both ranks.
 No useful improvement was established, so the prototype was removed and the
 previous parallel Engram implementation retained. Other worker counts or
 workloads were not tested by this screen.
+
+### Reusing Engram workers for large gathers
+
+A temporary option reused the existing 16-worker pool for gathers larger than
+256 rows, instead of creating per-gather threads. It retained the existing
+sharding, sorting and ordered outputs. The Spark-1 direct-row cache tests passed
+in both modes, including concurrent gathers and a failed large read.
+
+One candidate-first focused screen used the same binary on both ranks,
+SHA-256 `acb659f0a7f6dc36558aa9928d758e4bcb27196b0d1dad7d880e74bfd7df5626`,
+and the prefix-enabled tool sequence followed by three short recomputations.
+This is a diagnostic, not a benchmark campaign row. Initial prefill was
+38.502 seconds with existing large-gather threads versus 38.899 seconds with
+the persistent pool. Three continuation wall times totalled 34.017 versus
+33.972 seconds; their engine-prefill intervals totalled 4.836 versus 4.819
+seconds and decode totalled 29.042 versus 29.028 seconds. Each rank read
+42.611 GiB of expert data across continuations. On the third short repeat,
+both ranks read zero expert bytes; prefill was 1.613 versus 1.606 seconds and
+decode was 52.70 versus 52.57 tokens/s. Normalized responses, usage and
+speculative acceptance matched, with zero swap at captured boundaries.
+
+The comparison found no useful serving improvement. The option was removed
+and the previously selected binary restored; other large-gather shapes and
+concurrency levels remain untested.
