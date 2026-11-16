@@ -2157,3 +2157,29 @@ swap was zero on both ranks.
 This sequence did not benefit from the extra row-cache memory. The prototype
 was removed and the prior serving binary restored. Different prompt reuse and
 longer workloads may have different cache working sets.
+
+### Reader count on longer tool continuations
+
+The eight-versus-twelve-reader comparison was revisited with decode admission
+boost 16 and parallel small Engram gathers enabled. Both ranks used the same
+production binary, SHA-256
+`985c5e118dacd69eb4181074a0dfe0022d182fdaa437a1d605b83be9946249e0`,
+the same expert budget, 256 staging buffers and twelve execution slots. Each
+fresh process ran the four-request prefix-enabled tool sequence with a
+1,024-token continuation cap, then three short recomputations. This single
+candidate-first comparison is a focused diagnostic, not a campaign row.
+
+Initial prefill was 38.678 seconds with eight readers versus 38.312 with
+twelve. The three continuation wall times totalled 74.887 versus 74.287
+seconds; engine decode totalled 69.264 versus 68.623 seconds. Each rank read
+83.308 GiB of expert data across the continuations in either arm. The two
+prose responses completed at 413 tokens each; the code response reached the
+1,024-token cap. The third short recomputation read zero expert bytes on both
+ranks, with prefill 1.622 versus 1.616 seconds and decode 52.63 versus 52.59
+tokens/s. Normalized outputs, usage and speculative acceptance matched, and
+captured swap was zero on both ranks.
+
+The 0.600-second difference over the continuation sequence is too small for
+this single pair to establish a reliable improvement. Eight readers remain
+selected. The capped code response and one sequential request stream do not
+establish behavior for uncapped work or concurrent serving.
