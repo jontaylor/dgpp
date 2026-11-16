@@ -77,7 +77,7 @@ checkpoint: earlier partial row readiness or a split mHC implementation could
 expose input sooner, but this capture does not measure that possibility.
 Kernel envelopes can include in-kernel dependency waiting.
 
-The next focused implementation opportunity is to submit a bounded first wave
+The initial capture identified an opportunity to submit a bounded first wave
 of already-known misses earlier, ahead of nonessential host preparation, and
 reuse the graph's selected IDs instead of rerouting on the service stream.
 The latter alone accounts for only about 10 us. Preserve cache decisions,
@@ -129,6 +129,124 @@ python3 tests/python/expert_router_window_test.py
 
 Windows use the same format as the [cache replay guide](expert-cache-whatif.md).
 Output contains per-shape and per-window statistics, individual observations,
-worker evidence, exclusions and the analyzer's source hash. The six focused
+worker evidence, exclusions and the analyzer's source hash. The seven focused
 tests cover service pairing, selection/hash completion, cross-stream read
 ownership, graph producer mapping and rejection of ambiguous worker counts.
+
+
+## Early exact demand and captured-route reuse
+
+The host path now primes the first two ascending selected missing experts as
+soon as routing IDs are available, before host route copies, counting,
+observation, segmentation or shared-expert preparation. The graph miss handler
+primes from the acquire-loaded mailbox before accounting preceding layers or
+rebinding the layer. It passes the captured device IDs and weights into the
+existing service executor, removing the repeated router and its routing
+D2H/fence. The main graph remains paused until service output is complete.
+Supplied routes must belong to the executor's captured device scratch; host
+weight diagnostics are cleared because that path does not copy weights back.
+
+Priming uses existing demand tickets, coalescing, staging and the half-pool
+lookahead bound. It changes neither residency nor access observations. Larger
+populations than 384 experts keep ordinary submission. Resident graph hits
+still execute without a host decision. Set `DGPP_EXPERT_EARLY_DEMAND=0` to
+restore the former route/read path for a same-binary diagnostic control.
+
+A focused two-rank NVFP4 diagnostic compared that control with early demand
+using the same binary (SHA256
+`1faedfd88ec4a40446d83ac90f73fa235c088e1d10e8c68180482c08bd903939`),
+built from `3db61a47` plus this implementation. Both arms used identical
+warm-up history, tool requests and fixed depth three. Measured requests were
+a code continuation, repeated prose and a 2,209-token uncached prompt. All five
+responses and usage counts matched after normalizing generated tool-call IDs.
+Per-record expert-read counts matched on both ranks, with 318,168 read records
+per rank including warm-up. Both ranks had zero process swap.
+
+Median selections-to-first-expert-`pread`, in microseconds:
+
+| Execution shape | Observations per rank | Control rank 0 / 1 | Early demand rank 0 / 1 |
+|---|---:|---:|---:|
+| Four-row graph decode miss | 501 | 393.86 / 362.77 | 156.53 / 161.81 |
+| Small host prefill tails | 70 | 676.50 / 659.67 | 380.38 / 383.99 |
+| Larger host prefill | 75 | 281.70 / 376.72 | 240.26 / 289.78 |
+
+These are instrumented handoff diagnostics, not deployment-template throughput
+rows. They measure `pread` entry, not physical SSD dispatch. Decode duration
+improved modestly in these requests; the handoff reduction is not an equivalent
+end-to-end speedup. The analyzer's `--reuse-graph-routes` mode attributes graph
+miss reads without requiring a second service router.
+
+## Keeping a reader ready
+
+One representative early-demand decode observation signaled a reader about
+18 us after selections, but its condition-variable wait returned about 136 us
+after selections, with `pread` starting about 157 us after selections. This
+identified worker wake-up as another source of handoff delay.
+
+`DGPP_EXPERT_READY_WORKER=1` keeps worker zero polling while the graph walk is
+active, or during the ordinary host routing window. Other workers use the
+condition variable. The hint is unwound on normal and exceptional exits;
+there is no polling between requests. It reserves no additional weight or
+staging capacity.
+
+`DGPP_EXPERT_READY_WORKER=2` instead uses `LDXR` plus timed ARM `WFET` on Linux
+AArch64 with `HWCAP2_WFXT`; unsupported machines fall back to polling. A CPU
+publisher advances a dedicated notification word after queue submission,
+window changes and shutdown. The reader arms its exclusive monitor, checks
+for changes before parking, and rechecks queue/shutdown state after every
+wake. Each wait is bounded to about 1 ms. This applies the
+[GB10 timed-wait approach](https://gist.github.com/jetnet/94c8dcfd5381985efd5030d8a4dca36d)
+to CPU-published queue work; it does not rely on GPU stores waking a CPU.
+
+A second same-binary diagnostic kept early demand on and changed only the
+ready-reader setting (binary SHA256
+`45d306390e8cb0e38e5da31fcee7ab4b283a098aea0c890c5e9834a1c4b2018e`). Its responses, usage and per-expert/chunk read counts matched
+across the same five requests. Median selection-to-read latency was:
+
+| Execution shape | Sleeping reader rank 0 / 1, us | Polling reader rank 0 / 1, us |
+|---|---:|---:|
+| Four-row graph decode miss | 146.85 / 198.51 | 43.34 / 42.91 |
+| Small host prefill tails | 316.28 / 398.74 | 42.20 / 39.86 |
+| Larger host prefill | 248.58 / 296.53 | 127.15 / 136.93 |
+
+The measured request decode durations improved by about 0.6–1.5%; prefill
+changes were mixed and below 1%. Removing a handoff delay helps, but it is
+only one component of complete serving time.
+
+Both ready-reader modes keep one thread runnable during the active window:
+Linux CPU accounting still reports it as running, and it occupies a scheduling
+slot. WFET avoids the tight instruction polling and can reduce power; power
+savings have not been measured here. The default remains the ordinary sleeping
+reader unless a nonzero ready-worker mode is selected. Early demand must also
+be enabled for the engine to arm the reader.
+
+A final same-binary comparison used mode 1 versus mode 2 on both Sparks
+(SHA256 `80fff51f4811f122d0ccd8586b8acc85d6d49b247fb30b101fa1085af12c7b6c`).
+Both machines advertised timed-wait support. Median graph decode
+selection-to-read latency was 43.31 / 44.59 us with polling and
+44.48 / 44.93 us with WFET (501 observations per rank). Small prefill-tail
+medians were 41.27 / 41.16 us versus 39.07 / 32.29 us; larger-prefill medians
+were 137.34 / 130.03 us versus 127.41 / 124.16 us. Responses, usage and
+per-expert/chunk read counts matched, again with 318,168 records per rank
+and zero process swap. WFET therefore retained the fast handoff in this
+capture. It did not establish a serving speed advantage over polling:
+measured decode durations differed by about 1–1.5% in either direction,
+while prefill varied more. No power measurement was taken.
+
+The deployed setting is early demand enabled with
+`DGPP_EXPERT_READY_WORKER=2`, using the existing port, authentication and
+cache budget. Focused validation passed 30 cache tests, 10 read-queue tests,
+the B12x supplied-route GPU test, and seven analyzer tests. All 10 read-queue
+tests also passed on Spark with WFET selected. The first profiler startup
+attempt for the final pair was refused by the existing memory-headroom guard
+before requests ran; restarting with the same configuration succeeded.
+
+## Remaining scope
+
+This change does not move routing above its attention/normalization inputs or
+predict experts. It also does not add staging reservations, preallocated batch
+tickets, or a batched queue-submission API. Existing staging bounds already
+permit the bounded first wave; the measurements first pointed to worker wake-up
+rather than proving an allocation or descriptor bottleneck. It does not remove
+all service-stream completion fences, change expert arithmetic, or replace
+the engine's other CPU/GPU waits with WFET.

@@ -80,6 +80,11 @@ class ExpertReadQueue {
   // index; callers consume the result with wait(). Tickets must belong here.
   size_t wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const;
   ReadQueueStats stats() const;
+  // While armed, worker 0 stays runnable for queued reads (one CPU core).
+  // DGPP_EXPERT_READY_WORKER=2 uses bounded ARM WFET when supported;
+  // otherwise it polls. Linux accounts either mode as running CPU time.
+  // Disarm on both normal and exceptional exits from the demand window.
+  void set_demand_window(bool active);
   // Stops new work, cancels queued/blocked work and joins active file reads.
   // Completed leases remain valid afterward, without freeing their staging.
   void shutdown();

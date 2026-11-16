@@ -30,7 +30,7 @@ def summarize(values):
                 min_us=values[0]/1000, max_us=values[-1]/1000)
 
 
-def analyze(database, read_paths, windows, expected_workers=None):
+def analyze(database, read_paths, windows, expected_workers=None, reuse_graph_routes=False):
     c = sqlite3.connect(f'file:{database.resolve()}?mode=ro', uri=True)
     epoch, = c.execute('SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME').fetchone()
     identity = []
@@ -128,17 +128,23 @@ def analyze(database, read_paths, windows, expected_workers=None):
                      r['gate']['start'] <= s['start'] and s['end'] <= r['gate']['end'] and s['tokens']==r['tokens']]
             if len(service)>1:
                 raise ValueError('ambiguous service router in demand gate')
-            if not service:
-                excluded['graph_gate_without_service_router'] += 1
-                continue  # Usually a hit; also retain clipped/unmatched gates.
-            s=service[0]
-            service_key=(s['stream'],s['start'])
-            if service_key in paired_services:
-                raise ValueError('service router paired more than once')
-            paired_services.add(service_key)
             r['kind']='decode_graph_miss'
-            r['service_start']=s['start'];r['service_end']=s['end'];r['service_stream']=s['stream']
-            search_start=s['end'];limit=r['gate']['end']
+            if not service:
+                if not reuse_graph_routes:
+                    excluded['graph_gate_without_service_router'] += 1
+                    continue
+                # Supplied-route service intentionally has no second router.
+                # A resident gate has no expert pread within its short span.
+                search_start=r['end'];limit=r['gate']['end']
+                r['reused_graph_routes']=True
+            else:
+                s=service[0]
+                service_key=(s['stream'],s['start'])
+                if service_key in paired_services:
+                    raise ValueError('service router paired more than once')
+                paired_services.add(service_key)
+                r['service_start']=s['start'];r['service_end']=s['end'];r['service_stream']=s['stream']
+                search_start=s['end'];limit=r['gate']['end']
         elif any(g['gate']['start']<=r['start']<g['gate']['end'] and g['stream']!=r['stream'] for g in gates):
             continue  # Count graph+service as one demand, not two.
         else:
@@ -208,10 +214,11 @@ def main():
     p.add_argument('--sqlite',type=Path,required=True)
     p.add_argument('--reads',type=Path,nargs='+',required=True)
     p.add_argument('--windows',type=Path)
+    p.add_argument('--reuse-graph-routes',action='store_true',help='Service uses mailbox routes without a second router')
     p.add_argument('--io-workers',type=int,default=8,help='Expected expert read worker count; reject ambiguous thread attribution')
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args()
-    result=analyze(a.sqlite,a.reads,json.loads(a.windows.read_text()) if a.windows else [], a.io_workers)
+    result=analyze(a.sqlite,a.reads,json.loads(a.windows.read_text()) if a.windows else [], a.io_workers, a.reuse_graph_routes)
     a.output.write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps({k:v for k,v in result.items() if k!='observations'},indent=2))
 

@@ -119,10 +119,17 @@ class GlmMoeLayer {
   // waves, existing complete-expert kernels and the same final ordered sum.
   // cache_experts maps this layer's route IDs to the global cache population.
   // No CUDA graph capture; the cache must own this exact execution stream.
+  // Reuse only this executor's captured GPU routes while its demand gate
+  // holds the main stream. Host diagnostics expose IDs but no host weights.
+  struct ReadyRoutes {
+    std::span<const int32_t> ids;
+    const int32_t* device_ids;
+    const float* device_weights;
+  };
   void enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
                      expert::ExpertCache& cache, std::span<const size_t> cache_experts,
                      cudaStream_t stream, MoeExpertKernel kernel = MoeExpertKernel::kGemv,
-                     MoeTraceStaging* trace = nullptr);
+                     MoeTraceStaging* trace = nullptr, const ReadyRoutes* ready = nullptr);
   // Capturable resident path. A missing binding publishes a demand mailbox;
   // the engine services it on a separate stream before the GPU continues.
   void enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
@@ -177,6 +184,7 @@ class GlmMoeLayer {
   // (top_k + 1)) and the router weights of the most recent decode enqueue,
   // for a consumer that folds the accumulation itself (accumulate = false).
   const float* decode_slot_down() const { return d_slot_down_; }
+  const int32_t* decode_ids() const { return d_ids_; }
   const float* decode_weights() const { return d_weights_; }
 
   // The Mixed346 contract's expert-input codes (cfg.routed_int8_activations;
@@ -266,7 +274,7 @@ class GlmMoeLayer {
   // enqueue()/enqueue_f32(): exactly one of out_bf16 / out_f32 is set.
   void enqueue_host(const uint16_t* hidden, uint16_t* out_bf16, float* out_f32,
                     int tokens, cudaStream_t stream, MoeExpertKernel kernel,
-                    expert::ExpertCache* cache = nullptr, std::span<const size_t> cache_experts = {});
+                    expert::ExpertCache* cache = nullptr, std::span<const size_t> cache_experts = {}, const ReadyRoutes* ready = nullptr);
   void accumulate_grouped(uint16_t* out_bf16, float* out_f32, int shared_row0, int tokens,
                           cudaStream_t stream);
   // enqueue_decode / enqueue_decode_f32: exactly one of out_bf16 (the

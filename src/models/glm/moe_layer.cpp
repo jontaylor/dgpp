@@ -632,7 +632,7 @@ void GlmMoeLayer::enqueue_f32(const uint16_t* hidden, float* out, int tokens,
 
 void GlmMoeLayer::enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
     expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-    cudaStream_t stream, MoeExpertKernel kernel, MoeTraceStaging* trace) {
+    cudaStream_t stream, MoeExpertKernel kernel, MoeTraceStaging* trace, const ReadyRoutes* ready) {
   cudaStreamCaptureStatus capture;
   DGPP_CUDA_OK(cudaStreamIsCapturing(stream, &capture));
   if (capture != cudaStreamCaptureStatusNone)
@@ -654,14 +654,14 @@ void GlmMoeLayer::enqueue_paged(const uint16_t* hidden, uint16_t* out, int token
     if (key.expert != e || key.layer != first.layer || key.draft != first.draft)
       throw std::invalid_argument("GlmMoeLayer: cache mapping mixes layers or expert IDs");
   }
-  enqueue_host(hidden, out, nullptr, tokens, stream, kernel, &cache, cache_experts);
+  enqueue_host(hidden, out, nullptr, tokens, stream, kernel, &cache, cache_experts, ready);
   copy_route_trace(trace, tokens, stream);
 }
 
 void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
                                float* out_f32, int tokens, cudaStream_t stream,
                                MoeExpertKernel kernel, expert::ExpertCache* cache,
-                               std::span<const size_t> cache_experts) {
+                               std::span<const size_t> cache_experts, const ReadyRoutes* ready) {
   step_timing::Scope tick(step_timing::kMoe);
   if (tokens <= 0) return;
   if (tokens > max_tokens_)
@@ -677,28 +677,44 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   // of IDs and weights consistent with the diagnostic enqueue contract.
   // Paging provisions the same replay-safe router counters as resident
   // decode. Use its fused dot/selection kernel before the host decision.
-  route(hidden, tokens, stream, cache && tokens <= decode_slots_ ? d_router_counters_ : nullptr);
   const size_t tk = static_cast<size_t>(tokens) * K;
-  DGPP_CUDA_OK(cudaMemcpyAsync(h_ids_pinned_, d_ids_, tk * 4,
-                               cudaMemcpyDeviceToHost, stream));
-  DGPP_CUDA_OK(cudaMemcpyAsync(h_weights_pinned_, d_weights_, tk * 4,
-                               cudaMemcpyDeviceToHost, stream));
-  if (!cache) {
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_biased_pinned_, d_biased_,
-                                 static_cast<size_t>(tokens) * E * 4,
-                                 cudaMemcpyDeviceToHost, stream));
-  }
-  {
-    step_timing::Scope sync_tick(step_timing::kMoeSync);
-    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
-  }
-  h_ids_.assign(h_ids_pinned_, h_ids_pinned_ + tk);
-  h_weights_.assign(h_weights_pinned_, h_weights_pinned_ + tk);
-  if (!cache) {
-    h_biased_.assign(h_biased_pinned_,
-                     h_biased_pinned_ + static_cast<size_t>(tokens) * E);
+  if (ready) {
+    if (!cache || !cache->packed_nvfp4() || !sm12x_moe_ || tokens > decode_slots_ ||
+        ready->ids.size() != tk || ready->device_ids != d_ids_ || ready->device_weights != d_weights_)
+      throw std::invalid_argument("GlmMoeLayer: supplied routes must belong to this paused graph executor");
+    for (const auto id : ready->ids)
+      if (id < 0 || id >= E) throw std::out_of_range("GlmMoeLayer: supplied route ID");
+    h_ids_.assign(ready->ids.begin(), ready->ids.end());
+    h_weights_.clear(); h_biased_.clear();
   } else {
-    h_biased_.clear();
+    expert::DemandReadWindow demand_window(cache);
+    route(hidden, tokens, stream, cache && tokens <= decode_slots_ ? d_router_counters_ : nullptr);
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_ids_pinned_, d_ids_, tk * 4,
+                                 cudaMemcpyDeviceToHost, stream));
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_weights_pinned_, d_weights_, tk * 4,
+                                 cudaMemcpyDeviceToHost, stream));
+    if (!cache) {
+      DGPP_CUDA_OK(cudaMemcpyAsync(h_biased_pinned_, d_biased_,
+                                   static_cast<size_t>(tokens) * E * 4,
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+    {
+      step_timing::Scope sync_tick(step_timing::kMoeSync);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    }
+    // Exact IDs are available now. Start I/O before host copies, counts,
+    // history, segment construction, binding preparation or shared kernels.
+    if (cache && expert::early_demand_enabled())
+      (void)cache->prime_demand({h_ids_pinned_, tk}, cache_experts);
+    demand_window.end();
+    h_ids_.assign(h_ids_pinned_, h_ids_pinned_ + tk);
+    h_weights_.assign(h_weights_pinned_, h_weights_pinned_ + tk);
+    if (!cache) {
+      h_biased_.assign(h_biased_pinned_,
+                       h_biased_pinned_ + static_cast<size_t>(tokens) * E);
+    } else {
+      h_biased_.clear();
+    }
   }
 
   const int shared_row0 = shared ? static_cast<int>(tk) : -1;

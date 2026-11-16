@@ -80,6 +80,14 @@ class WindowTests(unittest.TestCase):
         row=w.analyze(db,[p],[])['observations'][0]
         self.assertEqual(row['input_to_router_start_ns'],10)
 
+    def test_supplied_routes_need_no_service_router(self):
+        db,p=self.fixture([(100,110,1,'mhc_dots_kernel',4),(120,140,1,'moe_router_dots_kernel',4),
+          (150,500,1,'demand_kernel',4)],[(180,7)])
+        rows=w.analyze(db,[p],[],reuse_graph_routes=True)['observations']
+        self.assertEqual(len(rows),1)
+        self.assertTrue(rows[0]['reused_graph_routes'])
+        self.assertEqual(rows[0]['selection_to_read_ns'],45)
+
     def test_worker_count_disagreement_rejected(self):
         db,p=self.fixture([(100,110,1,'rmsnorm_kernel',128),(120,140,1,'moe_router_dots_kernel',128)],[(300,3)])
         with self.assertRaises(ValueError):w.analyze(db,[p],[],expected_workers=8)

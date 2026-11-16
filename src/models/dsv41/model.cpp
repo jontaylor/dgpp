@@ -39,6 +39,8 @@ struct Dsv41Model::PagedGraphs {
     float *pre = nullptr, *pre_next = nullptr;
     std::vector<const uint16_t*> inputs;
     std::vector<uint16_t*> outputs;
+    const int32_t* route_ids = nullptr;
+    const float* route_weights = nullptr;
   };
   std::map<std::array<uint64_t, 7>, Graph> graphs;
   cudaStream_t service = nullptr;
@@ -1778,6 +1780,8 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     auto& p = *paged_graphs_;
     p.capturing->inputs[layer] = x_;
     p.capturing->outputs[layer] = ffn_out;
+    p.capturing->route_ids = moe_->decode_ids();
+    p.capturing->route_weights = moe_->decode_weights();
     moe_->enqueue_paged_device(x_, ffn_out, T, p.tables + layer * PagedGraphs::words,
                               p.demands + layer, stream_);
   } else if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
@@ -1904,21 +1908,29 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   bool launched = false;
   try {
     if (boundary_) boundary_->graph_segment_arm(g.variant);
+    expert::DemandReadWindow demand_window(expert_cache_.get());
     DGPP_CUDA_OK(cudaGraphLaunch(g.exec, stream_)); launched = true;
     DGPP_CUDA_OK(cudaEventRecord(p.done, stream_));
     for (;;) {
       for (int l = accounted; l < p.layers; ++l) {
         auto& demand = p.demands[l];
         if (__atomic_load_n(&demand.request, __ATOMIC_ACQUIRE) != 1) continue;
+        const auto bytes_before = p.layer_stamps ? expert_cache_->stats().demand_bytes : 0;
+        const auto reads_before = p.layer_stamps ? expert_cache_->read_stats().completed : 0;
+        const auto selected = std::span<const int32_t>(demand.ids, T * cfg_.num_experts_per_tok);
+        const bool early = expert::early_demand_enabled();
+        // The acquire-load above observes exact graph routes. Queue the first
+        // known misses before accounting prior layers or rebinding the MoE.
+        // This does not change residency; mutation still happens at the gate.
+        if (early) (void)expert_cache_->prime_demand(selected, expert_cache_map_[l]);
         account(l);
         // Reuse the existing exact miss path, including bounded waves,
         // admissions and shared-expert overlap. The paused GPU skips its
         // own expert output when this service has supplied it.
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
-        const auto bytes_before = p.layer_stamps ? expert_cache_->stats().demand_bytes : 0;
-        const auto reads_before = p.layer_stamps ? expert_cache_->read_stats().completed : 0;
+        const GlmMoeLayer::ReadyRoutes ready{selected, g.route_ids, g.route_weights};
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
-                            p.service, MoeExpertKernel::kGemv);
+                            p.service, MoeExpertKernel::kGemv, nullptr, early ? &ready : nullptr);
         DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
         if (p.layer_stamps) {
           layer_bytes[l] = expert_cache_->stats().demand_bytes - bytes_before;
@@ -1934,6 +1946,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       if (status != cudaErrorNotReady) DGPP_CUDA_OK(status);
       std::this_thread::yield();
     }
+    demand_window.end();
     if (boundary_) boundary_->graph_segment_finish();
     account(p.layers);
     expert_cache_->set_execution_context(stream_);

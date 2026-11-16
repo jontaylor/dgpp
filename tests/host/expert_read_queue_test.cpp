@@ -132,6 +132,48 @@ DGPP_TEST(expert_read_queue_coalesces_concurrent_consumers_without_duplicate_rea
   require(queue.staging_spans().size() == 2, "engine can register preallocated aligned spans");
 }
 
+DGPP_TEST(expert_read_queue_demand_window_reads_coalesce_and_disarm) {
+  Fixture f;
+  auto cfg = f.config();
+  cfg.buffers = cfg.workers = 2;
+  cfg.staging_budget_bytes *= 2;
+  ExpertReadQueue queue(f.store, cfg);
+  // Exercise wakeup from idle, repeated arming, and normal CV reads after disarm.
+  for (size_t record = 0; record < 8; ++record) {
+    const auto start = std::chrono::steady_clock::now();
+    queue.set_demand_window(true);
+    queue.set_demand_window(true);
+    require(std::chrono::steady_clock::now() - start < 1s, "arming is bounded");
+    std::this_thread::sleep_for(2ms);
+    auto ticket = queue.request(record);
+    auto joined = queue.request(record);
+    require(ticket == joined, "armed reader preserves coalescing");
+    const auto lease = ready(ticket);
+    require(!lease->bytes().empty() && lease->bytes()[0] == 77, "armed reader returns record bytes");
+    queue.set_demand_window(false);
+    queue.set_demand_window(false);
+  }
+  eventually([&] { return queue.stats().staging_in_use == 0; });
+  (void)ready(queue.request(0));
+  require(queue.stats().completed == 9 && queue.stats().coalesced == 8 &&
+              queue.stats().pending == 0 && f.store->stats().calls == 9,
+          "armed and disarmed reads retain normal accounting");
+}
+
+DGPP_TEST(expert_read_queue_demand_window_empty_shutdown_is_bounded) {
+  Fixture f;
+  ExpertReadQueue queue(f.store, f.config());
+  // Leave the window armed and empty so shutdown must interrupt the poll.
+  queue.set_demand_window(true);
+  std::this_thread::sleep_for(10ms);
+  require(f.store->stats().calls == 0, "arming alone does not issue reads");
+  const auto start = std::chrono::steady_clock::now();
+  queue.shutdown();
+  require(std::chrono::steady_clock::now() - start < 1s, "shutdown interrupts an armed empty reader");
+  queue.shutdown();
+  require(queue.stats().pending == 0 && queue.stats().active == 0, "empty shutdown stays drained");
+}
+
 DGPP_TEST(expert_read_queue_lease_backpressure_never_reuses_live_staging) {
   Fixture f;
   ExpertReadQueue queue(f.store, f.config(2));
@@ -161,6 +203,7 @@ DGPP_TEST(expert_read_queue_lease_backpressure_never_reuses_live_staging) {
 DGPP_TEST(expert_read_queue_demand_promotes_and_displaces_queued_prefetch) {
   Fixture f;
   ExpertReadQueue queue(f.store, f.config(3));
+  queue.set_demand_window(true);
   auto first = queue.request(0);
   auto held = ready(first);
   auto active = queue.request(1, ReadPriority::kPrefetch);
@@ -194,6 +237,7 @@ DGPP_TEST(expert_read_queue_shutdown_cancels_waiting_work_without_invalidating_c
   std::shared_ptr<ReadTicket> blocked, queued;
   {
     ExpertReadQueue queue(f.store, f.config());
+    queue.set_demand_window(true);
     auto first = queue.request(0);
     survivor = ready(first);
     blocked = queue.request(1);

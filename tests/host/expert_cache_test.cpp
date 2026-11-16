@@ -822,6 +822,38 @@ DGPP_TEST(expert_cache_demand_lookahead_is_bounded_under_pressure) {
   }
 }
 
+DGPP_TEST(expert_cache_prime_demand_preserves_policy_and_reuses_reads) {
+  for (auto policy : {Policy::kWholeExpert, Policy::kAdaptiveFractional}) {
+    Fixture f;
+    auto cfg = f.config(policy);
+    const auto record_bytes = cfg.reads.staging_budget_bytes / cfg.reads.buffers;
+    cfg.planner.minimum_fraction = 0;
+    cfg.planner.budget_bytes += (16-cfg.reads.buffers)*record_bytes;
+    cfg.reads.buffers = cfg.reads.max_pending = 16;
+    cfg.reads.staging_budget_bytes = 16*record_bytes;
+    ExpertCache cache(f.store, cfg, host(f));
+    cache.initialize();
+    const auto before = cache.residency().chunks;
+    const auto observations = cache.observations();
+    const std::array<size_t,2> mapping{0,1};
+    const std::array<int32_t,4> ids{1,0,1,0};
+    const auto accepted_before = cache.read_stats().accepted;
+    const size_t expected = cache.experts()[0].records.size()-before[0] +
+                            cache.experts()[1].records.size()-before[1];
+    require(expected > 0 && cache.prime_demand(ids,mapping) == expected,
+            "deduplicated first wave queues only missing chunks, including fractional experts");
+    require(cache.prime_demand(ids,mapping) == 0, "repeat submission shares existing tickets");
+    require(cache.observations() == observations && cache.residency().chunks == before,
+            "early I/O neither observes nor admits experts");
+    require(cache.read_stats().speculative_bytes == 0, "exact early reads have demand priority");
+    { auto lease = cache.acquire(0); check_bytes(lease,f); }
+    require(cache.read_stats().accepted == accepted_before+expected, "execution reuses early records");
+    require(cache.read_stats().staging_peak <= cfg.reads.staging_budget_bytes, "same staging budget");
+    const std::array<int32_t,1> invalid{-1};
+    refuses([&] { cache.prime_demand(invalid,mapping); });
+  }
+}
+
 int main() { return dgpp::test::run_all(); }
 
 DGPP_TEST(expert_cache_demand_io_overlaps_current_chunk_completion_with_two_buffers) {

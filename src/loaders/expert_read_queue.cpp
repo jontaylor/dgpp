@@ -12,9 +12,58 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#endif
 
 namespace dgpp::expert {
 namespace {
+bool timed_reader_wait_available() {
+#if defined(__aarch64__) && defined(__linux__)
+  constexpr unsigned long wfxt = 1UL << 31;
+  const char* mode = std::getenv("DGPP_EXPERT_READY_WORKER");
+  return mode && std::atoi(mode) == 2 && (getauxval(AT_HWCAP2) & wfxt);
+#else
+  return false;
+#endif
+}
+
+// CPU publication invalidates the waiter's exclusive monitor. A bounded wait
+// also guarantees progress if an event is missed; callers always recheck state.
+void reader_wait_change(uint32_t* sequence, uint32_t previous) {
+#if defined(__aarch64__) && defined(__linux__)
+  uint64_t now, frequency;
+  __asm__ __volatile__("isb\n\tmrs %0, cntvct_el0" : "=r"(now) :: "memory");
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(frequency));
+  const uint64_t deadline = now + std::max<uint64_t>(1, frequency / 1000);
+  uint32_t changed;
+  __asm__ __volatile__("mov x9, %[deadline]\n\t"
+                       "sevl\n\twfe\n\t"
+                       "ldxr %w[changed], %[sequence]\n\t"
+                       "eor %w[changed], %w[changed], %w[previous]\n\t"
+                       "cbnz %w[changed], 1f\n\t"
+                       ".inst 0xd5031009\n\t"  // wfet x9; runtime HWCAP gated
+                       "1:\n\tclrex"
+                       : [changed] "=&r"(changed), [sequence] "+Q"(*sequence)
+                       : [previous] "r"(previous), [deadline] "r"(deadline)
+                       : "x9", "memory");
+  (void)changed;
+#else
+  (void)sequence;
+  (void)previous;
+#endif
+}
+
+void reader_pause() {
+#if defined(__i386__) || defined(__x86_64__)
+  __asm__ __volatile__("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#else
+  std::this_thread::yield();
+#endif
+}
+
 bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout) {
   for (const auto* matrix : {&layout.gate, &layout.up, &layout.down}) {
     if (matrix->scales_offset > data.size() || matrix->scales_bytes > data.size() - matrix->scales_offset)
@@ -77,6 +126,13 @@ struct ReadQueueImpl {
   std::mutex shutdown_mutex;
   std::condition_variable work, completed;
   std::atomic<bool> stopping{false};
+  std::atomic<bool> demand_window_active{false};
+  // Writers hold mutex; the proactive reader polls without taking it.
+  std::atomic<size_t> queued{0};
+  // Keep unrelated counters off the monitored cache line. Only GNU atomic
+  // operations and the exclusive-load wait above access this word.
+  alignas(128) uint32_t wake_sequence = 0;
+  alignas(128) const bool timed_reader_wait = timed_reader_wait_available();
   std::deque<std::shared_ptr<Job>> demand, prefetch;
   std::unordered_map<size_t, std::weak_ptr<Job>> jobs;
   std::unordered_map<size_t, std::weak_ptr<ReadTicket>> tickets;
@@ -107,7 +163,7 @@ struct ReadQueueImpl {
     }
     workers.reserve(cfg.workers);
     try {
-      for (size_t i = 0; i < cfg.workers; ++i) workers.emplace_back([this] { run(); });
+      for (size_t i = 0; i < cfg.workers; ++i) workers.emplace_back([this, i] { run(i); });
     } catch (...) {
       shutdown();
       throw;
@@ -127,6 +183,7 @@ struct ReadQueueImpl {
     jobs.erase(job->record);
   }
   void cancel_queued_locked(const std::shared_ptr<Job>& job) {
+    --queued;
     retire_locked(job);
     tickets.erase(job->record);
     ++counters.cancelled;
@@ -184,6 +241,8 @@ struct ReadQueueImpl {
       throw;
     }
     ++counters.accepted;
+    ++queued;
+    __atomic_add_fetch(&wake_sequence, 1u, __ATOMIC_RELEASE);
     ++counters.pending;
     if (priority == ReadPriority::kPrefetch) counters.speculative_bytes += size;
     work.notify_one();
@@ -203,16 +262,43 @@ struct ReadQueueImpl {
     lease->active_ = true;
     return lease;
   }
-  void run() {
+  void set_demand_window(bool active) {
+    {
+      std::lock_guard lock(mutex);
+      demand_window_active.store(active);
+      __atomic_add_fetch(&wake_sequence, 1u, __ATOMIC_RELEASE);
+    }
+    if (active) work.notify_all();
+  }
+  void run(size_t index) {
     for (;;) {
+      if (index == 0) {
+        while (demand_window_active.load() && !stopping.load() && queued.load() == 0) {
+          if (timed_reader_wait) {
+            const uint32_t previous = __atomic_load_n(&wake_sequence, __ATOMIC_ACQUIRE);
+            if (demand_window_active.load() && !stopping.load() && queued.load() == 0)
+              reader_wait_change(&wake_sequence, previous);
+          } else {
+            reader_pause();
+          }
+        }
+      }
+      if (stopping.load()) return;
       std::shared_ptr<Job> job;
       {
         std::unique_lock lock(mutex);
-        work.wait(lock, [&] { return stopping || !demand.empty() || !prefetch.empty(); });
+        work.wait(lock, [&] {
+          return stopping || !demand.empty() || !prefetch.empty() ||
+                 (index == 0 && demand_window_active.load());
+        });
         if (stopping) return;
+        // Arming an empty queue wakes worker 0 into the lock-free poll.
+        // Another worker may also have taken the work observed by the poll.
+        if (demand.empty() && prefetch.empty()) continue;
         auto& queue = demand.empty() ? prefetch : demand;
         job = std::move(queue.front());
         queue.pop_front();
+        --queued;
         job->started = true;
         ++counters.active;
       }
@@ -259,6 +345,8 @@ struct ReadQueueImpl {
         for (const auto& job : prefetch) cancel_queued_locked(job);
         demand.clear();
         prefetch.clear();
+        queued.store(0);
+        __atomic_add_fetch(&wake_sequence, 1u, __ATOMIC_RELEASE);
       }
     }
     work.notify_all();
@@ -291,6 +379,7 @@ size_t ExpertReadQueue::wait_any(std::span<const std::shared_ptr<ReadTicket>> ti
   return ready;
 }
 ReadQueueStats ExpertReadQueue::stats() const { return impl_->stats(); }
+void ExpertReadQueue::set_demand_window(bool active) { impl_->set_demand_window(active); }
 void ExpertReadQueue::shutdown() { impl_->shutdown(); }
 std::vector<std::span<uint8_t>> ExpertReadQueue::staging_spans() const {
   std::vector<std::span<uint8_t>> result;

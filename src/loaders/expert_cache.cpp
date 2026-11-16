@@ -1,6 +1,7 @@
 #include "loaders/expert_cache.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -1102,6 +1103,47 @@ size_t ExpertCache::prefetch(size_t expert) {
     if (!ticket) break;
     s.prefetched.emplace(record, ExpertCacheState::QueuedRead{std::move(ticket), {}});
     ++accepted;
+  }
+  return accepted;
+}
+bool early_demand_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_EXPERT_EARLY_DEMAND");
+    return !value || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+bool ready_worker_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_EXPERT_READY_WORKER");
+    return value && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+void ExpertCache::set_demand_window(bool active) noexcept {
+  state_->reads->set_demand_window(active);
+}
+size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping) {
+  auto& s = *state_;
+  s.check();
+  std::array<bool,384> selected{};
+  if (mapping.size() > selected.size()) return 0;
+  for (const auto id : ids) {
+    if (id < 0 || static_cast<size_t>(id) >= mapping.size())
+      throw std::out_of_range("expert cache: early route ID");
+    selected[id] = true;
+  }
+  size_t accepted = 0, issued_experts = 0;
+  for (size_t id = 0; id < mapping.size() && issued_experts < 2; ++id) {
+    if (!selected[id]) continue;
+    const auto e = mapping[id];
+    s.expert_index(e);
+    if (s.planner->current().chunks[e] == s.experts[e].records.size()) continue;
+    const size_t count = lookahead_demand(e);
+    accepted += count;
+    if (count) ++issued_experts;
+    if (s.prefetched.size() + s.pending_copies.size() + s.direct_staging_count() >= s.config.reads.buffers / 2)
+      break;
   }
   return accepted;
 }

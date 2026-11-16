@@ -3513,14 +3513,19 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
           publish();
         }
         *demand={};
-        if (pass==1) DGPP_CUDA_OK(cudaMemsetAsync(table,0,E*6*sizeof(uint64_t),stream));
+        if (pass==1 || pass==3) DGPP_CUDA_OK(cudaMemsetAsync(table,0,E*6*sizeof(uint64_t),stream));
         hot.set_execution_context(service);
         DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
         DGPP_CUDA_OK(cudaEventRecord(done,stream));
         for (;;) {
           if (__atomic_load_n(&demand->request,__ATOMIC_ACQUIRE)==1) {
-            auto& selected_cache = pass==1 ? *cold : hot;
-            layer.enqueue_paged(c.d_hidden,c.d_out,6,selected_cache,mapping,service);
+            auto& selected_cache = (pass==1 || pass==3) ? *cold : hot;
+            const auto ids=std::span<const int32_t>(demand->ids,6*6);
+            selected_cache.prime_demand(ids,mapping);
+            const dgpp::GlmMoeLayer::ReadyRoutes ready{ids,layer.decode_ids(),layer.decode_weights()};
+            layer.enqueue_paged(c.d_hidden,c.d_out,6,selected_cache,mapping,service,
+                                dgpp::MoeExpertKernel::kGemv,nullptr,&ready);
+            require(layer.last_weights().empty(),"supplied routes clear stale host weight diagnostics");
             DGPP_CUDA_OK(cudaStreamSynchronize(service));
             publish();
             __atomic_store_n(&demand->request,2u,__ATOMIC_RELEASE);
@@ -3533,7 +3538,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
         std::memcpy(got.data(),c.d_out,got.size()*2);
         require(got==expected,"GPU resident/miss graph and CPU path are bitwise identical");
         if (pass==0 || pass==2) require(!demand->serviced,"resident graph needs no host service");
-        if (pass==1) require(demand->serviced,"missing binding takes the exact service path");
+        if (pass==1 || pass==3) require(demand->serviced,"missing/changed routes take the supplied-route service path");
         if (pass==1) require(cold->telemetry().file.calls > 0,"GPU demand service performs actual cold reads");
       }
       // Restore the fixture's original inputs and reference for later cases.
