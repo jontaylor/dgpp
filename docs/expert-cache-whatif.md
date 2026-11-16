@@ -198,3 +198,110 @@ Run the resource/causality checks with:
 ```bash
 python3 tests/python/expert_cache_whatif_test.py
 ```
+
+## Fitting score weights without future-route features
+
+`scripts/expert_cache_fit.py` fits a finite coefficient grid on an initial
+request prefix, freezes the selection, then evaluates later requests. Run:
+
+```bash
+python3 scripts/expert_cache_fit.py \
+  --demand DEMAND.bin --reads READS.bin --disk-samples DISK.jsonl \
+  --windows WINDOWS.json --train-requests 2 --workers 4 --output FIT_DIRECTORY
+```
+
+Use a fresh output directory. The fitter requires NumPy and multiprocessing
+fork support; its worker processes run locally and do not use the Sparks.
+`plan.json` records input/source hashes, the split, complete search grids and
+selection rule before any candidates are scored. Progress, frozen selections
+and the final report are separate artifacts. All remain untracked.
+
+The retention grid has eighteen combinations:
+
+| Factor | Tested coefficients |
+| --- | --- |
+| Deadline discount | 0, 0.25, 1 |
+| Memory holding rent | 0, 0.0001, 0.001 |
+| Replacement margin | 0, 0.05 ms |
+
+`--deadline-weight` multiplies only the within-cycle exponent:
+`exp(-deadline_weight * time_to_layer / cycle_time)`. The three-visit reward
+multiplier stays fixed, so reducing the deadline penalty does not also change
+the common reward scale. Its default of one preserves the initial replay;
+zero is a valid fitted outcome, not an invalid special case.
+
+Each retention combination is also tested against all eight prefetch settings:
+I/O price 0/0.1, staging rent 0/0.001, and one/four speculative expert slots.
+This is a joint grid of 144 configurations, rather than assuming the best
+retention-only coefficients must also be best with prefetch. The persistent
+capacity, physical staging limit and demand reserve remain fixed. LRU is an
+additional control. Predictors still learn only from observations already
+processed; future actual routes are outcomes for fitting, never policy inputs.
+
+There is no unique ideal weighting without an objective. This first fitter
+keeps prefill and decode separate: a recommended candidate cannot increase
+training misses in either phase relative to LRU. It minimizes the worst phase
+miss ratio, then the sum of those ratios, then total logical read bytes. Joint
+selection permits up to ten percent more I/O per phase by default, controlled
+by `--io-headroom`. Zero-miss controls cannot acquire new misses. Exact ties
+prefer no speculation. If nothing qualifies, the recommendation is the
+control, not a forced new score. The report also identifies and evaluates the
+best tested points *within* the proposed family, even when they are dominated
+and therefore not recommended.
+
+Both coefficients and the recommendation are frozen before later-request
+evaluation. Full replay starts again from the captured initial state, reaches
+the same prefix boundary, then continues into the suffix with coefficients
+fixed and causal histories still adapting. Service is advanced to the exact
+split before phase counters are snapshotted. Report suffix deltas separately
+from complete-trace totals; never select coefficients from those suffix results.
+
+This is empirical model selection within a finite family, not an analytic or
+global optimum over all possible weights, predictors and admission rules. The
+coarse grid also does not establish a continuous optimum between its points.
+History half-life, probability estimator, copy delay and bandwidth assumptions
+remain fixed. Misses and logical bytes are objectives/proxies; neither is a
+complete model of exposed latency. No fitted millisecond weights or throughput
+prediction conceal that distinction.
+
+The November 16 fit used the first two requests (7,000 observations) for
+selection and the remaining six (23,660 observations) for evaluation. This
+scripted workload had already been inspected and contains repeated requests;
+the suffix is selection-excluded, not pristine or independently held-out traffic.
+Only rank zero is fitted. A second rank would share routing and would not
+constitute independent workload validation.
+
+None of the eighteen retention settings or 144 joint settings beat LRU in
+training misses for either phase. The control therefore remained recommended.
+The best tested retention point under the declared balanced ranking had zero
+deadline discount, zero holding rent and zero replacement margin. The best
+joint point had zero deadline discount, holding rent 0.0001, zero replacement
+margin, zero I/O/staging prices and one speculative expert slot. These are
+training-selected diagnostic points, not production settings. They show that
+the initial constants were poor, but do not establish that reweighting alone
+fixes the proposed score/admission family.
+
+With those prefix-selected coefficients frozen, the remaining six requests
+produced these demanded-expert misses:
+
+| Policy | Prefill misses | Decode / verification misses |
+| --- | ---: | ---: |
+| Observed deployment | 5,524 | 4,921 |
+| LRU control / fitter recommendation | 5,411 | 5,802 |
+| Original deadline coefficients | 5,376 | 17,294 |
+| Best tested retention coefficients | 6,297 | 6,053 |
+| Best tested joint retention/prefetch coefficients | 6,022 | 6,514 |
+
+The suffix had 59,884 prefill and 397,268 decode expert demands. Reweighting
+removed about 65% of the original score's decode misses, but its prefill
+regression and remaining decode deficit rule it out. The two fitted family
+rows use different retention coefficients, so their difference is not an
+isolated causal effect of enabling prefetch. The observed policy was neither
+fitted nor approximated as LRU. The final fitting/evaluation run took about
+100 seconds on four local CPU workers and did not change serving.
+
+Selection and split-accounting checks:
+
+```bash
+python3 tests/python/expert_cache_fit_test.py
+```

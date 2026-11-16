@@ -184,7 +184,8 @@ class History:
         benefit = self.probability * (self.args.prefill_miss_ms if ev.phase else self.args.decode_miss_ms)
         # Three discounted future visits: rewards recurring experts beyond
         # the next use; time charges memory until the first benefit.
-        reward = benefit*np.exp(-self.tau/self.cycle)*sum(math.exp(-k) for k in range(3))
+        weight = self.args.deadline_weight
+        reward = benefit*np.exp(-weight*self.tau/self.cycle)*sum(math.exp(-k) for k in range(3))
         self.scores = reward-self.args.memory_rent*self.tau
 
 
@@ -492,6 +493,7 @@ def parser():
     p.add_argument('--decode-miss-ms', type=float, default=3.2)
     p.add_argument('--prefill-miss-ms', type=float, default=1.7)
     p.add_argument('--history-half-life', type=float, default=64.)
+    p.add_argument('--deadline-weight', type=float, default=1.)
     p.add_argument('--prior-visits', type=float, default=4.)
     p.add_argument('--shape-min-visits', type=int, default=2)
     p.add_argument('--memory-rent', type=float, default=.001)
@@ -506,7 +508,7 @@ def parser():
 def main():
     p = parser(); args = p.parse_args()
     positive = ('bandwidth_gbs', 'decode_layer_ms', 'prefill_layer_ms', 'history_half_life', 'prior_visits')
-    nonnegative = ('ready_delay_ms', 'decode_miss_ms', 'prefill_miss_ms', 'memory_rent',
+    nonnegative = ('ready_delay_ms', 'decode_miss_ms', 'prefill_miss_ms', 'memory_rent', 'deadline_weight',
                    'staging_rent', 'io_price', 'switch_margin_ms', 'min_layer_sample_ms')
     if any(not math.isfinite(getattr(args, k)) or getattr(args, k) <= 0 for k in positive):
         p.error('bandwidth, layer times, half-life and prior visits must be finite and positive')
