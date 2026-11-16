@@ -151,6 +151,7 @@ class ResidencyPlanner {
   ResidencyPlan current_;
   uint64_t epoch_ = 0;
   uint64_t generation_ = 0;
+  bool equal_full_bytes_ = true;
 };
 
 }  // namespace dgpp::expert
