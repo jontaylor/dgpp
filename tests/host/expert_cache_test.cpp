@@ -97,7 +97,7 @@ struct Fixture {
   std::vector<uint8_t> expected(size_t expert = 0) const { return pack_expert(expert, 128, 128).bytes; }
 };
 struct Control {
-  size_t finishes = 0, retains = 0, staged_assemblies = 0;
+  size_t finishes = 0, retains = 0, staged_assemblies = 0, assembly_batches = 0;
   bool fail_copy = false, fail_finish = false, native = false;
   std::function<void()> before_finish;
 };
@@ -129,6 +129,10 @@ class HostStorage final : public ExpertCacheStorage {
     }
     scatter_chunk(r.layout, host_bytes, id_.hidden, id_.intermediate / id_.world, id_.format,
                   execution(slot), id_.rank * (id_.intermediate / id_.world));
+  }
+  void assemble_many(std::span<const Assembly> ready) override {
+    if (!ready.empty()) ++control_->assembly_batches;
+    ExpertCacheStorage::assemble_many(ready);
   }
   const uint8_t* execution_data(size_t slot) const override {
     require(slot < memory_.execution_slots, "execution pointer bound");
@@ -1009,6 +1013,7 @@ DGPP_TEST(expert_cache_ready_batch_exact_bounded_and_admitted) {
           require(cache.read_stats().completed < 16, "first expert runs before all expert reads finish");
       });
       require(done == selected.size() && callbacks > 1, "independent ready callbacks cover all experts");
+      require(control->assembly_batches > 0, "ready reads use batched assembly");
       require(cache.stats().active_execution_slots == 0, "ready scratch retired");
       require(cache.read_stats().staging_peak <= cache.memory().staging_bytes, "bounded ready staging");
       for (auto e : selected) {

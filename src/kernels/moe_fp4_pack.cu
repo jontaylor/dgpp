@@ -1,6 +1,8 @@
 #include "kernels/moe_fp4_pack.hpp"
 #include "kernels/moe_fp4_layout.cuh"
 
+#include <algorithm>
+#include <array>
 #include <climits>
 #include <stdexcept>
 
@@ -32,8 +34,8 @@ __global__ void copy_globals(float* d0, float* d1, float* d2,
   if (threadIdx.x == 0) { *d0 = *s0; *d1 = *s1; *d2 = *s2; }
 }
 
-__global__ void scatter_expert_chunk(uint8_t* destination, const uint8_t* source,
-                                     ExpertChunkCopyPlan plan) {
+__device__ __forceinline__ void scatter_chunk_bytes(uint8_t* destination, const uint8_t* source,
+                                                   const ExpertChunkCopyPlan& plan) {
   for (uint32_t m = 0; m < plan.count; ++m) {
     const auto& c = plan.copies[m];
     if (blockIdx.x < c.first_block || blockIdx.x - c.first_block >= c.blocks) continue;
@@ -51,6 +53,16 @@ __global__ void scatter_expert_chunk(uint8_t* destination, const uint8_t* source
       *out = *in;
     return;
   }
+}
+
+__global__ void scatter_expert_chunk(uint8_t* destination, const uint8_t* source,
+                                     ExpertChunkCopyPlan plan) {
+  scatter_chunk_bytes(destination, source, plan);
+}
+struct ExpertScatterBatch { ExpertChunkScatter chunks[kExpertScatterBatch]; };
+__global__ void scatter_expert_chunks(const __grid_constant__ ExpertScatterBatch batch) {
+  const auto& chunk = batch.chunks[blockIdx.y];
+  scatter_chunk_bytes(chunk.destination, chunk.source, chunk.plan);
 }
 
 using namespace fp4_layout;
@@ -164,6 +176,44 @@ void launch_expert_chunk_scatter(uint8_t* destination, const uint8_t* source,
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+void launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter> chunks, cudaStream_t stream) {
+  if (chunks.empty()) return;
+  if (chunks.size() > kExpertScatterBatch) throw std::invalid_argument("expert scatter: batch too large");
+  if (chunks.size() == 1) {
+    const auto& c = chunks.front();
+    launch_expert_chunk_scatter(c.destination, c.source, c.plan, stream);
+    return;
+  }
+  ExpertScatterBatch batch{};
+  uint32_t blocks = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    const auto& c = chunks[i];
+    if (!c.destination || !c.source || !c.plan.count || !c.plan.blocks || c.plan.count > 9 ||
+        (reinterpret_cast<uintptr_t>(c.destination) & 15) || (reinterpret_cast<uintptr_t>(c.source) & 15))
+      throw std::invalid_argument("expert scatter: null, unaligned or empty batch entry");
+    batch.chunks[i] = c;
+    blocks = std::max(blocks, c.plan.blocks);
+  }
+  // NVFP4 chunks repeat each projection's scalar global at the same output
+  // address. Keep the final copy, matching sequential assembly without
+  // concurrent stores to the shared scalar. Payload/scales are disjoint.
+  std::array<uintptr_t, kExpertScatterBatch * 9> scalars;
+  size_t scalar_count = 0;
+  for (size_t i = chunks.size(); i-- > 0;) {
+    auto& chunk = batch.chunks[i];
+    for (uint32_t j = 0; j < chunk.plan.count; ++j) {
+      auto& c = chunk.plan.copies[j];
+      if (c.units != 1 || c.unit_bytes != 4) continue;
+      const auto address = reinterpret_cast<uintptr_t>(chunk.destination) + c.destination_offset;
+      if (std::find(scalars.begin(), scalars.begin() + scalar_count, address) != scalars.begin() + scalar_count)
+        c.blocks = 0;
+      else scalars[scalar_count++] = address;
+    }
+  }
+  scatter_expert_chunks<<<dim3(blocks, chunks.size()), kThreads, 0, stream>>>(batch);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 size_t moe_fp4_packed_bytes(int hidden, int intermediate) {
   check_geometry(hidden, intermediate);
   const size_t matrix = static_cast<size_t>(hidden) * intermediate;
@@ -246,6 +296,7 @@ Fp4PackedExpert launch_moe_fp4_expand_scales(Fp4CompactExpert src, uint8_t* scal
 void prepare_moe_fp4_pack() {
   cudaFuncAttributes attributes{};
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunk));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunks));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, compact_scales));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, expand_compact_scales));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, copy_globals));

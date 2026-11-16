@@ -58,6 +58,12 @@ struct CachedExpert {
 // reads/copies/kernels in finish(). The caller owns its execution stream.
 class ExpertCacheStorage {
  public:
+  struct Assembly {
+    size_t execution_slot;
+    const StoreRecord* record;
+    std::optional<size_t> cache_slot;
+    std::span<const uint8_t> host_bytes;
+  };
   virtual ~ExpertCacheStorage() = default;
   virtual const CacheMemory& memory() const = 0;
   virtual void retain(size_t slot, std::span<const uint8_t> bytes) = 0;
@@ -68,6 +74,11 @@ class ExpertCacheStorage {
   virtual uint64_t execution_zero_bytes_per_begin() const { return memory().execution_slot_bytes; }
   virtual void assemble(size_t execution_slot, const StoreRecord& record,
       std::optional<size_t> cache_slot, std::span<const uint8_t> host_bytes) = 0;
+  // Only already-ready records are batched. Source owners retain their leases
+  // until staging_complete() observes the final reader of every source.
+  virtual void assemble_many(std::span<const Assembly> ready) {
+    for (const auto& a : ready) assemble(a.execution_slot, *a.record, a.cache_slot, a.host_bytes);
+  }
   virtual const uint8_t* execution_data(size_t slot) const = 0;
   virtual const uint8_t* packed_execution_data(size_t) {
     throw std::logic_error("packed NVFP4 execution unsupported");

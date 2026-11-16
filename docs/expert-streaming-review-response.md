@@ -700,16 +700,12 @@ scanned when the cache revision changes; this is not a per-expert mutation
 journal. The existing service-stream fence remains because pointer equality
 alone does not establish completion of earlier payload mutations. A standalone
 host regression covers initialization, unchanged bindings, relocation,
-eviction and multiple changed experts. This implementation has no new serving
-performance measurement and is not included in the `f87df92b` throughput rows.
+eviction and multiple changed experts. The focused comparison below validates this implementation separately; it is
+not included in the `f87df92b` throughput rows.
 
-Per-expert batched scatter remains unimplemented. The reconstruction backend
-currently submits each chunk and attaches staging-buffer completion to that
-submission. Combining chunks requires preserving those buffer lifetimes and
-independent completion/readiness; simply postponing their launches could
-release source buffers early or serialize reads behind a complete expert.
-This needs a separate backend change and a focused serving comparison before
-replacing the current streaming path. No speedup is claimed for it here.
+Ready-chunk batched scatter is now implemented and evaluated below. A batch
+contains only already-completed reads; it does not wait for a complete expert
+or wave. Per-buffer fences retain staging until its batched kernel finishes.
 
 Existing cold-prefill device-counter captures are documented in
 [the prefetch opportunity analysis](chunk-direct-execution.md#prefetch-opportunity-live-io-gaps-and-absent-expert-forecasts).
@@ -718,3 +714,77 @@ not a measurement of peak drive bandwidth. Cache capacity alone does not
 predict bytes read, and a high GPU busy fraction does not establish that
 warm speculative verification has reached a performance floor. The MXFP4
 format comparison remains unrun on matched deployments.
+
+### Incremental binding publication: focused serving comparison
+
+A paired diagnostic compares the deployed `f87df92b` binary against the
+`21a30943` implementation on the same two Sparks. Both fresh processes use the
+production engine settings, fixed depth three and publication profiling. Each
+runs one 24,317-token tool request, prose/code/repeated-prose continuations, then
+three uncached 2,209-token tool probes. These are focused diagnostic requests,
+not a replacement for the standard campaign rows in `benchmarks.md`.
+
+| Cumulative publication work | Baseline rank 0 / 1 | Incremental rank 0 / 1 |
+| --- | ---: | ---: |
+| Host binding build | 730.6 / 772.8 ms | 475.9 / 480.2 ms |
+| Transfer and wait | 122.1 / 130.1 ms | 70.1 / 69.7 ms |
+| Binding upload bytes | 4.370 / 4.626 GB | 0.192 / 0.192 GB |
+
+The counters include 737 target passes and 6,606 serviced layer misses per
+rank. Publication-call counts can vary with host service timing; the table
+reports measured cumulative work rather than assuming identical call counts.
+Build and transfer/wait clocks are nested in the full walk clock and must not
+be added to it. The full target walk was 65.43 / 65.70 seconds in the baseline
+and 65.96 / 65.63 seconds in the candidate, so this does not establish a serving
+throughput gain despite the lower publication work.
+
+Cold tool prefill was 39.135 versus 39.107 seconds. The three continuation wall
+times summed to 72.491 versus 72.474 seconds. The final zero-expert-read probe
+was 1.633 versus 1.620 seconds of prefill and 52.92 versus 51.62 decode tokens/s.
+The short decode spans do not establish a regression or improvement. Each
+request read identical expert bytes on both ranks, used identical token counts
+and had identical speculative acceptance. Normalized response choices matched
+in all seven requests; normalization removes generated tool-call IDs only.
+Captured process swap remained zero. Production was restored after the pair.
+
+### Ready-chunk scatter batching: focused serving comparison
+
+`DGPP_EXPERT_BATCH_SCATTER=1` combines up to 32 completed reconstruction chunks
+into one 256-thread-block scatter launch. The kernel uses a second grid axis
+for independent chunk plans. Ready experts still execute independently of
+outstanding reads. Source leases remain owned until each staging event covers
+its last kernel read. Repeated NVFP4 scalar globals retain the final copy in
+submission order, avoiding overlapping stores; payload and scale regions remain
+disjoint. Single-record completions and unsupported backends use the existing
+path. This adds no expert, execution or staging payload allocation.
+
+One binary runs a paired off/on comparison with publication profiling disabled,
+fixed depth three and otherwise unchanged production settings. The workload is
+the same four-request tool sequence and three short recomputations described
+above. The binary SHA-256 is `89105da65cd51d8cf896bf2d136a00e6a37953a3e95dfcf7f2f42a8dfc9b7388`.
+
+| Request | Off prefill / decode | On prefill / decode |
+| --- | ---: | ---: |
+| tool.0 | 39.209 s / 22.97 tok/s | 39.203 s / 23.20 tok/s |
+| tool.1 | 1.838 s / 24.77 tok/s | 1.818 s / 24.99 tok/s |
+| tool.2 | 3.005 s / 28.08 tok/s | 2.940 s / 28.36 tok/s |
+| tool.3 | 0.452 s / 29.52 tok/s | 0.417 s / 30.04 tok/s |
+| -anchor.0 | 8.323 s / 27.99 tok/s | 8.241 s / 27.85 tok/s |
+| -anchor.1 | 2.936 s / 52.88 tok/s | 2.946 s / 52.65 tok/s |
+| -anchor.2 | 1.613 s / 52.32 tok/s | 1.626 s / 52.31 tok/s |
+
+The three continuation wall times total 72.471 seconds off and 71.600 seconds
+on, a 1.20% reduction in this pair. Cold prefill is effectively unchanged;
+the final zero-expert-read probe remains approximately 52.3 decode tokens/s.
+The template selects batching because all three miss-heavy continuations improve
+in this pair, but the gain is small and has not been established across repeated
+campaigns or concurrency levels. These diagnostic timings do not replace the
+older full benchmark rows.
+
+Every request matches normalized response choices (generated tool-call IDs
+removed only), usage, speculative acceptance and expert read bytes on both
+ranks. Both ranks use the recorded binary and captured process swap is zero.
+The 31-test host cache suite and five-test CUDA packing/scatter suite pass on
+Spark-1. CUDA coverage includes mixed mapped/device sources, pitched copies,
+padding/guards, graph replay and repeated-global ordering. The launcher,
+benchmark client and campaign Python suites also pass.

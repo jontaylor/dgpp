@@ -52,6 +52,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         gather_plans_.push_back(expert_chunk_copy_plan(reverse));
       }
     }
+    const char* batch = std::getenv("DGPP_EXPERT_BATCH_SCATTER");
+    batch_scatter_ = batch && std::atoi(batch) != 0;
     const char* direct = std::getenv("DGPP_EXPERT_CHUNK_DIRECT");
     chunk_direct_ = direct && std::atoi(direct) != 0;
     registered_.reserve(staging.size());
@@ -140,6 +142,42 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     for (const auto& c : copies_[record.key.chunk])
       DGPP_CUDA_OK(cudaMemcpy2DAsync(destination + c.destination_offset, c.destination_pitch,
                                      source + c.source_offset, c.source_pitch, c.row_bytes, c.rows, kind, copy_stream_));
+  }
+  void assemble_many(std::span<const Assembly> ready) override {
+    if (ready.empty()) return;
+    // Keep the existing path for unsupported layouts and tiny completions.
+    // Resident-source assembly continues to use its original ordering.
+    if (!batch_scatter_ || !gpu_scatter_ || ready.size() == 1 ||
+        std::any_of(ready.begin(), ready.end(), [](const auto& a) { return a.cache_slot.has_value(); })) {
+      ExpertCacheStorage::assemble_many(ready);
+      return;
+    }
+    Transfer transfer(*this);
+    std::array<ExpertChunkScatter, kExpertScatterBatch> chunks;
+    for (size_t base = 0; base < ready.size(); base += chunks.size()) {
+      const size_t count = std::min(chunks.size(), ready.size() - base);
+      for (size_t i = 0; i < count; ++i) {
+        const auto& a = ready[base + i];
+        check_execution(a.execution_slot);
+        if (!a.record || a.record->key.chunk >= layouts_.size())
+          throw std::invalid_argument("expert CUDA cache: batch chunk index");
+        const auto chunk = a.record->key.chunk;
+        const auto& expected = layouts_[chunk];
+        if (a.host_bytes.size() != expected.allocation_bytes ||
+            a.record->layout.intermediate_begin != expected.intermediate_begin ||
+            a.record->layout.intermediate_size != expected.intermediate_size ||
+            a.record->layout.allocation_bytes != expected.allocation_bytes)
+          throw std::invalid_argument("expert CUDA cache: batch record geometry");
+        wait_execution(a.execution_slot);
+        chunks[i] = {execution_ + a.execution_slot * memory_.execution_slot_bytes,
+                     mapped_.at(staging_index(a.host_bytes.data())), scatter_plans_[chunk]};
+      }
+      launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter>(chunks).first(count), copy_stream_);
+      // Do not release any source before the kernel containing its last read.
+      // Ready records already have owners in ExpertCache::pending_copies.
+      for (size_t i = 0; i < count; ++i)
+        DGPP_CUDA_OK(cudaEventRecord(staging_done_.at(staging_index(ready[base + i].host_bytes.data())), copy_stream_));
+    }
   }
   const uint8_t* execution_data(size_t slot) const override {
     check_execution(slot);
@@ -405,6 +443,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   std::vector<cudaEvent_t> metadata_done_;
   bool packed_nvfp4_ = false;
   bool gpu_scatter_ = false;
+  bool batch_scatter_ = false;
   ChunkLayout full_;
   uint8_t* cache_ = nullptr;
   uint8_t* execution_ = nullptr;

@@ -20,7 +20,7 @@ change again, keep each row's recorded configuration with its numbers.
 
 | Measurement set | Date (UTC) | Source revision | Scope |
 |---|---|---|---|
-| DeepSeek-V4.1-Flash-1017 NVFP4 streaming, two nodes | 2026-11-16 | `f87df92bce06281df61be66de09daf37dd249b76` (binary `ced82f672d3d438006b464f01d39f9b0cda0da8a0fcff76ec4d8896f1c0bf958`) | Production configuration, now encoded in the NVFP4 streaming template and its environment defaults: one serving/prefill campaign, 20:55–21:31 UTC; five classes at C1/C2/C4/C8/C16, three repetitions with 256-token caps; twelve uncached prefill probes. Both ranks had zero process swap before and after, matching binaries and operation streams, an otherwise idle benchmark fabric, and production restored at the end. The benchmark client includes the speculative token-delivery histogram correction; the server binary is unchanged. Quality, long context, API and plain/speculative equivalence were not evaluated in this campaign. |
+| DeepSeek-V4.1-Flash-1017 NVFP4 streaming, two nodes | 2026-11-16 | `f87df92bce06281df61be66de09daf37dd249b76` (binary `ced82f672d3d438006b464f01d39f9b0cda0da8a0fcff76ec4d8896f1c0bf958`) | Production configuration recorded by the NVFP4 streaming template at `21a30943` (batched scatter off): one serving/prefill campaign, 20:55–21:31 UTC; five classes at C1/C2/C4/C8/C16, three repetitions with 256-token caps; twelve uncached prefill probes. Both ranks had zero process swap before and after, matching binaries and operation streams, an otherwise idle benchmark fabric, and production restored at the end. The benchmark client includes the speculative token-delivery histogram correction; the server binary is unchanged. Quality, long context, API and plain/speculative equivalence were not evaluated in this campaign. |
 | MiniMax-M3.1-Flash NVFP4/MXFP8, four nodes | 2026-11-05 | `a40e587a8608` (binary `718a59bf8356b19c7d3ec63cd5bba644561cee2069ab4d3ac7fabb682ba6dbe3`) | One shipped-template campaign (18:34–20:18 UTC): native DSpark with adaptive verification and eight slots, five classes at C1/C2/C4/C8, twelve cold prefill probes, context timing through 512K, 164 HumanEval / 300 GSM8K / 100 extraction cases plus capped-response retries, API and transcript isolation, and fresh plain/full-seven C1 controls. All four boots ran the recorded binary with zero swap on every rank (head swap disabled for the window; swap-limited serving scopes), all cold probes had zero cached tokens, operation streams matched, the fabric was otherwise idle, and production and head swap were restored once after validation. Replaces the earlier sixteen-slot plain template's row set. |
 | GLM-5.3-Flash NVFP4/FP8, four nodes | 2026-10-29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `8216f398` (documentation commits only beyond the build) | The four-node template as shipped, every row from one `serve_campaign.py run` (00:59 to 01:51 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix through 512K on the 768K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Every rank at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 and 2026-10-13 rows, which ran with fixed prefill budgets and kept only the C1 decode rate |
 | GLM-5.3-Flash NVFP4/FP8, two nodes | 2026-10-28/29 | `11fe1807`, the 0.1.0 release build (binary `1960b127b308e83e`), tree at `acd81cf1` (documentation commits only beyond the build) | The two-node template as shipped, every row from one `serve_campaign.py run` (23:21 to 00:15 UTC): five classes at C1/C2/C4/C8, three cold probes each at 512/2K/8K/32K, the context matrix to the 160K pool, the 300-item quality set, the API, greedy-transcript and isolation checks, and the plain boot (5/5 classes matched). Both ranks at zero swap before and after, zero cached tokens in the twelve cold probes, matching operation streams. Replaces the 2026-10-06/07 row, which ran with fixed prefill budgets and kept only its C1 decode rate |
@@ -318,8 +318,10 @@ a row exactly.
 
 ## Two-Spark NVFP4 streaming measurement (2026-11-16)
 
-The [NVFP4 streaming template](../deploy/cluster_deepseek-v4.1-flash-1017_nvfp4-streaming_w2.example.json)
-now records the engine settings and execution environment used by this campaign.
+The NVFP4 streaming template at `21a30943` records the engine settings and
+execution environment used by this campaign. The [current template](../deploy/cluster_deepseek-v4.1-flash-1017_nvfp4-streaming_w2.example.json)
+also enables batched reconstruction scatter after a later focused comparison;
+that optimization is not included in the campaign rows below.
 These rows describe the `f87df92b` binary above; subsequent implementation
 changes are not measured by these results. The template retains the 1,048,576-token
 KV pool, 16 request slots, fixed depth-three speculation, 256 staging buffers,
@@ -362,7 +364,9 @@ python3 scripts/serve_campaign.py run \
 ```
 
 Stop production for the measurement window and restore it once after the
-campaign. A newer binary requires a fresh measurement and source/hash record.
+campaign. A newer binary requires a fresh measurement and source/hash record. To match
+the older campaign configuration, export `DGPP_EXPERT_BATCH_SCATTER=0`; the
+old binary predates both batching and incremental binding publication.
 
 ## Workload and timing
 

@@ -22,6 +22,19 @@ ExpertChunkCopyPlan expert_chunk_copy_plan(std::span<const expert::ScatterCopy> 
 void launch_expert_chunk_scatter(uint8_t* destination, const uint8_t* source,
     const ExpertChunkCopyPlan& plan, cudaStream_t stream);
 
+// Multiple completed chunks, possibly from different experts. Sources and
+// destinations obey the single-scatter contract and stay alive through stream
+// completion. Payload/scale regions must be disjoint; repeated scalar globals
+// retain the final copy in submission order. No staging metadata is retained
+// beyond the launch.
+struct ExpertChunkScatter {
+  uint8_t* destination;
+  const uint8_t* source;
+  ExpertChunkCopyPlan plan;
+};
+inline constexpr size_t kExpertScatterBatch = 32;
+void launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter> chunks, cudaStream_t stream);
+
 // NVFP4 source matrices, with the ordinary row-major payload/scales. Globals
 // retain DGPP's inverse-scale convention. This conversion moves bits only.
 struct Fp4ExpertSource {

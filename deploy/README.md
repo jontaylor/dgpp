@@ -454,3 +454,11 @@ See [the benchmark record](../docs/benchmarks.md#two-spark-nvfp4-streaming-measu
 for source/binary identity, timings and unrun evaluations. The separate MXFP4
 streaming template remains an unmeasured configuration; these NVFP4 settings
 and results are not claimed as an MXFP4 optimum.
+
+The current NVFP4 streaming template also selects `DGPP_EXPERT_BATCH_SCATTER=1`.
+It combines already-completed reconstruction chunks into launches of up to 32
+chunks while retaining per-buffer completion fences. It does not wait for the
+rest of a read wave. One focused pair reduced the three tool-continuation wall
+times by about 1.2%, with matching responses, expert reads and acceptance; this
+is a small preliminary serving gain. The earlier full benchmark campaign used
+batching off. Set `DGPP_EXPERT_BATCH_SCATTER=0` for the sequential-scatter control.

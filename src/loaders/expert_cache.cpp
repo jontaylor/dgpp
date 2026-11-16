@@ -938,6 +938,8 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
         else ++it;
       }
       std::vector<Read> pending;
+      std::vector<ExpertCacheStorage::Assembly> ready_assemblies;
+      ready_assemblies.reserve(s.config.reads.buffers);
       size_t next = 0, launched = 0;
       const auto drain = [&] { s.reap_copies(true); };
       const auto launch_ready = [&] {
@@ -965,6 +967,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           pending.push_back({j, r, std::move(ticket), queued}); ++next;
         }
         bool consumed = false;
+        ready_assemblies.clear();
         for (size_t i = 0; i < pending.size();) {
           if (!pending[i].ticket->ready()) { ++i; continue; }
           auto read = std::move(pending[i]);
@@ -972,13 +975,14 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           const auto& record = s.store->records()[read.record];
           s.pending_copy = s.read(read.record, std::move(read.ticket), read.started);
           s.pending_copies.push_back(std::move(s.pending_copy));
-          s.storage->assemble(jobs[read.job].slot, record, std::nullopt,
-              s.pending_copies.back()->bytes().first(record.layout.allocation_bytes));
+          ready_assemblies.push_back({jobs[read.job].slot, &record, std::nullopt,
+              s.pending_copies.back()->bytes().first(record.layout.allocation_bytes)});
           s.counters.demand_bytes += record.layout.record_bytes;
           s.counters.staged_copy_bytes += record.layout.useful_bytes;
           --jobs[read.job].remaining;
           consumed = true;
         }
+        s.storage->assemble_many(ready_assemblies);
         if (group_reads_enabled() && next == missing.size() && base+count < selected.size()) {
           const auto following = selected.subspan(base+count, std::min(capacity, selected.size()-base-count));
           size_t fresh = 0;

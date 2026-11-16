@@ -206,6 +206,67 @@ DGPP_TEST(expert_chunk_scatter_preserves_strides_padding_and_mapped_host_bytes) 
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
   DGPP_CUDA_OK(cudaFreeHost(host));
 }
+DGPP_TEST(expert_chunk_batch_scatter_mixed_plans_sources_and_graph_replay) {
+  constexpr size_t bytes = 8192;
+  const std::array<dgpp::expert::ScatterCopy, 3> copies{{
+      {0, 512, 64, 24, 80, 96}, {2048, 4096, 12, 31, 20, 24}, {4099, 6147, 3, 19, 7, 9}}};
+  const std::array<dgpp::expert::ScatterCopy, 1> small{{{0, 0, 16, 1, 16, 16}}};
+  std::vector<uint8_t> input(bytes), expected(bytes * dgpp::kExpertScatterBatch, 0xa5);
+  for (size_t i = 0; i < bytes; ++i) input[i] = static_cast<uint8_t>(i * 37 + i / 17);
+  Buffer source(bytes), destination(expected.size());
+  DGPP_CUDA_OK(cudaMemcpy(source.data(), input.data(), bytes, cudaMemcpyHostToDevice));
+  uint8_t* host = nullptr;
+  DGPP_CUDA_OK(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
+  void* mapped = nullptr;
+  DGPP_CUDA_OK(cudaHostGetDevicePointer(&mapped, host, 0));
+  std::memcpy(host, input.data(), bytes);
+  std::vector<dgpp::ExpertChunkScatter> chunks;
+  for (size_t i = 0; i < dgpp::kExpertScatterBatch; ++i) {
+    const auto layout = i % 3 ? std::span<const dgpp::expert::ScatterCopy>(copies)
+                              : std::span<const dgpp::expert::ScatterCopy>(small);
+    chunks.push_back({destination.data() + i * bytes,
+                      i % 2 ? source.data() : static_cast<uint8_t*>(mapped),
+                      dgpp::expert_chunk_copy_plan(layout)});
+    for (const auto& c : layout) for (size_t row = 0; row < c.rows; ++row)
+      std::memcpy(expected.data() + i * bytes + c.destination_offset + row * c.destination_pitch,
+                  input.data() + c.source_offset + row * c.source_pitch, c.row_bytes);
+  }
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  dgpp::launch_expert_chunk_scatter_batch(chunks, stream);
+  cudaGraph_t graph;
+  DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+  cudaGraphExec_t exec;
+  DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    DGPP_CUDA_OK(cudaMemsetAsync(destination.data(), 0xa5, expected.size(), stream));
+    DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    require(destination.read() == expected, "batched scatter changed payload, padding or guards");
+  }
+  DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+  DGPP_CUDA_OK(cudaGraphDestroy(graph));
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  DGPP_CUDA_OK(cudaFreeHost(host));
+}
+
+DGPP_TEST(expert_chunk_batch_scatter_repeated_global_keeps_final_copy) {
+  const std::array<dgpp::expert::ScatterCopy, 1> scalar{{{0, 0, 4, 1, 4, 4}}};
+  const auto plan = dgpp::expert_chunk_copy_plan(scalar);
+  Buffer source(32), destination(32);
+  std::array<uint8_t, 32> input;
+  for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<uint8_t>(i);
+  DGPP_CUDA_OK(cudaMemcpy(source.data(), input.data(), input.size(), cudaMemcpyHostToDevice));
+  const std::array<dgpp::ExpertChunkScatter, 2> chunks{{
+      {destination.data(), source.data(), plan}, {destination.data(), source.data() + 16, plan}}};
+  dgpp::launch_expert_chunk_scatter_batch(chunks, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const auto result = destination.read();
+  for (size_t i = 0; i < result.size(); ++i)
+    require(result[i] == (i < 4 ? input[16 + i] : 0xa5), "batched shared global lost sequential semantics");
+}
+
 int main() {
   int count = 0;
   if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return 2;
