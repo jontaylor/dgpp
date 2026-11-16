@@ -222,7 +222,6 @@ ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> ex
       !std::isfinite(cfg.decode_admission_boost) || cfg.decode_admission_boost < 0 || cfg.decode_admission_boost > 256 ||
       !std::isfinite(cfg.promotion_margin) || cfg.promotion_margin < 0)
     throw std::invalid_argument("expert residency: invalid budget, fraction or adaptation setting");
-  if (cfg.decode_admission_boost > 0) decode_decay_ = std::exp2(-1.0 / cfg.decay_routes);
   std::map<uint64_t, size_t> groups;
   for (const auto& e : experts_) {
     const auto [it, inserted] = groups.emplace(e.history_group, groups.size());
@@ -302,7 +301,8 @@ double ResidencyPlanner::admission_frequency(size_t expert) const {
   const double base = frequency(expert);
   if (config_.decode_admission_boost == 0 || last_prefill_) return base;
   const auto& h = decode_history_[expert];
-  return base + config_.decode_admission_boost * h.accesses * decode_scale_;
+  return base + config_.decode_admission_boost * h.accesses *
+      std::exp2(-static_cast<double>(decode_epoch_ - h.updated) / config_.decay_routes);
 }
 
 void ResidencyPlanner::observe(std::span<const size_t> selected, bool prefill) {
@@ -320,17 +320,10 @@ void ResidencyPlanner::observe(std::span<const size_t> selected, bool prefill) {
     h.accesses = frequency(e) + weight;
     h.updated = config_.layer_local_history ? group_epochs_[history_groups_[e]] : history_epoch_;
     if (!prefill && config_.decode_admission_boost > 0) {
-      // Keep all decode counts in units of one common scale. This removes an
-      // exponential per resident during each admission scan. Rebase rarely
-      // to keep the reciprocal bounded; an underflowed decay correctly
-      // drops all earlier counts before adding the current observation.
-      decode_scale_ *= decode_decay_;
-      if (decode_scale_ < 1e-12) {
-        for (auto& d : decode_history_) d.accesses *= decode_scale_;
-        decode_scale_ = 1;
-      }
+      ++decode_epoch_;
       auto& d = decode_history_[e];
-      d.accesses += 1 / decode_scale_;
+      d.accesses = d.accesses * std::exp2(-static_cast<double>(decode_epoch_ - d.updated) / config_.decay_routes) + 1;
+      d.updated = decode_epoch_;
     }
   }
 }
