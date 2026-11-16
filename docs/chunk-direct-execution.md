@@ -2240,3 +2240,42 @@ Fractional residency reached the fully warm state but did not improve this
 warmish sequence. The whole-expert configuration remains selected. The single
 ordering and distinct startup/execution paths limit causal attribution; this
 does not rule out other initial allocations or fractional implementations.
+
+### Fractional direct native admission screen
+
+An opt-in prototype extended ready-miss direct native admission to fractional
+residency when an expert was wholly absent, admission selected all its chunks,
+and an aligned whole-expert extent was free. Fractional demotions continued to
+use the separately reserved scratch slot. A checkpoint-shaped GPU fixture
+exercised exact reconstructed expert bytes through admissions and evictions;
+a constructed churn sequence with previously prepared native experts produced
+77 direct admissions. Without native preparation, the same churn produced no
+direct admissions because no suitable contiguous extent was found. The host
+cache suite also passed. The prototype was removed after the serving screen;
+these tests are not a general proof of every possible partial-demotion sequence.
+
+The focused control-first comparison used a single binary on both ranks,
+SHA-256 `d6ea57586f94a6a9159e7675055c42279d7ba86389f7e4e939680b79f986e5da`
+(source `18c4a912` plus the prototype),
+with fractional policy, zero minimum, initial fraction 0.05, the existing expert
+budget, eight readers, depth-three speculation and the selected Engram settings.
+Only the prototype switch differed. Both fresh processes served the same
+prefix-enabled four-request tool sequence followed by three short uncached
+recomputations. This is a diagnostic, not a benchmark campaign row.
+
+| Measurement | Control | Fractional direct admission |
+| --- | ---: | ---: |
+| Initial prefill | 37.233 s | 37.742 s |
+| Three continuation wall times, summed | 34.541 s | 35.756 s |
+| Three continuation decode intervals, summed | 29.592 s | 30.322 s |
+| Continuation expert reads per rank | 42.605 GiB | 42.605 GiB |
+| Third short recomputation prefill, zero reads | 1.608 s | 1.610 s |
+| Third short recomputation decode | 52.92 tok/s | 52.99 tok/s |
+
+Initial-request reads were 104.629 GiB per rank in both arms, after the same
+fractional startup population. Normalized outputs, usage and speculation
+acceptance matched; captured swap was zero on both ranks. The candidate
+increased native-pack counts during the continuations, indicating its path was
+exercised, but did not improve elapsed time in this one ordering. This does not
+rule out an improvement for a different allocation or workload. Whole-expert
+caching remains the selected deployment.
