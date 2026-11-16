@@ -2033,3 +2033,22 @@ the continuations, with the same read volumes and acceptance. This does not
 explain the outlier or establish results for other workloads or concurrency.
 The repeatable improvement on these partially warm continuations and the
 preserved warm anchor support selecting boost 16 for this Spark deployment.
+
+### Stronger decode admission weight
+
+A candidate-first focused screen compared the selected boost of 16 with 64
+using the same binary and deployment as the preceding experiment. Both fresh
+processes served the same prefix-enabled tool sequence and three short
+recomputations; these are diagnostics, not benchmark campaign rows. Initial
+prefill was 38.591 versus 38.640 seconds. The three continuation wall times
+totalled 35.589 versus 35.551 seconds, and their engine decode intervals
+totalled 30.686 versus 30.635 seconds. Both ranks read 42.611 GiB across the
+continuations in either arm. On the final short recomputation, prefill was
+1.608 versus 1.605 seconds and decode was 52.60 versus 52.74 tokens/s, with
+zero expert reads on both ranks. Normalized choices, usage and speculative
+acceptance matched, and captured swap was zero.
+
+The difference is too small to establish a serving benefit; the stronger
+weight also did not reduce reads on this sequence. Boost 16 remains selected.
+This single screen does not establish that the two weights behave identically
+on other workloads.
