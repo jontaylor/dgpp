@@ -1134,3 +1134,34 @@ was therefore removed and the original policy restored, rather than enabling
 another unproven setting. The deployed binary contains the disabled candidate
 until the next rebuild. Different workload sequences, concurrency and a
 cheaper or more adaptive admission policy remain open.
+
+## Combined graph service and binding wait
+
+Implementation `a54e2648` tested one service-stream wait in place of two
+consecutive waits on a serviced target-graph miss. It builds and enqueues the
+binding-table publication while miss execution is still queued, then waits
+once before releasing the graph gate. An unchanged table revision still forces
+that wait, because the serviced output must complete even when no pointers
+changed. The checkpoint-shaped b12x paging fixture passed; it covers the
+underlying graph and expert arithmetic, not this model-specific wait itself.
+
+The same binary on both ranks, SHA-256
+`0323d7a0658a82cdf6f57d4151c11073bd31e26ad95454fd85b1949451b651d3`
+(built before the candidate commit, stamped with parent `99aaa7c8`), ran the
+existing wait followed by the combined wait. Each arm restarted before the
+four-request prefix-enabled tool loop and three 2209-token recomputations.
+This is a single-order diagnostic, not a deployment campaign.
+
+Cold initial prefill was 38.627 versus 38.529 seconds. Three continuations
+took 37.898 versus 40.477 seconds wall; summed prefill was 5.134 versus 5.489
+seconds and engine decode 32.607 versus 34.865 seconds. Both ranks read
+47.009 GiB of expert data across the continuations. On the third short
+recomputation, both ranks read zero expert bytes; prefill was 1.602 versus
+1.594 seconds and engine decode 53.01 versus 51.52 tokens/s. All seven
+normalized messages and usage records matched, as did tool-loop speculative
+acceptance; both server processes had zero swap at captured boundaries.
+
+The single comparison did not demonstrate a serving improvement and cannot
+attribute the timing difference to the wait alone. The candidate and override
+were removed, and the prior service configuration restored. The current binary
+contains the disabled experiment until its next rebuild.
