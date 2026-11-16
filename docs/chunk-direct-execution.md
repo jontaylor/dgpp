@@ -1007,3 +1007,32 @@ acceptance; processes had zero swap at recorded boundaries. These timings do
 not demonstrate a meaningful serving benefit, nor do they independently
 measure planner CPU time. The candidate is removed and the existing planner
 is restored; the running binary contains the now-disabled experimental path.
+
+## FP4 prefill tile crossover screen
+
+Implementation `22d5edc0` tested selecting the 16-row FP4 grouped MMA tile
+for expert segments of up to 32 rows instead of the default 16. Both gate/up
+and down projections used the same crossover. The checkpoint-shaped paging
+fixture and the resident-chain parity fixture passed on Spark-1 with the
+candidate enabled. This did not measure how often serving selected that tile.
+
+The same binary on both ranks, SHA-256
+`93ba290787172314bbbb81b60c863d3cc5d353926787e26ebaad529aadb5de49`
+(built before the candidate commit and stamped with parent `fc059765`), ran
+the default followed by the candidate. Each fresh process served the same
+prefix-enabled four-request tool sequence and three 2209-token recomputations.
+This is a focused single-order diagnostic, not a campaign result.
+
+Cold initial prefill was 38.650 versus 38.619 seconds. The three continuations
+took 40.667 versus 40.552 seconds wall; summed prefill was 5.378 versus 5.370
+seconds and engine decode 35.176 versus 35.063 seconds. Each rank read 47.009
+GiB of expert data across continuations. In the third small recomputation both
+ranks read zero expert bytes; prefill was 1.597 versus 1.600 seconds and engine
+decode 51.38 versus 51.74 tokens/s. All seven normalized messages and usage
+records matched, as did tool-loop speculative counters. Both server processes
+had zero swap at the captured boundaries.
+
+The comparison shows no meaningful gain on this workload, so the crossover
+switch was removed and the default restored. The deployed binary still contains
+the disabled experimental switch until the next rebuild. Other shapes and
+concurrent workloads were not evaluated.
