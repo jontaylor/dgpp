@@ -2573,3 +2573,41 @@ repeated task the decode rates were essentially equal. Its zero-read short
 anchor remained faster. The contrast does not justify changing the deployment
 from depth three, and neither this one ordering nor one task rules out a depth
 four advantage elsewhere. The original serving configuration was restored.
+
+### Inspecting expert popularity by layer
+
+`scripts/expert_demand_stats.py` reads the existing opt-in `DGEMAND1` trace
+and writes a chart, per-expert CSV and JSON summary. It requires NumPy and
+Matplotlib. For example:
+
+```bash
+python3 scripts/expert_demand_stats.py TRACE --output /tmp/expert-demand
+```
+
+Optional `--start-ns` and `--end-ns` select an inclusive/exclusive timestamp
+window. Choose boundaries from request snapshots when analyzing continuations;
+the full trace can otherwise be dominated by a long initial prefill. The CSV
+separates token selections from distinct layer/batch visits that required an
+expert. Decode includes speculative verification rows, including rows that may
+later be rejected. Neither metric alone reports cache misses, speculative-read
+accuracy, exposed stalls or achievable speedup. Trace files and generated
+reports contain workload routing data and remain untracked.
+
+As an exploratory example, the previously recorded rank-zero trace above has
+three prefix-enabled tool continuations: prose, code, and the same prose prompt
+again. In their combined 11,320 decode layer visits, the ten most selected
+experts per layer accounted for a median 33.7% of selections (range 15.2–50.7%);
+the top twenty accounted for a median 48.0% (range 25.4–67.4%). A uniform
+384-expert distribution would give 2.6% and 5.2%, respectively, to any fixed
+ten and twenty experts. The top twenty computed from the first prose response
+accounted for a median 27.4% of selections per layer on the following code
+response and 55.8% on the repeated prose response. The latter is a repeated
+identical prompt, not independent evidence of cross-workload stability.
+
+Prefill and decode had a median eight experts in common among their respective
+top twenties per layer in this window. Popularity could inform phase-aware
+admission or bounded prefetch, but these are historical in-sample observations,
+not direct estimates of avoided I/O: many popular experts may already be
+resident, prefill batches fetch an expert only once, and speculative prefetch
+can compete with demanded reads. Evaluate any policy with actual missing
+experts, useful lead time, unused bytes and end-to-end serving latency.
