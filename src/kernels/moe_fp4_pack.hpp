@@ -52,6 +52,29 @@ struct Fp4PackedExpert {
 size_t moe_fp4_packed_bytes(int hidden, int intermediate);
 Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate);
 
+// Prepared weights/globals with nibble-encoded scales. This format is valid
+// only after every source scale byte has been checked to satisfy (x & 0x87)==0.
+struct Fp4CompactExpert {
+  uint8_t *w13 = nullptr, *s13 = nullptr;
+  float* g13 = nullptr;
+  uint8_t *w2 = nullptr, *s2 = nullptr;
+  float* g2 = nullptr;
+};
+size_t moe_fp4_compact_bytes(int hidden, int intermediate);
+size_t moe_fp4_expanded_scale_bytes(int hidden, int intermediate);
+Fp4CompactExpert moe_fp4_compact_view(uint8_t* data, int hidden, int intermediate);
+// Sources, compact destination, and expanded scale buffer must be disjoint.
+// Their owners must keep them alive until the stream's last consumer finishes.
+// Calling compaction for unchecked or unsupported scales is an error: the
+// operation itself intentionally does not validate the input.
+void launch_moe_fp4_compact(Fp4CompactExpert dst, Fp4PackedExpert src,
+                            int hidden, int intermediate, bool scales_verified,
+                            cudaStream_t stream);
+// Returns independent prepared weight/scale pointers suitable for the device
+// binding table; the scale expansion is enqueued on the given stream.
+Fp4PackedExpert launch_moe_fp4_expand_scales(Fp4CompactExpert src, uint8_t* scales,
+                                             int hidden, int intermediate, cudaStream_t stream);
+
 // Resolve lazily loaded packing kernels before a persistent demand gate can
 // wait for them. CUDA module loading may otherwise synchronize the device.
 void prepare_moe_fp4_pack();

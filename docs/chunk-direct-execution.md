@@ -1860,7 +1860,7 @@ The optional `DGPP_TEST_MIXED_SCALES=1` branch of the checkpoint-shaped B12x
 paging fixture now exercises the prepared graph with separate scale buffers.
 It limits the synthetic source scales to exactly representable values, packs
 and expands the prepared scales, and publishes the expanded scale pointers
-alongside the original prepared weight and global pointers. The same captured
+alongside prepared weight and global pointers. The same captured
 six-row graph produced bitwise-identical output and no host miss service, for
 both whole-expert and fractional policy fixtures. The ordinary fixture also
 passed with the option absent, preserving its arbitrary synthetic scale data.
@@ -1869,9 +1869,8 @@ Both were run on Spark-1 with `DGPP_MOE_B12X=1`.
 This establishes that this graph's B12x binding format can consume separate
 scale buffers without changing its computed output. The fixture allocates both
 the original and expanded scales; it neither implements mixed-size cache
-storage nor demonstrates a RAM or serving improvement. It also synchronizes
-before using the test's invalid-value flag, which is not a proposed admission
-path. Production prefill, real checkpoint values, eviction safety and
+storage nor demonstrates a RAM or serving improvement. Production prefill,
+real checkpoint values, eviction safety and
 warm/cold end-to-end performance remain to be addressed before deployment.
 
 ### Classifying staged scales without a GPU round trip
@@ -1902,3 +1901,28 @@ for existing expert caching. No per-record classification array is allocated
 when the scan is off. The Spark-1 host cache suite passed, including ordinary
 and independent-completion reads, partial initial residency, an unsupported
 chunk, and eviction. The status is not yet used to allocate compact storage.
+
+### Compact prepared expert representation
+
+The FP4 packing library now provides a compact prepared-expert layout and
+stream-ordered conversion functions. Weights and global scales are preserved
+exactly; supported scale bytes are packed two per byte. Expansion produces
+independent byte-wide scale pointers while the returned weight and global
+pointers still refer directly to the compact expert. The caller must establish
+that all source scales are supported before compaction; a false verification
+flag is rejected, and unsupported or unknown inputs need the uncompressed
+path. The conversion itself does not inspect its inputs. Source, destination
+and expansion buffers must be disjoint and remain alive through their GPU
+consumers.
+
+For the checkpoint's 5,120-by-1,152 TP-local expert, the prepared extent is
+9,953,312 bytes and the compact extent is 9,400,352 bytes. A currently
+executing compact expert also needs 1,105,920 bytes of expanded scale scratch;
+that scratch, metadata, alignment and any fallback must be charged to the
+same budget before claiming cache savings. The Spark-1 CUDA packing test passed
+byte-exact round trips and graph replay at small and checkpoint geometry. The
+optional B12x paging fixture now binds compact-resident weights and expanded
+scales to the captured six-row graph; its outputs matched the normal prepared
+path bit-for-bit. These are execution fixtures, not serving timings. The real
+cache still uses its original fixed-size slots and does not yet call these
+functions, so there is no memory saving or serving change in this revision.

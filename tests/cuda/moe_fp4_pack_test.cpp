@@ -114,6 +114,58 @@ DGPP_TEST(moe_fp4_pack_preserves_scales_globals_and_graph_replay) {
   roundtrip(128, 64);
   roundtrip(5120, 1152);
 }
+DGPP_TEST(moe_fp4_compact_preserves_prepared_weights_and_exact_scales) {
+  for (const auto& [h,i] : {std::pair{128,64},std::pair{5120,1152}}) {
+    const size_t matrix=size_t(h)*i;
+    Buffer original(dgpp::moe_fp4_packed_bytes(h,i));
+    Buffer compact(dgpp::moe_fp4_compact_bytes(h,i));
+    Buffer scales(dgpp::moe_fp4_expanded_scale_bytes(h,i));
+    std::vector<uint8_t> input(original.bytes);
+    for (size_t j=0;j<input.size();++j) input[j]=static_cast<uint8_t>(j*37+j/17);
+    for (size_t j=0;j<matrix/8;++j) input[matrix+j]=static_cast<uint8_t>((j%16)<<3);
+    const size_t w2=matrix+matrix/8+16, s2=w2+matrix/2;
+    for (size_t j=0;j<matrix/16;++j) input[s2+j]=static_cast<uint8_t>(((j+7)%16)<<3);
+    DGPP_CUDA_OK(cudaMemcpy(original.data(),input.data(),input.size(),cudaMemcpyHostToDevice));
+    auto source=dgpp::moe_fp4_packed_view(original.data(),h,i);
+    auto compressed=dgpp::moe_fp4_compact_view(compact.data(),h,i);
+    cudaStream_t stream;
+    DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    bool refused=false;
+    try { dgpp::launch_moe_fp4_compact(compressed,source,h,i,false,stream); }
+    catch (const std::invalid_argument&) { refused=true; }
+    require(refused,"unchecked scales must be rejected");
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+    dgpp::launch_moe_fp4_compact(compressed,source,h,i,true,stream);
+    const auto expanded=dgpp::launch_moe_fp4_expand_scales(compressed,scales.data(),h,i,stream);
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream,&graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+    require(expanded.w13==compressed.w13 && expanded.w2==compressed.w2 &&
+            expanded.s13==scales.data() && expanded.s2==scales.data()+matrix/8,
+            "expansion binds compact weights and separate scale buffer");
+    for (int pass=0;pass<2;++pass) {
+      if (pass) {
+        input[matrix]^=8;
+        DGPP_CUDA_OK(cudaMemcpyAsync(original.data(),input.data(),input.size(),cudaMemcpyHostToDevice,stream));
+      }
+      DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      const auto payload=compact.read(), unpacked=scales.read();
+      require(std::memcmp(payload.data(),input.data(),matrix)==0,"w13 bytes changed");
+      const size_t compact_w2=matrix+matrix/16+16;
+      require(std::memcmp(payload.data()+compact_w2,input.data()+w2,matrix/2)==0,"w2 bytes changed");
+      require(std::memcmp(payload.data()+matrix+matrix/16,input.data()+matrix+matrix/8,8)==0 &&
+              std::memcmp(payload.data()+compact_w2+matrix/2+matrix/32,input.data()+s2+matrix/16,4)==0,
+              "expert global scales changed");
+      require(std::memcmp(unpacked.data(),input.data()+matrix,matrix/8)==0 &&
+              std::memcmp(unpacked.data()+matrix/8,input.data()+s2,matrix/16)==0,
+              "expanded expert scales are not byte exact");
+      require(original.read()==input,"compaction changed source expert");
+    }
+    DGPP_CUDA_OK(cudaGraphExecDestroy(exec)); DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  }
+}
 DGPP_TEST(expert_chunk_scatter_preserves_strides_padding_and_mapped_host_bytes) {
   constexpr size_t bytes = 8192;
   const std::array<dgpp::expert::ScatterCopy, 3> copies{{

@@ -10,6 +10,21 @@ namespace dgpp {
 namespace {
 constexpr int kThreads = 256;
 
+__global__ void compact_scales(const uint32_t* source, uint16_t* destination, int words) {
+  const int j = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
+  if (j >= words) return;
+  const uint32_t x = source[j];
+  destination[j] = ((x >> 3) & 0xf) | ((x >> 7) & 0xf0) |
+                   ((x >> 11) & 0xf00) | ((x >> 15) & 0xf000);
+}
+__global__ void expand_compact_scales(const uint16_t* source, uint32_t* destination, int words) {
+  const int j = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
+  if (j >= words) return;
+  const uint32_t x = source[j];
+  destination[j] = ((x & 0xf) << 3) | ((x & 0xf0) << 7) |
+                   ((x & 0xf00) << 11) | ((x & 0xf000) << 15);
+}
+
 // Three scalar scales belong to the compute dependency chain. Avoid a
 // copy-engine operation between packing and its consumer.
 __global__ void copy_globals(float* d0, float* d1, float* d2,
@@ -166,9 +181,73 @@ Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate)
   return {data, s13, reinterpret_cast<float*>(g13), w2, s2, reinterpret_cast<float*>(g2)};
 }
 
+size_t moe_fp4_compact_bytes(int hidden, int intermediate) {
+  check_geometry(hidden, intermediate);
+  const size_t matrix = static_cast<size_t>(hidden) * intermediate;
+  return matrix + matrix / 16 + 16 + matrix / 2 + matrix / 32 + 16;
+}
+size_t moe_fp4_expanded_scale_bytes(int hidden, int intermediate) {
+  check_geometry(hidden, intermediate);
+  const size_t matrix = static_cast<size_t>(hidden) * intermediate;
+  return matrix / 8 + matrix / 16;
+}
+Fp4CompactExpert moe_fp4_compact_view(uint8_t* data, int hidden, int intermediate) {
+  (void)moe_fp4_compact_bytes(hidden, intermediate);
+  if (!data || (reinterpret_cast<uintptr_t>(data) & 15))
+    throw std::invalid_argument("MoE FP4 compact: null or unaligned base");
+  const size_t matrix = static_cast<size_t>(hidden) * intermediate;
+  auto* s13 = data + matrix;
+  auto* g13 = s13 + matrix / 16;
+  auto* w2 = g13 + 16;
+  auto* s2 = w2 + matrix / 2;
+  auto* g2 = s2 + matrix / 32;
+  return {data, s13, reinterpret_cast<float*>(g13), w2, s2, reinterpret_cast<float*>(g2)};
+}
+
+void launch_moe_fp4_compact(Fp4CompactExpert dst, Fp4PackedExpert src,
+                            int hidden, int intermediate, bool scales_verified, cudaStream_t stream) {
+  check_geometry(hidden, intermediate);
+  check_packed(src);
+  if (!scales_verified || !dst.w13 || !dst.s13 || !dst.g13 || !dst.w2 || !dst.s2 || !dst.g2 ||
+      (reinterpret_cast<uintptr_t>(dst.w13) & 15) || (reinterpret_cast<uintptr_t>(dst.w2) & 15) ||
+      (reinterpret_cast<uintptr_t>(src.s13) & 3) || (reinterpret_cast<uintptr_t>(src.s2) & 3) ||
+      (reinterpret_cast<uintptr_t>(dst.s13) & 1) || (reinterpret_cast<uintptr_t>(dst.s2) & 1))
+    throw std::invalid_argument("MoE FP4 compact: unchecked scales, null or unaligned pointers");
+  const size_t matrix = static_cast<size_t>(hidden) * intermediate;
+  DGPP_CUDA_OK(cudaMemcpyAsync(dst.w13, src.w13, matrix, cudaMemcpyDeviceToDevice, stream));
+  DGPP_CUDA_OK(cudaMemcpyAsync(dst.w2, src.w2, matrix / 2, cudaMemcpyDeviceToDevice, stream));
+  DGPP_CUDA_OK(cudaMemcpyAsync(dst.g13, src.g13, 2*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+  DGPP_CUDA_OK(cudaMemcpyAsync(dst.g2, src.g2, sizeof(float), cudaMemcpyDeviceToDevice, stream));
+  const int a = static_cast<int>(matrix / 8 / 4), b = static_cast<int>(matrix / 16 / 4);
+  compact_scales<<<blocks(a), kThreads, 0, stream>>>(
+      reinterpret_cast<const uint32_t*>(src.s13), reinterpret_cast<uint16_t*>(dst.s13), a);
+  compact_scales<<<blocks(b), kThreads, 0, stream>>>(
+      reinterpret_cast<const uint32_t*>(src.s2), reinterpret_cast<uint16_t*>(dst.s2), b);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+Fp4PackedExpert launch_moe_fp4_expand_scales(Fp4CompactExpert src, uint8_t* scales,
+                                             int hidden, int intermediate, cudaStream_t stream) {
+  check_geometry(hidden, intermediate);
+  if (!src.w13 || !src.s13 || !src.g13 || !src.w2 || !src.s2 || !src.g2 || !scales ||
+      (reinterpret_cast<uintptr_t>(src.w13) & 15) || (reinterpret_cast<uintptr_t>(src.w2) & 15) ||
+      (reinterpret_cast<uintptr_t>(src.s13) & 1) || (reinterpret_cast<uintptr_t>(src.s2) & 1) ||
+      (reinterpret_cast<uintptr_t>(scales) & 3))
+    throw std::invalid_argument("MoE FP4 expand: null or unaligned pointers");
+  const size_t matrix = static_cast<size_t>(hidden) * intermediate;
+  const int a = static_cast<int>(matrix / 8 / 4), b = static_cast<int>(matrix / 16 / 4);
+  expand_compact_scales<<<blocks(a), kThreads, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(src.s13), reinterpret_cast<uint32_t*>(scales), a);
+  expand_compact_scales<<<blocks(b), kThreads, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(src.s2), reinterpret_cast<uint32_t*>(scales + matrix / 8), b);
+  DGPP_CUDA_OK(cudaGetLastError());
+  return {src.w13, scales, src.g13, src.w2, scales + matrix / 8, src.g2};
+}
+
 void prepare_moe_fp4_pack() {
   cudaFuncAttributes attributes{};
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunk));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, compact_scales));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, expand_compact_scales));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, copy_globals));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_payload<true>));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_payload<false>));
