@@ -1744,3 +1744,42 @@ threshold gives too little apparent headroom on this prefill sample to justify
 implementing the approximation; a larger cutoff or decode-specific policy
 would require separate route, quality and serving evidence. The diagnostic
 instrumentation was removed and the previous server restored.
+
+## Lossless NVFP4 scale compaction feasibility
+
+A read-only screen sampled 512 evenly spaced 64-wide target-expert records
+from each rank's local NVFP4 image: 240 MiB of code bytes and 30 MiB of scale
+bytes per rank. Every sampled scale byte was one of 64, 72, 80, 88, 96, 104,
+112 or 120. These E4M3 encodings have zero low three bits, so each sampled
+scale can be represented exactly as a four-bit value and restored by shifting
+left three bits. This is a sample, not validation of all records. An actual
+implementation must check the values and preserve a fallback for unsupported
+scales, formats and checkpoints.
+
+For the deployed 5,120-by-64 chunk geometry, halving the three scale arrays
+would reduce the 553,728-byte canonical chunk allocation to approximately
+523,008 bytes before any new metadata or alignment. That is 5.55% less per
+chunk, or an ideal capacity increase of about 5.87% at a fixed byte budget.
+The code bytes themselves had marginal nibble entropy of about 3.78 bits on
+each rank; this does not by itself justify an assumed lossless three-bit code.
+
+An approximate fixed-route replay tested the value of extra capacity, without
+implementing compaction. Starting from the recorded 10,359 whole-expert slots,
+an ideal additional 150, 300 and 600 experts reduced simulated continuation
+reads from 47.009 GiB per rank to 43.918, 41.378 and 35.850 GiB respectively.
+Initial reads were 109.950, 109.782, 109.577 and 109.268 GiB. The third short
+recomputation was zero-read in all four simulations. This is a grouped-demand
+traffic screen with fixed routes and free staging, not evidence that a
+compacted serving cache can realize those capacities or timings.
+
+An isolated GB10 CUDA kernel packed and expanded synthetic supported scale
+bytes exactly. Expanding the scale arrays of one, six and twelve complete
+experts took approximately 4.97, 18.43 and 65.36 microseconds respectively
+per launch in this screen. This excludes admission, allocation, graph
+coordination, weight execution and SSD I/O, and is not a serving result.
+The prepared B12x and chunk-direct paths currently expect byte-wide scales;
+changing their cache representation without losing direct graph hits is the
+main unresolved design problem. A hybrid or indirection scheme also needs to
+charge its metadata, fallback and scratch bytes to the same memory budget.
+No production implementation or setting changed, and the normal server was
+restored after the kernel screen.
