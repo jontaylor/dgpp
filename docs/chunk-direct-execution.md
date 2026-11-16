@@ -2392,3 +2392,38 @@ routes prevent attribution to kernel speed alone. The limited completed prose
 sample and capped code response do not establish general task quality or a
 robust deployment win. Fixed depth three remains selected; different scheduling
 parameters and broader completed-task workloads remain untested.
+
+### Scheduled depth: completed code-review follow-up
+
+The preceding 1,024-token code responses both reached their cap. A follow-up
+raised the limit to 4,096 and presented the same Python cache-helper review
+twice after the initial prefix-enabled tool request. Control ran first and
+scheduled depth three second, with a fresh process for each. Both used the
+same deployed binary and serving settings as the previous comparison. These
+are focused observations of one task, not campaign rows or a quality suite.
+
+| Measurement | Fixed depth three | Confidence scheduled |
+| --- | --- | --- |
+| Initial prefill, 24,317 tokens | 38.616 s | 38.829 s |
+| First code response wall / decode | 67.021 s / 27.99 tok/s | 55.945 s / 29.57 tok/s |
+| First response output tokens | 1,788 | 1,562 |
+| Repeated code response wall / decode | 60.184 s / 30.14 tok/s | 55.180 s / 31.27 tok/s |
+| Repeated response output tokens | 1,788 | 1,703 |
+| Code-response expert reads, per rank | 107.139 GiB | 94.616 GiB |
+
+Both code responses in each arm ended normally, rather than reaching the
+limit; the initial tool call matched. Output content differed across modes, and
+the two scheduled responses differed in length. The scheduled first answer
+incorrectly said a cached `None` would be reloaded; the fixed first answer
+incorrectly said eviction occurs on a hit when the cache is merely full, even
+though the supplied code checks `len(cache) > 3`. Thus neither answer provides
+a general quality pass or establishes that the observed change is a trivial
+quality loss. Initial requests read 109.950 GiB per rank in both arms; both
+ranks had zero swap at the captured boundaries. The repeated task was warmish,
+not fully resident; the earlier short-recomputation screen supplied the
+zero-read anchor.
+
+Scheduled depth improved observed decode rate by about 4–6% on this sample,
+but differing token counts and expert routes also affect wall time. Fixed depth
+three remains selected until the performance and quality tradeoff is better
+established on completed real tasks.
