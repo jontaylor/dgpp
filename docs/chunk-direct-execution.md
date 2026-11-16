@@ -2183,3 +2183,26 @@ The 0.600-second difference over the continuation sequence is too small for
 this single pair to establish a reliable improvement. Eight readers remain
 selected. The capped code response and one sequential request stream do not
 establish behavior for uncapped work or concurrent serving.
+
+### Half-sized Engram worker pools
+
+A temporary candidate reduced each small-gather Engram pool from 16 to eight
+workers, with each worker serving two existing cache shards. Each rank would
+therefore have 16 rather than 32 persistent Engram workers for the two-table
+deployment. The Spark-1 row-cache suite passed in both modes. A candidate-first
+focused screen used the same binary, SHA-256
+`03ad829c2f486d64e7064244b74c9bc958d2887e31bf2b057c96ea7cba54278b`,
+for the prefix-enabled tool sequence and three short recomputations. This is a
+diagnostic, not a benchmark campaign row.
+
+Initial prefill was 38.540 seconds with 16 workers per table versus 38.879
+with eight. Three continuation wall times totalled 33.778 versus 33.952
+seconds, and engine decode totalled 28.885 versus 29.048 seconds. Each rank
+read 42.611 GiB of expert data across continuations in either arm. The third
+short recomputation read zero expert bytes per rank, with prefill 1.612 versus
+1.607 seconds and decode 52.73 versus 52.68 tokens/s. Normalized responses,
+usage and speculative acceptance matched, and captured swap was zero.
+
+The smaller pool did not improve this single-request screen, so the prototype
+was removed and the 16-worker-per-table configuration restored. This does not
+establish the effect of reduced thread count under concurrent serving.
