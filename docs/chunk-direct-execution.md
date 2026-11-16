@@ -1783,3 +1783,44 @@ main unresolved design problem. A hybrid or indirection scheme also needs to
 charge its metadata, fallback and scratch bytes to the same memory budget.
 No production implementation or setting changed, and the normal server was
 restored after the kernel screen.
+
+## Mixed native and compact-scale cache: route replay screen
+
+A follow-up fixed-route simulation explored the cost of retaining a directly
+executable native tier alongside a compact-scale tier. It uses the same saved
+14,040 grouped demand events and initial empty cache as the earlier capacity
+screen. The two ranks produced identical aggregate results. Each event admits
+all demanded experts using free staging, updates the decayed popularity score,
+then ranks residents. The highest-scored experts fill a fixed native tier; the
+remainder fit in the same total byte budget at the ideal compact size. This is
+an approximation, not the actual planner or a serving implementation. It
+assumes all scale bytes are compressible and ignores metadata, alignment,
+scratch space, allocation fragmentation, expansion and relocation cost.
+
+| Native tier, fraction of original expert capacity | Native / compact expert slots | Initial reads GiB/rank | Continuation reads GiB/rank | Continuation compact hits | Compact hits on final zero-read repeat |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 100% | 10,359 / 0 | 109.950 | 47.009 | 0 | 0 |
+| 90% | 9,323 / 1,097 | 109.903 | 45.515 | 3,026 | 3,055 |
+| 75% | 7,769 / 2,742 | 109.782 | 43.872 | 10,657 | 5,312 |
+| 50% | 5,179 / 5,484 | 109.567 | 41.276 | 32,516 | 9,267 |
+| 0% | 0 / 10,967 | 109.259 | 35.729 | 214,360 | 20,575 |
+
+Hits count unique demanded experts per grouped event, not tokens or kernel
+launches. They indicate possible scale expansions; they are not measured
+expansions or latency. On the final short repeat, the naive 90% ranking also
+made 3,055 compact-to-native promotions and 3,055 demotions despite zero SSD
+reads. A simple multiplier favoring existing native experts reduced, but did
+not eliminate, this movement: with a 4x multiplier, the same case had 2,833
+compact hits and 2,335 promotions on that repeat. This heuristic also affects
+ranking and is not a validated admission policy.
+
+This screen strengthens the case for testing a mixed representation but warns
+against moving experts between tiers whenever their popularity rank changes.
+It does not establish that the read savings exceed scale expansion, pointer
+publication or allocator costs. A practical prototype should preserve prepared
+weight pointers, support independent byte-wide scale buffers and bounded
+promotion/demotion, and account for every byte within the existing budget.
+Its fast path must still support graph replay. Check actual scale values on
+admission and fall back for unsupported data. Validate real partially warm
+tool continuations first, with fresh-process cold and fully warm controls.
+No serving code or deployment setting changed in this screen.
