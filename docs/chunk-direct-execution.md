@@ -2472,3 +2472,25 @@ The rebuilt deployment binary has SHA-256
 After deployment, a 2,209-token tool-enabled smoke request produced a
 `list_directory` call successfully, with zero captured swap on both ranks. That
 smoke is a functional check, not another performance comparison.
+
+### Eightfold decode-history comparison
+
+A candidate-first configuration screen compared the selected multiplier 4
+against 8 using the deployed binary SHA-256
+`e163306747831667813d601306ad38a68827a75cea118706751c75cb3307b8d6`.
+Both fresh processes used the same prefix-enabled four-request tool loop with
+1,024-token continuation caps, followed by three short uncached
+recomputations. These are focused diagnostics, not campaign rows.
+
+Initial prefill was 38.896 seconds at 4 versus 38.806 at 8; both ranks read
+109.950 GiB. The three continuation wall times summed to 74.108 versus 73.677
+seconds, and engine decode intervals summed to 68.546 versus 68.079 seconds.
+Expert reads per rank were 78.919 versus 79.442 GiB. The third short
+recomputation read zero expert bytes on both ranks: prefill was 1.632 versus
+1.638 seconds and decode was 52.77 versus 52.71 tok/s. Normalized outputs,
+usage and speculative acceptance matched; captured process swap was zero on
+both ranks. One code response reached its cap.
+
+The wall-time difference is too small in this single ordering to establish an
+improvement, and total reads increased slightly. Multiplier 4 remains selected;
+this does not establish that 4 is optimal for other workloads.
