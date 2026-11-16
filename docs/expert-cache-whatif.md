@@ -5,6 +5,10 @@ independent hypothetical expert caches. It does not execute the model, issue
 SSD reads, change production residency, or predict serving throughput. NumPy is
 required. Generated traces, decision logs and reports stay untracked.
 
+For a prefetch-only comparison that preserves actual deployed retention, see
+[staging-only prefetch replay](expert-staging-prefetch.md). It adds an optional
+residency-delta capture and keeps all persistent cache decisions frozen.
+
 ## Inputs and invocation
 
 The existing `DGPP_EXPERT_DEMAND_TRACE` and `DGPP_EXPERT_READ_TRACE` environment

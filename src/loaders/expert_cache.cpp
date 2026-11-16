@@ -107,6 +107,9 @@ struct ExpertCacheState {
   // touched by I/O workers or allocated in the normal serving configuration.
   std::unique_ptr<std::ofstream> demand_trace;
   bool demand_trace_header = false;
+  std::unique_ptr<std::ofstream> residency_trace;
+  std::vector<size_t> traced_residency;
+  uint64_t demand_sequence = 0;
   // Diagnostic only: rank absent upcoming experts without submitting I/O or
   // changing admission. Histories contain only observations already seen.
   std::unique_ptr<std::ofstream> prefetch_shadow;
@@ -154,12 +157,33 @@ struct ExpertCacheState {
     }
     // Each event is one layer/batch observation, including cache hits and
     // repeated routed selections. The reader groups IDs for fetch accounting.
-    word(prefill); word(selected.size());
-    word(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count()));
+    const auto timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    word(prefill); word(selected.size()); word(timestamp);
     for (const auto e : selected) word(e);
     out.flush();
     if (!out) throw std::runtime_error("expert cache: failed to write demand trace");
+    if (residency_trace) {
+      auto& trace = *residency_trace;
+      auto value = [&](uint64_t v) { trace.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+      const auto& resident = planner->current().chunks;
+      if (traced_residency.empty()) {
+        trace.write("DGRSIDE1", 8);
+        value(1); value(experts.size()); value(memory.cache_slots);
+        for (auto chunks : resident) value(chunks);
+        traced_residency.assign(resident.begin(), resident.end());
+      }
+      size_t changes = 0;
+      for (size_t e = 0; e < resident.size(); ++e) changes += resident[e] != traced_residency[e];
+      value(demand_sequence); value(timestamp); value(changes);
+      for (size_t e = 0; e < resident.size(); ++e) {
+        if (resident[e] == traced_residency[e]) continue;
+        value(e); value(resident[e]); traced_residency[e] = resident[e];
+      }
+      trace.flush();
+      if (!trace) throw std::runtime_error("expert cache: failed to write residency trace");
+    }
+    ++demand_sequence;
   }
   void trace_prefetch_shadow(std::span<const size_t> selected, bool prefill) {
     if (!prefetch_shadow) return;
@@ -527,6 +551,14 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
         ".p" + std::to_string(::getpid()) + ".c" + std::to_string(s.binding_identity) + ".bin";
     s.demand_trace = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
     if (!*s.demand_trace) throw std::runtime_error("expert cache: cannot open demand trace");
+  }
+  if (const char* prefix = std::getenv("DGPP_EXPERT_RESIDENCY_TRACE"); prefix && *prefix) {
+    if (!s.demand_trace)
+      throw std::invalid_argument("expert cache: residency trace requires demand trace");
+    const auto path = std::string(prefix) + ".r" + std::to_string(id.rank) +
+        ".p" + std::to_string(::getpid()) + ".c" + std::to_string(s.binding_identity) + ".bin";
+    s.residency_trace = std::make_unique<std::ofstream>(path, std::ios::binary | std::ios::trunc);
+    if (!*s.residency_trace) throw std::runtime_error("expert cache: cannot open residency trace");
   }
   if (const char* prefix = std::getenv("DGPP_EXPERT_PREFETCH_SHADOW"); prefix && *prefix) {
     const auto path = std::string(prefix) + ".r" + std::to_string(id.rank) +
