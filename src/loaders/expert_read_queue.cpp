@@ -118,6 +118,8 @@ struct ReadQueueImpl {
     ReadPriority priority;
     bool started = false;
     std::shared_ptr<ReadTicket> ticket;
+    size_t reserved_slot = SIZE_MAX;  // protected by pool mutex
+    bool acquired = false;          // protected by pool mutex
   };
   std::shared_ptr<const ExpertStore> store;
   ReadQueueConfig config;
@@ -129,6 +131,7 @@ struct ReadQueueImpl {
   std::atomic<bool> demand_window_active{false};
   // Writers hold mutex; the proactive reader polls without taking it.
   std::atomic<size_t> queued{0};
+  std::atomic<size_t> reserved_queued{0};
   // Keep unrelated counters off the monitored cache line. Only GNU atomic
   // operations and the exclusive-load wait above access this word.
   alignas(128) uint32_t wake_sequence = 0;
@@ -184,6 +187,7 @@ struct ReadQueueImpl {
   }
   void cancel_queued_locked(const std::shared_ptr<Job>& job) {
     --queued;
+    release_reservation(job);
     retire_locked(job);
     tickets.erase(job->record);
     ++counters.cancelled;
@@ -195,6 +199,9 @@ struct ReadQueueImpl {
         (priority != ReadPriority::kDemand && priority != ReadPriority::kPrefetch))
       throw std::invalid_argument("expert read queue: invalid record or priority");
     std::lock_guard lock(mutex);
+    return request_locked(record, priority);
+  }
+  std::shared_ptr<ReadTicket> request_locked(size_t record, ReadPriority priority, bool notify = true) {
     if (stopping) throw std::runtime_error("expert read queue: shut down");
     if (auto ticket = tickets[record].lock()) {
       if (auto job = jobs[record].lock(); job && priority == ReadPriority::kDemand && job->priority == ReadPriority::kPrefetch) {
@@ -245,20 +252,75 @@ struct ReadQueueImpl {
     __atomic_add_fetch(&wake_sequence, 1u, __ATOMIC_RELEASE);
     ++counters.pending;
     if (priority == ReadPriority::kPrefetch) counters.speculative_bytes += size;
-    work.notify_one();
+    if (notify) work.notify_one();
     return ticket;
   }
 
-  std::shared_ptr<ReadLease> acquire(size_t record) {
+  // Queue mutex precedes pool mutex everywhere; leases take only pool mutex.
+  void release_reservation(const std::shared_ptr<Job>& job) {
+    std::lock_guard lock(pool->mutex);
+    if (job->reserved_slot == SIZE_MAX) return;
+    pool->free.push_back(job->reserved_slot);
+    pool->used -= pool->slot_bytes;
+    job->reserved_slot = SIZE_MAX;
+    --reserved_queued;
+    pool->available.notify_all();
+  }
+  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records) {
+    std::vector<std::shared_ptr<ReadTicket>> result;
+    result.reserve(records.size());
+    std::vector<size_t> checked(records.begin(), records.end());
+    std::sort(checked.begin(), checked.end());
+    if ((!checked.empty() && checked.back() >= store->records().size()) ||
+        std::adjacent_find(checked.begin(), checked.end()) != checked.end())
+      throw std::invalid_argument("expert read queue: invalid/duplicate reserved record");
+    std::lock_guard lock(mutex);
+    if (stopping) throw std::runtime_error("expert read queue: shut down");
+    std::lock_guard pool_lock(pool->mutex);
+    size_t fresh = 0, slots = 0;
+    for (const auto r : records) {
+      const auto t = tickets.find(r);
+      if (t == tickets.end() || t->second.expired()) { ++fresh; ++slots; continue; }
+      const auto j = jobs.find(r);
+      if (j != jobs.end()) if (auto job = j->second.lock())
+        slots += !job->acquired && job->reserved_slot == SIZE_MAX;
+    }
+    // Refusal has no queue/slot side effects. Existing tickets need no fresh
+    // queue entry; started reads and completed leases already own a buffer.
+    if (fresh > config.max_pending-counters.pending || slots > pool->free.size()) return {};
+    for (const auto r : records) {
+      auto ticket = request_locked(r, ReadPriority::kDemand, false);
+      if (!ticket) throw std::logic_error("expert read queue: lost reserved queue capacity");
+      result.push_back(std::move(ticket));
+      if (auto job = jobs[r].lock(); job && !job->acquired && job->reserved_slot == SIZE_MAX) {
+        job->reserved_slot = pool->free.back();
+        pool->free.pop_back();
+        pool->used += pool->slot_bytes;
+        pool->peak = std::max(pool->peak, pool->used);
+        ++reserved_queued;
+      }
+    }
+    __atomic_add_fetch(&wake_sequence, 1u, __ATOMIC_RELEASE);
+    work.notify_all();
+    pool->available.notify_all();
+    return result;
+  }
+  std::shared_ptr<ReadLease> acquire(const std::shared_ptr<Job>& job) {
     std::unique_lock lock(pool->mutex);
-    pool->available.wait(lock, [&] { return stopping || !pool->free.empty(); });
+    pool->available.wait(lock, [&] {
+      return stopping || job->reserved_slot != SIZE_MAX || !pool->free.empty() || reserved_queued.load();
+    });
     if (stopping) std::rethrow_exception(cancelled());
-    const auto slot = pool->free.back();
-    // Allocate the lease before removing its slot: failure leaves the pool intact.
-    auto lease = std::shared_ptr<ReadLease>(new ReadLease(pool, slot, store->records()[record].layout.record_bytes));
-    pool->free.pop_back();
-    pool->used += pool->slot_bytes;
+    // Yield an unreserved job rather than occupying every worker while
+    // reserved runnable jobs wait behind it. No buffer is stolen from them.
+    if (job->reserved_slot == SIZE_MAX && pool->free.empty()) return {};
+    const bool reserved = job->reserved_slot != SIZE_MAX;
+    const auto slot = reserved ? job->reserved_slot : pool->free.back();
+    auto lease = std::shared_ptr<ReadLease>(new ReadLease(pool, slot, store->records()[job->record].layout.record_bytes));
+    if (reserved) { job->reserved_slot = SIZE_MAX; --reserved_queued; }
+    else { pool->free.pop_back(); pool->used += pool->slot_bytes; }
     pool->peak = std::max(pool->peak, pool->used);
+    job->acquired = true;
     lease->active_ = true;
     return lease;
   }
@@ -296,8 +358,16 @@ struct ReadQueueImpl {
         // Another worker may also have taken the work observed by the poll.
         if (demand.empty() && prefetch.empty()) continue;
         auto& queue = demand.empty() ? prefetch : demand;
-        job = std::move(queue.front());
-        queue.pop_front();
+        auto chosen = queue.begin();
+        if (!demand.empty() && reserved_queued.load()) {
+          std::lock_guard pool_lock(pool->mutex);
+          const auto ready = std::find_if(queue.begin(), queue.end(), [](const auto& j) {
+            return j->reserved_slot != SIZE_MAX;
+          });
+          if (ready != queue.end()) chosen = ready;
+        }
+        job = std::move(*chosen);
+        queue.erase(chosen);
         --queued;
         job->started = true;
         ++counters.active;
@@ -307,7 +377,18 @@ struct ReadQueueImpl {
       bool abandoned = job->ticket.use_count() == 1;
       try {
         if (abandoned) std::rethrow_exception(cancelled());
-        lease = acquire(job->record);
+        lease = acquire(job);
+        if (!lease) {
+          std::lock_guard lock(mutex);
+          if (stopping) std::rethrow_exception(cancelled());
+          auto& queue = job->priority == ReadPriority::kDemand ? demand : prefetch;
+          queue.push_back(job);
+          job->started = false;
+          --counters.active;
+          ++queued;
+          work.notify_all();
+          continue;
+        }
         abandoned = job->ticket.use_count() == 1;
         if (abandoned) std::rethrow_exception(cancelled());
         auto buffer = std::span<uint8_t>(static_cast<uint8_t*>(pool->buffers[lease->slot_].get()), lease->size_);
@@ -318,6 +399,7 @@ struct ReadQueueImpl {
       } catch (...) { failure = std::current_exception(); }
       {
         std::lock_guard lock(mutex);
+        release_reservation(job);
         retire_locked(job);
         if (stopping || abandoned) {
           failure = cancelled();
@@ -366,6 +448,9 @@ struct ReadQueueImpl {
 ExpertReadQueue::ExpertReadQueue(std::shared_ptr<const ExpertStore> store, ReadQueueConfig cfg)
     : impl_(std::make_unique<ReadQueueImpl>(std::move(store), cfg)) {}
 ExpertReadQueue::~ExpertReadQueue() = default;
+std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_demand(std::span<const size_t> records) {
+  return impl_->reserve_demand(records);
+}
 std::shared_ptr<ReadTicket> ExpertReadQueue::request(size_t record, ReadPriority priority) { return impl_->request(record, priority); }
 size_t ExpertReadQueue::wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const {
   if (tickets.empty() || std::any_of(tickets.begin(), tickets.end(), [](const auto& t) { return !t; }))

@@ -322,3 +322,58 @@ DGPP_TEST(expert_read_queue_wait_any_skips_blocked_first_ticket) {
   (void)blocked->wait();
   refuses([&] { queue.wait_any({}); });
 }
+
+DGPP_TEST(expert_read_queue_reserved_batch_is_atomic_and_reuses_destinations) {
+  Fixture f;
+  auto cfg = f.config(8); cfg.buffers = 4; cfg.staging_budget_bytes *= 4;
+  ExpertReadQueue queue(f.store,cfg);
+  const std::array<size_t,4> records{0,1,2,3};
+  auto batch = queue.reserve_demand(records);
+  require(batch.size()==4,"complete group reserves all destinations");
+  require(queue.reserve_demand(std::array<size_t,1>{4}).empty(),"held destinations cause nonblocking refusal");
+  const auto before = queue.stats().accepted;
+  auto joined = queue.reserve_demand(records);
+  require(joined==batch && queue.stats().accepted==before,"reserved group coalesces without more space or reads");
+  refuses([&] { queue.reserve_demand(std::array<size_t,2>{4,4}); });
+  for (const auto& t : batch) require(ready(t)->bytes()[0]==77,"reserved bytes are correct");
+  require(queue.stats().staging_peak==cfg.staging_budget_bytes,"destinations count against actual staging budget");
+  joined.clear(); batch.clear();
+  eventually([&] { return queue.stats().staging_in_use==0; });
+  auto next = queue.reserve_demand(std::array<size_t,2>{4,5});
+  require(next.size()==2,"released group credits immediately reusable");
+  for (const auto& t : next) (void)ready(t);
+  require(f.store->stats().calls==6,"no duplicate reads for reservations");
+}
+
+DGPP_TEST(expert_read_queue_reserved_work_cannot_be_starved_by_buffer_waiters) {
+  Fixture f;
+  auto cfg=f.config(8); cfg.buffers=2; cfg.staging_budget_bytes*=2;
+  ExpertReadQueue queue(f.store,cfg);
+  for (size_t attempt=0; attempt<32; ++attempt) {
+    auto held=queue.request(0); (void)ready(held);
+    auto held2=queue.request(1); (void)ready(held2);
+    auto blocked=queue.request(2);
+    eventually([&] { return queue.stats().active==1; });
+    const auto accepted=queue.stats().accepted;
+    require(queue.reserve_demand(std::array<size_t,1>{3}).empty(),"no destination means no submission");
+    require(queue.stats().accepted==accepted,"failed reservation leaves queue unchanged");
+    held.reset();
+    auto urgent=queue.reserve_demand(std::array<size_t,1>{3});
+    if (!urgent.empty()) (void)ready(urgent[0]); // blocked worker must yield to reserved job
+    urgent.clear(); held2.reset();
+    (void)ready(blocked); blocked.reset();
+    eventually([&] { return queue.stats().staging_in_use==0; });
+  }
+}
+
+DGPP_TEST(expert_read_queue_reserved_shutdown_releases_unconsumed_destinations) {
+  Fixture f;
+  auto cfg=f.config(8); cfg.buffers=4; cfg.staging_budget_bytes*=4;
+  ExpertReadQueue queue(f.store,cfg);
+  auto batch=queue.reserve_demand(std::array<size_t,4>{0,1,2,3});
+  queue.shutdown();
+  for (const auto& t:batch) require(t->wait_for(3s),"shutdown resolves all reserved tickets");
+  batch.clear();
+  require(queue.stats().pending==0 && queue.stats().active==0 && queue.stats().staging_in_use==0,
+          "shutdown and ticket retirement return every destination");
+}

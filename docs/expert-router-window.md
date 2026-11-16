@@ -241,7 +241,7 @@ tests also passed on Spark with WFET selected. The first profiler startup
 attempt for the final pair was refused by the existing memory-headroom guard
 before requests ran; restarting with the same configuration succeeded.
 
-## Remaining scope
+## Remaining scope of the initial implementation
 
 This change does not move routing above its attention/normalization inputs or
 predict experts. It also does not add staging reservations, preallocated batch
@@ -250,3 +250,9 @@ permit the bounded first wave; the measurements first pointed to worker wake-up
 rather than proving an allocation or descriptor bottleneck. It does not remove
 all service-stream completion fences, change expert arithmetic, or replace
 the engine's other CPU/GPU waits with WFET.
+
+
+The subsequent [reserved group scheduling](expert-group-scheduling.md) change
+replaces the fixed two-expert head start with complete execution-group
+reservations and batched queue submission. The measurements above describe
+the earlier implementation, before that extension.

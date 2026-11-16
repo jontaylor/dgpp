@@ -1034,6 +1034,16 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const auto read_ahead = [&](size_t expert) {
       return demand_lookahead ? cache->lookahead_demand(expert) : cache->prefetch(expert);
     };
+    const bool group_reads = expert::group_reads_enabled();
+    const auto submit_group = [&](size_t first, size_t count) {
+      if (!group_reads || first >= active_experts.size()) return;
+      std::vector<size_t> selected;
+      const size_t end = std::min(active_experts.size(), first+count);
+      selected.reserve(end-first);
+      for (size_t j = first; j < end; ++j)
+        selected.push_back(cache_experts[static_cast<size_t>(active_experts[j])]);
+      (void)cache->prime_group(selected);
+    };
     const bool resident_first = direct_prefill && resident_first_enabled;
     static const bool ready_groups_enabled = [] {
       const char* value = std::getenv("DGPP_EXPERT_READY_GROUPS");
@@ -1048,6 +1058,9 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
         return cache->residency().chunks[index] == cache->experts()[index].records.size();
       });
       resident_count = static_cast<size_t>(boundary-active_experts.begin());
+      // Reserve and enqueue the entire next streamed group before layout
+      // preparation or launching the ready resident group.
+      submit_group(resident_count, wave_capacity);
       // Grouped kernels use explicit expert ids in each segment. Reorder only
       // gathered-row storage, retaining the original token/route-slot mapping
       // used by final ordered accumulation. Prepared rows are then contiguous
@@ -1077,8 +1090,9 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       } else {
         DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_, h_segs_, (E+1)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
       }
-      for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + static_cast<size_t>(lookahead_experts)); ++j)
-        (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
+      if (!group_reads)
+        for (size_t j = resident_count; j < std::min(active_experts.size(), resident_count + static_cast<size_t>(lookahead_experts)); ++j)
+          (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
     } else {
       launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
     }
@@ -1094,7 +1108,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       if (ready_groups) {
         if (!(wave == 0 && resident_count)) {
           const int scan_end = std::min(n_segs, first + static_cast<int>(2*wave_capacity));
-          for (int j = first; j < scan_end; ++j)
+          if (group_reads) submit_group(first, wave_capacity);
+          else for (int j = first; j < scan_end; ++j)
             (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[j])]);
           const auto ready_end = std::stable_partition(active_experts.begin() + first,
               active_experts.begin() + scan_end, [&](int e) {
@@ -1109,6 +1124,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
         DGPP_CUDA_OK(cudaMemcpyAsync(d_segs_ + first, h_segs_ + first,
             static_cast<size_t>(end-first)*sizeof(MoeSegment), cudaMemcpyHostToDevice, stream));
       }
+      submit_group(first, static_cast<size_t>(end-first));
       // Full resident chunks need only one conversion to the direct layout.
       // Do it before this wave owns any scratch/native leases: preparation
       // relocates cache slots and uses the existing reconstruction reservation.
@@ -1142,8 +1158,9 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           if (reconstructed[j-first] || (direct_prefill && cache->prepared_address(expert))) continue;
           auto lease = cache->acquire(expert, /*canonical=*/true, chunk_direct_prefill && direct_prefill);
           if (!lease) throw std::runtime_error("GlmMoeLayer: paged execution slots are held by another caller");
-          for (int next = j+1; next < std::min(n_segs, j+1+lookahead_experts); ++next)
-            (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[next])]);
+          if (!group_reads)
+            for (int next = j+1; next < std::min(n_segs, j+1+lookahead_experts); ++next)
+              (void)read_ahead(cache_experts[static_cast<size_t>(active_experts[next])]);
           if (lease.chunked()) {
             const std::array<expert::MatrixLayout,3> matrices{chunk_layout.gate,chunk_layout.up,chunk_layout.down};
             for (int m = 0; m < 3; ++m) {
@@ -1204,6 +1221,9 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       // device table above are bound to live leases, never source pointers.
       w_.experts_fp4 = direct_prefill ? original.experts_fp4 : views.data();
       if (!direct_prefill) check_expert_geometry();
+      // All current-group sources are owned. Reserving the next group can
+      // no longer steal a destination needed to make the current group run.
+      submit_group(static_cast<size_t>(end), wave_capacity);
       upload_expert_views(d_views_prefill_, shared, stream, direct_prefill ? prepared_views.data() : nullptr);
       const int first_expert = resident_first ? first : active_experts[first];
       const int expert_span = resident_first ? end-first : active_experts[end-1] - first_expert + 1;
@@ -1365,7 +1385,14 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
   // File workers can fill the bounded staging window while the shared and
   // resident experts run. No speculative device allocation or cache binding
   // changes occur here.
-  if (!missing.empty()) (void)cache.prefetch(routed[missing.front()]);
+  if (!missing.empty()) {
+    if (expert::group_reads_enabled()) {
+      std::vector<size_t> next;
+      const size_t count = std::min(missing.size(), cache.memory().execution_slots);
+      for (size_t j = 0; j < count; ++j) next.push_back(routed[missing[j]]);
+      (void)cache.prime_group(next);
+    } else (void)cache.prefetch(routed[missing.front()]);
+  }
   shared();
   if (!complete.empty()) {
     if (!cache.prepare_resident(complete)) throw std::logic_error("b12x resident subset changed during preparation");

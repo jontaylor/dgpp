@@ -892,6 +892,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       std::vector<ExpertExecutionLease> leases;
       std::vector<std::pair<size_t, size_t>> missing;
       jobs.reserve(count); leases.reserve(count);
+      if (group_reads_enabled()) (void)prime_group(selected.subspan(base, count));
       // Snapshot every resident source before any admission can evict it.
       for (size_t j = 0; j < count; ++j) {
         const size_t e = selected[base+j];
@@ -929,7 +930,10 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       // Preserve useful speculative results, including errors. Unrelated
       // speculation must not occupy staging needed by these demanded records.
       for (auto it = s.prefetched.begin(); it != s.prefetched.end();) {
-        if (std::none_of(missing.begin(), missing.end(), [&](const auto& m) { return m.second == it->first; }))
+        if (std::none_of(missing.begin(), missing.end(), [&](const auto& m) { return m.second == it->first; }) &&
+            !(group_reads_enabled() && std::any_of(selected.begin()+base+count, selected.end(), [&](size_t e) {
+              return std::find(s.experts[e].records.begin(), s.experts[e].records.end(), it->first) != s.experts[e].records.end();
+            })))
           it = s.prefetched.erase(it);
         else ++it;
       }
@@ -974,6 +978,18 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           s.counters.staged_copy_bytes += record.layout.useful_bytes;
           --jobs[read.job].remaining;
           consumed = true;
+        }
+        if (group_reads_enabled() && next == missing.size() && base+count < selected.size()) {
+          const auto following = selected.subspan(base+count, std::min(capacity, selected.size()-base-count));
+          size_t fresh = 0;
+          for (const auto e : following) for (const auto r : s.experts[e].records)
+            fresh += s.slots[r] == absent && !s.prefetched.contains(r);
+          // Current rolling reads may be queued without destinations. Leave
+          // credits for all of them, not just buffers already held physically.
+          const size_t promised = pending.size() + s.pending_copies.size() +
+              s.direct_staging_count() + s.prefetched.size();
+          if (promised <= s.config.reads.buffers && fresh <= s.config.reads.buffers-promised)
+            (void)prime_group(following);
         }
         launch_ready();  // lease publication orders consumers after assembly
         if (launched == jobs.size()) break;
@@ -1123,6 +1139,45 @@ bool ready_worker_enabled() {
 void ExpertCache::set_demand_window(bool active) noexcept {
   state_->reads->set_demand_window(active);
 }
+bool group_reads_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DGPP_EXPERT_GROUP_READS");
+    return !value || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+size_t ExpertCache::demand_group_capacity() const {
+  const auto& s = *state_;
+  const size_t chunks = std::max<size_t>(1, s.experts.front().records.size());
+  return std::max<size_t>(1, std::min(s.memory.execution_slots / 2,
+                                    s.config.reads.buffers / (2*chunks)));
+}
+size_t ExpertCache::prime_group(std::span<const size_t> selected) {
+  auto& s = *state_;
+  s.check();
+  s.reap_copies();
+  std::vector<size_t> records;
+  for (size_t i = 0; i < selected.size(); ++i) {
+    const auto e = selected[i];
+    s.expert_index(e);
+    if (std::find(selected.begin(), selected.begin()+i, e) != selected.begin()+i) continue;
+    for (const auto r : s.experts[e].records)
+      if (s.slots[r] == absent) records.push_back(r);
+  }
+  if (records.empty()) return 0;
+  auto tickets = s.reads->reserve_demand(records);
+  if (tickets.empty()) return 0;
+  const auto started = std::chrono::steady_clock::now();
+  size_t fresh = 0;
+  for (size_t j = 0; j < records.size(); ++j) {
+    const auto [it, added] = s.prefetched.try_emplace(records[j],
+        ExpertCacheState::QueuedRead{std::move(tickets[j]), started});
+    fresh += added;
+    if (!added && it->second.demanded_at == std::chrono::steady_clock::time_point{})
+      it->second.demanded_at = started;
+  }
+  return fresh;
+}
 size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping) {
   auto& s = *state_;
   s.check();
@@ -1132,6 +1187,18 @@ size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const s
     if (id < 0 || static_cast<size_t>(id) >= mapping.size())
       throw std::out_of_range("expert cache: early route ID");
     selected[id] = true;
+  }
+  if (group_reads_enabled()) {
+    std::array<size_t,384> group{};
+    size_t count = 0;
+    const size_t capacity = demand_group_capacity();
+    for (size_t id = 0; id < mapping.size() && count < capacity; ++id) {
+      if (!selected[id]) continue;
+      const auto e = mapping[id];
+      s.expert_index(e);
+      if (s.planner->current().chunks[e] != s.experts[e].records.size()) group[count++] = e;
+    }
+    return prime_group(std::span<const size_t>(group).first(count));
   }
   size_t accepted = 0, issued_experts = 0;
   for (size_t id = 0; id < mapping.size() && issued_experts < 2; ++id) {

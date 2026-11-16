@@ -19,6 +19,7 @@ namespace dgpp::expert {
 bool early_demand_enabled();
 // Opt-in: 1 keeps a polling reader; 2 prefers bounded ARM WFET waits.
 bool ready_worker_enabled();
+bool group_reads_enabled();
 struct CacheConfig {
   bool operator==(const CacheConfig&) const = default;
   PlannerConfig planner;
@@ -237,10 +238,15 @@ class ExpertCache {
   // Already-routed upcoming work, not speculative background traffic. Uses
   // at most half of the existing staging slots and never changes residency.
   size_t lookahead_demand(size_t expert);
-  // Submit the first two ascending, already-selected missing experts before
-  // route bookkeeping. Existing half-pool cap; no observations/admissions.
+  // Submit the first complete missing-expert group before route bookkeeping.
+  // Legacy control submits two experts; no observations/admissions.
   // Small layer populations only; larger populations keep the normal path.
   size_t prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping);
+  // Reserve every missing record of the next execution group before queuing
+  // it. Zero means no fresh records (already queued/resident or backpressure).
+  size_t prime_group(std::span<const size_t> experts);
+  // Bounded complete group, fitting half of staging and half of scratch.
+  size_t demand_group_capacity() const;
   // Engine-owned scheduling hint only; no memory/cache ownership changes.
   void set_demand_window(bool active) noexcept;
   // Nonblocking observation only: every missing chunk has a completed ticket.

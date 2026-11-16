@@ -828,6 +828,8 @@ DGPP_TEST(expert_cache_prime_demand_preserves_policy_and_reuses_reads) {
     auto cfg = f.config(policy);
     const auto record_bytes = cfg.reads.staging_budget_bytes / cfg.reads.buffers;
     cfg.planner.minimum_fraction = 0;
+    cfg.execution_slots = 4;
+    cfg.planner.budget_bytes += 2*pack_chunk(f.sources,128,128).layout.allocation_bytes;
     cfg.planner.budget_bytes += (16-cfg.reads.buffers)*record_bytes;
     cfg.reads.buffers = cfg.reads.max_pending = 16;
     cfg.reads.staging_budget_bytes = 16*record_bytes;
@@ -1025,4 +1027,31 @@ DGPP_TEST(expert_cache_ready_callback_failure_poisons_and_retires) {
   refuses([&] { cache.execute_ready(selected, [](auto, auto) { throw std::runtime_error("consumer failed"); }); });
   require(cache.stats().poisoned && cache.stats().active_execution_slots == 0, "failed batch poisons and retires scratch");
   refuses([&] { (void)cache.acquire(0); });
+}
+
+DGPP_TEST(expert_cache_next_group_is_reserved_before_current_execution) {
+  for (const size_t buffers : {size_t{8},size_t{16}}) {
+    Fixture f(Format::kNvfp4,true);
+    auto cfg=f.config(Policy::kWholeExpert);
+    const size_t record_bytes=cfg.reads.staging_budget_bytes/cfg.reads.buffers;
+    cfg.planner.minimum_fraction=0;
+    cfg.planner.budget_bytes+=(buffers-cfg.reads.buffers)*record_bytes;
+    cfg.reads.buffers=cfg.reads.max_pending=buffers;
+    cfg.reads.staging_budget_bytes=buffers*record_bytes;
+    ExpertCache cache(f.store,cfg,host(f));
+    cache.initialize();
+    const std::array<size_t,4> selected{0,1,2,3};
+    size_t done=0;
+    cache.execute_ready(selected,[&](auto inputs,auto leases) {
+      if (done==0 && buffers==16) require(cache.read_stats().accepted==16,
+          "every read for the next group is submitted before current execution");
+      for (size_t j=0;j<inputs.size();++j) {
+        const auto expected=f.expected(selected[inputs[j]]);
+        require(std::equal(expected.begin(),expected.end(),leases[j].data()),"group source bytes preserved");
+        ++done;
+      }
+    });
+    require(done==4 && cache.telemetry().file.calls==16,"both groups execute with one read per missing chunk");
+    require(cache.read_stats().staging_peak<=cfg.reads.staging_budget_bytes,"two groups stay inside original reservation");
+  }
 }

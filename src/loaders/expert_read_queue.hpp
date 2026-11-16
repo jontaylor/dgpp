@@ -76,6 +76,10 @@ class ExpertReadQueue {
   // capacity, so a full queue still accepts another waiter for the same read.
   // Demand takes priority and can displace a queued speculative read.
   std::shared_ptr<ReadTicket> request(size_t record, ReadPriority priority = ReadPriority::kDemand);
+  // All-or-none nonblocking reservation: every returned ticket owns a buffer
+  // or an already-running/completed read. Empty on capacity backpressure.
+  // Unique records only. Reservations are released on cancellation/failure.
+  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records);
   // Wait for any selected ticket, including failures/cancellation. Returns its
   // index; callers consume the result with wait(). Tickets must belong here.
   size_t wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const;
