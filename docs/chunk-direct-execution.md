@@ -1480,3 +1480,25 @@ visit; sixteen visits offered 563 with the same one useful expert. These are
 upper-bound opportunities for this particular immediate-next-visit predictor,
 not measurements of serving speed or a rejection of other prediction methods.
 The result does not justify implementing this predictor on the tested stream.
+
+## Independent-miss copy versus read wait
+
+An opt-in prototype changed independent decode-miss scheduling to wait for a
+demanded read when reads were outstanding and staging was available, instead
+of first waiting for the oldest GPU staging copy. It retained the copy wait
+when no read was pending or staging was held by copies and prefetches. The
+28-test host cache suite passed with the candidate enabled, including its
+bounded ready-batch fixture; this suite does not prove all scheduling cases.
+
+A same-binary control-then-candidate screen on both ranks used binary SHA-256
+`5b505fb2299f3d6fe1d35212a87601fab083a049c83f6002055f782095cef84c`, the
+prefix-enabled four-request tool sequence, then three 2209-token recomputations.
+The candidate did not improve serving: initial cold prefill was 38.618 versus
+38.712 seconds and the three continuation wall times totaled 37.489 versus
+37.915 seconds. Each rank read 109.950 GiB initially and 47.009 GiB across
+continuations in both arms. The final recomputation read zero expert bytes;
+prefill was 1.598 versus 1.599 seconds and decode was 52.85 versus 52.49
+tokens/s. Response content, usage and speculative acceptance matched, and
+captured process swap was zero on both ranks. This single ordered comparison
+is a focused diagnostic, not a benchmark campaign or proof of a regression.
+The prototype was removed and the prior serving configuration restored.
