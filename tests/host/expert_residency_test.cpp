@@ -42,6 +42,26 @@ void bounded(const ResidencyPlanner& p, const PlannerConfig& c) {
 }
 }  // namespace
 
+DGPP_TEST(expert_decode_admission_boost_is_phase_specific) {
+  auto plain = config(Policy::kWholeExpert, 100);
+  auto boosted = plain;
+  boosted.decode_admission_boost = 16;
+  ResidencyPlanner a(plain, equal_experts(2, 1));
+  ResidencyPlanner b(boosted, equal_experts(2, 1));
+  for (auto* p : {&a, &b}) {
+    p->observe(std::vector<size_t>{0, 0});
+    p->commit_admission(0, p->propose_admission(0));
+    p->observe(std::vector<size_t>(10, 1), true);
+    auto prefill = p->propose_admission(1);
+    require(prefill.chunks[1] == 1, "prefill does not apply decode boost");
+    p->commit_admission(1, prefill);
+    p->observe(std::vector<size_t>{0});
+  }
+  require(a.propose_admission(0).chunks[0] == 0, "default retains more frequent prefill expert");
+  require(b.propose_admission(0).chunks[0] == 1, "decode history can favor a decode demand");
+  refuses([&] { boosted.decode_admission_boost = -1; ResidencyPlanner invalid(boosted, equal_experts(2, 1)); });
+}
+
 DGPP_TEST(expert_partition_matches_dsv41_tp_slices_and_format_bytes) {
   for (uint64_t world : {1, 2, 4}) {
     uint64_t total = 0;
