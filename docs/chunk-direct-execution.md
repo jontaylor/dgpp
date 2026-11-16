@@ -1204,3 +1204,23 @@ recomputations were slower, while cold prefill did not improve. The result does
 not isolate the effect of 8192 rows at unchanged expert capacity or establish
 performance for concurrent or longer-context requests. The 4096-token budgets
 and original expert capacity were restored.
+
+## Recent-decode admission replay screen
+
+A fixed-route offline screen tested a cheaper alternative to the rejected
+separate decode-frequency history. It added a constant score bonus to experts
+selected within the most recent 4,096, 16,384 or 65,536 decode selections,
+only when admitting during decode. The all-phase exponential popularity score
+and the 65,536-selection half-life were otherwise unchanged. Bonuses of 1, 4
+and 16 were screened, using the same rank-0 demand trace and request boundaries
+as the whole-expert bound. The simulator assumes free staging within each batch
+and selects a cache at batch boundaries; it is a policy screen, not an exact
+replay of admission, execution timing or a serving benchmark.
+
+The no-bonus control predicted 47.009 GiB of reads during the three tool
+continuations. The 4,096-selection window produced the same result at all
+three bonuses; the longer windows predicted 47.037 GiB. The control and all
+candidates predicted zero reads on the third small recomputation. Initial
+request reads were 109.950 GiB in each case. These results give no reason to
+implement this particular recent-use bonus, and do not rule out other admission
+policies or workloads. No serving settings changed.
