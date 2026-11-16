@@ -1460,3 +1460,23 @@ seconds and decode 52.82 versus 52.79 tokens/s. Response content, usage and
 speculative acceptance matched, and captured swap was zero on both ranks.
 The small continuation difference is within variation seen in previous screens;
 the prototype was removed and the prior serving binary restored.
+
+## Recent-layer decode prefetch replay
+
+A fixed-route replay of the previously captured demand stream screened a
+simple next-visit predictor: at each decode layer visit, offer currently
+nonresident experts used in that layer's previous N decode visits. The replay
+uses the earlier approximate whole-expert admission model, free staging at
+batch boundaries, and observed routes; it does not simulate prefetch changing
+residency, queue contention or latency. The same result appeared on both rank
+traces. Only the three tool continuations were counted; the cold request and
+short recomputations established the surrounding cache history.
+
+Of 3,443 simulated continuation decode misses per rank, none had appeared in
+the preceding four decode visits to that layer, and one had appeared in the
+preceding eight or sixteen visits. The eight-visit predictor would offer 99
+nonresident experts, only one of which was needed on the immediately following
+visit; sixteen visits offered 563 with the same one useful expert. These are
+upper-bound opportunities for this particular immediate-next-visit predictor,
+not measurements of serving speed or a rejection of other prediction methods.
+The result does not justify implementing this predictor on the tested stream.
