@@ -2427,3 +2427,48 @@ Scheduled depth improved observed decode rate by about 4–6% on this sample,
 but differing token counts and expert routes also affect wall time. Fixed depth
 three remains selected until the performance and quality tradeoff is better
 established on completed real tasks.
+
+### Longer decode-only admission history
+
+`engine.expert_streaming.decode_history_multiplier` scales the separate
+history used by decode demand admission, without changing prefill admission,
+periodic planning or the global history. The default is 1. A value of 4 makes
+its half-life four times `decay_routes` in decode selections. It has no effect
+when `decode_admission_boost` is zero. A planner fixture covers retaining an
+older decode resident and replacing it when new demand persists; configuration
+round-trip and invalid-value tests cover the setting on both ranks.
+
+Two focused paired screens compared multipliers 1 and 4 on the same binary,
+SHA-256 `3e1b77244ff6befe8a5f5613bb35b7af63ff625e2e3ed2cb7e163f3661c57ff5`.
+It contained source `dcbe0784` plus the planner prototype and the prior
+activation-cache-hint switch at its unchanged default; the final configurable
+implementation is a separate rebuild. Both ranks used whole-expert caching,
+decode boost 16, eight readers, the existing budget, fixed speculation depth
+three and the selected Engram settings. Each arm restarted before a
+prefix-enabled four-request tool loop with 1,024-token continuation caps,
+then three short uncached recomputations. Control ran first in the first pair
+and candidate first in the second. These are diagnostics, not campaign rows.
+
+| Measurement | Control / multiplier 4, control-first | Control / multiplier 4, candidate-first |
+| --- | --- | --- |
+| Initial prefill | 38.846 / 38.568 s | 38.657 / 39.098 s |
+| Three continuation wall times, summed | 75.140 / 73.633 s | 75.290 / 73.311 s |
+| Three continuation decode intervals, summed | 69.473 / 68.151 s | 69.553 / 67.903 s |
+| Continuation expert reads, per rank | 83.308 / 78.919 GiB | 83.308 / 78.919 GiB |
+| Third short recomputation prefill | 1.615 / 1.638 s | 1.619 / 1.617 s |
+| Third short recomputation decode | 52.59 / 52.61 tok/s | 52.27 / 52.44 tok/s |
+
+Each initial request read 109.950 GiB per rank. The third short recomputation
+read zero expert bytes on both ranks in all arms. Normalized outputs, usage and
+speculative acceptance matched within each pair, and captured process swap
+was zero on both ranks. The first code continuation reached its output cap;
+this is not an uncapped completed-task or multi-request comparison. Longer
+history decreased reads on the repeated prose continuation but increased them
+on the preceding code continuation. The consistent roughly 2% loop wall-time
+improvement and unchanged warm anchor support selecting multiplier 4 in this
+specific Spark deployment; other workload changes can prefer a shorter history.
+The rebuilt deployment binary has SHA-256
+`e163306747831667813d601306ad38a68827a75cea118706751c75cb3307b8d6`.
+After deployment, a 2,209-token tool-enabled smoke request produced a
+`list_directory` call successfully, with zero captured swap on both ranks. That
+smoke is a functional check, not another performance comparison.

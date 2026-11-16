@@ -73,6 +73,26 @@ DGPP_TEST(expert_decode_admission_boost_survives_history_rebases) {
   require(p.propose_admission(1).chunks[1] == 1, "new decode demand replaces stale history after rebases");
 }
 
+DGPP_TEST(expert_longer_decode_history_protects_then_adapts) {
+  auto c = config(Policy::kWholeExpert, 100);
+  c.decode_admission_boost = 16;
+  ResidencyPlanner baseline(c, equal_experts(3, 1));
+  c.decode_history_multiplier = 4;
+  ResidencyPlanner p(c, equal_experts(3, 1));
+  for (auto* planner : {&baseline, &p}) {
+    planner->observe(std::vector<size_t>(20, 0));
+    planner->commit_admission(0, planner->propose_admission(0));
+    planner->observe(std::vector<size_t>(100, 2));
+    planner->observe(std::vector<size_t>(5, 1));
+  }
+  require(baseline.propose_admission(1).chunks[1] == 1, "default history permits the newer resident");
+  require(p.propose_admission(1).chunks[0] == 1, "longer history protects earlier decode resident");
+  p.observe(std::vector<size_t>(512, 1));
+  require(p.propose_admission(1).chunks[1] == 1, "sustained new decode demand replaces stale resident");
+  refuses([&] { c.decode_history_multiplier = 0; ResidencyPlanner invalid(c, equal_experts(2, 1)); });
+  refuses([&] { c.decode_history_multiplier = 257; ResidencyPlanner invalid(c, equal_experts(2, 1)); });
+}
+
 DGPP_TEST(expert_partition_matches_dsv41_tp_slices_and_format_bytes) {
   for (uint64_t world : {1, 2, 4}) {
     uint64_t total = 0;

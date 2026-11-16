@@ -88,6 +88,7 @@ struct PlannerConfig {
   double horizon_routes = 8192;
   double prefill_route_weight = 1.0;  // weight in both popularity and ageing clock
   double decode_admission_boost = 0;  // experimental separate decode history
+  double decode_history_multiplier = 1;  // decode half-life relative to decay_routes
   bool layer_local_history = false;  // experimental; scale local clocks by group count
   bool learn_load_cost = true;  // false retains each expert's initial cost estimate
   double promotion_margin = 0.25;

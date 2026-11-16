@@ -2151,7 +2151,8 @@ For whole-expert caching change `policy` to `whole_expert_cache`; omit
 | `minimum_fraction` | Lower coverage bound in [0,1], default 0.05; positive values round up to chunks. Zero allows cold experts to become absent after universal initial population. |
 | `adapt_every_routes` | Reconsider allocation after this many routed selections, default 1024 |
 | `decay_routes`, `horizon_routes` | Routing half-life and benefit horizon, defaults 1024 and 8192 |
-| `decode_admission_boost` | Default `0` disables the separate decode history. A positive value adds that history, multiplied by the configured boost, to demand-admission scores during decode; prefill admission and periodic planning retain the ordinary history. The decode history uses `decay_routes` as its half-life in decode selections. |
+| `decode_admission_boost` | Default `0` disables the separate decode history. A positive value adds that history, multiplied by the configured boost, to demand-admission scores during decode; prefill admission and periodic planning retain the ordinary history. |
+| `decode_history_multiplier` | Multiplies `decay_routes` to set the separate decode history's half-life in decode selections. Default `1`; accepts 1–256. Has no effect when `decode_admission_boost` is zero. Longer history can delay adaptation to a new workload. |
 | `learn_load_cost` | Default `true`: update cost estimates from observed reads. `false` retains each expert's initial estimate; equal-size DSV4.1 target experts start with equal costs. Does not change popularity observations or disable demand reads. |
 | `promotion_margin`, `cooldown_routes` | Hysteresis and minimum change interval, defaults 0.25 and 128 |
 | `adaptation_bytes` | Maximum newly retained bytes per periodic adaptation; default unlimited. Both policies retain eligible chunks from existing demand reads separately. |

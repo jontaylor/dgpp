@@ -220,9 +220,11 @@ ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> ex
       !std::isfinite(cfg.horizon_routes) || cfg.horizon_routes <= 0 ||
       !std::isfinite(cfg.prefill_route_weight) || cfg.prefill_route_weight < 1.0 / 1024 || cfg.prefill_route_weight > 1 ||
       !std::isfinite(cfg.decode_admission_boost) || cfg.decode_admission_boost < 0 || cfg.decode_admission_boost > 256 ||
+      !std::isfinite(cfg.decode_history_multiplier) || cfg.decode_history_multiplier < 1 || cfg.decode_history_multiplier > 256 ||
       !std::isfinite(cfg.promotion_margin) || cfg.promotion_margin < 0)
     throw std::invalid_argument("expert residency: invalid budget, fraction or adaptation setting");
-  if (cfg.decode_admission_boost > 0) decode_decay_ = std::exp2(-1.0 / cfg.decay_routes);
+  if (cfg.decode_admission_boost > 0)
+    decode_decay_ = std::exp2(-1.0 / (cfg.decay_routes * cfg.decode_history_multiplier));
   std::map<uint64_t, size_t> groups;
   for (const auto& e : experts_) {
     const auto [it, inserted] = groups.emplace(e.history_group, groups.size());
