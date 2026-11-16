@@ -1352,3 +1352,35 @@ The 0.716-second continuation difference is small relative to timing variation
 across fresh processes in earlier screens; this one ordered pair does not
 establish a reliable gain or explain the effect of extra readers. Eight readers
 were restored. Independent decode-miss completion remains enabled.
+
+## Noncontiguous ready-expert grouping during decode misses
+
+A temporary opt-in prototype collected all currently ready reconstructed
+experts into one callback, even when their execution slots were nonadjacent.
+It did not wait for other experts: it moved the ready leases into a contiguous
+callback view, kept them alive through submission, then restored their original
+slot mapping for admission and retirement. Ordered final route-slot reduction
+remained unchanged. The control retained the existing contiguous-ready runs;
+both used independent miss completion, eight readers, 256 staging buffers
+and twelve execution slots.
+
+The 28-test host cache suite and the B12x paging arithmetic fixture passed with
+the prototype enabled. These fixtures do not establish how frequently the
+nonadjacent case occurs in serving. The same server binary on both ranks,
+SHA-256 `1ed75cb119b3466efd8b5b5431b0a284d17990279618e33d291ee0545b001ffd`
+(source based on `70fc97ef` plus the prototype), ran the control followed by
+the candidate. Each fresh process served the four-request prefix-enabled tool
+sequence and three 2209-token recomputations. This is a focused single-order
+diagnostic, not a benchmark campaign row.
+
+Cold prefill was 38.581 versus 38.490 seconds; the three continuation wall
+times summed to 38.106 versus 38.069 seconds, and engine decode times summed
+to 33.053 versus 33.171 seconds. Each rank read 109.950 GiB initially and
+47.009 GiB across continuations in both arms. The third short recomputation
+read zero expert bytes per rank; prefill was 1.594 versus 1.601 seconds and
+decode was 52.81 versus 52.73 tokens/s. Normalized messages, usage and
+speculative acceptance matched; both ranks had zero swap at captured boundaries.
+
+No meaningful serving improvement was observed, and launch grouping frequency
+was not measured. The prototype was removed and the prior binary and serving
+configuration restored. Independent completion remains enabled.
