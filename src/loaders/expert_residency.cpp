@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <queue>
@@ -240,7 +239,6 @@ ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> ex
     largest = std::max(largest, p.back());
     prefix_.push_back(std::move(p));
   }
-  for (const auto& p : prefix_) equal_full_bytes_ &= p.back() == prefix_.front().back();
   const uint64_t capacity = cfg.budget_bytes - cfg.reserved_bytes;
   // Whole policy must fit at least one complete expert even when cold.
   if (cfg.policy == Policy::kWholeExpert && largest > capacity)
@@ -470,42 +468,12 @@ ResidencyPlan ResidencyPlanner::propose_admission(size_t expert) const {
   if (available < required) {
     struct Victim { size_t expert; double value, density; };
     std::vector<Victim> victims;
-    static const bool single_donor = [] {
-      const char* value = std::getenv("DGPP_EXPERT_SINGLE_DONOR");
-      return value && std::atoi(value) != 0;
-    }();
     // Expected avoided load cost over the common horizon, per byte. Demand
     // admission incurs no extra storage read: its staging bytes are already
     // needed for execution. Replacement still sacrifices resident reuse.
     const auto value = [&](size_t e) {
       return frequency(e) * experts_[e].estimated_load_ms;
     };
-    if (single_donor && equal_full_bytes_) {
-      // With equal whole-expert sizes and less than one expert free, exactly
-      // one victim is sufficient. Match the heap's density and ID ordering.
-      size_t best = counts.size();
-      double best_value = 0, best_density = 0;
-      for (size_t e = 0; e < counts.size(); ++e) {
-        const auto& h = history_[e];
-        if (!counts[e] || (h.has_changed && epoch_ - h.changed < config_.cooldown_routes)) continue;
-        const double cost = value(e);
-        const double density = cost / static_cast<double>(prefix_[e].back());
-        if (!std::isfinite(cost) || !std::isfinite(density)) { best = counts.size(); break; }
-        if (best == counts.size() || density < best_density || (density == best_density && e < best)) {
-          best = e; best_value = cost; best_density = density;
-        }
-      }
-      if (best != counts.size()) {
-        const double benefit = value(expert);
-        if (!std::isfinite(benefit) || benefit <= best_value * (1 + config_.promotion_margin)) return unchanged();
-        counts[best] = 0;
-        counts[expert] = experts_[expert].chunk_bytes.size();
-        auto result = summarize(std::move(counts));
-        validate(result);
-        return result;
-      }
-      // Empty or nonfinite candidates use the original heap path.
-    }
     for (size_t e = 0; e < counts.size(); ++e) {
       const auto& h = history_[e];
       if (counts[e] && !(h.has_changed && epoch_ - h.changed < config_.cooldown_routes)) {

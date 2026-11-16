@@ -503,27 +503,4 @@ DGPP_TEST(expert_planner_weight_one_preserves_phase_independent_behavior) {
   }
 }
 
-DGPP_TEST(expert_planner_equal_size_donor_matches_general_heap_under_churn) {
-  auto c = config(Policy::kWholeExpert, 2000);
-  c.cooldown_routes = 17;
-  auto specs = equal_experts(16, 4);
-  for (size_t i = 0; i < specs.size(); ++i) specs[i].estimated_load_ms = 1.0 + (i % 5) * 0.2;
-  auto unequal = specs;
-  unequal.push_back(ExpertSpec{std::vector<uint64_t>(4, 200), 1.0});
-  ResidencyPlanner optimized(c, specs), reference(c, unequal);
-  std::mt19937 rng(7249);
-  for (int step = 0; step < 1500; ++step) {
-    std::vector<size_t> routes;
-    for (int j = 0; j < 1 + static_cast<int>(rng() % 16); ++j)
-      routes.push_back((rng() % 4) ? (step / 100) % 16 : rng() % 16);
-    optimized.observe(routes); reference.observe(routes);
-    const auto e = routes.back();
-    const auto a = optimized.propose_admission(e), b = reference.propose_admission(e);
-    require(std::equal(a.chunks.begin(), a.chunks.end(), b.chunks.begin()) && b.chunks.back() == 0 &&
-                a.cache_bytes == b.cache_bytes && a.load_bytes == b.load_bytes && a.release_bytes == b.release_bytes,
-            "equal-size donor selection matches general heap including ties, cooldown and workload shifts");
-    optimized.commit_admission(e, a); reference.commit_admission(e, b);
-  }
-}
-
 int main() { return dgpp::test::run_all(); }
