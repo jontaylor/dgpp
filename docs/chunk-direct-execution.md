@@ -2316,3 +2316,35 @@ zero on both ranks. This particular boost did not improve the normal tool loop
 and held back prefill adaptation after the workload switch. Its third repeat
 was not fully resident, so the decode rates are not a matched zero-read anchor.
 The result does not rule out a differently aged or bounded cross-phase policy.
+
+### FP4 prefill activation-cache hint screen
+
+The resident FP4 prefill kernel prefetches activation lines into L2 with an
+`evict_last` hint before its existing asynchronous loads. A temporary switch
+disabled only that hint; the activation loads, weight copies and arithmetic
+were unchanged. Grouped FP4/MXFP4 segment tests and the checkpoint-shaped B12x
+paging fixture passed with the hint disabled. The candidate was removed after
+the serving screen.
+
+The same binary on both ranks, SHA-256
+`53771a342f6e49f12e4f0e12cdcf5cea9b17822c74c678a3c1181180ffea3f8c`
+(source `6ff25c13` plus the switch), ran control first and hint disabled
+second. Both used the existing whole-expert budget, eight readers, depth three
+and Engram settings; each fresh process ran the prefix-enabled four-request
+tool sequence and three 2,209-token uncached recomputations. This is a focused
+diagnostic, not a benchmark campaign row.
+
+| Measurement | Hint enabled | Hint disabled |
+| --- | ---: | ---: |
+| Initial prefill | 38.499 s | 38.468 s |
+| Three continuation wall times, summed | 33.817 s | 33.718 s |
+| Three continuation decode intervals, summed | 28.886 s | 28.854 s |
+| Continuation expert reads per rank | 42.612 GiB | 42.612 GiB |
+| Third short recomputation prefill, zero reads | 1.601 s | 1.610 s |
+| Third short recomputation decode | 52.77 tok/s | 52.74 tok/s |
+
+Initial-request reads were 109.950 GiB per rank in both arms. Normalized
+outputs, usage and speculative acceptance matched; captured process swap was
+zero on both ranks. This single ordering did not show a meaningful gain from
+removing the hint; it does not establish performance for other shapes or
+hardware. The prior kernel and selected serving configuration were restored.
