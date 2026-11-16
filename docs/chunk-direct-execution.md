@@ -1441,3 +1441,22 @@ this comparison. The prototype was removed and the prior serving binary and
 configuration restored. This does not establish the cause of the result or
 rule out other batching widths, storage devices, workloads or scheduling
 approaches; no further width sweep was run.
+
+## Planner frequency memoization: serving screen
+
+A temporary prototype memoized each expert's decayed frequency within an
+observation epoch, avoiding repeated exponential calculations during admission
+without changing the residency policy. A deterministic planner comparison and
+the host cache suite passed. A same-binary, control-then-candidate screen used
+the four-request prefix-enabled tool sequence and three 2209-token
+recomputations, with eight readers and independent miss completion. This was a
+focused diagnostic, not a benchmark campaign row.
+
+Cold prefill was 38.583 versus 38.539 seconds; the three continuation wall
+times totaled 38.257 versus 38.012 seconds. Both ranks read 109.950 GiB on
+the initial request and 47.009 GiB across continuations in both arms. The
+final recomputation read no expert bytes, with prefill 1.600 versus 1.604
+seconds and decode 52.82 versus 52.79 tokens/s. Response content, usage and
+speculative acceptance matched, and captured swap was zero on both ranks.
+The small continuation difference is within variation seen in previous screens;
+the prototype was removed and the prior serving binary restored.
