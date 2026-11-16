@@ -1083,3 +1083,54 @@ This result makes cache allocation worth further work, especially across
 continuations, but does not establish that the rejected history variants or a
 future-aware allocation are practical improvements. The trace override was
 removed and the normal service configuration restored after the capture.
+
+## Decode-aware admission candidate
+
+The demand trace suggested giving recent decode demand additional weight when
+admitting experts during decode, while leaving prefill admission and periodic
+planning on the original popularity history. A quick fixed-route replay with
+free per-batch staging predicted 47.009 versus 42.611 GiB of continuation reads
+per rank at boost 16 and retained the zero-read repeated-prefill anchor. That
+replay is a policy screen with relaxed staging, not a throughput measurement.
+
+Implementation `f016793f` tested a separate, exponentially decayed decode-only
+history. Its initial implementation calculated an additional exponential per
+candidate in each admission scan. A first same-binary, default-first tool-loop
+comparison read 47.009 versus 42.611 GiB per rank, but continuation wall time
+was 37.925 versus 38.982 seconds. Initial cold prefill was 38.439 versus
+38.709 seconds. That binary was SHA-256
+`68d6328584045a6fd76007e8132f5e82ad322e679e1c3baee58b2cec887c4d2f`,
+built before the implementation commit and stamped with parent `6dd6c531`.
+The traffic result alone did not establish a speedup.
+
+Implementation `276997a1` used a shared decay scale and occasional rebasing to
+remove the extra exponential from the admission scan. It was tested in one
+binary on both ranks, SHA-256
+`c6cbe984c4a36cd9430aba16722589d936418c0b5d3c19862e888fe96101448e`,
+built before that commit and stamped with parent `f016793f`. Each arm restarted
+before the same prefix-enabled four-request tool loop. A candidate-first pair
+also ran three short recomputations; a default-first repeat ran the tool loop
+only. These are focused diagnostics, not published campaign rows.
+
+| Setting | Candidate-first pair: default / boost | Default-first repeat: default / boost |
+| --- | --- | --- |
+| Initial cold prefill | 38.626 / 38.627 s | 38.643 / 42.461 s |
+| Three continuation wall times summed | 41.385 / 37.755 s | 40.366 / 40.911 s |
+| Three continuation engine-prefill times summed | 5.417 / 5.330 s | 5.355 / 6.086 s |
+| Three continuation engine-decode times summed | 35.831 / 32.271 s | 34.895 / 34.673 s |
+| Expert reads across continuations, each rank | 47.009 / 42.611 GiB | 47.009 / 42.611 GiB |
+
+In the candidate-first pair, the third small recomputation read zero expert
+bytes on both ranks. Prefill was 1.645 versus 1.607 seconds and engine decode
+52.77 versus 52.32 tokens/s. All normalized outputs and usage matched, as did
+tool-loop speculative acceptance. Both ranks' server processes had zero swap
+at the captured boundaries. The repeat's four outputs, usage and acceptance
+also matched, with zero swap. The cold timing difference in that repeat
+occurred with identical expert read bytes; its cause was not established.
+
+The candidate reliably reduced logical expert traffic in this sequence, but the
+two optimized serving pairs did not establish a consistent wall-time win. It
+was therefore removed and the original policy restored, rather than enabling
+another unproven setting. The deployed binary contains the disabled candidate
+until the next rebuild. Different workload sequences, concurrency and a
+cheaper or more adaptive admission policy remain open.
