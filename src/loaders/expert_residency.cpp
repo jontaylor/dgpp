@@ -206,7 +206,8 @@ void scatter_chunk(const PackedChunk& chunk, uint64_t hidden, uint64_t intermedi
 }
 
 ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> experts)
-    : config_(cfg), experts_(std::move(experts)), history_(experts_.size()) {
+    : config_(cfg), experts_(std::move(experts)), history_(experts_.size()),
+      decode_history_(cfg.decode_admission_boost > 0 ? experts_.size() : 0) {
   if (cfg.policy != Policy::kWholeExpert && cfg.policy != Policy::kAdaptiveFractional)
     throw std::invalid_argument("expert residency: unknown policy");
   if (cfg.policy == Policy::kWholeExpert && cfg.initial_fraction)
@@ -218,8 +219,10 @@ ResidencyPlanner::ResidencyPlanner(PlannerConfig cfg, std::vector<ExpertSpec> ex
       !std::isfinite(cfg.decay_routes) || cfg.decay_routes <= 0 ||
       !std::isfinite(cfg.horizon_routes) || cfg.horizon_routes <= 0 ||
       !std::isfinite(cfg.prefill_route_weight) || cfg.prefill_route_weight < 1.0 / 1024 || cfg.prefill_route_weight > 1 ||
+      !std::isfinite(cfg.decode_admission_boost) || cfg.decode_admission_boost < 0 || cfg.decode_admission_boost > 256 ||
       !std::isfinite(cfg.promotion_margin) || cfg.promotion_margin < 0)
     throw std::invalid_argument("expert residency: invalid budget, fraction or adaptation setting");
+  if (cfg.decode_admission_boost > 0) decode_decay_ = std::exp2(-1.0 / cfg.decay_routes);
   std::map<uint64_t, size_t> groups;
   for (const auto& e : experts_) {
     const auto [it, inserted] = groups.emplace(e.history_group, groups.size());
@@ -295,12 +298,20 @@ double ResidencyPlanner::frequency(size_t expert) const {
   return h.accesses * std::exp2(-static_cast<double>(clock - h.updated) * scale / config_.decay_routes);
 }
 
+double ResidencyPlanner::admission_frequency(size_t expert) const {
+  const double base = frequency(expert);
+  if (config_.decode_admission_boost == 0 || last_prefill_) return base;
+  const auto& h = decode_history_[expert];
+  return base + config_.decode_admission_boost * h.accesses * decode_scale_;
+}
+
 void ResidencyPlanner::observe(std::span<const size_t> selected, bool prefill) {
   const double weight = prefill ? config_.prefill_route_weight : 1.0;
   if (selected.size() > std::numeric_limits<uint64_t>::max() - epoch_)
     throw std::overflow_error("expert residency: observation clock overflow");
   for (size_t e : selected)
     if (e >= experts_.size()) throw std::out_of_range("expert residency: invalid observed expert");
+  if (!selected.empty()) last_prefill_ = prefill;
   for (size_t e : selected) {
     ++epoch_;
     history_epoch_ += weight;
@@ -308,6 +319,19 @@ void ResidencyPlanner::observe(std::span<const size_t> selected, bool prefill) {
     auto& h = history_[e];
     h.accesses = frequency(e) + weight;
     h.updated = config_.layer_local_history ? group_epochs_[history_groups_[e]] : history_epoch_;
+    if (!prefill && config_.decode_admission_boost > 0) {
+      // Keep all decode counts in units of one common scale. This removes an
+      // exponential per resident during each admission scan. Rebase rarely
+      // to keep the reciprocal bounded; an underflowed decay correctly
+      // drops all earlier counts before adding the current observation.
+      decode_scale_ *= decode_decay_;
+      if (decode_scale_ < 1e-12) {
+        for (auto& d : decode_history_) d.accesses *= decode_scale_;
+        decode_scale_ = 1;
+      }
+      auto& d = decode_history_[e];
+      d.accesses += 1 / decode_scale_;
+    }
   }
 }
 void ResidencyPlanner::observe_load(size_t expert, double ms) {
@@ -416,7 +440,7 @@ ResidencyPlan ResidencyPlanner::propose_admission(size_t expert) const {
     // speculative read cost or periodic adaptation-byte limit. Compare the
     // expected saved load cost per byte against colder resident tails.
     const auto density = [&](size_t e) {
-      return frequency(e) * experts_[e].estimated_load_ms / static_cast<double>(prefix_[e].back());
+      return admission_frequency(e) * experts_[e].estimated_load_ms / static_cast<double>(prefix_[e].back());
     };
     const double benefit = density(expert);
     struct Victim { size_t expert; double density; };
@@ -472,7 +496,7 @@ ResidencyPlan ResidencyPlanner::propose_admission(size_t expert) const {
     // admission incurs no extra storage read: its staging bytes are already
     // needed for execution. Replacement still sacrifices resident reuse.
     const auto value = [&](size_t e) {
-      return frequency(e) * experts_[e].estimated_load_ms;
+      return admission_frequency(e) * experts_[e].estimated_load_ms;
     };
     for (size_t e = 0; e < counts.size(); ++e) {
       const auto& h = history_[e];

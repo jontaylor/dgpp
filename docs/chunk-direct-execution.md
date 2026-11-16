@@ -1998,3 +1998,38 @@ warm working set or improve the tool sequence. The integration was removed and
 the original serving configuration restored. This result does not rule out a
 different compact-cache design; it does not demonstrate a serving benefit from
 this one.
+
+### Decode-aware admission on the current miss path
+
+The separate decode-history admission policy was revisited after independent
+decode-miss completion and direct native admission were enabled. A positive
+`decode_admission_boost` gives recent decode selections additional weight
+only when scoring demand admission during decode; prefill admission and
+periodic planning retain the ordinary history. The default is zero. The
+23-test residency suite and three configuration tests passed on Spark-1.
+
+The two-rank focused screens used the same binary, SHA-256
+`a95179efb496d1f515467c523cca5e2a929c19b9c3809bf5afe4e4d333f18593`,
+with boost 0 or 16, equal expert budgets, eight readers, independent misses,
+direct native admission and depth-three speculation. Each fresh process served
+the prefix-enabled four-request tool sequence and three short recomputations.
+These are diagnostics, not benchmark campaign rows.
+
+| Measurement | Candidate-first: control / boost | Control-first: control / boost |
+| --- | --- | --- |
+| Initial prefill | 38.400 / 38.518 s | 38.480 / 45.888 s |
+| Three continuation wall times, summed | 37.667 / 35.637 s | 37.187 / 35.751 s |
+| Three continuation decode intervals, summed | 32.633 / 30.691 s | 32.301 / 30.820 s |
+| Continuation expert reads, per rank | 47.009 / 42.611 GiB | 47.009 / 42.611 GiB |
+| Third short recomputation prefill | 1.603 / 1.605 s | 1.605 / 1.612 s |
+| Third short recomputation decode | 52.63 / 52.60 tok/s | 52.87 / 52.37 tok/s |
+
+The last recomputation read zero expert bytes on both ranks in both arms.
+Normalized outputs, usage and speculative acceptance matched; captured swap
+was zero. The second boosted cold prefill was slower even though each rank
+read the same 109.950 GiB of expert data. Its cause was not established. A
+third fresh boosted process took 38.764 s for initial prefill and 35.558 s for
+the continuations, with the same read volumes and acceptance. This does not
+explain the outlier or establish results for other workloads or concurrency.
+The repeatable improvement on these partially warm continuations and the
+preserved warm anchor support selecting boost 16 for this Spark deployment.

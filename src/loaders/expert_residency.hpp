@@ -87,6 +87,7 @@ struct PlannerConfig {
   double decay_routes = 1024;  // exponential half-life in routed selections
   double horizon_routes = 8192;
   double prefill_route_weight = 1.0;  // weight in both popularity and ageing clock
+  double decode_admission_boost = 0;  // experimental separate decode history
   bool layer_local_history = false;  // experimental; scale local clocks by group count
   bool learn_load_cost = true;  // false retains each expert's initial cost estimate
   double promotion_margin = 0.25;
@@ -134,9 +135,11 @@ class ResidencyPlanner {
     uint64_t changed = 0;
     bool has_changed = false;
   };
+  struct DecodeHistory { double accesses = 0; };
   uint64_t prefix_bytes(size_t expert, size_t chunks) const;
   size_t minimum_chunks(size_t expert) const;
   double frequency(size_t expert) const;
+  double admission_frequency(size_t expert) const;
   ResidencyPlan summarize(std::vector<size_t> chunks) const;
   void validate(const ResidencyPlan& plan) const;
   void commit_validated(const ResidencyPlan& plan);
@@ -145,9 +148,13 @@ class ResidencyPlanner {
   std::vector<ExpertSpec> experts_;
   std::vector<std::vector<uint64_t>> prefix_;
   std::vector<History> history_;
+  std::vector<DecodeHistory> decode_history_;
   std::vector<size_t> history_groups_;
   std::vector<double> group_epochs_;
   double history_epoch_ = 0;
+  double decode_scale_ = 1;
+  double decode_decay_ = 1;
+  bool last_prefill_ = false;
   ResidencyPlan current_;
   uint64_t epoch_ = 0;
   uint64_t generation_ = 0;
