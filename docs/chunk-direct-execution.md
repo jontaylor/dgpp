@@ -2764,3 +2764,8 @@ Windows use inclusive `start_ns` and exclusive `end_ns` against the pass-end
 Unix timestamp. The analyzer reports each target width separately and rejects
 partial-expert reads rather than silently rounding them into whole-expert bins.
 With tracing disabled there are no marker kernels or timing-file writes.
+
+The subsequent [expert-cache what-if replay](expert-cache-whatif.md) uses the
+recorded demand/read/device traces to compare independent retention and
+prefetch choices without changing serving. Its initial deadline-weighted score
+increased logical read volume, particularly during decode; it is not deployed.
