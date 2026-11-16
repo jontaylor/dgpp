@@ -83,6 +83,10 @@ struct ExpertCacheState {
   std::vector<size_t> slots, free_slots;
   std::vector<size_t> slot_records, native_start, native_holes, free_positions;
   std::vector<size_t> record_owner;
+  // Allocated only when the opt-in read scan is enabled. The store is
+  // immutable and these results survive eviction, but every later read
+  // replaces the result for its record before a caller can use it.
+  std::vector<ScaleCompactibility> record_scale_compactibility;
   std::vector<uint64_t> expert_record_bytes;
   std::vector<bool> execution_busy, execution_packed;
   size_t next_execution_slot = 0;
@@ -182,6 +186,8 @@ struct ExpertCacheState {
       throw std::runtime_error("expert cache: read queue capacity exhausted");
     }
     auto lease = ticket->wait();
+    if (!record_scale_compactibility.empty())
+      record_scale_compactibility[record] = lease->scale_compactibility();
     const auto completed = std::chrono::steady_clock::now();
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(completed - started).count();
     counters.read_wait_ns += static_cast<uint64_t>(std::max<int64_t>(elapsed, 0));
@@ -420,6 +426,8 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   const uint64_t reserved = add(m.staging_bytes, mul(m.execution_slot_bytes, m.execution_slots));
   std::map<std::tuple<bool, uint32_t, uint32_t>, size_t> groups;
   s.slots.assign(s.store->records().size(), absent);
+  if (cfg.reads.scan_nvfp4_scales)
+    s.record_scale_compactibility.assign(s.store->records().size(), ScaleCompactibility::kUnknown);
   s.record_owner.resize(s.store->records().size());
   for (size_t r = 0; r < s.store->records().size(); ++r) {
     const auto& key = s.store->records()[r].key;
@@ -471,6 +479,18 @@ const CacheMemory& ExpertCache::memory() const { return state_->memory; }
 uint64_t ExpertCache::binding_identity() const { return state_->binding_identity; }
 const ChunkLayout& ExpertCache::execution_layout() const { return state_->full; }
 const std::vector<CachedExpert>& ExpertCache::experts() const { return state_->experts; }
+ScaleCompactibility ExpertCache::scale_compactibility(size_t expert) const {
+  const auto& s = *state_;
+  s.check(); s.expert_index(expert);
+  if (s.record_scale_compactibility.empty()) return ScaleCompactibility::kUnknown;
+  auto result = ScaleCompactibility::kExact;
+  for (const auto record : s.experts[expert].records) {
+    const auto value = s.record_scale_compactibility[record];
+    if (value == ScaleCompactibility::kUnsupported) return value;
+    if (value == ScaleCompactibility::kUnknown) result = value;
+  }
+  return result;
+}
 void ExpertCache::initialize() {
   auto& s = *state_;
   s.check(false);

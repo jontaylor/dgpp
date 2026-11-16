@@ -194,6 +194,61 @@ void check_bytes(const ExpertExecutionLease& lease, const Fixture& f, size_t exp
 }
 }
 
+DGPP_TEST(expert_cache_aggregates_complete_scale_compatibility_across_reads) {
+  Fixture f(Format::kNvfp4);
+  for (auto& scales : f.scales) std::fill(scales.begin(),scales.end(),72);
+  std::vector<RecordKey> keys;
+  for (uint32_t e=0;e<4;++e)
+    for (uint32_t c=0;c<4;++c) keys.push_back({e/2,e%2,c,e>=2});
+  const auto path=(f.dir/"compactibility.img").string();
+  ExpertStoreBuilder writer(path,f.identity,keys);
+  for (size_t i=0;i<keys.size();++i) {
+    const auto& key=keys[i];
+    auto chunk=f.pack_expert(key.layer*2+key.expert,128+key.chunk*32,32);
+    if (key.layer==0 && key.expert==1 && key.chunk==2)
+      chunk.bytes[chunk.layout.down.scales_offset] |= 1;
+    writer.write(i,chunk);
+  }
+  writer.finish();
+  f.store=std::make_shared<ExpertStore>(path,f.identity,keys.size(),IoMode::kDirect);
+  auto cfg=f.config(Policy::kWholeExpert);
+  cfg.reads.scan_nvfp4_scales=true;
+  ExpertCache cache(f.store,cfg,host(f)); cache.initialize();
+  require(cache.scale_compactibility(0)==ScaleCompactibility::kUnknown,
+          "unread expert cannot be considered compactible");
+  { auto lease=cache.acquire(0); require(bool(lease),"first expert read"); }
+  require(cache.scale_compactibility(0)==ScaleCompactibility::kExact,
+          "all supported chunks establish exact compactibility");
+  require(cache.scale_compactibility(1)==ScaleCompactibility::kUnknown,
+          "reading a different expert cannot classify this expert");
+  { auto lease=cache.acquire(1); require(bool(lease),"second expert read"); }
+  require(cache.scale_compactibility(1)==ScaleCompactibility::kUnsupported,
+          "one unsupported chunk rejects the complete expert");
+  { auto lease=cache.acquire(2); require(bool(lease),"third expert read under pressure"); }
+  require(cache.scale_compactibility(0)==ScaleCompactibility::kExact &&
+          cache.scale_compactibility(1)==ScaleCompactibility::kUnsupported,
+          "classification remains associated with immutable records through eviction");
+  auto no_scan=cfg; no_scan.reads.scan_nvfp4_scales=false;
+  ExpertCache control(f.store,no_scan,host(f)); control.initialize();
+  { auto lease=control.acquire(0); require(bool(lease),"unscanned expert read"); }
+  require(control.scale_compactibility(0)==ScaleCompactibility::kUnknown,
+          "disabled scan never promotes unknown to exact");
+  ExpertCache ready_cache(f.store,cfg,host(f)); ready_cache.initialize();
+  const std::array<size_t,2> selected{0,1};
+  ready_cache.execute_ready(selected,[](auto,auto) {});
+  require(ready_cache.scale_compactibility(0)==ScaleCompactibility::kExact &&
+          ready_cache.scale_compactibility(1)==ScaleCompactibility::kUnsupported,
+          "independent read completion classifies both complete experts");
+  auto partial_cfg=f.config(Policy::kAdaptiveFractional);
+  partial_cfg.reads.scan_nvfp4_scales=true;
+  ExpertCache partial(f.store,partial_cfg,host(f)); partial.initialize();
+  require(partial.scale_compactibility(0)==ScaleCompactibility::kUnknown,
+          "partially read expert stays unknown");
+  { auto lease=partial.acquire(0); require(bool(lease),"complete partial expert"); }
+  require(partial.scale_compactibility(0)==ScaleCompactibility::kExact,
+          "partial and subsequent demand reads aggregate");
+}
+
 DGPP_TEST(expert_cache_fractional_floor_initialization_exact_reconstruction_and_budget) {
   for (auto format : {Format::kMxfp4, Format::kNvfp4}) {
     Fixture f(format);

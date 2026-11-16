@@ -186,6 +186,10 @@ class ExpertCache {
   uint64_t binding_identity() const;
   const ChunkLayout& execution_layout() const;
   const std::vector<CachedExpert>& experts() const;
+  // Classification of the latest successfully read chunks. Exact is returned
+  // only when every chunk was scanned and supported; unknown and unsupported
+  // must both use the existing uncompressed path.
+  ScaleCompactibility scale_compactibility(size_t expert) const;
   // Completes mandatory fractional population before making any expert usable.
   void initialize();
   void observe(std::span<const size_t> selected, bool prefill = false);

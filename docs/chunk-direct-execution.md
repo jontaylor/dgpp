@@ -1893,3 +1893,12 @@ microseconds when multiplied by 18 chunks). This sample does not establish
 complete checkpoint coverage, and this timing is not a serving measurement.
 The cache must still aggregate all chunks for an expert and preserve a full
 uncompressed fallback whenever the status is unknown or unsupported.
+
+The cache now retains those per-record results when scanning is enabled and
+exposes an expert-level result: every chunk must be known exact, and any
+unsupported chunk rejects the expert. A successful subsequent read replaces
+the corresponding record's result; the image is treated as immutable just as
+for existing expert caching. No per-record classification array is allocated
+when the scan is off. The Spark-1 host cache suite passed, including ordinary
+and independent-completion reads, partial initial residency, an unsupported
+chunk, and eviction. The status is not yet used to allocate compact storage.
