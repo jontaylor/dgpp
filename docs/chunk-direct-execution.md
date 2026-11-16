@@ -2086,3 +2086,25 @@ The results support selecting the option for this deployment's tested tool
 sequence; they do not quantify long-running memory cost, other workloads or
 concurrent-serving throughput. The exact contribution of overlapping storage
 reads versus other host scheduling effects was not isolated.
+
+### Selective Engram worker wakeups
+
+A temporary prototype gave the persistent Engram workers individual wakeups
+and notified only shards with requests. A same-binary candidate-first screen
+used SHA-256 `7a6dbb793017c44d8d66e95735f431cd193e13490d58fd0040e7391f005a36f7`
+and the same prefix-enabled tool sequence and three short recomputations as
+the preceding experiment. The direct-row tests passed in both modes,
+including changing active worker sets. This is a focused diagnostic, not a
+benchmark campaign row.
+
+Waking all workers versus selective wakeups produced initial
+prefill of 38.562 versus 38.614 seconds. The three continuation wall times
+totalled 33.973 versus 33.993 seconds; engine decode totalled 29.084 versus
+28.981 seconds. Each rank read 42.611 GiB of expert data in either arm. The
+final short recomputation read no expert data, with prefill 1.616 versus
+1.614 seconds and decode 52.81 versus 52.78 tokens/s. Normalized responses,
+usage and acceptance matched, and captured swap was zero on both ranks.
+
+No useful improvement was established, so the prototype was removed and the
+previous parallel Engram implementation retained. Other worker counts or
+workloads were not tested by this screen.
