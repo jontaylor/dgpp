@@ -335,3 +335,55 @@ Padding the reduction scratch by one float per warp row averaged 732.18 µs
 against 722.03 µs for its paired b12x control. The stable mixed-workload
 selection remains 32-block b12x. The two-Spark service resumed with the
 original binary, mode-3 prefill and its 4 GiB startup headroom threshold.
+
+## Four-row dense projections and per-expert handoff
+
+The `dsv41_verify_dense_bench` diagnostic replays six TP2 FP8 projection
+shapes on four independent BF16 inputs. It rotates synthetic packed weights
+through a working set at least four times the device L2 capacity, alternates
+the order of candidates, and compares the four-row result with the same
+candidate run one row at a time. Pairing adjacent CSA2 output groups reduced
+the median time for all four groups from 90.54 to 83.48 µs on the first
+run and from 93.80 to 84.95 µs on the second. Each group retained its
+accumulation order. Four warps for the unsplit Engram projection took
+315.05 versus 329.74 µs and 341.80 versus 345.21 µs. Both changes matched
+the reference outputs bit for bit on these inputs. Splitting the following
+CSA2 output projection over K changed the reduction order. Its isolated
+result varied between runs.
+
+The serving experiment used two GB10s, TP2, depth three, and the same
+24,448-token prefix for three warm 256-token continuations each on prose
+and code. Both ranks recorded zero expert reads on these repetitions.
+Decode throughput counts engine decode steps and excludes prompt time.
+The directory measurement sums decode time across the tool call and its
+answer, averaged over eight zero-read exchanges on four tasks. All four
+arms produced the correct arguments and answers on those tasks.
+
+| Diagnostic arm | Prose decode tok/s | Prose ms/pass | Code decode tok/s | Code ms/pass | Directory decode ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prior 32-block b12x | 39.08 | 66.58 | 42.88 | 66.08 | 899.89 |
+| Paired output groups and four-warp Engram | 39.16 | 66.45 | 43.39 | 65.30 | 891.44 |
+| Also split the output projection over K | 41.39 | 66.24 | 42.72 | 65.60 | 888.33 |
+| Per-expert handoff with corrected reset | 36.64 | 71.75 | 38.17 | 71.07 | 970.72 |
+
+Splitting the output projection increased prose acceptance from 157 to 162
+predictions per 256-token request and reduced code acceptance from 165 to
+164. The two dense variants matched on tokens, accepted predictions and
+pass counts across the eight directory exchanges. The 3.11 ms difference
+between them on that workload includes between-start variation.
+
+On the 34-route kernel replay, allowing down work to start when each expert
+became ready reduced the mean from 828.59 to 820.39 µs. The existing b12x
+kernel took 710.62 µs. The first serving implementation stalled. After the
+readiness state was reset on every replay, the completed full-model
+comparison still favored b12x. The production control used binary
+`a3cf4d608a2c`. The three candidates used source base `9771204e` and binaries `c0d433c2e968`,
+`d7210c932efa` and `07bd53510dd0`, respectively. These measurements
+compare individual implementation choices at concurrency one.
+
+FlashDecoding++ describes the trade between output-tile width and available
+blocks for shallow GEMMs on A100. MonoMoE schedules the two projections with
+independent readiness flags on H200. Here the depth-three verifier supplies four
+rows on each GB10 and runs alongside the shared expert and TP2 communication.
+[FlashDecoding++, pp. 7–9](https://arxiv.org/pdf/2311.01282#page=7) ·
+[MonoMoE, pp. 8–9](https://arxiv.org/pdf/2609.04244#page=8)
