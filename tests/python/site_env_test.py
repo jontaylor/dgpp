@@ -339,7 +339,7 @@ class SiteEnvTest(unittest.TestCase):
         flags = {"DGPP_MOE_MX_NATIVE_PREFILL": "1", "DGPP_MOE_MX_NATIVE_TILE_ROWS": "128",
                  "DGPP_MOE_MX_NATIVE_STAGES": "2", "DGPP_MOE_MX_NATIVE_TAIL_SKIP": "1",
                  "DGPP_MX_VERIFY_SINGLETONS": "1", "DGPP_AUDIT_PREFIX_REUSE": "1",
-                 "DGPP_CSA2_LISTED_PREFILL": "1", "DGPP_MX_FUSED_ACTIVATION": "1", "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4",
+                 "DGPP_CSA2_LISTED_PREFILL": "1", "DGPP_MX_FUSED_ACTIVATION": "3", "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4",
                  "DGPP_BULK_STREAM_ORDERED": "1", "CUDA_MODULE_LOADING": "EAGER", "CUDA_DEVICE_MAX_CONNECTIONS": "32", "DGPP_MEMORY_HEADROOM_MIB": "3072"}
         cfg["environment"] = flags
         self.config.write_text(json.dumps(cfg))

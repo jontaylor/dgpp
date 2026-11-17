@@ -172,3 +172,49 @@ ordinary b12x four-row verification backend. The split remains available for
 controlled comparisons. The proxy audit is disabled for ordinary traffic.
 Full deployment campaign rows and broad model-quality scores are outside this
 focused comparison.
+
+## Paired gate/up prefill on two Sparks
+
+The resident specialization in revision `e28aa505` consumes the existing
+packed W13 payload and scale table directly. A thread block computes 64
+columns of each projection using the same input rows. Its epilogue reuses
+the projection pipeline's shared memory, pads each row by eight BF16
+elements and writes one set of MXFP8 down-input codes and scales. Mixed
+waves use the existing projections and 384-CTA quantizer. Both paths preserve
+the gate, up, SiLU and product rounding, the shared-expert stream and the
+expert pool budget. The existing intermediate allocations still serve
+fallbacks. This change reduces intermediate traffic without freeing those
+allocations for other experts.
+
+In a C1 diagnostic, each arm processed the same 24,317-token tool request
+eight times. The final six requests per start had zero cached prompt tokens,
+zero expert-file reads on both ranks, matching operation streams and zero
+process swap. All returned the same 50 tokens and directory arguments, with
+38 accepted predictions across 14 speculative passes. The prior production
+binary averaged 10.913 s of warm prefill. The first implementation supported
+all weight layouts inside the paired kernel and took 11.219 s against
+11.139 s for its own control. The final specialization gave the following
+same-binary comparison (SHA-256
+`a3cf4d608a2c7764be5037b882ac6256909551d48af43c6fc790ca3b9802b32c`).
+
+| Routed prefill path | Mean prefill, s | Range, s | Prompt tokens/s | C1 engine decode, tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Separate gate/up, mode 2 | 10.967 | 10.917–11.003 | 2,217 | 49.14 |
+| Packed gate/up, mode 3 | 10.425 | 10.393–10.456 | 2,332 | 49.66 |
+
+With the real 4,096-token routing patterns and synthetic packed weights, the
+gate/up-to-quantized-activation chain took 17.00 to 12.58 ms on layer 10.
+The least-skewed and most-skewed saved patterns went from 16.69 to 12.51 ms
+and 17.85 to 13.63 ms respectively. Codes and scales matched byte-for-byte on
+all three. The CUDA regression also exercises noncontiguous routed rows,
+a second M tile, small waves, and graph replay. These focused comparisons
+measure the paired prefill path. Decode continues to use grouped b12x.
+
+After promotion the normal service repeated the six warm prefills in 10.454 s
+on average. A 96,296-token prompt following the same 24K sequence took
+46.649 s in mode 2 and 44.464 s in mode 3, one request per mode. Both ranks
+read 8.675 GiB of expert records in each arm, cached zero prompt tokens and
+completed with identical tool arguments, 45 output tokens and 33 accepted
+predictions in 11 passes. A separate two-turn request on the restored
+endpoint listed the source directory and returned its first entry correctly.
+The two-Spark MXFP4 streaming template selects mode 3.
