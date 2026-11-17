@@ -1120,9 +1120,23 @@ DGPP_TEST(csa2_fused_prefill_scores_match_the_oracle) {
     const auto cnt = download<int32_t>(dcnt, rows);
     const auto cp = download<int32_t>(dcp, size_t(rows) * cand_stride);
     const auto cpc = download<int32_t>(dcpc, rows);
+    DGPP_CUDA_OK(cudaMemset(dlog.p, 0xff, size_t(rows) * stride * sizeof(float)));
+    dgpp::csa2_score_listed_prefill(fx.dq8.p, fx.dk.p, static_cast<const float*>(fx.dwf.p),
+        static_cast<const float*>(fx.dks.p), fx.ps(), rows, n, 32, static_cast<float*>(dlog.p), stride,
+        fx.tab(), fx.epb, static_cast<const int32_t*>(dcp.p), cand_stride,
+        static_cast<const int32_t*>(dcpc.p), block_size, nullptr);
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k,
+        static_cast<const int32_t*>(dcp.p), cand_stride, static_cast<const int32_t*>(dcpc.p),
+        block_size, static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), nullptr);
+    sync();
+    const auto sparse = download<float>(dlog, size_t(rows) * stride);
+    require(top == download<int32_t>(dtop, top.size()) && cnt == download<int32_t>(dcnt, rows),
+            "listed prefill preserves selected IDs and counts");
     for (int r = 0; r < rows; ++r) {
       const int64_t visible = std::min<int64_t>(std::max<int64_t>(fx.pos_sel[size_t(r)] + 1, 0), n);
       auto c = ref_candidate_blocks(&lg_ref[size_t(r) * n], visible, block_size, topk_blocks);
+      for (const int entry : ref_pool_entries(c, visible, block_size))
+        require(sparse[size_t(r) * stride + entry] == lg[size_t(r) * stride + entry], "listed score differs");
       require(cpc[size_t(r)] == int(c.size()), "fused prefill: candidate count");
       const auto want = ref_topk_among(&lg_ref[size_t(r) * n], ref_pool_entries(c, visible, block_size), visible, select_k);
       require(cnt[size_t(r)] == int(want.size()), "fused prefill: restricted count row " + std::to_string(r));

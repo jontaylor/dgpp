@@ -756,9 +756,18 @@ __global__ void logits_prefill_kernel(const float* dot, int64_t dot_stride, cons
 // Entries at or past the row's visible count are -inf; keys past it are
 // not read.
 constexpr int kScoreTile = 128;
+struct ListedKeys {
+  const int32_t* table;
+  int entries_per_block;
+  const int32_t* candidates;
+  int stride;
+  const int32_t* counts;
+  int block_size;
+};
+template <bool Listed>
 __global__ void __launch_bounds__(128, 4)
 score_prefill_kernel(const uint8_t* q_fp8, const uint8_t* k, const float* w_folded, const float* k_scale,
-                     const int64_t* pos_sel, int rows, int64_t n, float* logits, int64_t logits_stride) {
+                     const int64_t* pos_sel, int rows, int64_t n, float* logits, int64_t logits_stride, ListedKeys list) {
   dgpp_pdl_wait();
   constexpr int S = 144, N = kScoreTile;
   __shared__ __align__(16) uint8_t a[32 * S];
@@ -769,7 +778,17 @@ score_prefill_kernel(const uint8_t* q_fp8, const uint8_t* k, const float* w_fold
   const int64_t p = pos_sel[r];
   const int64_t visible = p < 0 ? 0 : min(p + 1, n);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-  if (p0 >= visible) {  // the tile holds no visible entry: -inf, no key reads
+  __shared__ int64_t physical[Listed ? N : 1], logical[Listed ? N : 1];
+  if constexpr (Listed) {
+    const int count = list.counts[r];
+    const int64_t size = pool_size(count, list.block_size, visible);
+    if (p0 >= size || visible == 0) return;
+    const int64_t e = p0 + tid < size ? pool_entry(list.candidates + int64_t(r) * list.stride,
+        count, list.block_size, visible, p0 + tid) : -1;
+    logical[tid] = e >= 0 && e < visible ? e : -1;
+    physical[tid] = logical[tid] >= 0 ? entry_slot(list.table, list.entries_per_block, e) : -1;
+    __syncthreads();
+  } else if (p0 >= visible) {  // Invisible dense tile.
     const int64_t e = p0 + tid;
     if (e < n) logits[int64_t(r) * logits_stride + e] = -INFINITY;
     return;
@@ -781,9 +800,9 @@ score_prefill_kernel(const uint8_t* q_fp8, const uint8_t* k, const float* w_fold
   }
   for (int i = tid; i < N * 8; i += 128) {
     const int row = i / 8, col = (i % 8) * 16;
-    const int64_t e = p0 + row;
+    const int64_t e = Listed ? physical[row] : p0 + row;
     *reinterpret_cast<uint4*>(b + row * S + col) =
-        e < visible ? *reinterpret_cast<const uint4*>(k + e * kCsa2IndexDim + col) : make_uint4(0, 0, 0, 0);
+        (Listed ? e >= 0 : e < visible) ? *reinterpret_cast<const uint4*>(k + e * kCsa2IndexDim + col) : make_uint4(0, 0, 0, 0);
   }
   __syncthreads();
   float acc[2][4][4] = {};
@@ -835,8 +854,10 @@ score_prefill_kernel(const uint8_t* q_fp8, const uint8_t* k, const float* w_fold
   for (int j = 0; j < 4; ++j)
 #pragma unroll
     for (int v = 0; v < 2; ++v) {
-      const int64_t e = p0 + warp * 32 + j * 8 + (lane % 4) * 2 + v;
-      const float ks = e < visible ? k_scale[e] : 0.0f;
+      const int col = warp * 32 + j * 8 + (lane % 4) * 2 + v;
+      const int64_t e = Listed ? logical[col] : p0 + col;
+      const bool valid = Listed ? e >= 0 : e < visible;
+      const float ks = valid ? k_scale[Listed ? physical[col] : e] : 0.0f;
       float c[2][2];
 #pragma unroll
       for (int i = 0; i < 2; ++i)
@@ -846,7 +867,7 @@ score_prefill_kernel(const uint8_t* q_fp8, const uint8_t* k, const float* w_fold
       float sum = __fadd_rn(__fadd_rn(c[0][0], c[1][0]), __fadd_rn(c[0][1], c[1][1]));
 #pragma unroll
       for (int off = 16; off >= 4; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
-      if (lane < 4 && e < n) logits[int64_t(r) * logits_stride + e] = e < visible ? sum : -INFINITY;
+      if (lane < 4 && (Listed ? valid : e < n)) logits[int64_t(r) * logits_stride + e] = e < visible ? sum : -INFINITY;
     }
 }
 struct RowKeyFn {
@@ -1322,9 +1343,25 @@ void csa2_score_prefill(const void* q_fp8, const void* k, const float* w_folded,
   const int64_t tiles = (n + kScoreTile - 1) / kScoreTile;
   const int64_t blocks = tiles * rows;
   if (blocks > 0x7fffffffLL) throw std::invalid_argument("csa2_score_prefill: grid");
-  score_prefill_kernel<<<static_cast<unsigned>(blocks), 128, 0, stream>>>(
+  score_prefill_kernel<false><<<static_cast<unsigned>(blocks), 128, 0, stream>>>(
       static_cast<const uint8_t*>(q_fp8), static_cast<const uint8_t*>(k), w_folded, k_scale, pos_sel, rows, n, logits,
-      logits_stride);
+      logits_stride, {});
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_score_listed_prefill(const void* q, const void* k, const float* w, const float* scales,
+                               const int64_t* positions, int rows, int64_t n, int heads, float* logits,
+                               int64_t stride, const int32_t* table, int epb, const int32_t* candidates,
+                               int capacity, const int32_t* counts, int block_size, cudaStream_t stream) {
+  if (heads != 32 || rows <= 0 || n < 0 || stride < n || capacity <= 0 || block_size <= 0 || epb <= 0)
+    throw std::invalid_argument("csa2_score_listed_prefill: shape");
+  const int64_t entries = std::min(n, int64_t(capacity) * block_size + block_size - 1);
+  const int64_t blocks = ((entries + kScoreTile - 1) / kScoreTile) * rows;
+  if (blocks == 0) return;
+  if (blocks > 0x7fffffffLL) throw std::invalid_argument("csa2_score_listed_prefill: grid");
+  score_prefill_kernel<true><<<static_cast<unsigned>(blocks), 128, 0, stream>>>(
+      static_cast<const uint8_t*>(q), static_cast<const uint8_t*>(k), w, scales, positions, rows, n,
+      logits, stride, {table, epb, candidates, capacity, counts, block_size});
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

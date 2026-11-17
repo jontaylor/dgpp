@@ -159,7 +159,7 @@ add_library(dgpp_moe_mxfp4_native STATIC src/kernels/moe_mxfp4_native.cu)
 target_link_libraries(dgpp_moe_mxfp4_native PUBLIC CUDA::cudart)
 dgpp_set_common(dgpp_moe_mxfp4_native)
 
-add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu src/kernels/expert_demand.cu)
+add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu src/kernels/expert_demand.cu src/kernels/mxfp4_verify.cu)
 target_link_libraries(dgpp_moe_fp4_pack PUBLIC CUDA::cudart)
 dgpp_set_common(dgpp_moe_fp4_pack)
 

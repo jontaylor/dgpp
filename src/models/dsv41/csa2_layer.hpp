@@ -146,7 +146,8 @@ class Csa2Layer {
   // state the following layers reuse (topk_, counts_, the candidate pool)
   // and its shape record live at that offset, so every span keeps its own.
   void enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int req, int64_t pos0, int tokens,
-                       void* out, cudaStream_t stream, int64_t floor = 0, bool publish = true, int row_base = 0);
+                       void* out, cudaStream_t stream, int64_t floor = 0, bool publish = true, int row_base = 0,
+                       bool full_logits = false);
   // A kv source's publish alone over the chunk's rows: the compressor and
   // the index keys into the pool (the bounded prefill publishes the
   // decoder's global KV for every prompt row, then runs the segment).

@@ -1,12 +1,14 @@
 #include <cstdlib>
+#include "common/dtypes.hpp"
 
 #include "kernels/moe_mxfp4_native.hpp"
 #include "kernels/moe_mxfp4_native_impl.cuh"
 namespace dgpp {
 namespace {
+template <bool Activate>
 __global__ void quantize_tiles(const uint16_t* x, size_t stride, int k, uint8_t* codes,
                                uint8_t* scales, const MoeSegment* segs, const MoeTile* tiles,
-                               const int32_t* count) {
+                               const int32_t* count, const uint16_t* up, float limit) {
   dgpp_pdl_wait();
   const int columns = (k + 511) / 512;
   const int work_items = *count * 64 * columns;
@@ -22,6 +24,17 @@ __global__ void quantize_tiles(const uint16_t* x, size_t stride, int k, uint8_t*
         *reinterpret_cast<const uint2*>(x + static_cast<size_t>(row) * stride + column);
     float values[4] = {__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u),
                        __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u)};
+    if constexpr (Activate) {
+      const uint2 u = *reinterpret_cast<const uint2*>(up + static_cast<size_t>(row) * stride + column);
+      const uint16_t words[4] = {uint16_t(u.x), uint16_t(u.x >> 16), uint16_t(u.y), uint16_t(u.y >> 16)};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float g = values[j] > limit ? limit : values[j];
+        const float clamped = fminf(fmaxf(bf16_bits_to_float(words[j]), -limit), limit);
+        const uint16_t silu = float_to_bf16_bits(g * (1.f / (1.f + expf(-g))));
+        values[j] = bf16_bits_to_float(float_to_bf16_bits(bf16_bits_to_float(silu) * clamped));
+      }
+    }
     float maximum =
         fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])), fmaxf(fabsf(values[2]), fabsf(values[3])));
     const unsigned active = __activemask();
@@ -93,7 +106,13 @@ void launch(const uint8_t* a, const uint8_t* as, const MoeSegment* segs, int cou
 void launch_moe_mxfp8_quantize_tiles(const uint16_t* x, size_t stride, int k, uint8_t* codes,
                                      uint8_t* scales, const MoeSegment* segs, const MoeTile* tiles,
                                      const int32_t* count, cudaStream_t stream) {
-  quantize_tiles<<<96, 128, 0, stream>>>(x, stride, k, codes, scales, segs, tiles, count);
+  quantize_tiles<false><<<96, 128, 0, stream>>>(x, stride, k, codes, scales, segs, tiles, count, nullptr, 0.f);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void launch_moe_mxfp8_swiglu_tiles(const uint16_t* gate, const uint16_t* up, float limit, size_t stride, int k,
+                                   uint8_t* codes, uint8_t* scales, const MoeSegment* segs,
+                                   const MoeTile* tiles, const int32_t* count, cudaStream_t stream, int blocks) {
+  quantize_tiles<true><<<blocks, 128, 0, stream>>>(gate, stride, k, codes, scales, segs, tiles, count, up, limit);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void launch_moe_mxfp4_native_bf16(const uint8_t* a, const uint8_t* as, const MoeSegment* s,

@@ -117,6 +117,21 @@ int main() {
                         qsr.begin() + r * (K / 32)))
           throw std::runtime_error("segmented quantization differs from row quantization");
       }
+    // Compare all bytes, including untouched gaps between routed segments.
+    Buffer<uint16_t> activation(R*K), up(R*K);
+    std::reverse(hx.begin(), hx.end());
+    up.write(hx);
+    for (float limit : {0.5f, 8.f}) {
+      for (auto* buf : {a.p, qa.p}) DGPP_CUDA_OK(cudaMemsetAsync(buf, 0xcc, R*K, stream));
+      for (auto* buf : {as.p, qas.p}) DGPP_CUDA_OK(cudaMemsetAsync(buf, 0xcc, R*K/32, stream));
+      launch_moe_swiglu_clamp(x.p, up.p, activation.p, R*K, limit, stream);
+      launch_moe_mxfp8_quantize_tiles(activation.p, K, K, a.p, as.p, seg.p, tiles.p, count.p, stream);
+      launch_moe_mxfp8_swiglu_tiles(x.p, up.p, limit, K, K, qa.p, qas.p, seg.p, tiles.p, count.p, stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      if (a.read(R*K) != qa.read(R*K) || as.read(R*K/32) != qas.read(R*K/32))
+        throw std::runtime_error("fused SwiGLU quantization differs from the two-stage chain");
+    }
+    launch_mxfp8_quantize_rows(x.p, K, R, K, a.p, as.p, stream);
     for (int active_rows : {19, 7}) {
       hseg[1].rows = active_rows;
       seg.write(hseg);

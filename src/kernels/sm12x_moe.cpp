@@ -8,6 +8,7 @@
 #include "common/cuda_check.hpp"
 #include "kernels/moe_fp4_pack.hpp"
 #include "kernels/expert_demand.hpp"
+#include "kernels/mxfp4_verify.hpp"
 #ifdef DGPP_HAVE_B12X_AOT
 #define CUTE_DSL_CUDA_ERROR_CHECK(err) DGPP_CUDA_OK(err)
 #include "dgpp_b12x_raw_fp32.h"
@@ -17,6 +18,10 @@ static_assert(DGPP_B12X_CAPACITY == dgpp::Sm12xMoe::kCapacity, "regenerate the b
 
 namespace dgpp {
 namespace {
+bool verify_split_enabled() {
+  const char* value = std::getenv("DGPP_MX_VERIFY_SINGLETONS");
+  return value && value[0] == '1';
+}
 constexpr int H = 5120, I = 1152, E = 384, K = 6, M = Sm12xMoe::kCapacity, B = 8;
 constexpr size_t kTemp = 4 * 256 * B * 256;
 constexpr size_t kPacket = E * 6 * sizeof(uint64_t) + M * K * (B + 1) * sizeof(int32_t) + sizeof(int32_t);
@@ -31,7 +36,7 @@ bool sm12x_moe_enabled(int hidden, int intermediate, int experts, int top_k) {
 }
 size_t Sm12xMoe::device_bytes() {
   return M * K * 3 * I * sizeof(uint16_t) + 2 * kTemp * sizeof(float) +
-      (4 * 256 + 2) * sizeof(int32_t) + kPacket;
+      (4 * 256 + 2) * sizeof(int32_t) + kPacket + (verify_split_enabled() ? (M*K*(B+1)+1)*sizeof(int32_t) : 0);
 }
 size_t Sm12xMoe::pinned_bytes() { return kPacket; }
 #ifdef DGPP_HAVE_B12X_AOT
@@ -66,6 +71,7 @@ struct MxBackend {
   void load() { dgpp_b12x_mxfp4_fp32_Kernel_Module_Load(&module); }
 };
 struct Sm12xMoe::Impl {
+  int32_t* reused = nullptr;
   NvBackend nv;
   MxBackend mx;
   int group;
@@ -86,6 +92,7 @@ struct Sm12xMoe::Impl {
     allocate(fc1, M*K*2*I); allocate(act, M*K*I);
     allocate(tmp1, kTemp); allocate(tmp2, kTemp); allocate(locks, 4*256+2);
     allocate(packet, kPacket);
+    if (group == 32 && verify_split_enabled()) allocate(reused, M*K*(B+1)+1);
     DGPP_CUDA_OK(cudaMemset(locks, 0, (4*256+2)*sizeof(int32_t)));
     DGPP_CUDA_OK(cudaHostAlloc(&host, kPacket, cudaHostAllocDefault));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&upload, cudaEventDisableTiming));
@@ -94,6 +101,7 @@ struct Sm12xMoe::Impl {
     if (uploaded) (void)cudaEventSynchronize(upload);
     for (void* p : std::array<void*,6>{fc1, act, tmp1, tmp2, locks, packet})
       if (p) (void)cudaFree(p);
+    if (reused) (void)cudaFree(reused);
     if (host) (void)cudaFreeHost(host);
     if (upload) (void)cudaEventDestroy(upload);
     if (nv.module.module) (void)cudaLibraryUnload(nv.module.module);
@@ -164,6 +172,11 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
     typename Backend::Act act{c.act};
     typename Backend::Fc2 fc2{out};
     auto* packed = reinterpret_cast<int32_t*>(c.packet + E*6*sizeof(uint64_t));
+    if (c.reused && rows == 4) {
+      launch_mxfp4_verify_singletons(hidden, c.act, out, reinterpret_cast<const uint64_t*>(c.packet),
+                                     packed, c.reused, stream);
+      packed = c.reused;
+    }
     typename Backend::Routes routes{packed};
     typename Backend::Experts experts{packed+M*K*B};
     typename Backend::Count count{packed+M*K*(B+1)};

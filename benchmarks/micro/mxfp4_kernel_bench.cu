@@ -10,6 +10,7 @@
 #include "common/dtypes.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/moe_fp4_pack.hpp"
+#include "kernels/moe_mxfp4_native.hpp"
 #include "kernels/mxfp8_gemm.hpp"
 #include "mxfp4_native_prototype.cuh"
 using namespace dgpp;
@@ -286,6 +287,44 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
   printf("%d,%d,%d,%d,%.4f,%.4f,%.4f,%.6f\n", tokens, rows, n, k, t64, t128, tn, rel);
   fflush(stdout);
 }
+void activation_timing(const std::vector<int>& routes, cudaStream_t stream) {
+  constexpr int E = 384, I = 1152;
+  std::vector<int> counts(E);
+  for (int e : routes) ++counts.at(e);
+  std::vector<MoeSegment> segments;
+  int first = 0;
+  for (int e = 0; e < E; ++e) {
+    segments.push_back({first, counts[e], e});
+    first += counts[e];
+  }
+  const size_t values = size_t(first) * I;
+  Buffer<MoeSegment> segs(E);
+  Buffer<MoeTile> tiles(moe_tile_list_capacity(E, first, 64));
+  Buffer<int32_t> count(1);
+  Buffer<uint16_t> x(values), up(values), act(values);
+  Buffer<uint8_t> q(values), scales(values / 32);
+  std::vector<uint16_t> data(values);
+  std::mt19937 gen(178);
+  for (auto* to : {x.p, up.p}) {
+    for (auto& v : data) v = float_to_bf16_bits((int(gen() % 8193) - 4096) / 512.f);
+    DGPP_CUDA_OK(cudaMemcpy(to, data.data(), values * 2, cudaMemcpyHostToDevice));
+  }
+  DGPP_CUDA_OK(cudaMemcpy(segs.p, segments.data(), segments.size() * sizeof(MoeSegment),
+                          cudaMemcpyHostToDevice));
+  launch_moe_tile_list(segs.p, E, 64, tiles.p, count.p, stream);
+  auto run = [&](int blocks) {
+    if (blocks) {
+      launch_moe_mxfp8_swiglu_tiles(x.p, up.p, 10.f, I, I, q.p, scales.p, segs.p, tiles.p, count.p,
+                                    stream, blocks);
+    } else {
+      launch_moe_swiglu_clamp(x.p, up.p, act.p, values, 10.f, stream);
+      launch_moe_mxfp8_quantize_tiles(act.p, I, I, q.p, scales.p, segs.p, tiles.p, count.p, stream);
+    }
+  };
+  for (int blocks : {0, 96, 384, 576, 384, 96, 0})
+    std::printf("activation,%zu,%d,%.4f\n", routes.size(), blocks,
+                timing([&] { run(blocks); }, stream));
+}
 int main(int argc, char** argv) {
   try {
     cudaStream_t s;
@@ -297,6 +336,11 @@ int main(int argc, char** argv) {
       int e;
       while (f >> e) routes.push_back(e);
       if (routes.empty() || routes.size() % 6) throw std::runtime_error("bad routes file");
+    }
+    if (!routes.empty() && argc == 3 && std::string(argv[2]) == "activation") {
+      activation_timing(routes,s);
+      DGPP_CUDA_OK(cudaStreamDestroy(s));
+      return 0;
     }
     for (int t : (routes.empty() ? std::vector<int>{4096, 24317}
                                  : std::vector<int>{int(routes.size() / 6)})) {

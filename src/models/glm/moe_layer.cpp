@@ -1969,6 +1969,13 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   auto* native_down_scales = native_down + (native_scratch ? down_bytes : 0);
   const bool native_gate_on = native_mx && native_scratch && native_mode != 3;
   const bool native_down_on = native_mx && native_scratch && native_mode != 2;
+  static const int fuse_mx_blocks = [] {
+    const char* enabled = std::getenv("DGPP_MX_FUSED_ACTIVATION");
+    if (!enabled || std::getenv("DGPP_MOE_CHAIN_DUMP")) return 0;
+    if (enabled[0] == '2') return 384;
+    return enabled[0] == '1' ? 96 : 0;
+  }();
+  const bool fused_mx = fuse_mx_blocks && native_down_on && w_.fp4_of(2) && !packq;
   if (native_gate_on && !native_hidden_ready_) {
     for (int first = 0; first < tokens; first += 65535) {
       const int count = std::min(65535, tokens - first);
@@ -2156,8 +2163,12 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
     else if (native_down_on && routed_arg && fp4_w) {
-      launch_moe_mxfp8_quantize_tiles(d_act_, I_max, k, native_down, native_down_scales,
-          sg, d_tiles_, d_tile_count_, stream);
+      if (fused_mx)
+        launch_moe_mxfp8_swiglu_tiles(d_gate_, d_up_, cfg_.swiglu_limit, I_max, k, native_down,
+                                     native_down_scales, sg, d_tiles_, d_tile_count_, stream, fuse_mx_blocks);
+      else
+        launch_moe_mxfp8_quantize_tiles(d_act_, I_max, k, native_down, native_down_scales,
+                                        sg, d_tiles_, d_tile_count_, stream);
       launch_moe_mxfp4_native_f32(native_down, native_down_scales, sg, ns, mr,
           d_views_prefill_, 2, d_down_, H, H, k, stream);
     } else if (mma && fp4_w)
@@ -2203,7 +2214,13 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   activation_elements_ += local_activation
       ? (static_cast<size_t>(activation_rows) + (shared_seg && execute_shared ? tokens : 0)) * I_max
       : rows_total * I_max;
-  if (fused_swiglu) {
+  if (fused_mx) {
+    if (shared_seg && execute_shared) {
+      const size_t offset = static_cast<size_t>(tokens) * cfg_.top_k * I_max;
+      launch_moe_swiglu_clamp(d_gate_ + offset, d_up_ + offset, d_act_ + offset,
+                              static_cast<int64_t>(tokens) * I_max, cfg_.swiglu_limit, stream);
+    }
+  } else if (fused_swiglu) {
     launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
                                       d_q_codes_, d_q_scales_, d_q_gs_, stream,
                                       0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);

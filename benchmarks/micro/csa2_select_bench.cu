@@ -243,6 +243,17 @@ int main(int argc, char** argv) {
     auto score_prefill = [&] {
       dgpp::csa2_score_prefill(dq.p, dk.p, dw.p, ds.p, dp.p, rows, stride, 32, logits.p, stride, stream);
     };
+    Buffer<uint8_t> gathered(csa ? size_t(stride) * 128 : 1);
+    Buffer<float> gathered_scales(csa ? stride : 1);
+    auto gather_score = [&] {
+      dgpp::dsa_gather_index_pools(dt.p, ppb, dk.p, ds.p, entries, gathered.p, gathered_scales.p, 128, stream);
+      dgpp::csa2_score_prefill(dq.p, gathered.p, dw.p, gathered_scales.p, dp.p, rows, entries, 32,
+                               logits.p, stride, stream);
+    };
+    auto score_listed = [&] {
+      dgpp::csa2_score_listed_prefill(dq.p, dk.p, dw.p, ds.p, dp.p, rows, entries, 32, logits.p, stride,
+          dt.p, ppb, candidates.p, candidate_blocks, candidate_counts.p, block_size, stream);
+    };
     std::vector<int32_t> expected_top, expected_counts, expected_candidates,
         expected_candidate_counts;
     if (csa) {
@@ -316,7 +327,9 @@ int main(int argc, char** argv) {
                    candidate();
                    listed();
                  }},
-                {"score_prefill", score_prefill}};
+                {"score_prefill", score_prefill},
+                {"gather_score_prefill", gather_score},
+                {"score_listed_prefill", score_listed}};
     require(only.empty() || std::any_of(stages.begin(), stages.end(),
                                         [&](const auto& stage) { return stage.first == only; }),
             "unknown stage for family");

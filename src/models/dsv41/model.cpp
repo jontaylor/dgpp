@@ -1789,11 +1789,11 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
       if (!csa2_->prepare(len)) throw std::runtime_error("run_rows: CSA2 GEMM plans unavailable");
       const int64_t floor = rows.span_floor ? rows.span_floor[s] : rows.window_floor;
       csa2_->enqueue_prefill(x_ + static_cast<size_t>(row0) * H, pool_, rows.span_reqs[s], rows.span_pos0[s], len,
-                             attn_out + static_cast<size_t>(row0) * H, stream_, floor, rows.publish, row0);
+                             attn_out + static_cast<size_t>(row0) * H, stream_, floor, rows.publish, row0, debug_capture_);
       row0 += len;
     }
   } else {
-    csa2_->enqueue_prefill(x_, pool_, rows.req, rows.pos0, T, attn_out, stream_, rows.window_floor, rows.publish);
+    csa2_->enqueue_prefill(x_, pool_, rows.req, rows.pos0, T, attn_out, stream_, rows.window_floor, rows.publish, 0, debug_capture_);
   }
   if (pf) prefetch_ffn_side(r, T);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: wo_b's partial

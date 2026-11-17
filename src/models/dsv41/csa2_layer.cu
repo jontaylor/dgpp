@@ -901,7 +901,7 @@ void Csa2Layer::publish_prefill(const void* hidden_in, Csa2StatePool& pool, int 
 }
 
 void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int req, int64_t pos0, int tokens,
-                                void* out, cudaStream_t stream, int64_t floor, bool publish, int row_base) {
+                                void* out, cudaStream_t stream, int64_t floor, bool publish, int row_base, bool full_logits) {
   validate_pool(pool);
   prefill_tile_ = prefill_dense_tile_;
   struct TileScope {
@@ -946,13 +946,20 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
       const int64_t n_gather = (pos0 + tokens) / w_.ratio;
       const int64_t padded_n = n_gather > 0 ? round_up_to(n_gather, kEntryPad) : 0;
       if (padded_n > max_entries_) throw std::invalid_argument("csa2 layer: the context exceeds max_cache_tokens");
-      if (padded_n > gather_zeroed_) {
+      if (w_.uses_candidates) require_shape(cand_at(row_base), shape, "the candidate pool");
+      static const bool listed_enabled = [] {
+        const char* v = std::getenv("DGPP_CSA2_LISTED_PREFILL");
+        return v && v[0] == '1';
+      }();
+      const bool listed = listed_enabled && w_.uses_candidates && !full_logits &&
+                          n_gather > 2LL * cfg_.candidate_blocks * cfg_.candidate_block;
+      if (!listed && padded_n > gather_zeroed_) {
         DGPP_CUDA_OK(cudaMemsetAsync(gather_k_ + gather_zeroed_ * kCsa2IndexDim, 0,
                                      size_t(padded_n - gather_zeroed_) * kCsa2IndexDim, stream));
         DGPP_CUDA_OK(cudaMemsetAsync(gather_scale_ + gather_zeroed_, 0, size_t(padded_n - gather_zeroed_) * 4, stream));
         gather_zeroed_ = padded_n;
       }
-      if (n_gather > 0)
+      if (!listed && n_gather > 0)
         dsa_gather_index_pools(pool.block_tables() + size_t(req) * pool.total_blocks(), epb, pool.index_k(ord),
                                pool.index_scale(ord), n_gather, gather_k_, gather_scale_, kCsa2IndexDim, stream);
       // The logits tile holds tile_cap_ rows at max_entries_; at this
@@ -966,15 +973,21 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
           : tokens;
       for (int row0 = 0; row0 < tokens; row0 += tile_rows) {
         const int rows = std::min(tile_rows, tokens - row0);
-        if (padded_n > 0)
+        const size_t srow = size_t(row_base + row0);
+        if (listed)
+          csa2_score_listed_prefill(q_fp8_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, pool.index_k(ord),
+              w_folded_ + size_t(row0) * cfg_.index_heads, pool.index_scale(ord), pos_sel_ + row0, rows,
+              n_gather, cfg_.index_heads, logits_, padded_n, pool.block_tables() + size_t(req) * pool.total_blocks(),
+              epb, cand_ + srow * cfg_.candidate_blocks, cfg_.candidate_blocks, cand_counts_ + srow,
+              cfg_.candidate_block, stream);
+        else if (padded_n > 0)
           csa2_score_prefill(q_fp8_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, gather_k_,
                              w_folded_ + size_t(row0) * cfg_.index_heads, gather_scale_, pos_sel_ + row0, rows, n_gather,
                              cfg_.index_heads, logits_, padded_n, stream);
         const int64_t stride = std::max<int64_t>(padded_n, 1);
-        dbg_logits_rows_ = padded_n > 0 ? rows : 0;
+        dbg_logits_rows_ = !listed && padded_n > 0 ? rows : 0;
         dbg_logits_stride_ = stride;
         dbg_logits_entries_ = n_gather;
-        const size_t srow = size_t(row_base + row0);  // the selection state's row
         if (w_.candidate_source)
           csa2_select_candidates_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.candidate_block, cfg_.candidate_blocks,
                                          cand_ + srow * cfg_.candidate_blocks, cand_counts_ + srow, stream);
@@ -985,7 +998,6 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
                                  topk_ + srow * cfg_.index_topk, counts_ + srow, stream);
       }
       if (w_.candidate_source) cand_at(row_base) = shape;
-      else if (w_.uses_candidates) require_shape(cand_at(row_base), shape, "the candidate pool");
       sel_at(row_base) = shape;
     } else {
       require_shape(sel_at(row_base), shape, "the selection");

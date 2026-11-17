@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <format>
 #include <stdexcept>
@@ -1319,6 +1320,21 @@ void Scheduler::retire(int arrival, Result::Status status,
   if (r.state == State::kPrefilling)
     prefill_request_ms_ += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - r.admitted_at).count();
+  static const bool audit_prefix = [] {
+    const char* v = std::getenv("DGPP_AUDIT_PREFIX_REUSE");
+    return v && v[0] == '1';
+  }();
+  if (audit_prefix && r.slot >= 0) {
+    const auto& prompt = r.spec.prompt;
+    const auto end = std::mismatch(prompt.begin(), prompt.end(), previous_sequence_.begin(), previous_sequence_.end());
+    const int64_t common = end.first - prompt.begin();
+    DGPP_LOG_INFO("prefix reuse: prompt={} previous_prompt={} previous_generated={} common={} attached={} align={}",
+        prompt.size(), previous_prompt_size_, previous_sequence_.size() - previous_prompt_size_,
+        common, r.attach_position, prefix_info_.align);
+    previous_sequence_.assign(prompt.begin(), prompt.end());
+    previous_prompt_size_ = prompt.size();
+    previous_sequence_.insert(previous_sequence_.end(), r.generated.begin(), r.generated.end());
+  }
   // The slot's draft acceptance for the retire line, read before close
   // resets it.
   const SchedulerEngine::MtpAcceptance acceptance =

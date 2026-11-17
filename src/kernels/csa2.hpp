@@ -255,6 +255,13 @@ void csa2_logits_prefill(const float* dot, int64_t dot_stride, const float* w_fo
 void csa2_score_prefill(const void* q_fp8, const void* k, const float* w_folded, const float* k_scale,
                         const int64_t* pos_sel, int rows, int64_t n, int heads, float* logits,
                         int64_t logits_stride, cudaStream_t stream);
+// Writes only the listed logical entries and the newest incomplete block.
+// Keys/scales are in physical pool order; logits keep their logical stride.
+void csa2_score_listed_prefill(const void* q, const void* k, const float* w, const float* scales,
+                               const int64_t* positions, int rows, int64_t n, int heads, float* logits,
+                               int64_t stride, const int32_t* table, int epb, const int32_t* candidates,
+                               int capacity, const int32_t* counts, int block_size, cudaStream_t stream);
+
 // Prefill selections over the logits rows: the plain / restricted top-k
 // (cand null: every visible entry; else the block ids as above) and the
 // candidate stage.

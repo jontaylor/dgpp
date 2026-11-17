@@ -1197,6 +1197,8 @@ class Scheduler {
   double prefill_ms_ = 0.0;
   double prefill_request_ms_ = 0.0;
   double step_ms_ = 0.0;
+  std::vector<int64_t> previous_sequence_;  // populated only for the opt-in consecutive-turn audit
+  size_t previous_prompt_size_ = 0;
   PrefixCache cache_;              // the prefix cache's index (M7)
   SchedulerEngine::PrefixInfo prefix_info_;
   uint64_t ticks_ = 0;             // the LRU clock
