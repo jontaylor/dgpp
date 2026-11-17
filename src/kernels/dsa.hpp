@@ -394,12 +394,12 @@ bool dsa_attn_dense(const void* q_tilde, const void* latent_cache,
 // dsa_attn_partial takes them, each 16-row slab (one query row) walking its
 // own list. Requires local_heads a multiple of 16 (returns false otherwise,
 // as for kv_lora outside 512/256); combine with dsa_attn_combine.
-// `group` (2026-10-23): kAttnSplitGroup merges each kAttnSplitGroup
+// `group`: 4 or kAttnSplitGroup merges that many
 // consecutive splits of a row — the last of the group's blocks to arrive
 // folds the per-split partials from L2 with the finish's formula into the
-// group's partial (mg_ws / lg_ws / cg_ws, n_split / kAttnSplitGroup per
+// group's partial (mg_ws / lg_ws / cg_ws, n_split / group per
 // row) and discards the dead per-split rows from L2 — so the finish reads
-// eight times fewer partials and the per-split ones never write back. The
+// four or eight times fewer partials and the per-split ones never write back. The
 // grouping is fixed per request, so a row's output is the same whatever
 // rows share the launch. n_split must be a multiple of the group;
 // `tickets` holds ceil(rows * local_heads / 32) * n_split / group ints,

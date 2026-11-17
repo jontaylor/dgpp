@@ -4204,6 +4204,15 @@ void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                int32_t* tickets, float* mg_ws, float* lg_ws, float* cg_ws,
                                cudaStream_t stream) {
   constexpr size_t kSmem = dense::Geo<KV, SD, kListed ? 16 : dense::kTile>::smem_bytes;
+  if constexpr (kGroup == 4) {
+    static const bool prepared = [] {
+      DGPP_CUDA_OK(cudaFuncSetAttribute(attn_flash_kernel<KV, SD, kListed, F, kGroup>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(kSmem)));
+      return true;
+    }();
+    (void)prepared;
+  }
   attn_flash_kernel<KV, SD, kListed, F, kGroup><<<grid, dense::kThreads, kSmem, stream>>>(
       static_cast<const uint16_t*>(q_tilde),
       static_cast<const uint8_t*>(latent_cache), latent_scale, req_ids, pos, topk,
@@ -4269,12 +4278,14 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
                        float* cg_ws) {
   if (rows <= 0) return true;
   if (blocks_total < 0) blocks_total = blocks_per_request;
-  // The split groups (listed form only): 1, or kAttnSplitGroup dividing
+  // The split groups (listed form only): 1, or 4/8 dividing
   // n_split with the tickets and the group partials' buffers.
-  if (group != 1 && (!kListed || group != kAttnSplitGroup || n_split % kAttnSplitGroup != 0 || tickets == nullptr ||
-                     mg_ws == nullptr || lg_ws == nullptr || cg_ws == nullptr))
+  if (group != 1 &&
+      (!kListed || (group != kAttnSplitGroup && group != 4) || n_split % group != 0 ||
+       tickets == nullptr || mg_ws == nullptr || lg_ws == nullptr || cg_ws == nullptr))
     throw std::invalid_argument(
-        "dsa attention: the split group must be 1, or kAttnSplitGroup dividing n_split with tickets and group buffers (listed form)");
+        "dsa attention: the split group must be 1, or 4/8 dividing n_split with tickets and group "
+        "buffers (listed form)");
   // The compiled geometries: 512 and 256 without a tail, 512 + 64 with one.
   if (rope == 0 && kv_lora != 512 && kv_lora != 256) return false;  // caller falls back
   if (rope != 0 && !(kv_lora == 512 && rope == 64)) return false;
@@ -4306,7 +4317,9 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
     }
   };
   if constexpr (kListed) {
-    if (group == kAttnSplitGroup)
+    if (group == 4)
+      dispatch(std::integral_constant<int, 4>{});
+    else if (group == kAttnSplitGroup)
       dispatch(std::integral_constant<int, kAttnSplitGroup>{});
     else
       dispatch(std::integral_constant<int, 1>{});

@@ -1,21 +1,44 @@
-#include "models/dsv41/csa2_layer.hpp"
-
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "common/cuda_check.hpp"
+#include "common/log.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/mma_gemv.hpp"
+#include "kernels/mxfp8_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
+#include "models/dsv41/csa2_layer.hpp"
 
 namespace dgpp {
 namespace {
+// These weights come from DSV's E8M0 loader, expanded to exact FP32 powers of two.
+void launch_csa2_projection(const uint16_t* act, size_t xs, const uint8_t* w, const float* scales,
+                            uint16_t* out, int m, int n, int k, cudaStream_t stream, size_t os,
+                            int rs, int cs, bool decode_mma, void* workspace, size_t bytes,
+                            bool prefill) {
+  static const int mode = [] {
+    const char* v = std::getenv("DGPP_DSV41_NATIVE_FP8_PREFILL");
+    return v && v[0] == '2' ? 2 : v && v[0] == '1' ? 1 : 0;
+  }();
+  if (mode && prefill && rs == 5 && cs == 5 && (mode == 1 || m <= 128 || n >= 5120) &&
+      launch_mxfp8_grid32_expanded_bf16(act, xs, w, scales, out, m, n, k, stream, os, workspace,
+                                        bytes)) {
+    static const bool announced = [] {
+      DGPP_LOG_INFO("dsv41 native FP8 prefill: CSA2 projections selected, existing workspace");
+      return true;
+    }();
+    (void)announced;
+    return;
+  }
+  launch_scale_gemm_grid_bf16(act, xs, w, scales, out, m, n, k, stream, os, rs, cs, decode_mma,
+                              workspace, bytes, prefill);
+}
 size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 int64_t round_up_to(int64_t v, int64_t g) { return (v + g - 1) / g * g; }
 }  // namespace
@@ -119,7 +142,8 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   // The split groups' partials (one per kAttnSplitGroup splits) and the
   // groups' tickets per row pair (the listed kernel's 32 M-rows), both
   // sources (2026-10-23).
-  const size_t grp_slots = size_t(L.ws_slots) / kAttnSplitGroup + 1;
+  const size_t grp_slots =
+      std::max(size_t(L.ws_slots) / kAttnSplitGroup + 1, size_t(kPrefillAttnRows));
   L.m_grp_main = alloc(grp_slots * lh * 4);
   L.l_grp_main = alloc(grp_slots * lh * 4);
   L.c_grp_main = alloc(grp_slots * lh * kCsa2Latent * 4);
@@ -127,7 +151,9 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.l_grp_win = alloc(grp_slots * lh * 4);
   L.c_grp_win = alloc(grp_slots * lh * kCsa2Latent * 4);
   const size_t row_pairs = (size_t(std::max(max_decode_rows, 8)) * lh + 31) / 32;
-  L.tickets_per_source = row_pairs * (size_t(std::max(decode_n_split, 8)) / kAttnSplitGroup + 1);
+  L.tickets_per_source =
+      std::max(row_pairs * (size_t(std::max(decode_n_split, 8)) / kAttnSplitGroup + 1),
+               (size_t(kPrefillAttnRows) * lh + 31) / 32);
   L.tickets = alloc(2 * L.tickets_per_source * 4);
   L.gather_k = alloc(size_t(L.max_entries) * kCsa2IndexDim);
   L.gather_scale = alloc(size_t(L.max_entries) * 4);
@@ -354,8 +380,9 @@ void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos
     launch_exl3_gemm_bf16(h, size_t(cfg_.hidden), w_.wkv_x, kv_, tokens, kCsa2Latent, cfg_.hidden, 0, stream, exl3_ws_,
                           exl3_ws_bytes_);
   else
-    launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, tokens, kCsa2Latent,
-                                cfg_.hidden, stream, 0, 5, 5, cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_, prefill_tile_);
+    launch_csa2_projection(h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, tokens,
+                           kCsa2Latent, cfg_.hidden, stream, 0, 5, 5, cfg_.dense_mma, gemm_ws_,
+                           gemm_ws_bytes_, prefill_tile_);
   csa2_rmsnorm_bf16(kv_, kCsa2Latent, w_.kv_norm, kv_, kCsa2Latent, tokens, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(kv_ + (kCsa2Latent - kCsa2Rope), kCsa2Latent, kCsa2Latent, 1, kCsa2Rope, pos, w_.inv_freq, false,
                   tokens, stream);
@@ -385,8 +412,9 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
     csa2_norms_rope(qr_, cfg_.q_lora, w_.q_norm, cfg_.q_lora, kv_, kCsa2Latent, w_.kv_norm, kCsa2Latent, cfg_.eps,
                     kCsa2Latent - kCsa2Rope, kCsa2Rope, pos, w_.inv_freq, tokens, stream);
   } else {
-    launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, tokens, cfg_.q_lora,
-                                cfg_.hidden, stream, 0, 5, 5, cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_, prefill_tile_);
+    launch_csa2_projection(h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, tokens,
+                           cfg_.q_lora, cfg_.hidden, stream, 0, 5, 5, cfg_.dense_mma, gemm_ws_,
+                           gemm_ws_bytes_, prefill_tile_);
     csa2_rmsnorm_bf16(qr_, cfg_.q_lora, w_.q_norm, qr_, cfg_.q_lora, tokens, cfg_.q_lora, cfg_.eps, stream);
     project_kv(hidden_in, tokens, pos, stream);
   }
@@ -394,8 +422,10 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
     launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b_x, q_, tokens, lh * kCsa2Latent, cfg_.q_lora, 0, stream,
                           exl3_ws_, exl3_ws_bytes_);
   else
-    launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
-                                lh * kCsa2Latent, cfg_.q_lora, stream, 0, 5, 5, cfg_.dense_mma, nullptr, 0, prefill_tile_);
+    launch_csa2_projection(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
+                           lh * kCsa2Latent, cfg_.q_lora, stream, 0, 5, 5, cfg_.dense_mma,
+                           prefill_tile_ ? gemm_ws_ : nullptr, prefill_tile_ ? gemm_ws_bytes_ : 0,
+                           prefill_tile_);
   if (rope_q)
     csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                     w_.inv_freq, false, tokens, stream);
@@ -407,8 +437,10 @@ void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* 
     launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b_x, idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, 0,
                           stream, exl3_ws_, exl3_ws_bytes_);
   else
-    launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, tokens,
-                                heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 5, 5, cfg_.dense_mma, nullptr, 0, prefill_tile_);
+    launch_csa2_projection(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales,
+                           idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 5, 5,
+                           cfg_.dense_mma, prefill_tile_ ? gemm_ws_ : nullptr,
+                           prefill_tile_ ? gemm_ws_bytes_ : 0, prefill_tile_);
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
   csa2_index_q_quant(idx_q_, tokens, heads, q_fp8_, q_scale_, violations_, stream);
@@ -526,6 +558,11 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   // write back. The scalar fallback keeps one per split.
   const int group = split_window && n_split_win % kAttnSplitGroup == 0 && n_split_main % kAttnSplitGroup == 0
                         ? kAttnSplitGroup : 1;
+  static const bool prefill_merge = [] {
+    const char* value = std::getenv("DGPP_CSA2_PREFILL_MERGE4");
+    return value && value[0] == '1';
+  }();
+  const int main_group = !split_window && n_split_main == 4 && prefill_merge ? 4 : group;
   // The window table has one entry per request (the ring: request r's
   // region r; the prefill scratch: block 0): the physical bound is the
   // ring's region count, not the row width.
@@ -557,12 +594,13 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
     const int32_t* counts = counts_ + sel_base + row0;
     const int n_main = n_split_main;
     if (lh >= 16 && lh % 16 == 0 &&
-        dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh, kCsa2Latent,
-                        epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
-                        stream, Csa2StatePool::kMainFormat, nullptr, 0, -1, group, tickets_main_, m_grp_main_,
-                        l_grp_main_, c_grp_main_)) {
-      n_main_pub = n_main / group;
-      if (group > 1) {
+        dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows,
+                        n_main, lh, kCsa2Latent, epb, pool.block_tables(), int(pool.total_blocks()),
+                        attn_scale_, m_main_, l_main_, c_main_, stream, Csa2StatePool::kMainFormat,
+                        nullptr, 0, -1, main_group, tickets_main_, m_grp_main_, l_grp_main_,
+                        c_grp_main_)) {
+      n_main_pub = n_main / main_group;
+      if (main_group > 1) {
         m_main_pub = m_grp_main_;
         l_main_pub = l_grp_main_;
         c_main_pub = c_grp_main_;
@@ -611,13 +649,16 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
   } else {
     for (int g = 0; g < lg; ++g) {
       const size_t row_off = size_t(g) * cfg_.o_lora;
-      launch_scale_gemm_grid_bf16(o_ + size_t(g) * K, act_stride, w_.wo_a.payload + row_off * K,
-                                  w_.wo_a.scales + (row_off / 32) * (size_t(K) / 32), oa_ + row_off, tokens, cfg_.o_lora, K,
-                                  stream, size_t(lg) * cfg_.o_lora, 5, 5, cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_, prefill_tile_);
+      launch_csa2_projection(o_ + size_t(g) * K, act_stride, w_.wo_a.payload + row_off * K,
+                             w_.wo_a.scales + (row_off / 32) * (size_t(K) / 32), oa_ + row_off,
+                             tokens, cfg_.o_lora, K, stream, size_t(lg) * cfg_.o_lora, 5, 5,
+                             cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_, prefill_tile_);
     }
   }
-  launch_scale_gemm_grid_bf16(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
-                              static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream, 0, 5, 5, cfg_.dense_mma, nullptr, 0, prefill_tile_);
+  launch_csa2_projection(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
+                         static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream,
+                         0, 5, 5, cfg_.dense_mma, prefill_tile_ ? gemm_ws_ : nullptr,
+                         prefill_tile_ ? gemm_ws_bytes_ : 0, prefill_tile_);
 }
 
 // ---- the decode walk's prefetch windows --------------------------------------------------------

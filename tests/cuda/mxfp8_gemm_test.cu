@@ -269,6 +269,99 @@ void gemm(int rows, int n, int k, unsigned seed) {
   std::printf("MXFP8 GEMM: m=%d n=%d k=%d FP64 relRMS=%.3g, row geometry exact\n", rows, n, k,
               relative);
 }
+// DSV's grid scales and activation floor, including padded rows and tails.
+void grid32() {
+  constexpr int m = 35, n = 45, k = 128, xs = k + 4, os = n + 3;
+  std::vector<uint16_t> x(m * xs, 0x7fc0);
+  std::vector<uint8_t> w(n * k), ws(((n + 31) / 32) * k / 32);
+  for (int r = 0; r < m; ++r)
+    for (int c = 0; c < k; ++c)
+      x[r * xs + c] = float_to_bf16_bits((r % 3 == 0   ? 0.f
+                                          : r % 3 == 1 ? 1e-7f
+                                                       : .03f) *
+                                         ((r * 17 + c * 7) % 29 - 14));
+  for (int i = 0; i < n * k; ++i) w[i] = fp8_bits((i % 13 - 6) * .25f);
+  for (size_t i = 0; i < ws.size(); ++i) ws[i] = 124 + i % 5;
+  Buffer<uint16_t> dx(x), bf(m * os);
+  Buffer<uint8_t> dw(w), ds(ws), scratch(m * k * 33 / 32);
+  Buffer<float> out(m * os);
+  out.write(std::vector<float>(m * os, -123.f));
+  bf.write(std::vector<uint16_t>(m * os, 0x3f01));
+  require(!launch_mxfp8_grid32_f32(dx.ptr, xs, dw.ptr, ds.ptr, out.ptr, m, n, k, nullptr, os,
+                                   scratch.ptr, scratch.count - 1),
+          "grid workspace guard");
+  require(!launch_mxfp8_grid32_f32(dx.ptr, xs, dw.ptr, ds.ptr, out.ptr, 65536, n, k, nullptr, os,
+                                   scratch.ptr, scratch.count),
+          "grid row limit guard");
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  auto run = [&] {
+    require(launch_mxfp8_grid32_f32(dx.ptr, xs, dw.ptr, ds.ptr, out.ptr, m, n, k, stream, os,
+                                    scratch.ptr, scratch.count),
+            "grid f32 dispatch");
+    require(launch_mxfp8_grid32_bf16(dx.ptr, xs, dw.ptr, ds.ptr, bf.ptr, m, n, k, stream, os,
+                                     scratch.ptr, scratch.count),
+            "grid bf16 dispatch");
+  };
+  run();
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  run();
+  DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+  DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  const auto actual = out.read();
+  const auto b = bf.read();
+  std::vector<float> expanded_scales(ws.size());
+  for (size_t i = 0; i < ws.size(); ++i) expanded_scales[i] = std::ldexp(1.f, int(ws[i]) - 127);
+  Buffer<float> expanded(expanded_scales);
+  require(launch_mxfp8_grid32_expanded_bf16(dx.ptr, xs, dw.ptr, expanded.ptr, bf.ptr, m, n, k,
+                                            stream, os, scratch.ptr, scratch.count),
+          "grid expanded float-scale dispatch");
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  require(bf.read() == b, "expanded scale representation changed output");
+  const auto quant = scratch.read();
+  std::vector<float> decoded(m * k);
+  for (int r = 0; r < m; ++r)
+    for (int g = 0; g < k / 32; ++g) {
+      double amax = 1e-4;
+      for (int j = 0; j < 32; ++j)
+        amax = std::max(amax, std::abs(double(bf16_bits_to_float(x[r * xs + g * 32 + j]))));
+      const int exponent = int(std::ceil(std::log2(amax / 448.)));
+      require(quant[m * k + r * (k / 32) + g] == exponent + 127, "grid activation floor/scale");
+      for (int j = 0; j < 32; ++j) {
+        int c = g * 32 + j;
+        uint8_t code = fp8_bits(std::ldexp(bf16_bits_to_float(x[r * xs + c]), -exponent));
+        require(quant[r * k + c] == code, "grid activation code");
+        decoded[r * k + c] = std::ldexp(fp8(code), exponent);
+      }
+    }
+  for (int r = 0; r < m; ++r)
+    for (int c = 0; c < os; ++c) {
+      if (c >= n) {
+        require(actual[r * os + c] == -123.f && b[r * os + c] == 0x3f01, "grid output stride");
+        continue;
+      }
+      double expected = 0, absolute = 0;
+      for (int j = 0; j < k; ++j) {
+        double v = double(decoded[r * k + j]) * fp8(w[c * k + j]) *
+                   std::ldexp(1., int(ws[(c / 32) * (k / 32) + j / 32]) - 127);
+        expected += v;
+        absolute += std::abs(v);
+      }
+      require(std::abs(actual[r * os + c] - expected) <= 2e-5 * absolute + 1e-15,
+              "grid FP64 reference");
+      require(b[r * os + c] == float_to_bf16_bits(actual[r * os + c]), "grid BF16 epilogue");
+    }
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+  std::puts(
+      "DSV grid32: activation floor, FP64 reference, both outputs, tails, guards and graph passed");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -281,6 +374,7 @@ int main(int argc, char** argv) {
     }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 2;
+    grid32();
     quantization();
     fused_quantization(2040, 32, true);
     fused_quantization(17, 6176, false);

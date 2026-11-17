@@ -1569,6 +1569,7 @@ target_include_directories(csa2_layer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(csa2_layer_test PRIVATE dgpp_models_csa2 dgpp_kernels CUDA::cudart CUDA::cublasLt Threads::Threads)
 dgpp_set_common(csa2_layer_test)
 add_test(NAME csa2_layer_test COMMAND csa2_layer_test)
+add_test(NAME csa2_layer_test_merge4 COMMAND ${CMAKE_COMMAND} -E env DGPP_CSA2_PREFILL_MERGE4=1 $<TARGET_FILE:csa2_layer_test>)
 
 # The dsv41 suites run twice: on the fp8 / MXFP4 release fixture and, as
 # the `_exl3` variants, on the EXL3 pack fixture (DGPP_DSV41_FIXTURE=exl3,
@@ -2903,6 +2904,17 @@ if(DGPP_BUILD_BENCHMARKS)
     endif()
     dgpp_set_common(${target})
   endfunction()
+
+  # Focused MXFP4 kernel alternatives; not deployment benchmark rows.
+  dgpp_add_benchmark(dsv41_native_dense_bench
+    SOURCES benchmarks/micro/dsv41_native_dense_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(mxfp4_kernel_bench
+    SOURCES benchmarks/micro/mxfp4_kernel_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(mxfp4_backend_bench
+    SOURCES benchmarks/micro/mxfp4_backend_bench.cpp
+    LIBRARIES dgpp_sm12x_moe CUDA::cudart)
 
   dgpp_add_benchmark(host_penalties_bench
     SOURCES benchmarks/micro/host_penalties_bench.cpp)

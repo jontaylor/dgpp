@@ -102,3 +102,8 @@ A complete deployment campaign, concurrency scaling and a wider quality
 evaluation are outside this focused comparison. These changes do not address
 the larger routed-expert or dense-projection kernel costs identified by the
 profile.
+
+
+The subsequent [kernel alternatives screen](mxfp4-kernel-options.md) tested
+128-row experts, matched b12x formats, native W4A8 experts, native dense FP8
+and four-way attention merging. None displaced this serving configuration.

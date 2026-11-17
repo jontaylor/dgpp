@@ -3899,14 +3899,15 @@ __device__ __forceinline__ uint32_t decode_pair_bf16_mx(uint32_t byte, float s) 
 // routed experts, 2026-09-14). A stage's 64 k spans 4 or 2 scale bytes per
 // row; the ring keeps 4 bytes per row either way.
 template <typename OutT, int kGroup, int TileRows>
-__global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_kernel(
+__global__
+__launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_mma_fp4_ldm_kernel(
     const uint16_t* __restrict__ act, size_t act_stride, int act_vec,
     const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride,
     int n, int k, int m_tiles, bool packed_direct) {
   dgpp_pdl_wait();
   using namespace fp4_ldm;
-  static_assert(TileRows == 16 || TileRows == 64);
+  static_assert(TileRows == 16 || TileRows == 64 || TileRows == 128);
   constexpr size_t tile_a_bytes = size_t(TileRows) * A_PAD * 2;
   constexpr size_t tile_slot_bytes = tile_a_bytes + kCodeBytes + kScaleBytes;
   static_assert(kGroup == 16 || kGroup == 32, "the fp4 scale group");
@@ -4241,7 +4242,7 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
                                     OutT* out, size_t out_stride, int n, int k, cudaStream_t stream,
                                     int fp4_group = kFp4Group) {
   using namespace fp4_ldm;
-  static_assert(TileRows == 16 || TileRows == 64);
+  static_assert(TileRows == 16 || TileRows == 64 || TileRows == 128);
   constexpr size_t tile_a_bytes = size_t(TileRows) * A_PAD * 2;
   constexpr size_t tile_slot_bytes = tile_a_bytes + kCodeBytes + kScaleBytes;
   constexpr size_t tile_smem = kStages * tile_slot_bytes;
@@ -5017,12 +5018,19 @@ void launch_moe_grouped_mma_fp4(const uint16_t* act, size_t act_stride, const in
                                                rows_per_block, views, which, out, out_stride, n, k,
                                                stream, fp4_group);
   };
-  if (tile_rows == 16)
+  static const bool wide = [] {
+    const char* v = std::getenv("DGPP_MOE_MX_PREFILL_ROWS128");
+    return v && v[0] == '1';
+  }();
+  if (wide && fp4_group == kMxfp4Group && tile_rows == 64 && max_rows > 64) tile_rows = 128;
+  if (tile_rows == 128)
+    launch.template operator()<128>();
+  else if (tile_rows == 16)
     launch.template operator()<16>();
   else if (tile_rows == 64)
     launch.template operator()<64>();
   else
-    throw std::invalid_argument("moe grouped mma fp4: tile_rows must be 16 or 64");
+    throw std::invalid_argument("moe grouped mma fp4: tile_rows must be 16, 64 or 128");
 }
 
 // The retired 64 x 128 x 32 two-stage cp.async kernel (bench variant 14).

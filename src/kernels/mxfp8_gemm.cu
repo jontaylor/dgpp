@@ -23,7 +23,7 @@ struct Tile {
 template <bool SwiGLU>
 __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, uint8_t* codes,
                                       uint8_t* scales, const uint16_t* up = nullptr,
-                                      float alpha = 0.f, float limit = 0.f) {
+                                      float alpha = 0.f, float limit = 0.f, float minimum = 0.f) {
   dgpp_pdl_wait();
   // Eight lanes cooperate on each group; each lane loads four adjacent BF16s.
   const int row = blockIdx.y;
@@ -58,6 +58,7 @@ __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, u
 #pragma unroll
   for (int offset = 4; offset; offset >>= 1)
     maximum = fmaxf(maximum, __shfl_xor_sync(active, maximum, offset, 8));
+  maximum = fmaxf(maximum, minimum);
   // Exactly ceil(log2(amax / 448)) from IEEE bits, without log2 rounding
   // at the exponent boundary. Zero groups use scale byte zero and zero codes.
   const int biased = static_cast<int>((__float_as_uint(maximum) >> 23) & 255);
@@ -103,9 +104,9 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
         "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
 }
 
-template <typename Out, int BM, int BN>
+template <typename Out, int BM, int BN, bool Grid32 = false, typename Scale = uint8_t>
 __global__ __launch_bounds__((Tile<BM, BN>::threads)) void mxfp8_gemm_kernel(
-    const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const uint8_t* w_scales, Out* out,
+    const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const Scale* w_scales, Out* out,
     int m, int n, int k, size_t out_stride) {
   dgpp_pdl_wait();
   constexpr int threads = Tile<BM, BN>::threads;
@@ -172,9 +173,17 @@ __global__ __launch_bounds__((Tile<BM, BN>::threads)) void mxfp8_gemm_kernel(
         bf[j][0] = *reinterpret_cast<const uint32_t*>(p);
         bf[j][1] = *reinterpret_cast<const uint32_t*>(p + 16);
         const int scale_row = n0 + row;
-        bs[j] = scale_row < n
-                    ? w_scales[static_cast<size_t>(scale_row) * scale_stride + scale_column]
-                    : 127;
+        bs[j] = 127;
+        if (scale_row < n) {
+          const auto scale =
+              w_scales[static_cast<size_t>(Grid32 ? scale_row / 32 : scale_row) * scale_stride +
+                       scale_column];
+          if constexpr (std::is_same_v<Scale, float>)
+            // DSV loader expands E8M0 to exact powers of two, including byte 0.
+            bs[j] = (__float_as_uint(scale) >> 23) & 255;
+          else
+            bs[j] = scale;
+        }
       }
 #pragma unroll
       for (int i = 0; i < MT; ++i)
@@ -275,4 +284,47 @@ void launch_mxfp8_gemm_f32(const uint8_t* a, const uint8_t* as, const uint8_t* w
                            int output_tile) {
   dispatch(a, as, w, ws, out, m, n, k, stream, stride, output_tile);
 }
+// Native dense path for DSV4.1's 32x32 E8M0 scale grid. Quantization
+// consumes the caller's existing GEMM workspace and stays on its stream.
+template <class Out, class Scale>
+bool native_grid32(const uint16_t* x, size_t x_stride, const uint8_t* w, const Scale* ws, Out* out,
+                   int m, int n, int k, cudaStream_t stream, size_t stride, void* workspace,
+                   size_t bytes) {
+  if (m <= 16 || m > 65535 || n <= 0 || k <= 0 || k % 64 || x_stride < size_t(k) || x_stride % 4 ||
+      (stride && stride < size_t(n)) || !workspace || (reinterpret_cast<uintptr_t>(x) % 8) ||
+      (reinterpret_cast<uintptr_t>(workspace) % 16))
+    return false;
+  const size_t codes = size_t(m) * k, scales = codes / 32;
+  if (bytes < codes + scales) return false;
+  auto* a = static_cast<uint8_t*>(workspace);
+  auto* as = a + codes;
+  const dim3 quant_grid(unsigned((k + 4 * kThreads - 1) / (4 * kThreads)), unsigned(m));
+  mxfp8_quantize_kernel<false>
+      <<<quant_grid, kThreads, 0, stream>>>(x, x_stride, k, a, as, nullptr, 0.f, 0.f, 1e-4f);
+  constexpr int BM = 64, BN = 128;
+  constexpr int smem = kStages * (BM + BN) * Tile<BM, BN>::stride;
+  const unsigned blocks = unsigned(((m + BM - 1) / BM) * ((n + BN - 1) / BN));
+  mxfp8_gemm_kernel<Out, BM, BN, true, Scale><<<blocks, Tile<BM, BN>::threads, smem, stream>>>(
+      a, as, w, ws, out, m, n, k, stride ? stride : size_t(n));
+  DGPP_CUDA_OK(cudaGetLastError());
+  return true;
+}
+bool launch_mxfp8_grid32_bf16(const uint16_t* x, size_t xs, const uint8_t* w, const uint8_t* ws,
+                              uint16_t* out, int m, int n, int k, cudaStream_t stream, size_t os,
+                              void* scratch, size_t bytes) {
+  return native_grid32(x, xs, w, ws, out, m, n, k, stream, os, scratch, bytes);
+}
+bool launch_mxfp8_grid32_f32(const uint16_t* x, size_t xs, const uint8_t* w, const uint8_t* ws,
+                             float* out, int m, int n, int k, cudaStream_t stream, size_t os,
+                             void* scratch, size_t bytes) {
+  return native_grid32(x, xs, w, ws, out, m, n, k, stream, os, scratch, bytes);
+}
+
+bool launch_mxfp8_grid32_expanded_bf16(const uint16_t* x, size_t xs, const uint8_t* w,
+                                       const float* ws, uint16_t* out, int m, int n, int k,
+                                       cudaStream_t stream, size_t os, void* scratch,
+                                       size_t bytes) {
+  return native_grid32(x, xs, w, ws, out, m, n, k, stream, os, scratch, bytes);
+}
+
 }  // namespace dgpp

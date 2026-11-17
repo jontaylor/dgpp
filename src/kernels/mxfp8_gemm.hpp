@@ -29,4 +29,14 @@ void launch_mxfp8_gemm_bf16(const uint8_t* a, const uint8_t* a_scales, const uin
 void launch_mxfp8_gemm_f32(const uint8_t* a, const uint8_t* a_scales, const uint8_t* w,
                            const uint8_t* w_scales, float* out, int m, int n, int k, cudaStream_t,
                            size_t out_stride = 0, int output_tile = 0);
+// Optional prefill path: FP8 weights with one E8M0 scale per 32x32 tile,
+// dynamically quantized activations. Returns false if scratch/shape is unsuitable.
+bool launch_mxfp8_grid32_bf16(const uint16_t*, size_t, const uint8_t*, const uint8_t*, uint16_t*,
+                              int, int, int, cudaStream_t, size_t, void*, size_t);
+bool launch_mxfp8_grid32_f32(const uint16_t*, size_t, const uint8_t*, const uint8_t*, float*, int,
+                             int, int, cudaStream_t, size_t, void*, size_t);
+// DSV loader's exact E8M0-to-float expansion, NOT arbitrary FP32 scales.
+bool launch_mxfp8_grid32_expanded_bf16(const uint16_t*, size_t, const uint8_t*, const float*,
+                                       uint16_t*, int, int, int, cudaStream_t, size_t, void*,
+                                       size_t);
 }  // namespace dgpp
