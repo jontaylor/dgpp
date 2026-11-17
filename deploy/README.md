@@ -470,5 +470,10 @@ explicitly declare their four `engram_embed_*` metadata fields; see the
 [comparison preparation](../docs/expert-streaming-review-response.md#preparing-a-matched-mxfp4-deployment).
 Serving reads should use local SSD files for both the expert image and Engram.
 Draft experts are resident and charged to the expert budget in both formats.
-NVFP4-specific b12x/GPU-paging/chunk-direct paths remain format-specific; matching
-configuration switches does not establish identical kernel execution.
+Both formats support the prepared b12x W4A16 backend, GPU paging with graph
+replay, prepared resident prefill and chunk-direct miss execution. MXFP4 retains
+its native E8M0 scales per 32 weights; its prepared cache does not expand them
+into NVFP4 scales. Build both AOT specializations as described in the
+[backend build instructions](../docs/adaptive-expert-residency.md). Native
+weight values, scale arithmetic, routing and speculative acceptance can still
+differ between checkpoints; matched settings do not imply matching outputs.

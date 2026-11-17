@@ -3323,12 +3323,14 @@ DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
 }
 
 
-DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
+namespace {
+void check_b12x_paging(int group) {
   using namespace dgpp::expert;
   if (!dgpp::sm12x_moe_enabled(5120, 1152, 384, 6)) dgpp::test::skip("optional b12x AOT path disabled");
+  const auto format = group == 32 ? Format::kMxfp4 : Format::kNvfp4;
   constexpr int H = 5120, I = 1152, E = 384, live = 12, M = 256;
-  auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true);
-  const bool mixed_scale_screen = std::getenv("DGPP_TEST_MIXED_SCALES") != nullptr;
+  auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true, false, 0, group);
+  const bool mixed_scale_screen = group == 16 && std::getenv("DGPP_TEST_MIXED_SCALES") != nullptr;
   if (mixed_scale_screen) for (auto& scale : c.host_w.fp4_scales) scale &= 0x78;
   c.cfg.shared_run_lane_min_rows = 1;
   c.alloc();
@@ -3354,7 +3356,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
   require(::mkdtemp(directory.data()) != nullptr, "b12x fixture directory");
   struct Remove { std::string p; ~Remove() { std::error_code ec; std::filesystem::remove_all(p, ec); } } remove{directory};
   StoreIdentity identity;
-  identity.checkpoint_sha256.fill(43); identity.format = Format::kNvfp4;
+  identity.checkpoint_sha256.fill(43); identity.format = format;
   identity.hidden = H; identity.intermediate = I; identity.chunk_intermediate = 64;
   std::vector<RecordKey> keys;
   for (uint32_t e = 0; e < E; ++e)
@@ -3367,15 +3369,15 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
       auto v = dgpp::glm_moe_host_view_fp4(c.host_w, GlmMoeConfig{.hidden=H,.inter=I,.n_experts=live},
                                           (keys[r].expert%live)*3+m);
       const auto n = static_cast<size_t>(v.rows)*v.cols;
-      source[m] = {static_cast<uint64_t>(v.rows), static_cast<uint64_t>(v.cols), Format::kNvfp4,
-                    {v.payload,n/2}, {v.scales,n/16}, v.global_scale};
+      source[m] = {static_cast<uint64_t>(v.rows), static_cast<uint64_t>(v.cols), format,
+                    {v.payload,n/2}, {v.scales,n/group}, group == 16 ? std::optional<float>(v.global_scale) : std::nullopt};
     }
     builder.write(r, pack_chunk(source, keys[r].chunk*64, 64));
   }
   builder.finish();
   auto store = std::make_shared<ExpertStore>(image, identity, keys.size(), IoMode::kDirect);
-  const auto chunk = partition(H,I,1,0,64,Format::kNvfp4).front();
-  const auto full = partition(H,I,1,0,I,Format::kNvfp4).front();
+  const auto chunk = partition(H,I,1,0,64,format).front();
+  const auto full = partition(H,I,1,0,I,format).front();
   cudaStream_t stream = nullptr;
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
   struct Stream { cudaStream_t s; ~Stream() { cudaStreamDestroy(s); } } stream_cleanup{stream};
@@ -3388,7 +3390,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
   std::memcpy(reference.data(),c.d_out,reference.size()*2);
   for (const auto policy : {Policy::kWholeExpert,Policy::kAdaptiveFractional}) {
     auto config = [&](int experts, int execution_slots = 1) {
-      CacheConfig cfg; cfg.packed_nvfp4 = true;
+      CacheConfig cfg; cfg.packed_fp4 = true;
       cfg.execution_slots = execution_slots;
       if (std::getenv("DGPP_EXPERT_CHUNK_DIRECT")) {
         // Ready-prefix scheduling needs room for more than one 18-chunk
@@ -3478,7 +3480,7 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
         for (int e=0;e<E;++e) {
           auto* address=hot.prepared_address(e);
           if (!address) continue;
-          auto v=dgpp::moe_fp4_packed_view(const_cast<uint8_t*>(address),H,I);
+          auto v=dgpp::moe_fp4_packed_view(const_cast<uint8_t*>(address),H,I,group);
           if (split_scales) {
             require(e < live, "mixed-scale fixture has sufficient expansion slots");
             auto compact = dgpp::moe_fp4_compact_view(compact_experts+size_t(e)*compact_bytes,H,I);
@@ -3675,6 +3677,10 @@ DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) {
     require(hot.memory().allocated_bytes() <= config(live,4).planner.budget_bytes,"packed scratch stays within cache budget");
   }
 }
+}  // namespace
+
+DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(16); }
+DGPP_TEST(moe_b12x_mxfp4_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(32); }
 
 DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {
   using namespace dgpp::expert;

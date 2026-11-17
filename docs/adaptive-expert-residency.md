@@ -591,9 +591,15 @@ adapter's approximately 0.00368 on its synthetic reference. These are numerical
 observations for those inputs, not full-model quality results. Device pointer
 and route rebinding preserved output bits under the same captured graph.
 
-Build the optional backend by running `scripts/export_b12x_moe.py --output DIR`
-on the target GPU with FlashInfer 0.7.4 and Cutlass DSL 4.8.1/CUDA 13 installed,
-then configure CMake with `-DDGPP_B12X_AOT_DIR=DIR`. The exporter emits the AOT
+Build both optional native FP4 specializations on the target GPU with
+FlashInfer 0.7.4 and Cutlass DSL 4.8.1/CUDA 13 installed:
+
+```sh
+python scripts/export_b12x_moe.py --format nvfp4 --output DIR
+python scripts/export_b12x_moe.py --format mxfp4 --output DIR
+```
+
+Then configure CMake with `-DDGPP_B12X_AOT_DIR=DIR`. The exporter emits the AOT
 header, object and small static CUDA dialect runtime archive. The server needs
 neither Python nor a JIT compiler. Generated files belong in the build directory.
 

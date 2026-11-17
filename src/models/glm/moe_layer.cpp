@@ -153,7 +153,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
     : w_(weights), cfg_(cfg), max_tokens_(max_tokens),
       decode_slots_(decode_slots), graph_table_slots_(graph_table_slots) {
   if (decode_slots > 0 && sm12x_moe_enabled(cfg.hidden, cfg.inter, cfg.n_experts, cfg.top_k))
-    sm12x_moe_ = std::make_unique<Sm12xMoe>();
+    sm12x_moe_ = std::make_unique<Sm12xMoe>(fp4_group_of(w_));
   GlmMoeConfig::validate_config(cfg_);
   if (max_tokens_ <= 0)
     throw std::invalid_argument("GlmMoeLayer: max_tokens must be positive");
@@ -679,7 +679,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   // decode. Use its fused dot/selection kernel before the host decision.
   const size_t tk = static_cast<size_t>(tokens) * K;
   if (ready) {
-    if (!cache || !cache->packed_nvfp4() || !sm12x_moe_ || tokens > decode_slots_ ||
+    if (!cache || !cache->packed_fp4() || !sm12x_moe_ || tokens > decode_slots_ ||
         ready->ids.size() != tk || ready->device_ids != d_ids_ || ready->device_weights != d_weights_)
       throw std::invalid_argument("GlmMoeLayer: supplied routes must belong to this paused graph executor");
     for (const auto id : ready->ids)
@@ -788,7 +788,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const auto& observations = demand_history ? active_experts : h_ids_;
     for (const auto id : observations) selected.push_back(cache_experts[static_cast<size_t>(id)]);
     cache->observe(selected, kernel == MoeExpertKernel::kMma);
-    if (cache->packed_nvfp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
+    if (cache->packed_fp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
         (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
       enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts);
       return;
@@ -808,7 +808,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     routed.reserve(static_cast<size_t>(n_segs));
     for (int wave = 0; wave < n_segs; ++wave)
       routed.push_back(cache_experts[static_cast<size_t>(active_experts[wave])]);
-    if (!cache->packed_nvfp4() && cache->prepare_resident(routed)) {
+    if (!cache->packed_fp4() && cache->prepare_resident(routed)) {
       // The executor may be rebound across all model layers. Keep tables
       // separate by the layer's global expert base, not by executor address.
       auto& binding = paged_bindings_[cache_experts.front()];
@@ -995,7 +995,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     const auto& chunk_layout = cache->chunk_layout();
     const size_t chunks_per_expert = cache->experts().front().records.size();
     const bool chunk_direct_prefill = chunk_direct_enabled && kernel == MoeExpertKernel::kMma &&
-        cache->packed_nvfp4() && !full_batch_activation && chunk_layout.intermediate_size % 64 == 0 &&
+        cache->packed_fp4() && !full_batch_activation && chunk_layout.intermediate_size % 64 == 0 &&
         (chunk_layout.intermediate_size & (chunk_layout.intermediate_size-1)) == 0 &&
         full.intermediate_size % chunk_layout.intermediate_size == 0;
     static const bool ready_prefill = [] {
@@ -1012,9 +1012,10 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       const char* e = std::getenv("DGPP_MOE_PREPARED_PREFILL");
       return e == nullptr || e[0] != '0';
     }();
-    const bool direct_prefill = prepared_prefill && cache->packed_nvfp4() &&
+    const bool direct_prefill = prepared_prefill && cache->packed_fp4() &&
         kernel == MoeExpertKernel::kMma &&
-        (w_.weight_only_fp4 || !moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total));
+        (format == expert::Format::kMxfp4 || w_.weight_only_fp4 ||
+         !moe_w4a4_eligible(cfg_.hidden, cfg_.inter, rows_total));
     static const bool resident_first_enabled = [] {
       const char* value = std::getenv("DGPP_MOE_RESIDENT_FIRST");
       return value && std::atoi(value) != 0;
@@ -1170,7 +1171,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
               view.fp4_chunk_columns = m == 2;
               view.fp4_chunk_payload = matrices[m].payload_offset;
               view.fp4_chunk_scales = matrices[m].scales_offset;
-              view.fp4_chunk_global = *matrices[m].global_offset;
+              view.fp4_chunk_global = matrices[m].global_offset.value_or(0);
               prepared_views[static_cast<size_t>(e)*3+m] = view;
             }
           } else {
@@ -1202,13 +1203,13 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)]);
           if (!lease) throw std::runtime_error("GlmMoeLayer: missing prepared execution lease");
           const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(lease.packed_data()),
-              cfg_.hidden, static_cast<int>(full.intermediate_size));
+              cfg_.hidden, static_cast<int>(full.intermediate_size), fp4_group_of(w_));
           for (int m = 0; m < 3; ++m) {
             auto& v = prepared_views[static_cast<size_t>(e)*3+m];
             v = MoeExpertView{};
             v.payload = m == 2 ? p.w2 : p.w13;
             v.fp4_scales = m == 2 ? p.s2 : p.s13;
-            v.fp4_global = m == 2 ? p.g2 : p.g13 + m;
+            v.fp4_global = m == 2 ? p.g2 : (p.g13 ? p.g13 + m : nullptr);
             v.fp4_packed_rows = m == 2 ? cfg_.hidden : 2*full.intermediate_size;
             v.fp4_packed_row0 = m == 1 ? full.intermediate_size : 0;
           }

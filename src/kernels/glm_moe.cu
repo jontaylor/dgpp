@@ -3930,7 +3930,8 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   if (v.fp4_chunks) {
     v.payload = v.fp4_chunks[0] + v.fp4_chunk_payload;
     v.fp4_scales = v.fp4_chunks[0] + v.fp4_chunk_scales;
-    v.fp4_global = reinterpret_cast<const float*>(v.fp4_chunks[0] + v.fp4_chunk_global);
+    if constexpr (kGroup == kFp4Group)
+      v.fp4_global = reinterpret_cast<const float*>(v.fp4_chunks[0] + v.fp4_chunk_global);
   }
   const int chunk_shift = v.fp4_chunks ? __ffs(v.fp4_chunk_width) - 1 : 0;
   const int chunk_mask = v.fp4_chunk_width - 1;

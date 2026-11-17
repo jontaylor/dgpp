@@ -163,7 +163,8 @@ set(DGPP_B12X_AOT_DIR "" CACHE PATH "Optional b12x SM121 AOT header, object and 
 add_library(dgpp_sm12x_moe STATIC src/kernels/sm12x_moe.cpp)
 target_link_libraries(dgpp_sm12x_moe PUBLIC dgpp_moe_fp4_pack CUDA::cudart)
 if(DGPP_B12X_AOT_DIR)
-  target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_raw_fp32.o")
+  target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_raw_fp32.o"
+    "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_fp32.o")
   target_include_directories(dgpp_sm12x_moe SYSTEM PRIVATE "${DGPP_B12X_AOT_DIR}")
   target_link_libraries(dgpp_sm12x_moe PUBLIC "${DGPP_B12X_AOT_DIR}/libcuda_dialect_runtime_static.a" CUDA::cuda_driver)
   target_compile_definitions(dgpp_sm12x_moe PRIVATE DGPP_HAVE_B12X_AOT=1)

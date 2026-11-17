@@ -9,7 +9,7 @@ namespace dgpp::expert {
 // nonblocking stream with storage lifetime fences. No worker CUDA contexts.
 // Construct/register at boot, before fabric collective execution, and keep
 // the engine stream/context alive until all cache/execution leases are gone.
-CacheStorageFactory cuda_cache_storage(const StoreIdentity&, cudaStream_t, bool packed_nvfp4 = false);
+CacheStorageFactory cuda_cache_storage(const StoreIdentity&, cudaStream_t, bool packed_fp4 = false);
 
 // Converts a complete reconstruction into the exact existing kernel views.
 // The returned pointers are valid only while the execution lease is held.

@@ -7,7 +7,7 @@
 
 namespace dgpp {
 struct ExpertDemand;
-// Optional b12x W4A16 specialization for the TP2 NVFP4 target. All preparation
+// Optional b12x W4A16 specialization for the TP2 native FP4 target. All preparation
 // precedes graph capture; execution has no Python or JIT dependency.
 bool sm12x_moe_enabled(int hidden, int intermediate, int experts, int top_k);
 class Sm12xMoe {
@@ -15,7 +15,7 @@ class Sm12xMoe {
   static constexpr int kCapacity = 64;
   static size_t device_bytes();
   static size_t pinned_bytes();
-  Sm12xMoe();
+  explicit Sm12xMoe(int scale_group = 16);
   ~Sm12xMoe();
   Sm12xMoe(const Sm12xMoe&) = delete;
   Sm12xMoe& operator=(const Sm12xMoe&) = delete;

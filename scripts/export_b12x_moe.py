@@ -1,4 +1,4 @@
-"""Export DGPP's optional TP2 GB10 NVFP4 W4A16 specialization.
+"""Export DGPP's optional TP2 GB10 native FP4 W4A16 specialization.
 
 Requires FlashInfer 0.7.4's b12x, Cutlass DSL 4.8.1 with CUDA 13 and an
 SM121 GPU during generation. Produces an AOT C header, ARM object and runtime;
@@ -14,7 +14,10 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
+parser.add_argument('--format', choices=('nvfp4', 'mxfp4'), default='nvfp4')
 args = parser.parse_args()
+is_mx = args.format == 'mxfp4'
+symbol = 'dgpp_b12x_mxfp4_fp32' if is_mx else 'dgpp_b12x_raw_fp32'
 args.output.mkdir(parents=True, exist_ok=True)
 
 import torch
@@ -45,9 +48,10 @@ for method in cls.body:
             cute.make_layout((2,), stride=(1,)))
         expert_idx = Int32(0)
 '''
+  if is_mx: prefix = prefix.replace("self.size_n * self.size_k // 64", "self.size_n * self.size_k // 128")
   new=prefix+old
- elif method.name=='__cache_key__':new=old.replace('return (','return ("dgpp_raw_fp32_v3",',1)
- elif method.name=='_dequant_scale_x4_to_elem2x2':
+ elif method.name=='__cache_key__':new=old.replace('return (','return ("dgpp_native_fp32_v4",',1)
+ elif method.name=='_dequant_scale_x4_to_elem2x2' and not is_mx:
   new='''        s0, s1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(packed)
         lift = Uint32(0x7B007B00)
         # Packed scale words interleave even/odd channels; native widening
@@ -56,6 +60,9 @@ for method in cls.body:
         odd = (s0 >> Uint32(16)) | (s1 & Uint32(0xFFFF0000))
         return bfloat2_mul(even, lift), bfloat2_mul(odd, lift)
 '''
+ elif method.name=='_tile_common_prologue' and is_mx:
+  # MX has no per-matrix global. Retain b12x's native E8M0 compensation.
+  new=old.replace('global_scale[expert_idx].to(cutlass.Float32)', 'cutlass.Float32(1.0)')
  elif method.name=='_tile_common_prologue':
   new=old.replace('        global_scale_f32 = global_scale[expert_idx].to(cutlass.Float32)', '''        global_idx = Int32(0)
         if cutlass.const_expr(not self.mul_topk_weights):
@@ -102,9 +109,9 @@ props=torch.cuda.get_device_properties(0)
 compiled=kernel.compile_w4a16_fused_moe(size_m=64,hidden_size=5120,intermediate_size=1152,num_experts=384,top_k=6,
  activation='silu',apply_router_weight_on_input=False,zero_fc2_output=False,moe_block_size=8,max_m_blocks=384,
  element_dtype='bf16',sms=48,max_shared_mem=props.shared_memory_per_block_optin,swiglu_limit=10.,
- weight_layout='packed',scale_format='e4m3_k16',w13_layout='packed',force_tile_config=(128,128,64,256))
-compiled.compiled.export_to_c(str(args.output), 'dgpp_b12x_raw_fp32')
-with (args.output / 'dgpp_b12x_raw_fp32.h').open('a') as header:
+ weight_layout='packed',scale_format='e8m0_k32' if is_mx else 'e4m3_k16',w13_layout='packed',force_tile_config=(128,128,64,256))
+compiled.compiled.export_to_c(str(args.output), symbol)
+with (args.output / (symbol + '.h')).open('a') as header:
  header.write('\n#define DGPP_B12X_CAPACITY 64\n')
 from cutlass.cute.export.aot_config import get_libdir
 shutil.copy2(Path(get_libdir()) / 'libcuda_dialect_runtime_static.a', args.output)

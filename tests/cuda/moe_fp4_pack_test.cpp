@@ -31,20 +31,20 @@ struct Buffer {
     return {all.begin() + 16, all.begin() + 16 + bytes};
   }
 };
-void roundtrip(int h, int i) {
+void roundtrip(int h, int i, int group = 16) {
   std::array<std::unique_ptr<Buffer>, 9> source, restored;
   std::array<std::vector<uint8_t>, 9> original;
   const float globals[3] = {4.f, .25f, 8.f};
   for (int m = 0; m < 3; ++m) {
     const int n = m == 2 ? h : i, k = m == 2 ? i : h;
     original[m * 3].resize(static_cast<size_t>(n) * k / 2);
-    original[m * 3 + 1].resize(static_cast<size_t>(n) * k / 16);
+    original[m * 3 + 1].resize(static_cast<size_t>(n) * k / group);
     for (int row = 0; row < n; ++row) {
       for (int col = 0; col < k / 2; ++col)
         original[m * 3][static_cast<size_t>(row) * (k / 2) + col] =
             static_cast<uint8_t>(row * 131 + col * 17 + 17 + m * 29);
-      for (int col = 0; col < k / 16; ++col)
-        original[m * 3 + 1][static_cast<size_t>(row) * (k / 16) + col] =
+      for (int col = 0; col < k / group; ++col)
+        original[m * 3 + 1][static_cast<size_t>(row) * (k / group) + col] =
             static_cast<uint8_t>(row * 37 + col * 13 + m * 17);
     }
     original[m * 3 + 2].resize(4);
@@ -57,24 +57,31 @@ void roundtrip(int h, int i) {
     }
   }
   std::array<std::unique_ptr<Buffer>, 6> packed;
-  const size_t sizes[] = {static_cast<size_t>(i) * h, static_cast<size_t>(i) * h / 8, 8,
-                           static_cast<size_t>(h) * i / 2, static_cast<size_t>(h) * i / 16, 4};
+  const size_t sizes[] = {static_cast<size_t>(i) * h, static_cast<size_t>(i) * h * 2 / group, 8,
+                           static_cast<size_t>(h) * i / 2, static_cast<size_t>(h) * i / group, 4};
   for (int j = 0; j < 6; ++j) packed[j] = std::make_unique<Buffer>(sizes[j]);
   dgpp::Fp4ExpertSource src;
   dgpp::Fp4ExpertDestination dst;
   for (int m = 0; m < 3; ++m) {
     src.payload[m] = source[m * 3]->data(); src.scales[m] = source[m * 3 + 1]->data();
-    src.globals[m] = reinterpret_cast<float*>(source[m * 3 + 2]->data());
+    src.globals[m] = group == 16 ? reinterpret_cast<float*>(source[m * 3 + 2]->data()) : nullptr;
     dst.payload[m] = restored[m * 3]->data(); dst.scales[m] = restored[m * 3 + 1]->data();
-    dst.globals[m] = reinterpret_cast<float*>(restored[m * 3 + 2]->data());
+    dst.globals[m] = group == 16 ? reinterpret_cast<float*>(restored[m * 3 + 2]->data()) : nullptr;
   }
   dgpp::Fp4PackedExpert view{packed[0]->data(), packed[1]->data(), reinterpret_cast<float*>(packed[2]->data()),
                              packed[3]->data(), packed[4]->data(), reinterpret_cast<float*>(packed[5]->data())};
   cudaStream_t stream;
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  if (group == 32) {
+    for (int m = 0; m < 3; ++m) {
+      original[m*3+2].assign(4, 0xa5);
+      DGPP_CUDA_OK(cudaMemset(source[m*3+2]->data(), 0xa5, 4));
+    }
+    require(dgpp::moe_fp4_packed_bytes(h,i,32) == size_t(h)*i*3*17/32, "native MX scale density retained");
+  }
   auto launch = [&] {
-    dgpp::launch_moe_fp4_pack(view, src, h, i, stream);
-    dgpp::launch_moe_fp4_unpack(dst, view, h, i, stream);
+    dgpp::launch_moe_fp4_pack(view, src, h, i, stream, group);
+    dgpp::launch_moe_fp4_unpack(dst, view, h, i, stream, group);
   };
   launch();
   DGPP_CUDA_OK(cudaStreamSynchronize(stream));
@@ -113,6 +120,10 @@ void roundtrip(int h, int i) {
 DGPP_TEST(moe_fp4_pack_preserves_scales_globals_and_graph_replay) {
   roundtrip(128, 64);
   roundtrip(5120, 1152);
+}
+DGPP_TEST(moe_mxfp4_pack_preserves_native_scales_and_graph_replay) {
+  roundtrip(128, 64, 32);
+  roundtrip(5120, 1152, 32);
 }
 DGPP_TEST(moe_fp4_compact_preserves_prepared_weights_and_exact_scales) {
   for (const auto& [h,i] : {std::pair{128,64},std::pair{5120,1152}}) {

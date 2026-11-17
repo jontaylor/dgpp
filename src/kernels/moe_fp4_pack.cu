@@ -111,21 +111,21 @@ __global__ void unpack_payload(uint8_t* first, uint8_t* second,
 template <bool Merge, bool Unpack>
 __global__ void move_scales(uint8_t* first, uint8_t* second, uint8_t* packed,
                              const uint8_t* source_first, const uint8_t* source_second,
-                             const uint8_t* source_packed, int rows, int k) {
+                             const uint8_t* source_packed, int rows, int k, int group) {
   const int idx = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
-  if (idx >= rows * (k / 16)) return;
+  if (idx >= rows * (k / group)) return;
   if constexpr (Unpack) {
-    const int n = idx / (k / 16), kg = idx % (k / 16);
+    const int n = idx / (k / group), kg = idx % (k / group);
     const int packed_n = swap_scale_pair(transpose_scale_block(n));
     const bool up = Merge && n >= rows / 2;
     const int source_n = up ? n - rows / 2 : n;
-    (up ? second : first)[source_n * (k / 16) + kg] = source_packed[kg * rows + packed_n];
+    (up ? second : first)[source_n * (k / group) + kg] = source_packed[kg * rows + packed_n];
   } else {
     const int kg = idx / rows;
     const int n = transpose_scale_block(swap_scale_pair(idx % rows));
     const bool up = Merge && n >= rows / 2;
     const int source_n = up ? n - rows / 2 : n;
-    packed[idx] = (up ? source_second : source_first)[source_n * (k / 16) + kg];
+    packed[idx] = (up ? source_second : source_first)[source_n * (k / group) + kg];
   }
 }
 
@@ -136,8 +136,9 @@ void check_geometry(int h, int i) {
       static_cast<int64_t>(h) * i > INT_MAX / 2)
     throw std::invalid_argument("MoE FP4 packing: widths must be positive multiples of 64 within index range");
 }
-void check_packed(Fp4PackedExpert p) {
-  if (!p.w13 || !p.s13 || !p.g13 || !p.w2 || !p.s2 || !p.g2 ||
+void check_packed(Fp4PackedExpert p, int group = 16) {
+  if (group != 16 && group != 32) throw std::invalid_argument("MoE FP4 packing: invalid scale group");
+  if (!p.w13 || !p.s13 || !p.w2 || !p.s2 || (group == 16 && (!p.g13 || !p.g2)) ||
       (reinterpret_cast<uintptr_t>(p.w13) & 15) || (reinterpret_cast<uintptr_t>(p.w2) & 15))
     throw std::invalid_argument("MoE FP4 packing: null or unaligned packed pointers");
 }
@@ -214,21 +215,23 @@ void launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter> chunk
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
-size_t moe_fp4_packed_bytes(int hidden, int intermediate) {
+size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group) {
+  if (scale_group != 16 && scale_group != 32) throw std::invalid_argument("MoE FP4 packing: invalid scale group");
   check_geometry(hidden, intermediate);
   const size_t matrix = static_cast<size_t>(hidden) * intermediate;
   // W13 codes/scales/globals, alignment, then W2 codes/scales/globals.
-  return matrix + matrix / 8 + 16 + matrix / 2 + matrix / 16 + 16;
+  return matrix + 2*matrix / scale_group + matrix / 2 + matrix / scale_group + (scale_group == 16 ? 32 : 0);
 }
-Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate) {
-  (void)moe_fp4_packed_bytes(hidden, intermediate);
+Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group) {
+  (void)moe_fp4_packed_bytes(hidden, intermediate, scale_group);
   const size_t matrix = static_cast<size_t>(hidden) * intermediate;
   auto* s13 = data + matrix;
-  auto* g13 = s13 + matrix / 8;
-  auto* w2 = g13 + 16;
+  auto* g13 = s13 + 2*matrix / scale_group;
+  auto* w2 = g13 + (scale_group == 16 ? 16 : 0);
   auto* s2 = w2 + matrix / 2;
-  auto* g2 = s2 + matrix / 16;
-  return {data, s13, reinterpret_cast<float*>(g13), w2, s2, reinterpret_cast<float*>(g2)};
+  auto* g2 = s2 + matrix / scale_group;
+  return {data, s13, scale_group == 16 ? reinterpret_cast<float*>(g13) : nullptr,
+          w2, s2, scale_group == 16 ? reinterpret_cast<float*>(g2) : nullptr};
 }
 
 size_t moe_fp4_compact_bytes(int hidden, int intermediate) {
@@ -311,43 +314,43 @@ void prepare_moe_fp4_pack() {
 }
 
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
-                         int hidden, int intermediate, cudaStream_t stream) {
+                         int hidden, int intermediate, cudaStream_t stream, int scale_group) {
   check_geometry(hidden, intermediate);
-  check_packed(dst);
+  check_packed(dst, scale_group);
   for (int m = 0; m < 3; ++m)
-    if (!src.payload[m] || !src.scales[m] || !src.globals[m])
+    if (!src.payload[m] || !src.scales[m] || (scale_group == 16 && !src.globals[m]))
       throw std::invalid_argument("MoE FP4 packing: null source matrix");
   pack_payload<true><<<blocks(2 * intermediate * hidden / 8), kThreads, 0, stream>>>(
       reinterpret_cast<uint32_t*>(dst.w13), src.payload[0], src.payload[1], 2 * intermediate, hidden);
   pack_payload<false><<<blocks(hidden * intermediate / 8), kThreads, 0, stream>>>(
       reinterpret_cast<uint32_t*>(dst.w2), src.payload[2], nullptr, hidden, intermediate);
-  move_scales<true, false><<<blocks(2 * intermediate * (hidden / 16)), kThreads, 0, stream>>>(
-      nullptr, nullptr, dst.s13, src.scales[0], src.scales[1], nullptr, 2 * intermediate, hidden);
-  move_scales<false, false><<<blocks(hidden * (intermediate / 16)), kThreads, 0, stream>>>(
-      nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate);
+  move_scales<true, false><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+      nullptr, nullptr, dst.s13, src.scales[0], src.scales[1], nullptr, 2 * intermediate, hidden, scale_group);
+  move_scales<false, false><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+      nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate, scale_group);
   DGPP_CUDA_OK(cudaGetLastError());
-  copy_globals<<<1, 32, 0, stream>>>(dst.g13, dst.g13 + 1, dst.g2,
+  if (scale_group == 16) copy_globals<<<1, 32, 0, stream>>>(dst.g13, dst.g13 + 1, dst.g2,
                                     src.globals[0], src.globals[1], src.globals[2]);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
 void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
-                           int hidden, int intermediate, cudaStream_t stream) {
+                           int hidden, int intermediate, cudaStream_t stream, int scale_group) {
   check_geometry(hidden, intermediate);
-  check_packed(src);
+  check_packed(src, scale_group);
   for (int m = 0; m < 3; ++m)
-    if (!dst.payload[m] || !dst.scales[m] || !dst.globals[m])
+    if (!dst.payload[m] || !dst.scales[m] || (scale_group == 16 && !dst.globals[m]))
       throw std::invalid_argument("MoE FP4 packing: null destination matrix");
   unpack_payload<true><<<blocks(2 * intermediate * hidden / 2), kThreads, 0, stream>>>(
       dst.payload[0], dst.payload[1], reinterpret_cast<const uint32_t*>(src.w13), 2 * intermediate, hidden);
   unpack_payload<false><<<blocks(hidden * intermediate / 2), kThreads, 0, stream>>>(
       dst.payload[2], nullptr, reinterpret_cast<const uint32_t*>(src.w2), hidden, intermediate);
-  move_scales<true, true><<<blocks(2 * intermediate * (hidden / 16)), kThreads, 0, stream>>>(
-      dst.scales[0], dst.scales[1], nullptr, nullptr, nullptr, src.s13, 2 * intermediate, hidden);
-  move_scales<false, true><<<blocks(hidden * (intermediate / 16)), kThreads, 0, stream>>>(
-      dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate);
+  move_scales<true, true><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+      dst.scales[0], dst.scales[1], nullptr, nullptr, nullptr, src.s13, 2 * intermediate, hidden, scale_group);
+  move_scales<false, true><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+      dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate, scale_group);
   DGPP_CUDA_OK(cudaGetLastError());
-  copy_globals<<<1, 32, 0, stream>>>(dst.globals[0], dst.globals[1], dst.globals[2],
+  if (scale_group == 16) copy_globals<<<1, 32, 0, stream>>>(dst.globals[0], dst.globals[1], dst.globals[2],
                                     src.g13, src.g13 + 1, src.g2);
   DGPP_CUDA_OK(cudaGetLastError());
 }

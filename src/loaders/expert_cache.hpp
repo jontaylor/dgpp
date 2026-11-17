@@ -27,7 +27,7 @@ struct CacheConfig {
   size_t execution_slots = 1;
   // Internal execution layout, selected before memory preflight. The second
   // half of each execution slot is charged conversion space for miss waves.
-  bool packed_nvfp4 = false;
+  bool packed_fp4 = false;
 };
 struct PagingOptions {
   bool operator==(const PagingOptions&) const = default;
@@ -225,7 +225,7 @@ class ExpertCache {
   // Admission follows execution submission and uses the reconstructed payload.
   void execute_ready(std::span<const size_t> selected,
       const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute);
-  bool packed_nvfp4() const;
+  bool packed_fp4() const;
   // Borrowed metadata, not a lease. Only usable by a quiescent engine-owned
   // walk that stops payload readers before any cache mutation. A revision
   // change invalidates the published table; null means not prepared.

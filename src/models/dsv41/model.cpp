@@ -90,7 +90,7 @@ struct Dsv41Model::PagedGraphs {
     if (service) (void)cudaStreamDestroy(service);
   }
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
-               int hidden, int inter) {
+               int hidden, int inter, int scale_group) {
     if (published_revision == cache.prepared_revision()) return;
     const auto started = profile_publish ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
@@ -103,8 +103,8 @@ struct Dsv41Model::PagedGraphs {
       else for (int e = 0; e < experts; ++e) addresses[e] = cache.prepared_address(mapping[l][e]);
       const bool changed = dsv41_detail::update_paged_binding_table(
           std::span<uint64_t>(host_tables + l * words, words), addresses,
-          [hidden, inter](const uint8_t* address) {
-            const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter);
+          [hidden, inter, scale_group](const uint8_t* address) {
+            const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter, scale_group);
             return std::array<uint64_t, 6>{reinterpret_cast<uintptr_t>(p.w13),
                 reinterpret_cast<uintptr_t>(p.s13), reinterpret_cast<uintptr_t>(p.g13),
                 reinterpret_cast<uintptr_t>(p.w2), reinterpret_cast<uintptr_t>(p.s2),
@@ -154,7 +154,7 @@ expert::StoreIdentity paging_identity(const Dsv41TextConfig& cfg, int rank, int 
 expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, int world,
     const Dsv41ExpertPaging& paging, bool mtp) {
   auto cache = paging.cache;
-  cache.packed_nvfp4 = cfg.experts_nvfp4 && sm12x_moe_enabled(cfg.hidden_size,
+  cache.packed_fp4 = sm12x_moe_enabled(cfg.hidden_size,
       cfg.moe_intermediate_size / world, cfg.n_routed_experts, cfg.num_experts_per_tok);
   if (mtp) {
     auto resident = cfg, descriptors = cfg;
@@ -322,7 +322,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     expert_cache_ = std::make_unique<expert::ExpertCache>(expert_store,
         paging_cache_config(cfg_, tp_rank, tp_world, *expert_paging, mtp),
         expert::cuda_cache_storage(expert_store->identity(), stream_,
-            paging_cache_config(cfg_, tp_rank, tp_world, *expert_paging, mtp).packed_nvfp4),
+            paging_cache_config(cfg_, tp_rank, tp_world, *expert_paging, mtp).packed_fp4),
         expert::linux_expert_resource_sampler(expert_paging->image_directory));
     expert_cache_->initialize();
     expert_adapt_every_routes_ = expert_paging->adapt_every_routes;
@@ -339,7 +339,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     DGPP_LOG_INFO("dsv41 expert cache: budget={} cache={}x{} execution={}x{} staging={} unallocated={}",
         memory.budget_bytes, memory.cache_slots, memory.cache_slot_bytes, memory.execution_slots,
         memory.execution_slot_bytes, memory.staging_bytes, memory.unallocated_bytes);
-    if (expert_cache_->packed_nvfp4())
+    if (expert_cache_->packed_fp4())
       DGPP_LOG_INFO("dsv41 experts: b12x SM121 W4A16, BF16 activations, FP32 slots, capacity {}, graph/shared lane enabled",
                     Sm12xMoe::kCapacity);
   }
@@ -1907,7 +1907,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   expert_cache_->set_execution_context(p.service);
   const auto profile_started = p.profile_publish ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
-  p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
+  p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
+                  cfg_.experts_nvfp4 ? 16 : 32);
   int accounted = 0;
   std::vector<uint64_t> layer_bytes, layer_reads;
   if (p.layer_stamps) { layer_bytes.resize(p.layers); layer_reads.resize(p.layers); }
@@ -1951,7 +1952,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
           layer_bytes[l] = expert_cache_->stats().demand_bytes - bytes_before;
           layer_reads[l] = expert_cache_->read_stats().completed - reads_before;
         }
-        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_);
+        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
+                  cfg_.experts_nvfp4 ? 16 : 32);
         ++p.misses; accounted = l + 1;
         __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
         break;
@@ -2186,7 +2188,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // Multi-request verification retains the eager path: its draft/rollback
   // state contract has not been qualified for these target graph captures.
   const bool paged_candidate = gpu_paging && gpu_paging[0] == '1' && expert_cache_ &&
-      expert_cache_->packed_nvfp4() && run.decode && !run.capture && !capture_layers &&
+      expert_cache_->packed_fp4() && run.decode && !run.capture && !capture_layers &&
       !debug_teacher_ && !debug_capture_ && !traces && rows.num_requests == 1 &&
       last_layer == cfg_.num_hidden_layers && T <= 16 &&
       (!boundary_ || boundary_->supports_graph_segments());

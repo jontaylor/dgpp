@@ -41,9 +41,7 @@ CacheMemory expert_cache_memory(const StoreIdentity& id, const CacheConfig& cfg)
   CacheMemory m;
   m.budget_bytes = cfg.planner.budget_bytes;
   m.execution_slot_bytes = full.allocation_bytes;
-  if (cfg.packed_nvfp4) {
-    if (id.format != Format::kNvfp4)
-      throw std::invalid_argument("expert cache: packed execution requires NVFP4");
+  if (cfg.packed_fp4) {
     m.execution_slot_bytes = mul(m.execution_slot_bytes, 2);
   }
   m.execution_slots = cfg.execution_slots;
@@ -644,7 +642,7 @@ void ExpertCache::adapt() {
     s.all_observed_full = true;
   } catch (...) { s.counters.poisoned = true; throw; }
 }
-bool ExpertCache::packed_nvfp4() const { return state_->config.packed_nvfp4; }
+bool ExpertCache::packed_fp4() const { return state_->config.packed_fp4; }
 const uint8_t* ExpertCache::prepared_address(size_t expert) const {
   const auto& s = *state_;
   s.check(); s.expert_index(expert);
@@ -695,7 +693,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical, bool ch
     s.counters.chunk_lookups += e.records.size();
     s.counters.chunk_hits += e.records.size();
     ++s.counters.native_hits;
-    if (canonical && s.config.packed_nvfp4) {
+    if (canonical && s.config.packed_fp4) {
       const size_t slot = s.free_execution_slot();
       if (slot == absent) { ++s.counters.backpressure; return {}; }
       const auto started = std::chrono::steady_clock::now();
@@ -738,7 +736,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical, bool ch
   uint64_t cached_bytes = 0, staged_bytes = 0;
   try {
     if (hits == e.records.size() && !s.counters.active_native_leases && s.storage->cache_data(0) &&
-        !(canonical && s.config.packed_nvfp4)) {
+        !(canonical && s.config.packed_fp4)) {
       s.pack_native(expert, slot);
       ++s.counters.native_hits;
       ++s.counters.direct_native_hits;
@@ -1026,7 +1024,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
         }();
         const auto& records = s.experts[job.expert].records;
         size_t native_first = absent;
-        if (direct_native_admission && s.config.packed_nvfp4 && !fractional &&
+        if (direct_native_admission && s.config.packed_fp4 && !fractional &&
             previous[job.expert] == 0 && plan.chunks[job.expert] == records.size()) {
           for (const size_t first : s.free_slots) {
             if (first % records.size() || first + records.size() > s.slot_records.size()) continue;
@@ -1324,7 +1322,7 @@ const uint8_t* ExpertExecutionLease::packed_data() const {
   if (chunked_) throw std::logic_error("expert cache: chunk-direct lease has no packed payload");
   if (!state_) throw std::logic_error("expert cache: empty execution lease");
   state_->check();
-  if (!state_->config.packed_nvfp4) throw std::logic_error("expert cache: packed layout is disabled");
+  if (!state_->config.packed_fp4) throw std::logic_error("expert cache: packed layout is disabled");
   if (native_data_) return native_data_;
   try {
     const auto* data = state_->storage->packed_execution_data(slot_);

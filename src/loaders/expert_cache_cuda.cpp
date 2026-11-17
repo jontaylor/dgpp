@@ -17,14 +17,13 @@ namespace {
 class CudaCacheStorage final : public ExpertCacheStorage {
  public:
   CudaCacheStorage(CacheMemory memory, std::span<const std::span<uint8_t>> staging,
-                   StoreIdentity identity, cudaStream_t stream, bool packed_nvfp4)
-      : memory_(memory), identity_(identity), stream_(stream), packed_nvfp4_(packed_nvfp4) {
+                   StoreIdentity identity, cudaStream_t stream, bool packed_fp4)
+      : memory_(memory), identity_(identity), stream_(stream), packed_fp4_(packed_fp4) {
     full_ = partition(identity.hidden, identity.intermediate, identity.world, identity.rank,
                       identity.intermediate / identity.world, identity.format).front();
-    if (packed_nvfp4_ && (identity.format != Format::kNvfp4 ||
-        memory_.execution_slot_bytes != 2 * full_.allocation_bytes ||
-        moe_fp4_packed_bytes(identity.hidden, identity.intermediate / identity.world) > full_.allocation_bytes))
-      throw std::invalid_argument("expert CUDA cache: invalid packed NVFP4 reservation");
+    if (packed_fp4_ && (memory_.execution_slot_bytes != 2 * full_.allocation_bytes ||
+        moe_fp4_packed_bytes(identity.hidden, identity.intermediate / identity.world, scale_group()) > full_.allocation_bytes))
+      throw std::invalid_argument("expert CUDA cache: invalid packed FP4 reservation");
     // Precompute the pitched-copy lists at startup: no hot-path metadata or
     // payload allocations. Store validation guarantees authoritative layouts.
     layouts_ = partition(identity.hidden, identity.intermediate, identity.world,
@@ -186,7 +185,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   }
   const uint8_t* packed_execution_data(size_t slot) override {
     check_execution(slot);
-    if (!packed_nvfp4_) throw std::logic_error("expert CUDA cache: packed layout disabled");
+    if (!packed_fp4_) throw std::logic_error("expert CUDA cache: packed layout disabled");
     auto* source = execution_ + slot * memory_.execution_slot_bytes;
     auto* destination = source + full_.allocation_bytes;
     wait_execution(slot);
@@ -219,7 +218,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     check_native(execution_slot, first);
     wait_execution(execution_slot);
     Transfer transfer(*this);
-    if (packed_nvfp4_) {
+    if (packed_fp4_) {
       auto* destination = execution_ + execution_slot * memory_.execution_slot_bytes;
       auto* source = cache_ + first * memory_.cache_slot_bytes;
       Fp4ExpertDestination out;
@@ -227,11 +226,11 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       for (size_t m = 0; m < matrices.size(); ++m) {
         out.payload[m] = destination + matrices[m].payload_offset;
         out.scales[m] = destination + matrices[m].scales_offset;
-        out.globals[m] = reinterpret_cast<float*>(destination + *matrices[m].global_offset);
+        out.globals[m] = matrices[m].global_offset ? reinterpret_cast<float*>(destination + *matrices[m].global_offset) : nullptr;
       }
       launch_moe_fp4_unpack(out, moe_fp4_packed_view(source, identity_.hidden,
-          identity_.intermediate / identity_.world), identity_.hidden,
-          identity_.intermediate / identity_.world, copy_stream_);
+          identity_.intermediate / identity_.world, scale_group()), identity_.hidden,
+          identity_.intermediate / identity_.world, copy_stream_, scale_group());
       return;
     }
     DGPP_CUDA_OK(cudaMemcpyAsync(execution_ + execution_slot * memory_.execution_slot_bytes,
@@ -242,7 +241,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     check_native(execution_slot, first);
     for (size_t c = 0; c < layouts_.size(); ++c) wait_cache(first+c);
     Transfer transfer(*this);
-    if (packed_nvfp4_) {
+    if (packed_fp4_) {
       pack(cache_ + first * memory_.cache_slot_bytes,
            execution_ + execution_slot * memory_.execution_slot_bytes);
       return;
@@ -252,11 +251,11 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         cudaMemcpyDeviceToDevice, copy_stream_));
   }
   bool packed_execution_to_native(size_t execution_slot, size_t first) override {
-    if (!packed_nvfp4_) return false;
+    if (!packed_fp4_) return false;
     check_native(execution_slot, first);
     for (size_t c = 0; c < layouts_.size(); ++c) wait_cache(first+c);
     Transfer transfer(*this);
-    const size_t bytes = moe_fp4_packed_bytes(identity_.hidden, identity_.intermediate / identity_.world);
+    const size_t bytes = moe_fp4_packed_bytes(identity_.hidden, identity_.intermediate / identity_.world, scale_group());
     DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + first * memory_.cache_slot_bytes,
         execution_ + execution_slot * memory_.execution_slot_bytes + full_.allocation_bytes,
         bytes, cudaMemcpyDeviceToDevice, copy_stream_));
@@ -387,17 +386,18 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     if (index == registered_.size()) throw std::invalid_argument("expert CUDA cache: unregistered staging");
     return index;
   }
+  int scale_group() const { return identity_.format == Format::kNvfp4 ? 16 : 32; }
   void pack(uint8_t* destination, const uint8_t* source) {
     Fp4ExpertSource in;
     const std::array<MatrixLayout, 3> matrices{full_.gate, full_.up, full_.down};
     for (size_t m = 0; m < matrices.size(); ++m) {
       in.payload[m] = source + matrices[m].payload_offset;
       in.scales[m] = source + matrices[m].scales_offset;
-      in.globals[m] = reinterpret_cast<const float*>(source + *matrices[m].global_offset);
+      in.globals[m] = matrices[m].global_offset ? reinterpret_cast<const float*>(source + *matrices[m].global_offset) : nullptr;
     }
     launch_moe_fp4_pack(moe_fp4_packed_view(destination, identity_.hidden,
-        identity_.intermediate / identity_.world), in, identity_.hidden,
-        identity_.intermediate / identity_.world, copy_stream_);
+        identity_.intermediate / identity_.world, scale_group()), in, identity_.hidden,
+        identity_.intermediate / identity_.world, copy_stream_, scale_group());
   }
   void check_cache(size_t slot) const {
     if (slot >= memory_.cache_slots) throw std::invalid_argument("expert CUDA cache: cache slot");
@@ -441,7 +441,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   bool chunk_direct_ = false;
   const uint8_t** chunk_sources_ = nullptr;
   std::vector<cudaEvent_t> metadata_done_;
-  bool packed_nvfp4_ = false;
+  bool packed_fp4_ = false;
   bool gpu_scatter_ = false;
   bool batch_scatter_ = false;
   ChunkLayout full_;
@@ -454,9 +454,9 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   std::vector<std::vector<ScatterCopy>> copies_;
 };
 }
-CacheStorageFactory cuda_cache_storage(const StoreIdentity& identity, cudaStream_t stream, bool packed_nvfp4) {
-  return [identity, stream, packed_nvfp4](const CacheMemory& memory, std::span<const std::span<uint8_t>> staging) {
-    return std::make_unique<CudaCacheStorage>(memory, staging, identity, stream, packed_nvfp4);
+CacheStorageFactory cuda_cache_storage(const StoreIdentity& identity, cudaStream_t stream, bool packed_fp4) {
+  return [identity, stream, packed_fp4](const CacheMemory& memory, std::span<const std::span<uint8_t>> staging) {
+    return std::make_unique<CudaCacheStorage>(memory, staging, identity, stream, packed_fp4);
   };
 }
 std::array<GlmFp4Matrix, 3> execution_matrices(const ExpertExecutionLease& lease,

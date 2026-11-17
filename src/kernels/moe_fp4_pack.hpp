@@ -35,8 +35,8 @@ struct ExpertChunkScatter {
 inline constexpr size_t kExpertScatterBatch = 32;
 void launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter> chunks, cudaStream_t stream);
 
-// NVFP4 source matrices, with the ordinary row-major payload/scales. Globals
-// retain DGPP's inverse-scale convention. This conversion moves bits only.
+// Native FP4 source matrices in row-major order. NVFP4 globals retain
+// DGPP's inverse-scale convention; MXFP4 has none. Conversion moves bits only.
 struct Fp4ExpertSource {
   const uint8_t* payload[3]{};  // gate, up, down
   const uint8_t* scales[3]{};
@@ -48,8 +48,8 @@ struct Fp4ExpertDestination {
   float* globals[3]{};
 };
 
-// SM12x W4A16 MMA tiles: K16/N64 packed codes, and K16/N64 permuted raw
-// E4M3 scales. Unlike the b12x prepared scale encoding, raw scale bytes are
+// SM12x W4A16 MMA tiles: K16/N64 packed codes, with permuted raw
+// E4M3 (group 16) or E8M0 (group 32) scales. Unlike the b12x prepared scale encoding, raw scale bytes are
 // reversible, including subnormals and NaNs. The consuming kernel must use
 // raw-scale decoding. W13 is gate then up; its two globals stay independent.
 struct Fp4PackedExpert {
@@ -60,10 +60,12 @@ struct Fp4PackedExpert {
   uint8_t* s2 = nullptr;
   float* g2 = nullptr;
 };
+// Scale group 16 stores raw E4M3 with inverse globals; group 32 stores
+// raw E8M0 without globals. Both retain native scale density.
 // One expert's compact prepared representation. It fits inside the existing
 // canonical full-expert allocation; all matrix starts are 16-byte aligned.
-size_t moe_fp4_packed_bytes(int hidden, int intermediate);
-Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate);
+size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group = 16);
+Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group = 16);
 
 // Prepared weights/globals with nibble-encoded scales. This format is valid
 // only after every source scale byte has been checked to satisfy (x & 0x87)==0.
@@ -95,8 +97,8 @@ void prepare_moe_fp4_pack();
 // Source and destination must be disjoint. All allocations belong to the
 // caller; the launchers allocate nothing and are CUDA-graph capturable.
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
-                         int hidden, int intermediate, cudaStream_t stream);
+                         int hidden, int intermediate, cudaStream_t stream, int scale_group = 16);
 void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
-                           int hidden, int intermediate, cudaStream_t stream);
+                           int hidden, int intermediate, cudaStream_t stream, int scale_group = 16);
 
 }  // namespace dgpp

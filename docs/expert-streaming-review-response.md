@@ -898,3 +898,26 @@ SIGKILL regression that leaves no partial image. The 28-test launcher suite
 passes with one optional dependency skip. The successful build used one process
 per rank throughout. Normal `Restart=on-failure` supervision was restored after
 the comparison without restarting the running MXFP4 world.
+
+### Native MXFP4 fast-path parity
+
+MXFP4 now supports the same prepared expert execution, small-batch b12x
+W4A16 dispatch, GPU miss gating and graph replay, shared-expert overlap,
+prepared resident prefill and chunk-direct prefill misses as NVFP4. The cache
+layout flag is now `packed_fp4`; its scale group comes from the checkpoint.
+MXFP4 keeps raw E8M0 scales per 32 weights, without global scales or an
+expanded resident-scale buffer. Both formats charge canonical and prepared
+miss scratch to the expert budget. Existing on-disk expert images remain
+canonical and reusable.
+
+The optional build now links both AOT specializations. Export each format
+using `scripts/export_b12x_moe.py --format nvfp4|mxfp4 --output DIR` before
+configuring `DGPP_B12X_AOT_DIR`. Generated objects remain build artifacts.
+
+Validation on GB10 passed six packing/scatter tests, both format-specific
+paging fixtures and eleven paged-model fixtures. The paging fixtures cover
+cold/native bitwise equivalence, changed routing and injected misses under
+captured GPU execution, pressure, prepared prefill, chunk-direct misses and
+cache-budget accounting. The b12x output also passed the existing numerical
+budget against canonical expert execution. This establishes execution-path
+coverage, not equal quality or equal speculative acceptance across checkpoints.
