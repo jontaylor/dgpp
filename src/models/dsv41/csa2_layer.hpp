@@ -55,6 +55,7 @@ struct Csa2Config {
   int o_groups = 8;
   int index_heads = 32;
   int index_topk = 512;
+  int prefill_splits = 4;
   int candidate_block = 8;
   int candidate_blocks = 2048;
   int window = 128;

@@ -672,6 +672,41 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   const bool shared = has_shared();
   if (!cache) check_expert_geometry();
 
+  // The shared expert needs only the FFN input, not the router's result.
+  // Its existing tail rows are disjoint from every routed wave's scratch.
+  const bool early_shared_prefill = [] {
+    const char* value = std::getenv("DGPP_EXPERT_SHARED_PREFILL_EARLY");
+    return value && value[0] == '1';
+  }();
+  const bool early_shared = early_shared_prefill && cache && cache->packed_fp4() &&
+      fp4_group_of(w_) == 32 && kernel == MoeExpertKernel::kMma && tokens > 16 &&
+      out_bf16 && shared && shared_lane_takes(true, tokens) &&
+      !(sm12x_moe_ && tokens <= Sm12xMoe::kCapacity && (tokens <= decode_slots_ || !down_bf16_));
+  if (early_shared) {
+    const size_t width = static_cast<size_t>(routed_inter_of(w_, E));
+    const size_t offset = static_cast<size_t>(tokens) * K * width;
+    const auto& g = w_.shared[0];
+    const auto& u = w_.shared[1];
+    const auto& d = w_.shared[2];
+    const int inter = static_cast<int>(g.rows);
+    const auto shift = [](int block) { int n = 0; while ((1 << n) < block) ++n; return n; };
+    DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
+    launch_scale_gemm_grid_bf16(hidden, cfg_.hidden, g.payload, g.scales, d_gate_ + offset,
+        tokens, inter, cfg_.hidden, sh_lane_, width, shift(g.scale_block_rows), shift(g.scale_block_cols),
+        true, nullptr, 0, true);
+    launch_scale_gemm_grid_bf16(hidden, cfg_.hidden, u.payload, u.scales, d_up_ + offset,
+        tokens, inter, cfg_.hidden, sh_lane_, width, shift(u.scale_block_rows), shift(u.scale_block_cols),
+        true, nullptr, 0, true);
+    launch_moe_swiglu_clamp(d_gate_ + offset, d_up_ + offset, d_act_ + offset,
+        static_cast<int64_t>(tokens) * width, cfg_.swiglu_limit, sh_lane_);
+    launch_scale_gemm_grid_f32(d_act_ + offset, width, d.payload, d.scales,
+        d_down_ + static_cast<size_t>(tokens) * K * cfg_.hidden,
+        tokens, cfg_.hidden, inter, sh_lane_, cfg_.hidden,
+        shift(d.scale_block_rows), shift(d.scale_block_cols), true, nullptr, 0, true);
+    DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
+  }
+
   // Router and a single host decision fence. Paging needs route IDs for
   // demand I/O, but builds row/slot maps on the GPU. Keep host getter copies
   // of IDs and weights consistent with the diagnostic enqueue contract.
@@ -1232,14 +1267,14 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
           grouped_decode ? tk : rows_total, stream,
-          nullptr, nullptr, 0, end == n_segs, ready_groups ? -1 : activation_row, wave_rows);
+          nullptr, nullptr, 0, end == n_segs && !early_shared, ready_groups ? -1 : activation_row, wave_rows);
       activation_row += wave_rows;
       cache->release_native_leases(native_leases);
       native_leases.clear();
       for (auto& lease : leases) lease.release();
       leases.clear();
     }
-    if (grouped_decode) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
+    if (grouped_decode || early_shared) DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
     accumulate_grouped(out_bf16, out_f32, shared_row0, tokens, stream);
     return;
   }

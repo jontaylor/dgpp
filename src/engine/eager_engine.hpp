@@ -783,9 +783,18 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // with the other verify/draft rows, without a per-token collective.
   sample::Candidate mtp_row_max(const DecodeOutputs& out, int row,
                                 const text::GrammarState* grammar) const {
-    const float* logits = out.logits.data() + static_cast<size_t>(row) * out.lm_vocab_count;
-    const auto best = sample::local_max(logits, out.lm_vocab_count, out.lm_vocab_begin);
+    const bool compact = !out.local_candidates.empty();
+    const float* logits = compact ? nullptr : out.logits.data() + static_cast<size_t>(row) * out.lm_vocab_count;
+    const auto best = compact ? out.local_candidates.at(row)
+        : sample::local_max(logits, out.lm_vocab_count, out.lm_vocab_begin);
     if (!grammar || grammar->allows(best.id)) return best;
+    std::vector<float> downloaded;
+    if (compact) {
+      if constexpr (requires { model_->verification_logits_row(row); }) {
+        downloaded = model_->verification_logits_row(row);
+        logits = downloaded.data();
+      } else throw std::logic_error("compact verification requires grammar row fallback");
+    }
     text::TokenMask mask;
     grammar->mask(&mask);
     std::vector<float> masked(logits, logits + out.lm_vocab_count);
@@ -851,7 +860,11 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       std::vector<typename Model::Outputs> outputs;
       if (reqs.size() == 1) {
         offsets.push_back(0);
-        outputs.push_back(model_->session_verify(reqs[0], feeds[0]));
+        if constexpr (requires { model_->session_verify_candidates(reqs[0], feeds[0]); }) {
+          if (eligible[0] && feeds[0].size() > 1)
+            outputs.push_back(model_->session_verify_candidates(reqs[0], feeds[0]));
+          else outputs.push_back(model_->session_verify(reqs[0], feeds[0]));
+        } else outputs.push_back(model_->session_verify(reqs[0], feeds[0]));
       } else outputs = model_->session_verify_batch(reqs, feeds, &offsets);
       const auto verify_end = stamp();
       std::vector<sample::Candidate> local;

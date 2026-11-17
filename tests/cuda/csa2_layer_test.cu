@@ -460,10 +460,11 @@ struct Scenario {
   std::vector<std::vector<float>> hidden;  // per request, per position: [hidden] rows (all positions ever generated)
 
   explicit Scenario(int tp, const std::string& tag_, int64_t cache_tokens = 512,
-                    size_t dot_budget = 64ull << 20) : max_cache(cache_tokens), tag(tag_) {
+                    size_t dot_budget = 64ull << 20, int prefill_splits = 4) : max_cache(cache_tokens), tag(tag_) {
     cfg.hidden = 256; cfg.q_lora = 64; cfg.o_lora = 32; cfg.num_heads = 16; cfg.o_groups = 4;
     cfg.index_topk = 16; cfg.candidate_block = 8; cfg.candidate_blocks = 4; cfg.window = 32; cfg.ring_slots = 48;
     cfg.block_tokens = 32; cfg.tp = tp;
+    cfg.prefill_splits = prefill_splits;
     const int lh = cfg.local_heads(), lg = cfg.local_groups(), hpg = cfg.heads_per_group();
     // Six layers: window; ratio-2 kv+index source (ord 0, tail 0); ratio-2
     // reuse; ratio-1 kv+index+candidate source (ord 1); ratio-1 reindex
@@ -717,6 +718,19 @@ DGPP_TEST(csa2_prefill_reuses_score_workspace_at_shorter_contexts) {
       s.decode({{0, 81, 3}});
       require(s.layer->index_violations() == 0, s.tag + ": index-key exactness violations");
       std::printf("[INFO] %s: %d selection flips, every one certified as a near tie\n", s.tag.c_str(), s.flips);
+    }
+  }
+}
+
+DGPP_TEST(csa2_prefill_split_counts_preserve_attention_and_selection) {
+  for (int splits : {1, 2}) {
+    for (int tp : {1, 4}) {
+      Scenario s(tp, "splits-" + std::to_string(splits) + "-tp" + std::to_string(tp),
+                 512, 64ull << 20, splits);
+      s.prefill(0, 0, 32);
+      s.prefill(0, 32, 17);
+      s.decode({{0, 49, 3}});
+      require(s.layer->index_violations() == 0, s.tag + ": index-key exactness violations");
     }
   }
 }

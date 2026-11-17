@@ -213,6 +213,12 @@ Csa2Config Dsv41Model::csa2_config(const Dsv41TextConfig& cfg, int tp_world) {
   c.o_groups = cfg.o_groups;
   c.index_heads = cfg.index_n_heads;
   c.index_topk = cfg.index_topk;
+  if (const char* splits = std::getenv("DGPP_CSA2_PREFILL_SPLITS")) {
+    const std::string value(splits);
+    if (value != "1" && value != "2" && value != "4")
+      throw std::invalid_argument("DGPP_CSA2_PREFILL_SPLITS must be 1, 2 or 4");
+    c.prefill_splits = value[0] - '0';
+  }
   c.candidate_block = cfg.candidate_block_size > 0 ? cfg.candidate_block_size : 8;
   c.candidate_blocks = cfg.candidate_topk_blocks > 0 ? cfg.candidate_topk_blocks : 2048;
   c.window = cfg.sliding_window;
@@ -387,6 +393,11 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     exl3_ws_ = dev_alloc<char>(exl3_ws_bytes_);
     DGPP_CUDA_OK(cudaMemset(exl3_ws_, 0, exl3_ws_bytes_));
   }
+  verify_locals_ = dev_alloc<PickLocal>(max_decode_rows_);
+  h_verify_locals_ = pinned_alloc<PickLocal>(max_decode_rows_);
+  verify_table_ = dev_alloc<uint16_t>(device_pick_table_elems(max_decode_rows_, 1));
+  verify_digest_ = dev_alloc<uint64_t>(1);
+  DGPP_CUDA_OK(cudaMemset(verify_digest_, 0, sizeof(uint64_t)));
   gemm_.set_decode_rows(max_decode_rows_);
   const Dsv41LocalGeometry& geo = loader_.geometry();
   moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/false);
@@ -585,6 +596,10 @@ Dsv41Model::~Dsv41Model() {
   csa2_.reset();
   moe_.reset();
   engram_.reset();
+  cudaFree(verify_locals_);
+  cudaFreeHost(h_verify_locals_);
+  cudaFree(verify_table_);
+  cudaFree(verify_digest_);
   cudaFree(gemm_ws_);
   cudaFree(exl3_ws_);
   cudaFree(csa2_scratch_);
@@ -717,6 +732,8 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg
     // The bounded prefill's tail streams and the tail/segment coefficients.
     act += (R + 1) * static_cast<size_t>(cfg.sliding_window) * 4 * H * 2 +
            (R + 1) * static_cast<size_t>(cfg.sliding_window) * 4 * 4;
+    act += static_cast<size_t>(rows) * sizeof(PickLocal) + device_pick_table_elems(rows, 1) * 2 + 8;
+    core_pin += static_cast<size_t>(rows) * sizeof(PickLocal);
     plan.add("activations (session core, the four residual streams, block io, mHC coefficients, route staging)", act,
              core_pin + static_cast<size_t>(cfg.num_hidden_layers) * M * K * 8);
   }
@@ -2018,6 +2035,30 @@ bool Dsv41Model::prefill_batch_fits(const RowRun& run) const {
   return rows <= max_tokens_;
 }
 
+Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::vector<int64_t>& tokens) {
+  const char* flag = std::getenv("DGPP_DSV41_GPU_CANDIDATES");
+  if (!flag || flag[0] != '1') return Base::session_verify(req, tokens);
+  // Only the eager greedy verifier requests compact output. All diagnostic,
+  // sampling, logprob and multi-request entry points retain full host outputs.
+  compact_verify_ = true;
+  compact_verify_rows_ = 0;
+  try {
+    auto out = Base::session_verify(req, tokens);
+    compact_verify_ = false;
+    return out;
+  } catch (...) { compact_verify_ = false; throw; }
+}
+
+std::vector<float> Dsv41Model::verification_logits_row(int row) const {
+  if (row < 0 || row >= compact_verify_rows_) throw std::out_of_range("compact verification row");
+  // Called before rollback/redrafting can overwrite the target head. Grammar
+  // constraints need a full row only when its unmasked winner is forbidden.
+  DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_ + static_cast<size_t>(row) * lm_vocab_count_,
+      static_cast<size_t>(lm_vocab_count_) * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  return {h_tail_logits_, h_tail_logits_ + lm_vocab_count_};
+}
+
 Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   if (run.capture && expert_cache_)
     throw std::logic_error("run_rows: expert paging requires eager execution");
@@ -2498,8 +2539,21 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // The stream-ordered reducer's verdict for this pass's folds (a failed
   // collective is an error here, not a wrong number read later).
   if (!run.capture && boundary_) boundary_->settle();
-  out = finish_run(run, std::move(out), packed_logits, -1,
-                   output_hidden_rows.empty() ? nullptr : &output_hidden_rows);
+  if (compact_verify_ && run.decode && run.all_rows && !run.capture) {
+    device_pick_local(logits_, run.T, lm_vocab_count_, lm_vocab_begin_, 0, 1,
+        verify_digest_, verify_table_, verify_locals_, stream_);
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_verify_locals_, verify_locals_, run.T * sizeof(PickLocal),
+        cudaMemcpyDeviceToHost, stream_));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    out.lm_vocab_begin = lm_vocab_begin_;
+    out.lm_vocab_count = lm_vocab_count_;
+    for (int r = 0; r < run.T; ++r)
+      out.local_candidates.push_back({h_verify_locals_[r].best_id, h_verify_locals_[r].best_logit});
+    compact_verify_rows_ = run.T;
+  } else {
+    out = finish_run(run, std::move(out), packed_logits, -1,
+                     output_hidden_rows.empty() ? nullptr : &output_hidden_rows);
+  }
   if (!run.capture && traces) {
     for (size_t l = 0; l < out.route_ids.size(); ++l) {
       const size_t slot = l * static_cast<size_t>(max_tokens_) * K;

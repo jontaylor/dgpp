@@ -119,6 +119,11 @@ inline std::vector<int32_t> spec_sampled_winners(const DecodeOutputs& out, const
 // Per-row local argmax over a rank's [rows, count] logits slice.
 inline std::vector<sample::Candidate> local_row_maxes(
     const DecodeOutputs& out, int rows) {
+  if (!out.local_candidates.empty()) {
+    if (out.local_candidates.size() != static_cast<size_t>(rows))
+      throw std::logic_error("local_row_maxes: compact row count mismatch");
+    return out.local_candidates;
+  }
   std::vector<sample::Candidate> locals;
   locals.reserve(static_cast<size_t>(rows));
   for (int r = 0; r < rows; ++r)

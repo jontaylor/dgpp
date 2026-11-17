@@ -2762,6 +2762,10 @@ target_link_libraries(glm_moe_test PRIVATE dgpp_models_glm_loader dgpp_models_gl
 dgpp_set_common(glm_moe_test)
 add_test(NAME glm_moe_test COMMAND glm_moe_test)
 set_tests_properties(glm_moe_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME glm_moe_test_mxfp4_early_shared
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_MOE_B12X=1 DGPP_EXPERT_SHARED_PREFILL_EARLY=1
+    DGPP_TEST_FILTER=moe_b12x_mxfp4_paging $<TARGET_FILE:glm_moe_test>)
+set_tests_properties(glm_moe_test_mxfp4_early_shared PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE LABELS "gpu")
 add_test(NAME moe_w4a4_layer_test COMMAND ${CMAKE_COMMAND} -E env
   DGPP_MOE_W4A4=1 --unset=DGPP_MOE_W4A4_F32_DOWN --unset=DGPP_MOE_W4A4_DYNAMIC
   DGPP_MOE_W4A4_MIN_ROWS=256 DGPP_MOE_SWIGLU_QUANT=1

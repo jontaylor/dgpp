@@ -173,3 +173,6 @@ The next experiments should target prefill attention split/merge traffic and
 earlier shared prefill execution, with resident b12x/dense execution as the
 main verification kernel targets. No execution change or speedup from these
 proposals is claimed by this profiling pass.
+
+The first three follow-up changes and their focused serving screens are
+described in [MXFP4 execution optimizations](mxfp4-execution-optimizations.md).

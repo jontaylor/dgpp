@@ -59,6 +59,7 @@
 #include "kernels/bf12_companions.hpp"
 #include "engine/session_model.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/pick.hpp"
 #include "kernels/draft_head.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/glm_mhc_launch.hpp"
@@ -81,6 +82,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
  public:
   using Base = SessionModel<Dsv41Model>;
   bool prefill_batch_fits(const RowRun& run) const;
+  Base::Outputs session_verify_candidates(int req, const std::vector<int64_t>& tokens);
+  std::vector<float> verification_logits_row(int row) const;
   int max_mixed_prefill_readers(int decode_rows) const {
     return prefill_bounded_ ? std::max(0, (max_tokens_ - decode_rows) / cfg_.sliding_window) : max_requests_;
   }
@@ -293,6 +296,12 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   const std::vector<std::vector<float>>& debug_layer_pre() const { return debug_layer_pre_; }
 
  private:
+  bool compact_verify_ = false;
+  PickLocal* verify_locals_ = nullptr;
+  PickLocal* h_verify_locals_ = nullptr;
+  uint16_t* verify_table_ = nullptr;
+  uint64_t* verify_digest_ = nullptr;
+  int compact_verify_rows_ = 0;
   static constexpr int kBlockTokens = 128;
   // Amortize prefill launches while bounding scratch growth on four GB10s.
   static constexpr int kPrefillChunkTokens = 4096;

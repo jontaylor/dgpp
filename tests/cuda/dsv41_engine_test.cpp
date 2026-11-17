@@ -915,6 +915,43 @@ DGPP_TEST(dsv41_eager_group_prefill_preserves_slot_transcripts) {
   require(engine.prefill_group_span_limit() == 0, "grouping can be disabled");
 }
 
+DGPP_TEST(dsv41_compact_verification_preserves_candidates_and_grammar_fallback_rows) {
+  const auto cfg = dsv41fx::tiny_config();
+  const std::string dir = "dsv41_compact_verify_fixture";
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  Dsv41Model model(cfg, dir, 128, 512, Dsv41Residency::Resident, nullptr, 0, 1, 1);
+  const auto prompt = smoke_tokens(cfg, 17, 123);
+  const auto tokens = smoke_tokens(cfg, 4, 456);
+  model.session_prefill(0, prompt);
+  const auto full = model.session_verify(0, tokens);
+  const auto expected = dgpp::local_row_maxes(full, 4);
+  model.session_close(0);
+  model.session_prefill(0, prompt);
+  const char* prior = std::getenv("DGPP_DSV41_GPU_CANDIDATES");
+  const std::string saved = prior ? prior : "";
+  struct Restore {
+    bool had; std::string value;
+    ~Restore() { if (had) ::setenv("DGPP_DSV41_GPU_CANDIDATES", value.c_str(), 1);
+                 else ::unsetenv("DGPP_DSV41_GPU_CANDIDATES"); }
+  } restore{prior != nullptr, saved};
+  ::setenv("DGPP_DSV41_GPU_CANDIDATES", "1", 1);
+  const auto compact = model.session_verify_candidates(0, tokens);
+  require(compact.logits.empty() && compact.final_hidden_bits.empty(), "compact verify omits host mirrors");
+  const auto actual = dgpp::local_row_maxes(compact, 4);
+  for (int r = 0; r < 4; ++r) {
+    require(actual[r].id == expected[r].id && actual[r].logit == expected[r].logit,
+            "device candidates exactly match full host scan");
+    const auto row = model.verification_logits_row(r);
+    require(std::equal(row.begin(), row.end(), full.logits.begin() + r * full.lm_vocab_count),
+            "grammar fallback downloads the exact target row");
+  }
+  require(model.session_position(0) == 21, "compact verification advances ordinary session state");
+  model.session_rollback(0, 2, 4);
+  require(model.session_position(0) == 19, "compact verification preserves rollback snapshots");
+  model.session_close(0);
+}
+
 int main() {
   // DGPP_TEST_DRAFT_SCREEN=N: every case drafts through the head screen
   // (kernels/draft_head.hpp) with an N-block candidate cap; every gate

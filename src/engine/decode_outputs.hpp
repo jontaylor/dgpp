@@ -54,6 +54,8 @@ struct DecodeOutputs {
   // accumulators unrounded so sampling and log-probability comparisons
   // do not incur an extra BF16 rounding.
   std::vector<float> logits;
+  // Optional exact local maxima for greedy verification; full rows stay on device.
+  std::vector<sample::Candidate> local_candidates;
   int lm_vocab_begin = 0;  // first vocab column of logits
   int lm_vocab_count = 0;
 };

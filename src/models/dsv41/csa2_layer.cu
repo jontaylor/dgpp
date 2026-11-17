@@ -30,6 +30,8 @@ void Csa2Config::validate(const Csa2Config& c) {
   if (c.local_heads() < 4 || (c.local_heads() & (c.local_heads() - 1)) != 0)
     fail("local heads must be a power of two >= 4 (the attention head-group tiling)");
   if (c.index_heads != 32) fail("the selection kernels pin 32 index heads");
+  if (c.prefill_splits != 1 && c.prefill_splits != 2 && c.prefill_splits != 4)
+    fail("prefill_splits must be 1, 2 or 4");
   // The select networks' bound (kernels/topk_select.cuh): the release's 512,
   // or the 2048 a deployment widens the index budget to (engine.index_topk).
   if (c.index_topk <= 0 || (c.index_topk & (c.index_topk - 1)) != 0 || c.index_topk > kDsaSelectMaxK)
@@ -950,7 +952,7 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
   }
   for (int row0 = 0; row0 < tokens; row0 += kPrefillAttnRows) {
     const int rows = std::min(kPrefillAttnRows, tokens - row0);
-    attend_rows(pool, req_zero_, wscratch_, win_rows, one_block_, req_ids_, pos_ + row0, row0, rows, kPrefillSplit,
+    attend_rows(pool, req_zero_, wscratch_, win_rows, one_block_, req_ids_, pos_ + row0, row0, rows, cfg_.prefill_splits,
                 stream, wlist_, cfg_.window, wcounts_, false, row_base, prefill_window_flash_);
   }
   csa2_window_ring_writeback(wscratch_, cfg_.window, pos0, tokens, cfg_.ring_slots, rb, ring, stream);
