@@ -958,3 +958,73 @@ was bypassed. A new full campaign and full-model quality evaluation remain
 unrun; the current evidence establishes fast-path coverage and practical
 MXFP4 performance, not a controlled ranking of checkpoint quality or a precise
 format-only speed advantage.
+
+### Review of the native MXFP4 follow-up
+
+The external review of `e09a4ecf` identifies useful experiments, but several
+premises need qualification before using its ranking:
+
+- Chunk-direct prefill uses `execution_slots / 2`, hence six experts per
+  wave with twelve slots. Six current and six lookahead experts require
+  216 records, which fit the 256-buffer pool. Twelve-expert miss groups do
+  occur in small-batch b12x execution. Prior GPU readers can also retain
+  staging buffers, so larger staging remains an empirical question.
+- Building binding publication before the service wait was already screened
+  in the combined graph-service/binding-wait experiment. It preserved the
+  normalized responses but demonstrated no serving gain. The present
+  implementation also has bulk binding lookup and changed-layer publication.
+- The older NVFP4 timeline and payload/time bandwidth estimates do not
+  establish that current MXFP4 resident execution has reached its DRAM limit.
+  They motivate reducing weight traffic, but do not rule out scheduling or
+  execution improvements.
+- CPU `Sm12xMoe::prepare` rebuilds packets on serviced misses and eager
+  execution. Resident GPU graph execution uses `prepare_device`; reducing
+  the CPU packet therefore does not accelerate every resident layer.
+- The source stamp includes filesystem identity and metadata as well as
+  paths. Making paths independent alone would not make relocated checkpoint
+  files reusable without revalidation. No identity check was bypassed.
+- Unifying the format/scale-group derivation is a maintenance opportunity;
+  the current MXFP4 and NVFP4 fixtures do not demonstrate a format mismatch.
+  Dense FP8-to-FP4 conversion remains a larger performance/quality experiment,
+  rather than a demonstrated necessary fix.
+
+A same-binary, fixed-budget staging screen on two GB10s compared 256 with
+512 read buffers and matching queue depths. Both used `e09a4ecf`, server
+SHA-256 `c870b9f50ed31a6f2e569e2333122e045c34e25225b319cb88bb4b890046513d`,
+eight workers, twelve execution slots and fixed-depth-three DSpark. Each arm
+restarted before the same four-request tool loop and three uncached-prompt
+recomputations. This is a focused C1 diagnostic, not a benchmark campaign.
+
+Cold 24,317-token prefill was 37.591 versus 37.383 seconds. The three
+continuation engine decode rates were 27.40/31.30/32.55 versus
+27.46/31.29/32.49 tokens/s. The final 2,209-token recomputation, with zero
+expert reads on both ranks and zero cached prompt tokens, took 1.486 versus
+1.479 seconds to prefill and decoded at 55.65 versus 55.54 tokens/s.
+All seven normalized responses, usage and speculative acceptance matched.
+Both ranks stayed at zero swap and their operation streams matched in each
+arm. No build, other benchmark or second serving world ran during requests.
+The larger pool did not demonstrate a practical gain on this sequence; the
+256-buffer reservation remains the preferred setting.
+
+The same sequence then screened fixed speculative depths two and five with
+256 buffers against the depth-three baseline. Cold initial prefill stayed
+within 37.42–37.59 seconds. Depths two/three/five produced engine decode
+rates of 27.21/27.40/25.78 tokens/s on the first prose continuation,
+30.35/31.30/32.15 on code, and 32.20/32.55/31.64 on repeated prose. The
+final short probe read zero expert bytes on both ranks in every arm; its
+prefill took 1.502/1.486/1.522 seconds and engine decode was
+48.17/55.65/61.03 tokens/s respectively. Depth five helps the short,
+high-acceptance workload but does not dominate on the longer continuations.
+Depth three remains the general-purpose selection.
+
+Changing depth changes both verification geometry and speculative acceptance.
+The initial tool call retained its normalized response; the short probe
+retained its 50-token output length but its response differed. Prose
+responses were 386/413/380 tokens at depths two/three/five and code reached
+the 1,024-token cap in each arm. These are practical request
+comparisons, not identical-token attribution or a quality evaluation. Every
+arm recorded the same binary on both ranks, zero process swap and matching
+rank operation streams. The selected native MXFP4 service retains the
+original port, client alias, keys and normal supervision. These screens do
+not replace a full deployment campaign, a fresh format-only NVFP4 comparison
+or full-model quality validation; none of those were run here.
