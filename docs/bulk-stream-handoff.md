@@ -123,3 +123,64 @@ available memory. This reserve covers memory
 outside the model plan; lowering it is an explicit deployment choice, not a
 memory saving. The repeated comparison requested after the initial screen
 uses 3072 MiB and keeps the normal 1 GiB prefix cache in both arms.
+
+## Repeated comparison with the full prefix cache
+
+A second, fixed-size comparison on 2026-11-17 kept the full 1 GiB prefix
+cache and used the explicit 3072 MiB reserve on both arms. It completed
+144 requests across twelve service starts: six on/off pairs, each with two
+warm-up requests and eight measured 24,317-token prefills per arm. Pair
+orders were off/on, on/off, off/on, on/off, off/on, on/off. Three pairs also
+included prose and code, each requested twice per arm; the second request
+provided the warm decode sample. The run was not stopped on a favourable
+intermediate result. All requests were tool-enabled, greedy and C1.
+
+Both arms used eager CUDA loading, 32 CUDA connections, the same expert
+pool, KV capacity, depth-three speculation and the same executable. Source:
+`f44b7456` (the working tree committed as that revision); binary SHA-256:
+`80567e8f4402c93219023bb32c7403f1ed973f46f3793f08b358025d8f8e5ad0`.
+These remain focused diagnostics, not the full serving campaign row set.
+
+| Measurement | Existing handoff | Deferred handoff |
+| --- | ---: | ---: |
+| Mean warm prefill, 48 requests per arm | 11.1224 s | 11.1570 s |
+| Mean warm prose decode, three samples per arm | 39.03 tok/s | 39.00 tok/s |
+| Mean warm code decode, three samples per arm | 42.82 tok/s | 42.85 tok/s |
+
+The primary analysis averages log prefill duration within each boot, then
+computes six paired differences. A Student-t interval with five degrees of
+freedom treats the paired boots as replicates; it does not treat the 96
+requests as independent observations. The estimated deferred-path latency
+increase is **0.313%**, with a paired **95% interval from 0.048% faster to
+0.676% slower**. Every pair favoured the existing handoff:
+
+| Pair | Deferred-path latency increase |
+| --- | ---: |
+| 1 | 0.914% |
+| 2 | 0.034% |
+| 3 | 0.143% |
+| 4 | 0.155% |
+| 5 | 0.091% |
+| 6 | 0.547% |
+
+This does not establish an exact regression at 95% confidence: parity and a
+very small gain remain inside the interval. A 0.2% gain is outside this
+interval for this workload and configuration. The initial 128 MiB-prefix
+screen and this full-prefix comparison are different configurations; they
+must not be pooled. No first-pair exclusion or favourable-subset selection
+was used. Decode figures are descriptive secondary measurements, with only
+three paired warm samples per class.
+
+All 96 measured prefills had zero prefix reuse and zero expert-read bytes on
+both ranks. All 72 paired requests, including warm-ups and decode probes,
+had identical response content (ignoring generated tool-call IDs), acceptance
+counts and expert-read byte counts. Every arm had matching rank operation
+streams and both rank processes reported zero swap. The lowest sampled host
+available memory was 1.407 GiB on rank 0 and 1.446 GiB on rank 1. There were
+no allocation failures or OOMs: the full prefix cache did fit.
+
+Production was restored with the tested executable, the original CUDA loading
+settings, the full 1 GiB prefix cache and the deferred mode disabled. That
+choice follows the repeated results favouring the baseline, rather than a
+minimum percentage threshold for accepting an improvement. The override and
+asynchronous implementation remain available for further work.
