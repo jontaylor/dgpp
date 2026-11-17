@@ -1,5 +1,7 @@
 # Native MXFP4 prefill serving comparison
 
+For future implementations, use the [kernel development checklist](kernel-development-checklist.md).
+
 This carries the [weight-prefetch findings](mxfp4-kernel-attribution.md)
 into a serving-capable expert backend. The comparisons are focused C1
 screens on two GB10 Sparks, not new deployment campaign rows.
