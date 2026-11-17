@@ -478,6 +478,22 @@ class LauncherScanTest(unittest.TestCase):
                     self.assertEqual(cluster.start_ranks(), 0)
                 self.assertEqual(wait.call_args.args[2], expected)
 
+    def test_explicit_startup_timeout_allows_first_expert_image_preparation(self):
+        cluster = self.cluster(self.namespace("prepare", "org/model"))
+        cluster.startup_timeout = 3600
+        with patch.object(cluster, "boot_head", return_value=object()), \
+                patch.object(cluster, "wait_log", return_value=True) as wait, \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cluster.start_ranks(), 0)
+        self.assertEqual(wait.call_args.args[2], 3600)
+
+    def test_startup_timeout_rejects_invalid_bounds(self):
+        namespace = self.namespace("bounds", "org/model")
+        for value in (0, -1, 86401):
+            with self.subTest(value=value), patch.dict(os.environ, self.environ, clear=True):
+                with self.assertRaisesRegex(ValueError, "startup-timeout"):
+                    Cluster(SimpleNamespace(startup_timeout=value), namespace=str(namespace))
+
     def test_peer_staging_cleans_stale_streams_in_bash(self):
         self.check_peer_staging(["bash"])
 

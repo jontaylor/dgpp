@@ -125,19 +125,35 @@ ExpertStoreBuilder::ExpertStoreBuilder(std::string path, StoreIdentity identity,
     : path_(std::move(path)), identity_(identity), written_(keys.size(), false) {
   records_ = plan(identity, keys, &file_bytes_);
   temporary_ = path_ + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(temporary_id++);
-  fd_ = ::open(temporary_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  // Anonymous images disappear when the last descriptor closes, including
+  // SIGKILL during preparation. Unsupported filesystems retain named staging.
+#ifdef O_TMPFILE
+  fd_ = ::open(parent(path_).c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  anonymous_ = fd_ >= 0;
+#endif
+  if (fd_ < 0) fd_ = ::open(temporary_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd_ < 0) error("create temporary image: " + std::string(std::strerror(errno)));
+  temporary_linked_ = !anonymous_;
   if (::ftruncate(fd_, static_cast<off_t>(file_bytes_)) != 0) {
     const auto why = std::string(std::strerror(errno));
     ::close(fd_);
     fd_ = -1;
-    ::unlink(temporary_.c_str());
+    if (temporary_linked_) ::unlink(temporary_.c_str());
     error("size temporary image: " + why);
+  }
+  // Reserve the complete image before packing, rather than discovering a
+  // full disk after minutes of reads and writes to a sparse file.
+  const int allocated = ::posix_fallocate(fd_, 0, static_cast<off_t>(file_bytes_));
+  if (allocated && allocated != EOPNOTSUPP && allocated != ENOSYS && allocated != EINVAL) {
+    ::close(fd_);
+    fd_ = -1;
+    if (temporary_linked_) ::unlink(temporary_.c_str());
+    error("reserve temporary image: " + std::string(std::strerror(allocated)));
   }
 }
 ExpertStoreBuilder::~ExpertStoreBuilder() {
   if (fd_ >= 0) ::close(fd_);
-  if (!published_ && !temporary_.empty()) ::unlink(temporary_.c_str());
+  if (!published_ && temporary_linked_) ::unlink(temporary_.c_str());
 }
 void ExpertStoreBuilder::write(size_t index, const PackedChunk& chunk) {
   if (published_ || index >= records_.size() || written_[index]) error("invalid or duplicate record write");
@@ -173,6 +189,12 @@ void ExpertStoreBuilder::finish() {
   const auto h = header(identity_, records_.size(), file_bytes_, hash(index));
   write_all(fd_, h, 0);
   if (::fdatasync(fd_) != 0) error("sync temporary image failed");
+  if (anonymous_) {
+    const auto descriptor = "/proc/self/fd/" + std::to_string(fd_);
+    if (::linkat(AT_FDCWD, descriptor.c_str(), AT_FDCWD, temporary_.c_str(), AT_SYMLINK_FOLLOW) != 0)
+      error("link completed image: " + std::string(std::strerror(errno)));
+    temporary_linked_ = true;
+  }
   if (::rename(temporary_.c_str(), path_.c_str()) != 0) error("publish image failed");
   published_ = true;
   const int dir = ::open(parent(path_).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

@@ -10,6 +10,8 @@
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 #include "common/test.hpp"
 
@@ -96,6 +98,36 @@ DGPP_TEST(expert_store_bounded_record_roundtrip_reconstructs_tp_experts_for_both
     require(stats.returned_bytes == bytes && stats.calls == f.keys.size() && stats.failures == 0,
             "actual returned file bytes and syscalls reconcile");
   }
+}
+
+DGPP_TEST(expert_store_killed_builder_leaves_no_anonymous_partial_image) {
+  Fixture f;
+#ifdef O_TMPFILE
+  const int probe = ::open(f.dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  if (probe < 0) dgpp::test::skip("filesystem does not support anonymous temporary files");
+  ::close(probe);
+  int pipefd[2];
+  require(::pipe(pipefd) == 0, "pipe");
+  const pid_t child = ::fork();
+  require(child >= 0, "fork");
+  if (child == 0) {
+    ::close(pipefd[0]);
+    ExpertStoreBuilder writer(f.path, f.identity, f.keys);
+    writer.write(0, f.chunk(0));
+    const char ready = 1;
+    if (::write(pipefd[1], &ready, 1) != 1) ::_exit(2);
+    for (;;) ::pause();
+  }
+  ::close(pipefd[1]);
+  char ready = 0;
+  const auto received = ::read(pipefd[0], &ready, 1);
+  ::close(pipefd[0]);
+  ::kill(child, SIGKILL);
+  int status = 0;
+  require(::waitpid(child, &status, 0) == child, "wait for killed builder");
+  require(received == 1 && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "kill after first record");
+  require(std::filesystem::is_empty(f.dir), "killed builder releases image without a named orphan");
+#endif
 }
 
 DGPP_TEST(expert_store_incomplete_builder_preserves_existing_image_and_cleans_its_temporary) {

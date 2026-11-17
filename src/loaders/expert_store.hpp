@@ -54,6 +54,8 @@ class ExpertStoreBuilder {
   uint64_t file_bytes_ = 0;
   int fd_ = -1;
   bool published_ = false;
+  bool anonymous_ = false;
+  bool temporary_linked_ = false;
 };
 
 class ExpertStore {

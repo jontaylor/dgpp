@@ -109,6 +109,9 @@ class Cluster:
             raise ValueError("set model, topology, and HTTP options in the deployment or .env, not --knobs")
         self.replace = getattr(args, "replace", False)
         self.skip_preflight = getattr(args, "skip_preflight", False)
+        self.startup_timeout = getattr(args, "startup_timeout", None)
+        if self.startup_timeout is not None and not 1 <= self.startup_timeout <= 86400:
+            raise ValueError("--startup-timeout must be between 1 and 86400 seconds")
         # The profiling hook (2026-09-09, the Qwen decode session): rank 0's
         # command line prefixed with CMD (word-split) — e.g. `nsys profile
         # --trace=cuda -o /tmp/r0` — while the peers run bare. The head pid
@@ -462,7 +465,7 @@ class Cluster:
                 if not self.remote_control("status", rank, host):
                     say(f"WARN: peer rank {rank} not observed on {host}")
         verify_weights = self.cfg.get("engine", {}).get("runtime_adapter_verify_weights", False)
-        ready_timeout = 1200 if verify_weights else 600
+        ready_timeout = self.startup_timeout or (1200 if verify_weights else 600)
         if not self.wait_log(r0, f"listening on :{self.http}", ready_timeout, "rank 0 serving", proc):
             raise RuntimeError("rank 0 did not become ready")
         bind = self.cfg["http"]["bind_host"]
@@ -739,6 +742,8 @@ def main():
     ap.add_argument("--all", action="store_true",
                     help="down/status: scan every deployment under DGPP_LOG_DIR/deployments; status also includes stopped deployments")
     ap.add_argument("--skip-preflight", action="store_true", help="skip environment checks, not process ownership checks")
+    ap.add_argument("--startup-timeout", type=int, default=None,
+                    help="seconds to wait for HTTP readiness during initial image preparation (default: 600, or 1200 with explicit adapter weight verification)")
     ap.add_argument("--local-only", action="store_true", help="doctor: inspect this node without SSH")
     ap.add_argument("--rank", type=int, default=0, help="signal: rank in this deployment")
     ap.add_argument("--signal", choices=("INT", "TERM", "KILL"), default="INT")
