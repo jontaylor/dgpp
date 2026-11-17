@@ -106,7 +106,7 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
 }
 
 template <typename Out, int BM, int BN, bool Grid32 = false, typename Scale = uint8_t,
-          bool Wide = false>
+          bool Wide = false, bool Prefetch = false>
 __global__ __launch_bounds__((Tile<BM, BN, Wide>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const Scale* w_scales, Out* out,
     int m, int n, int k, size_t out_stride) {
@@ -135,6 +135,12 @@ __global__ __launch_bounds__((Tile<BM, BN, Wide>::threads)) void mxfp8_gemm_kern
       const uint8_t* src = (is_a ? a : w) + static_cast<size_t>(valid ? global_row : 0) * k;
       copy16(smem + slot * slot_bytes + row * stride + column,
                valid ? src + step * BK + column : src, valid);
+      if constexpr (Prefetch) {
+        if (!is_a && valid && column == 0 && step % 2 == 0 && (step + 2) * BK < k) {
+          const auto* next = src + (step + 2) * BK;
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(next));
+        }
+      }
     }
   };
   float accum[MT][NT][4] = {};
@@ -310,15 +316,22 @@ bool native_grid32(const uint16_t* x, size_t x_stride, const uint8_t* w, const S
     const char* v = std::getenv("DGPP_DSV41_NATIVE_FP8_WIDE");
     return v && v[0] == '1';
   }();
-  if (wide) {
-    constexpr int smem = 2 * (BM + BN) * Tile<BM, BN, true>::stride;
-    mxfp8_gemm_kernel<Out, BM, BN, true, Scale, true>
-        <<<blocks, Tile<BM, BN, true>::threads, smem, stream>>>(a, as, w, ws, out, m, n, k,
+  static const bool prefetch = [] {
+    const char* v = std::getenv("DGPP_DSV41_NATIVE_FP8_PREFETCH");
+    return v && v[0] == '1';
+  }();
+  auto run = [&]<bool Wide, bool Prefetch>() {
+    constexpr int smem = (Wide ? 2 : kStages) * (BM + BN) * Tile<BM, BN, Wide>::stride;
+    mxfp8_gemm_kernel<Out, BM, BN, true, Scale, Wide, Prefetch>
+        <<<blocks, Tile<BM, BN, Wide>::threads, smem, stream>>>(a, as, w, ws, out, m, n, k,
                                                                 stride ? stride : size_t(n));
+  };
+  if (wide) {
+    if (prefetch) run.template operator()<true,true>();
+    else run.template operator()<true,false>();
   } else {
-    constexpr int smem = kStages * (BM + BN) * Tile<BM, BN>::stride;
-    mxfp8_gemm_kernel<Out, BM, BN, true, Scale><<<blocks, Tile<BM, BN>::threads, smem, stream>>>(
-        a, as, w, ws, out, m, n, k, stride ? stride : size_t(n));
+    if (prefetch) run.template operator()<false,true>();
+    else run.template operator()<false,false>();
   }
   DGPP_CUDA_OK(cudaGetLastError());
   return true;

@@ -16,6 +16,8 @@
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/hadamard32.hpp"
 #include "kernels/moe_w4a4.hpp"
+#include "kernels/moe_mxfp4_native.hpp"
+#include "kernels/mxfp8_gemm.hpp"
 #include "kernels/moe_fp4_pack.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -663,6 +665,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
                                MoeExpertKernel kernel, expert::ExpertCache* cache,
                                std::span<const size_t> cache_experts, const ReadyRoutes* ready) {
   step_timing::Scope tick(step_timing::kMoe);
+  native_hidden_ready_ = false;
   if (tokens <= 0) return;
   if (tokens > max_tokens_)
     throw std::invalid_argument("GlmMoeLayer: tokens exceed max_tokens");
@@ -1732,6 +1735,7 @@ void GlmMoeLayer::accumulate_prefill_rows(uint16_t* out, int tokens, int r0, int
 // grouped kernels over every segment (the down rows left for the caller's
 // accumulation).
 void GlmMoeLayer::prefill_chain(const uint16_t* hidden, int tokens, cudaStream_t stream, int route_row) {
+  native_hidden_ready_ = false;
   const int E = cfg_.n_experts, K = cfg_.top_k;
   const size_t tk = static_cast<size_t>(tokens) * K;
   // 2. Segmentation on the device: rows, slot map, segment table (every
@@ -1810,6 +1814,7 @@ void GlmMoeLayer::enqueue_prefill_f32(const uint16_t* hidden, float* out, int to
     upload_expert_views(d_views_prefill_, /*with_shared=*/false, stream);
     // The routed chain alone (no shared segment), returned unrounded.
     const int tile_cap = tile_list_for(kernel, E, static_cast<int>(tk), stream);
+    native_hidden_ready_ = false;
     grouped_expert_chain(kernel, reader_hidden, d_segs_, E,
                          tile_cap ? readers : routed_seg_max_rows(d_segs_, E, readers, stream),
                          /*shared_seg=*/nullptr, readers, tk, stream, tile_cap ? d_tiles_ : nullptr,
@@ -1945,6 +1950,36 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     fp4_tiles = d_tiles_;
   }
   const size_t I_max = static_cast<size_t>(std::max(I_r, I_s));
+  static const int native_mode = [] {
+    const char* v = std::getenv("DGPP_MOE_MX_NATIVE_PREFILL");
+    return v ? std::atoi(v) : 0;
+  }();
+  const bool native_mx = native_mode && fp4 && fp4_group == 32 &&
+      kernel == MoeExpertKernel::kMma && tokens > 16 && n_segs > 0 &&
+      H % 64 == 0 && I_r % 64 == 0;
+  const size_t gate_bytes = size_t(tokens) * H;
+  const size_t down_rows = size_t(tokens) * cfg_.top_k;
+  const size_t down_bytes = down_rows * I_r;
+  const size_t gate_region = (gate_bytes + gate_bytes / 32 + 15) & ~size_t(15);
+  const bool native_scratch = gate_region + down_bytes + down_bytes / 32 <=
+      size_t(max_tokens_) * (cfg_.top_k + 1) * H * 2;
+  auto* native_gate = reinterpret_cast<uint8_t*>(d_gather_);
+  auto* native_gate_scales = native_gate + (native_scratch ? gate_bytes : 0);
+  auto* native_down = native_gate + (native_scratch ? gate_region : 0);
+  auto* native_down_scales = native_down + (native_scratch ? down_bytes : 0);
+  const bool native_gate_on = native_mx && native_scratch && native_mode != 3;
+  const bool native_down_on = native_mx && native_scratch && native_mode != 2;
+  if (native_gate_on && !native_hidden_ready_) {
+    for (int first = 0; first < tokens; first += 65535) {
+      const int count = std::min(65535, tokens - first);
+      launch_mxfp8_quantize_rows(hidden + size_t(first)*H, H, count, H,
+          native_gate + size_t(first)*H, native_gate_scales + size_t(first)*(H/32), stream);
+    }
+    native_hidden_ready_ = true;
+  }
+  if (native_down_on && !fp4_tiles)
+    launch_moe_tile_list(segs, n_segs, 64, d_tiles_, d_tile_count_, stream);
+
   const bool w4a4 = fp4 && !packq && !w_.weight_only_fp4 && fp4_group == kFp4Group &&
                     kernel == MoeExpertKernel::kMma && moe_w4a4_eligible(H, I_r, rows_total);
   // The W4A4 chain's down rows in bf16 (half the write and the ordered
@@ -2060,6 +2095,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
                                    I_max, n, H, stream);
+    else if (native_gate_on && routed_arg && fp4_w)
+      launch_moe_mxfp4_native_bf16(native_gate, native_gate_scales, sg, ns, mr,
+          d_views_prefill_, which, out, I_max, n, H, stream, d_rows_);
     else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_, which, out,
                                       I_max, n, H, stream, d_rows_, fp4_group, mr <= 16 ? 16 : 64,
@@ -2117,7 +2155,12 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
-    else if (mma && fp4_w)
+    else if (native_down_on && routed_arg && fp4_w) {
+      launch_moe_mxfp8_quantize_tiles(d_act_, I_max, k, native_down, native_down_scales,
+          sg, d_tiles_, d_tile_count_, stream);
+      launch_moe_mxfp4_native_f32(native_down, native_down_scales, sg, ns, mr,
+          d_views_prefill_, 2, d_down_, H, H, k, stream);
+    } else if (mma && fp4_w)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_, 2, d_down_,
                                      H, H, k, stream, nullptr, fp4_group, mr <= 16 ? 16 : 64,
                                      routed_arg ? fp4_tiles : nullptr, d_tile_count_, fp4_tile_cap);
@@ -2202,6 +2245,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
   if (shared_seg && execute_shared) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);
   if (std::getenv("DGPP_MOE_CHAIN_DUMP") != nullptr) {
+    native_hidden_ready_ = false;
     // Hunt instrument: per-stage checksums of the chain's buffers.
     // Materialize stages bypassed by the optimized chain before reading them.
     if (mma)

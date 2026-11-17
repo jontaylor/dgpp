@@ -363,6 +363,7 @@ class GlmMoeLayer {
   // [max(rows_total, decode rows), inter] — decode and prefill share them.
   int8_t* d_hidden_q_ = nullptr;
   float* d_hidden_qs_ = nullptr;
+  bool native_hidden_ready_ = false;
   bool hidden_codes_ready_ = false;  // mark_hidden_codes_ready: the next enqueue reads them as given
   int8_t* d_act_q_ = nullptr;
   float* d_act_qs_ = nullptr;

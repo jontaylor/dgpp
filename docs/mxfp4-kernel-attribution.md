@@ -1,5 +1,8 @@
 # Why the existing MXFP4 prefill kernel beat the native prototype
 
+Follow-up: [native serving integration and final comparison](mxfp4-native-serving.md).
+The results and deployment statements below describe the earlier screen.
+
 This is a causal follow-up to the [kernel follow-through](mxfp4-kernel-followthrough.md).
 The comparison concerns grouped expert **prefill**, not the b12x verification
 backend. It replays one real 4,096-token, top-six layer routing pattern on

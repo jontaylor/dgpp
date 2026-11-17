@@ -149,6 +149,31 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
     if (h1 != h0) throw std::runtime_error("prepared layout changed BF16 accumulators");
     printf("prepared-bf16,%d,%d,%d,%.4f\n", tokens, n, k, timing(prepared_run, stream));
     fflush(stdout);
+    launch_mxfp8_quantize_rows(x.p, k, input_rows, k, a.p, as.p, stream);
+    mx4bench::run<float, 64, 128, true, true, true, 2, true, false, 24>(
+        a.p, as.p, out.p, rows, E, n, k, stream, segs.p, views.p, 0, actrows.p);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<float> native_ref(h0.size()), native_got(h0.size());
+    DGPP_CUDA_OK(cudaMemcpy(native_ref.data(), out.p, h0.size() * 4, cudaMemcpyDeviceToHost));
+    auto prepared_native = [&]<int M, int S, int Schedule = 24>() {
+      auto run = [&] {
+        mx4bench::run<float, M, 128, true, true, true, S, true, false, Schedule, true>(
+            a.p, as.p, out.p, rows, E, n, k, stream, segs.p, pv.p, 0, actrows.p);
+      };
+      run();
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      DGPP_CUDA_OK(cudaMemcpy(native_got.data(), out.p, h0.size() * 4, cudaMemcpyDeviceToHost));
+      if (native_got != native_ref) throw std::runtime_error("prepared native arithmetic mismatch");
+      printf("prepared-native,%d,%d,%d,%d,%d,%d,%.4f\n", tokens, n, k, M, S, Schedule,
+             timing(run, stream));
+      fflush(stdout);
+    };
+    prepared_native.template operator()<64, 2>();
+    prepared_native.template operator()<64, 3>();
+    prepared_native.template operator()<128, 2>();
+    prepared_native.template operator()<128, 3>();
+    prepared_native.template operator()<64, 2, 27>();
+    prepared_native.template operator()<128, 2, 27>();
   }
   const int tile_capacity = moe_tile_list_capacity(E, total, 64);
   Buffer<MoeTile> work(moe_tile_list_capacity(E, total, 32));

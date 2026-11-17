@@ -1,5 +1,8 @@
 # MXFP4 kernel and cache follow-through
 
+Follow-up: [native serving integration and final comparison](mxfp4-native-serving.md).
+The results and deployment statements below describe the earlier screen.
+
 This follows the [initial kernel screen](mxfp4-kernel-options.md) on two GB10
 Sparks. These are focused diagnostics, not deployment campaign rows. They
 use the same 24,317-token tool request and tool-enabled prose/code

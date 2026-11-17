@@ -155,6 +155,10 @@ add_library(dgpp_expert_residency STATIC
 target_link_libraries(dgpp_expert_residency PUBLIC Threads::Threads)
 dgpp_set_common(dgpp_expert_residency)
 
+add_library(dgpp_moe_mxfp4_native STATIC src/kernels/moe_mxfp4_native.cu)
+target_link_libraries(dgpp_moe_mxfp4_native PUBLIC CUDA::cudart)
+dgpp_set_common(dgpp_moe_mxfp4_native)
+
 add_library(dgpp_moe_fp4_pack STATIC src/kernels/moe_fp4_pack.cu src/kernels/expert_demand.cu)
 target_link_libraries(dgpp_moe_fp4_pack PUBLIC CUDA::cudart)
 dgpp_set_common(dgpp_moe_fp4_pack)
@@ -841,7 +845,7 @@ set_tests_properties(qwen35_image_prefill_test qwen35_mixed_image_prefill_test
 add_library(dgpp_models_moe STATIC
   src/models/glm/moe_layer.cpp)
 target_include_directories(dgpp_models_moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dgpp_models_moe PUBLIC dgpp_models_glm dgpp_kernels dgpp_expert_cache_cuda dgpp_sm12x_moe)
+target_link_libraries(dgpp_models_moe PUBLIC dgpp_models_glm dgpp_kernels dgpp_expert_cache_cuda dgpp_sm12x_moe dgpp_moe_mxfp4_native)
 dgpp_set_common(dgpp_models_moe)
 
 add_library(dgpp_models_glm_loader STATIC
@@ -2631,6 +2635,11 @@ dgpp_set_common(fp4_gemv_test)
 add_test(NAME fp4_gemv_test COMMAND fp4_gemv_test)
 set_tests_properties(fp4_gemv_test PROPERTIES SKIP_RETURN_CODE 2)
 
+add_executable(moe_mxfp4_native_test tests/cuda/moe_mxfp4_native_test.cu)
+target_link_libraries(moe_mxfp4_native_test PRIVATE dgpp_kernels dgpp_moe_fp4_pack dgpp_moe_mxfp4_native CUDA::cudart)
+dgpp_set_common(moe_mxfp4_native_test)
+add_test(NAME moe_mxfp4_native_test COMMAND moe_mxfp4_native_test)
+
 add_executable(moe_fp4_pack_test tests/cuda/moe_fp4_pack_test.cpp)
 target_link_libraries(moe_fp4_pack_test PRIVATE dgpp_moe_fp4_pack CUDA::cudart)
 dgpp_set_common(moe_fp4_pack_test)
@@ -2911,7 +2920,7 @@ if(DGPP_BUILD_BENCHMARKS)
     LIBRARIES dgpp_kernels CUDA::cudart)
   dgpp_add_benchmark(mxfp4_kernel_bench
     SOURCES benchmarks/micro/mxfp4_kernel_bench.cu
-    LIBRARIES dgpp_kernels dgpp_moe_fp4_pack CUDA::cudart)
+    LIBRARIES dgpp_kernels dgpp_moe_fp4_pack dgpp_moe_mxfp4_native CUDA::cudart)
   dgpp_add_benchmark(mxfp4_backend_bench
     SOURCES benchmarks/micro/mxfp4_backend_bench.cpp
     LIBRARIES dgpp_sm12x_moe CUDA::cudart)
