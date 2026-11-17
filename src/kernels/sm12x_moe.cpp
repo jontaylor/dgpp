@@ -174,7 +174,7 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
     auto* packed = reinterpret_cast<int32_t*>(c.packet + E*6*sizeof(uint64_t));
     if (c.reused && rows == 4) {
       launch_mxfp4_verify_singletons(hidden, c.act, out, reinterpret_cast<const uint64_t*>(c.packet),
-                                     packed, c.reused, stream);
+                                     ids, packed, c.reused, stream);
       packed = c.reused;
     }
     typename Backend::Routes routes{packed};

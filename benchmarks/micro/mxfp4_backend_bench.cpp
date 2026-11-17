@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <random>
@@ -43,7 +44,7 @@ static int replay(const char* path) {
   auto* out = alloc<float>(values);
   std::mt19937 gen(17);
   std::vector<uint16_t> x(4 * H);
-  for (auto& v : x) v = ((gen() & 1) << 15) | (0x3e00 + gen() % 384);
+  for (auto& v : x) v = ((gen() & 1) << 15) | (0x3b80 + gen() % 1280);
   DGPP_CUDA_OK(cudaMemcpy(input, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
   std::array<float, routes> prob;
   prob.fill(1.f / 6);
@@ -62,7 +63,7 @@ static int replay(const char* path) {
     DGPP_CUDA_OK(cudaMemcpy(block, data.data(), bytes, cudaMemcpyHostToDevice));
     auto scales = [&](uint8_t* to, size_t n) {
       std::vector<uint8_t> exponents(n);
-      for (auto& sc : exponents) sc = 118 + gen() % 4;
+      for (auto& sc : exponents) sc = 115 + gen() % 11;
       DGPP_CUDA_OK(cudaMemcpy(to, exponents.data(), n, cudaMemcpyHostToDevice));
     };
     scales(v.s13, size_t(2 * I) * H / 32);
@@ -132,6 +133,23 @@ static int replay(const char* path) {
       base_us = measure(baseline, ref);
       split_us = measure(hybrid, candidate);
     }
+    // Splitting the same groups across residency waves must preserve every
+    // output bit of the hybrid backend, including its shared-slot sentinel.
+    std::vector<int> waves[2];
+    int ordinal = 0;
+    for (int e = 0; e < E; ++e)
+      if (counts[e]) waves[(ordinal++) % 2].push_back(e);
+    DGPP_CUDA_OK(cudaMemsetAsync(out, 0xff, values*sizeof(float), stream));
+    for (const auto& wave : waves) {
+      if (wave.empty()) continue;
+      hybrid.prepare(group, addresses, 4, stream, wave);
+      hybrid.run(input, ids, weights, out, 4, stream);
+    }
+    std::vector<float> combined(values);
+    DGPP_CUDA_OK(cudaMemcpyAsync(combined.data(), out, values*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    if (std::memcmp(combined.data(),candidate.data(),values*sizeof(float)) != 0)
+      throw std::runtime_error("masked waves differ from one resident invocation");
     double error[2]{}, norm[2]{};
     for (int slot = 0; slot < 28; ++slot) {
       for (int col = 0; col < H; ++col) {

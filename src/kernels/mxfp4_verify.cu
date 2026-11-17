@@ -2,17 +2,22 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
-#include "kernels/moe_fp4_layout.cuh"
 #include "kernels/mxfp4_verify.hpp"
 
 namespace dgpp {
 namespace {
 constexpr int H = 5120, I = 1152, E = 384, slots = 24, B = 8, capacity = 64 * 6;
-__global__ void partition(const int32_t* routes, int32_t* reused) {
+__global__ void partition(const int32_t* routes, const int32_t* ids, int32_t* reused) {
   const int lane = threadIdx.x;
   const auto* experts = routes + capacity * B;
   const int count = experts[capacity] / B;
-  const bool keep = lane < count && routes[lane * B + 1] < slots;
+  // Masked groups still occupy the same b12x reduction position in each
+  // miss wave. Their sentinel routes suppress stores, as in the full packet.
+  const int expert = lane < count ? experts[lane] : -1;
+  int assignments = 0;
+#pragma unroll
+  for (int i = 0; i < slots; ++i) assignments += ids[i] == expert;
+  const bool keep = lane < count && assignments > 1;
   const unsigned mask = __ballot_sync(0xffffffff, keep);
   if (keep) {
     const int dst = __popc(mask & ((1u << lane) - 1));
@@ -60,10 +65,17 @@ __global__ __launch_bounds__(256) void singleton_projection(const uint16_t* inpu
   const auto* x = input + (Gate ? route / 6 : route) * K;
   float acc[4][4] = {};
   for (int k = (warp % partitions) * 32; k < K; k += partitions * 32) {
-    const auto scale = [&](int n) {
-      return scales[(k / 32) * N +
-                    fp4_layout::swap_scale_pair(fp4_layout::transpose_scale_block(n))];
-    };
+    // The packed scales of the four m16 fragments occupy eight contiguous
+    // bytes: (low0, low1, high0, high1) for each pair of fragments.
+    const uint2 scales8 = *reinterpret_cast<const uint2*>(scales + (k / 32) * N + n0 + row * 8);
+    const int next = k + partitions * 64;
+    if (next < K && lane % 8 == 0) {
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const int slab = (next / 16 + half) * (N / 64) + n0 / 64;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(w + slab * 32 + lane));
+      }
+    }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
       const int slab = (k / 16 + half) * (N / 64) + n0 / 64;
@@ -74,8 +86,8 @@ __global__ __launch_bounds__(256) void singleton_projection(const uint16_t* inpu
       const unsigned b1 = *reinterpret_cast<const unsigned*>(x + at + 8);
 #pragma unroll
       for (int t = 0; t < 4; ++t) {
-        const int n = n0 + t * 16 + row;
-        const uint8_t s0 = scale(n), s1 = scale(n + 8);
+        const unsigned sc = (t < 2 ? scales8.x : scales8.y) >> ((t % 2) * 8);
+        const uint8_t s0 = sc, s1 = sc >> 16;
         const unsigned a0 = pair(words[t], 0, s0), a1 = pair(words[t], 8, s1);
         const unsigned a2 = pair(words[t], 4, s0), a3 = pair(words[t], 12, s1);
         asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -114,9 +126,9 @@ __global__ __launch_bounds__(256) void singleton_projection(const uint16_t* inpu
 }  // namespace
 
 void launch_mxfp4_verify_singletons(const uint16_t* hidden, uint16_t* act, float* out,
-                                    const uint64_t* table, const int32_t* routes, int32_t* reused,
-                                    cudaStream_t stream) {
-  partition<<<1, 32, 0, stream>>>(routes, reused);
+                                    const uint64_t* table, const int32_t* ids,
+                                    const int32_t* routes, int32_t* reused, cudaStream_t stream) {
+  partition<<<1, 32, 0, stream>>>(routes, ids, reused);
   singleton_projection<true>
       <<<dim3(I / 64, slots), 256, 0, stream>>>(hidden, act, out, table, routes);
   singleton_projection<false>
