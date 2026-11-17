@@ -2911,7 +2911,7 @@ if(DGPP_BUILD_BENCHMARKS)
     LIBRARIES dgpp_kernels CUDA::cudart)
   dgpp_add_benchmark(mxfp4_kernel_bench
     SOURCES benchmarks/micro/mxfp4_kernel_bench.cu
-    LIBRARIES dgpp_kernels CUDA::cudart)
+    LIBRARIES dgpp_kernels dgpp_moe_fp4_pack CUDA::cudart)
   dgpp_add_benchmark(mxfp4_backend_bench
     SOURCES benchmarks/micro/mxfp4_backend_bench.cpp
     LIBRARIES dgpp_sm12x_moe CUDA::cudart)

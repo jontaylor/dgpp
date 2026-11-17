@@ -3905,7 +3905,7 @@ __launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_m
     const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride,
     int n, int k, int m_tiles, bool packed_direct, const MoeTile* tiles,
-    const int32_t* tile_count) {
+    const int32_t* tile_count, bool weight_prefetch) {
   dgpp_pdl_wait();
   using namespace fp4_ldm;
   static_assert(TileRows == 16 || TileRows == 64 || TileRows == 128);
@@ -4089,7 +4089,8 @@ __launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_m
         // DRAM sees quarter-line requests. Pull the row's NEXT 128-byte line
         // (the codes of stages s+4 .. s+7) into L2 as a whole line, two
         // stages ahead of the ring's own copies.
-        if (!v.fp4_chunks && !v.fp4_packed_rows && b_half == 0 && b_ok && (s % 4) == 0) {
+        if (weight_prefetch && !v.fp4_chunks && !v.fp4_packed_rows && b_half == 0 && b_ok &&
+            (s % 4) == 0) {
 #pragma unroll
           for (int l = (s == 0 ? 1 : kPrefetchLines); l <= kPrefetchLines; ++l) {
             const int nk = k0 + 4 * BK * l;
@@ -4283,6 +4284,11 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
     const char* value = std::getenv("DGPP_MOE_PACKED_PREFILL_COPY");
     return !value || std::atoi(value) != 0;
   }();
+  // Diagnostic ablation; production retains weight-line lookahead by default.
+  static const bool weight_prefetch = [] {
+    const char* value = std::getenv("DGPP_MOE_FP4_WEIGHT_PREFETCH");
+    return !value || std::atoi(value) != 0;
+  }();
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
   if (static_cast<size_t>(n_tiles) * (tiles ? tile_capacity : m_tiles) > 0x7fffffffu)
     throw std::invalid_argument("moe grouped mma fp4 ldm: grid too large");
@@ -4292,12 +4298,12 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
     moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
                                                 which, out, out_stride, n, k, m_tiles,
-                                                packed_direct, tiles, tile_count);
+                                                packed_direct, tiles, tile_count, weight_prefetch);
   else
     moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
                                                 which, out, out_stride, n, k, m_tiles,
-                                                packed_direct, tiles, tile_count);
+                                                packed_direct, tiles, tile_count, weight_prefetch);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

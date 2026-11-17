@@ -7,6 +7,10 @@ continuations, depth-three speculation, and MXFP4 weights. Prefill probes
 disable prefix reuse; continuation probes include both first use and repeat.
 Decode rates count engine decode steps, excluding prefill and queueing.
 
+The subsequent [kernel attribution](mxfp4-kernel-attribution.md) identifies
+missing GPU weight prefetch and reverses the native prototype performance
+conclusion below. The serving configuration described here is unchanged.
+
 ## Why the extra reads did not converge away
 
 Routing still selects six experts per target token. Expert reads measure

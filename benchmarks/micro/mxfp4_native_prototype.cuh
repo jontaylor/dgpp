@@ -13,6 +13,14 @@
 #include "kernels/pdl.cuh"
 
 namespace dgpp::mx4bench {
+// Benchmark ablations; every combination preserves native accumulators.
+enum ScheduleBits {
+  kSingleBarrier = 1,
+  kSkipEmptyRows = 2,
+  kWeightReuse = 4,
+  kPrefetchWeights = 8,
+  kOnePrefetchLine = 16,
+};
 namespace {
 constexpr int kThreads = 128, kStages = 3;
 
@@ -53,7 +61,8 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
 }
 
 template <typename Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
-          bool WideWarps = false, int Stages = 3, bool StageScales = false, bool ColumnScales = false>
+          bool WideWarps = false, int Stages = 3, bool StageScales = false,
+          bool ColumnScales = false, int Schedule = 0>
 __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const uint8_t* w_scales, Out* out,
     int m, int n, int k, size_t out_stride, const MoeSegment* segs, const MoeExpertView* views,
@@ -63,7 +72,8 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
   constexpr int kStages = Stages;
   constexpr int threads = Tile<BM, BN, WideWarps>::threads;
   constexpr int BK = Tile<BM, BN, WideWarps>::bk, stride = Tile<BM, BN, WideWarps>::stride;
-  constexpr int warp_m = BM == 16 ? 1 : 2, warp_n = Tile<BM, BN, WideWarps>::warps / warp_m;
+  constexpr int warp_m = BM == 16 || (Schedule & kWeightReuse) ? 1 : 2,
+                warp_n = Tile<BM, BN, WideWarps>::warps / warp_m;
   constexpr int MT = BM / warp_m / 16, NT = BN / warp_n / 8;
   static_assert(!StageScales || BK == 64, "staged scales require two K32 groups");
   static_assert(!ColumnScales || StageScales, "column scales require staged loads");
@@ -134,6 +144,18 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
             is_a ? a + size_t(ar) * k + step * BK + col
                  : w + size_t(valid ? global_row : 0) * (k / 2) + step * (BK / 2) + col;
         copy16(dst, valid ? src : (is_a ? a : w), valid);
+        if constexpr (Schedule & kPrefetchWeights) {
+          if (!is_a && col == 0 && valid && step % 4 == 0) {
+#pragma unroll
+            for (int ahead = 1; ahead <= ((Schedule & kOnePrefetchLine) ? 1 : 2); ++ahead) {
+              const int next_k = (step + 4 * ahead) * BK;
+              if (next_k < k) {
+                const uint8_t* next = w + size_t(global_row) * (k / 2) + next_k / 2;
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(next));
+              }
+            }
+          }
+        }
       }
     } else {
 
@@ -191,6 +213,8 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
       const int scale_column = (step * BK + kk) / 32;
 #pragma unroll
       for (int i = 0; i < MT; ++i) {
+        if constexpr (Schedule & kSkipEmptyRows)
+          if (m0 + row_base + i * 16 >= m) break;
         const int row = row_base + i * 16 + group;
         const uint8_t* p = sa + row * stride + kk + part * 4;
         if constexpr (MatrixLoads) {
@@ -242,12 +266,15 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
         }
       }
 #pragma unroll
-      for (int i = 0; i < MT; ++i)
+      for (int i = 0; i < MT; ++i) {
+        if constexpr (Schedule & kSkipEmptyRows)
+          if (m0 + row_base + i * 16 >= m) break;
 #pragma unroll
         for (int j = 0; j < NT; ++j) mma(accum[i][j], af[i], bf[j][0], bf[j][1], as[i], bs[j]);
+      }
     }
-    // No warp may reuse a ring slot until every warp has consumed it.
-    __syncthreads();
+    // The next iteration's initial barrier also protects ring reuse.
+    if constexpr (!(Schedule & kSingleBarrier)) __syncthreads();
   }
 #pragma unroll
   for (int i = 0; i < MT; ++i)
@@ -268,7 +295,8 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
 }
 
 template <class Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
-          bool WideWarps = false, int Stages = 3, bool StageScales = false, bool ColumnScales = false>
+          bool WideWarps = false, int Stages = 3, bool StageScales = false,
+          bool ColumnScales = false, int Schedule = 0>
 void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts, int n, int k,
          cudaStream_t stream, const MoeSegment* segs, const MoeExpertView* views, int which,
          const int32_t* act_rows = nullptr, const MoeTile* tiles = nullptr,
@@ -280,7 +308,7 @@ void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts
   dim3 grid(unsigned((tiles ? tile_capacity : (maxrows + BM - 1) / BM) * ((n + BN - 1) / BN)),
             tiles ? 1u : unsigned(experts));
   mxfp8_gemm_kernel<Out, BM, BN, PackedPipeline, MatrixLoads, WideWarps, Stages, StageScales,
-                      ColumnScales>
+                    ColumnScales, Schedule>
       <<<grid, Tile<BM, BN, WideWarps>::threads, smem, stream>>>(
           a, as, nullptr, nullptr, out, maxrows, n, k, n, segs, views, which, act_rows, tiles,
           tile_count, tile_capacity);

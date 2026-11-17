@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <random>
 #include <vector>
@@ -8,6 +9,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/glm_moe_launch.hpp"
+#include "kernels/moe_fp4_pack.hpp"
 #include "kernels/mxfp8_gemm.hpp"
 #include "mxfp4_native_prototype.cuh"
 using namespace dgpp;
@@ -94,13 +96,13 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
   auto hvc = hv;
   for (int e = 0; e < E; ++e) {
     DGPP_CUDA_OK(cudaMemcpy(ws.p + size_t(e) * hsrow.size(), hsrow.data(), hsrow.size(),
-                           cudaMemcpyHostToDevice));
+                            cudaMemcpyHostToDevice));
     DGPP_CUDA_OK(cudaMemcpy(column_ws.p + size_t(e) * hscol.size(), hscol.data(), hscol.size(),
-                           cudaMemcpyHostToDevice));
+                            cudaMemcpyHostToDevice));
     hvc[e * 3].fp4_scales = column_ws.p + size_t(e) * hscol.size();
   }
   DGPP_CUDA_OK(cudaMemcpy(column_views.p, hvc.data(), hvc.size() * sizeof(MoeExpertView),
-                         cudaMemcpyHostToDevice));
+                          cudaMemcpyHostToDevice));
   DGPP_CUDA_OK(
       cudaMemcpy(segs.p, hs.data(), hs.size() * sizeof(MoeSegment), cudaMemcpyHostToDevice));
   DGPP_CUDA_OK(
@@ -116,6 +118,38 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
   cudaMemcpy(h0.data(), ref.p, h0.size() * 4, cudaMemcpyDeviceToHost);
   cudaMemcpy(h1.data(), out.p, h1.size() * 4, cudaMemcpyDeviceToHost);
   if (h0 != h1) throw std::runtime_error("128-row output differs");
+  const char* prepared = std::getenv("DGPP_MXFP4_BENCH_PREPARED");
+  if (prepared && prepared[0] == '1') {
+    constexpr int hidden = 5120, intermediate = 1152;
+    const size_t bytes = moe_fp4_packed_bytes(hidden, intermediate, 32);
+    Buffer<uint8_t> pw(bytes * E);
+    Buffer<MoeExpertView> pv(E * 3);
+    auto hpv = hv;
+    for (int e = 0; e < E; ++e) {
+      auto dst = moe_fp4_packed_view(pw.p + bytes * e, hidden, intermediate, 32);
+      Fp4ExpertSource source;
+      for (int q = 0; q < 3; ++q) {
+        source.payload[q] = hv[e * 3].payload;
+        source.scales[q] = hv[e * 3].fp4_scales;
+      }
+      launch_moe_fp4_pack(dst, source, hidden, intermediate, stream, 32);
+      hpv[e * 3].payload = k == intermediate ? dst.w2 : dst.w13;
+      hpv[e * 3].fp4_scales = k == intermediate ? dst.s2 : dst.s13;
+      hpv[e * 3].fp4_packed_rows = k == intermediate ? hidden : 2 * intermediate;
+    }
+    DGPP_CUDA_OK(cudaMemcpyAsync(pv.p, hpv.data(), hpv.size() * sizeof(MoeExpertView),
+                                 cudaMemcpyHostToDevice, stream));
+    auto prepared_run = [&] {
+      launch_moe_grouped_mma_fp4_f32(x.p, k, segs.p, E, rows, 0, pv.p, 0, out.p, n, n, k, stream,
+                                     actrows.p, 32, 64);
+    };
+    prepared_run();
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    DGPP_CUDA_OK(cudaMemcpy(h1.data(), out.p, h1.size() * 4, cudaMemcpyDeviceToHost));
+    if (h1 != h0) throw std::runtime_error("prepared layout changed BF16 accumulators");
+    printf("prepared-bf16,%d,%d,%d,%.4f\n", tokens, n, k, timing(prepared_run, stream));
+    fflush(stdout);
+  }
   const int tile_capacity = moe_tile_list_capacity(E, total, 64);
   Buffer<MoeTile> work(moe_tile_list_capacity(E, total, 32));
   Buffer<int32_t> work_count(1);
@@ -158,13 +192,14 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
     throw std::runtime_error("native result outside quantization budget");
   auto packed = [&]<int BM, int BN, bool MatrixLoads = false, bool WideWarps = false,
                     int Stages = 3, bool StageScales = false, bool Compact = false,
-                    bool ColumnScales = false>() {
+                    bool ColumnScales = false, int Schedule = 0>() {
     auto run = [&] {
       if constexpr (Compact) launch_moe_tile_list(segs.p, E, BM, work.p, work_count.p, stream);
-      mx4bench::run<float, BM, BN, true, MatrixLoads, WideWarps, Stages, StageScales, ColumnScales>(
-          a.p, as.p, out.p, rows, E, n, k, stream, segs.p,
-          ColumnScales ? column_views.p : views.p, 0, actrows.p,
-          Compact ? work.p : nullptr, work_count.p, moe_tile_list_capacity(E, total, BM));
+      mx4bench::run<float, BM, BN, true, MatrixLoads, WideWarps, Stages, StageScales, ColumnScales,
+                    Schedule>(a.p, as.p, out.p, rows, E, n, k, stream, segs.p,
+                              ColumnScales ? column_views.p : views.p, 0, actrows.p,
+                              Compact ? work.p : nullptr, work_count.p,
+                              moe_tile_list_capacity(E, total, BM));
     };
     run();
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
@@ -178,29 +213,43 @@ void measure(int tokens, int n, int k, cudaStream_t stream, const std::vector<in
           run();
         },
         stream);
-    printf("packed,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f\n", tokens, n, k, BM, BN,
+    printf("packed,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f\n", tokens, n, k, BM, BN,
            int(MatrixLoads), int(WideWarps), Stages, int(StageScales), int(Compact),
-           int(ColumnScales), kernel, all);
+           int(ColumnScales), Schedule, kernel, all);
     fflush(stdout);
   };
-  packed.template operator()<64, 128>();
+  const char* ablations = std::getenv("DGPP_MXFP4_BENCH_ABLATIONS");
+  if (ablations && ablations[0] == '1') {
+    // Causal ablations: one change at a time, then cumulative combinations.
+    packed.template operator()<64, 128, true, true, 2, true>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 1>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 2>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 4>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 8>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 24>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 3>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 7>();
+    packed.template operator()<64, 128, true, true, 2, true, false, false, 15>();
+  } else {
+    packed.template operator()<64, 128>();
 
-  packed.template operator()<64, 128, true, true>();
-  packed.template operator()<64, 128, true, true, 2>();
-  packed.template operator()<64, 128, true, false, 2>();
-  packed.template operator()<64, 128, true, true, 2, true>();
-  packed.template operator()<64, 128, true, true, 3, true>();
-  packed.template operator()<64, 128, true, true, 2, true, true>();
-  packed.template operator()<64, 128, true, true, 3, true, true>();
-  packed.template operator()<32, 256, true, true, 2, true, true>();
-  packed.template operator()<32, 256, true, true, 3, true, true>();
-  // Smaller tiles reduce per-block register pressure and raise occupancy.
-  packed.template operator()<64, 64, true, true, 2, true, true>();
-  packed.template operator()<64, 64, true, true, 3, true, true>();
-  packed.template operator()<32, 128, true, true, 2, true, true>();
-  packed.template operator()<32, 128, true, false, 2, true, true>();
-  packed.template operator()<64, 128, true, true, 2, true, true, true>();
-  packed.template operator()<64, 128, true, true, 3, true, true, true>();
+    packed.template operator()<64, 128, true, true>();
+    packed.template operator()<64, 128, true, true, 2>();
+    packed.template operator()<64, 128, true, false, 2>();
+    packed.template operator()<64, 128, true, true, 2, true>();
+    packed.template operator()<64, 128, true, true, 3, true>();
+    packed.template operator()<64, 128, true, true, 2, true, true>();
+    packed.template operator()<64, 128, true, true, 3, true, true>();
+    packed.template operator()<32, 256, true, true, 2, true, true>();
+    packed.template operator()<32, 256, true, true, 3, true, true>();
+    // Smaller tiles reduce per-block register pressure and raise occupancy.
+    packed.template operator()<64, 64, true, true, 2, true, true>();
+    packed.template operator()<64, 64, true, true, 3, true, true>();
+    packed.template operator()<32, 128, true, true, 2, true, true>();
+    packed.template operator()<32, 128, true, false, 2, true, true>();
+    packed.template operator()<64, 128, true, true, 2, true, true, true>();
+    packed.template operator()<64, 128, true, true, 3, true, true, true>();
+  }
   float t64 = timing([&] { legacy(64, out.p); }, stream),
         t128 = timing([&] { legacy(128, out.p); }, stream),
         tn = timing(
@@ -218,7 +267,7 @@ int main(int argc, char** argv) {
     cudaStreamCreate(&s);
     puts("tokens,rows_per_expert,n,k,bf16_64_ms,bf16_128_ms,native_with_quant_ms,relative_l2");
     std::vector<int> routes;
-    if (argc == 2) {
+    if (argc >= 2) {
       std::ifstream f(argv[1]);
       int e;
       while (f >> e) routes.push_back(e);
@@ -226,8 +275,11 @@ int main(int argc, char** argv) {
     }
     for (int t : (routes.empty() ? std::vector<int>{4096, 24317}
                                  : std::vector<int>{int(routes.size() / 6)})) {
-      measure(t, 1152, 5120, s, routes);
-      measure(t, 5120, 1152, s, routes);
+      const std::string projection = argc >= 3 ? argv[2] : "both";
+      if (projection != "both" && projection != "gate" && projection != "down")
+        throw std::runtime_error("projection must be both, gate or down");
+      if (projection != "down") measure(t, 1152, 5120, s, routes);
+      if (projection != "gate") measure(t, 5120, 1152, s, routes);
     }
     cudaStreamDestroy(s);
   } catch (const std::exception& e) {
