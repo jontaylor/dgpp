@@ -334,6 +334,18 @@ class SiteEnvTest(unittest.TestCase):
         overridden = site_env.resolve_config(self.config, self.values(DGPP_EXPERT_CHUNK_DIRECT="0"))
         self.assertTrue(all(n["DGPP_EXPERT_CHUNK_DIRECT"] == "0" for n in overridden["node_env"]))
 
+    def test_native_mxfp4_settings_reach_both_ranks(self):
+        cfg = json.loads(self.config.read_text())
+        flags = {"DGPP_MOE_MX_NATIVE_PREFILL": "1", "DGPP_MOE_MX_NATIVE_TILE_ROWS": "128",
+                 "DGPP_MOE_MX_NATIVE_STAGES": "2", "DGPP_MOE_MX_NATIVE_TAIL_SKIP": "1",
+                 "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4"}
+        cfg["environment"] = flags
+        self.config.write_text(json.dumps(cfg))
+        resolved = site_env.resolve_config(self.config, self.values())
+        for node in resolved["node_env"]:
+            for key, value in flags.items():
+                self.assertEqual(node[key], value)
+
     def test_deployment_execution_environment_is_applied_by_launcher(self):
         cfg = json.loads(self.config.read_text())
         cfg["environment"] = {"DGPP_EXPERT_CHUNK_DIRECT": "1", "DGPP_EXPERT_READY_WORKER": "2"}

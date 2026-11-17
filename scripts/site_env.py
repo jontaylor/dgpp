@@ -11,7 +11,7 @@ import shlex
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-# Non-secret execution switches retained by the measured NVFP4 deployment.
+# Non-secret execution switches retained by the measured streaming deployments.
 DEPLOYMENT_ENV_KEYS = (
     "DGPP_MOE_B12X", "DGPP_MOE_FP4_GROUPED_DECODE",
     "DGPP_EXPERT_GPU_SCATTER", "DGPP_EXPERT_VERIFY_RECORDS",
@@ -21,6 +21,11 @@ DEPLOYMENT_ENV_KEYS = (
     "DGPP_ENGRAM_PARALLEL_SMALL", "DGPP_EXPERT_GPU_PAGING",
     "DGPP_EXPERT_GROUP_READS", "DGPP_MOE_RESIDENT_FIRST",
     "DGPP_EXPERT_CHUNK_DIRECT", "DGPP_EXPERT_BATCH_SCATTER",
+    "DGPP_EXPERT_SHARED_PREFILL_EARLY", "DGPP_CSA2_PREFILL_SPLITS",
+    "DGPP_DSV41_GPU_CANDIDATES", "DGPP_CSA2_PREFILL_MERGE4",
+    "DGPP_MOE_MX_NATIVE_PREFILL", "DGPP_MOE_MX_NATIVE_TILE_ROWS",
+    "DGPP_MOE_MX_NATIVE_STAGES", "DGPP_MOE_MX_NATIVE_TAIL_SKIP",
+    "DGPP_DSV41_NATIVE_FP8_PREFILL",
 )
 
 SITE_KEYS = (
@@ -174,7 +179,14 @@ def deployment(path):
     if not isinstance(execution_env, dict) or set(execution_env) - set(DEPLOYMENT_ENV_KEYS):
         raise ValueError("environment may only contain supported deployment execution switches")
     for key, value in execution_env.items():
-        allowed = ("0", "1", "2") if key == "DGPP_EXPERT_READY_WORKER" else ("0", "1")
+        allowed = {
+            "DGPP_EXPERT_READY_WORKER": ("0", "1", "2"),
+            "DGPP_CSA2_PREFILL_SPLITS": ("1", "2", "4"),
+            "DGPP_MOE_MX_NATIVE_PREFILL": ("0", "1", "2", "3"),
+            "DGPP_MOE_MX_NATIVE_TILE_ROWS": ("64", "128"),
+            "DGPP_MOE_MX_NATIVE_STAGES": ("2", "3"),
+            "DGPP_DSV41_NATIVE_FP8_PREFILL": ("0", "1", "2"),
+        }.get(key, ("0", "1"))
         if not isinstance(value, str) or value not in allowed:
             raise ValueError(f"invalid deployment execution switch {key}: expected {allowed}")
     nvme = cfg.get("nvme_cache", {})
