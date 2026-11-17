@@ -24,6 +24,16 @@
 #include "net/bus_kernel.hpp"
 #include "net/collective_bus.hpp"
 
+__global__ void bulk_dependent_consumer(const uint16_t* data) {
+  const uint16_t value = *reinterpret_cast<const volatile uint16_t*>(data);
+  asm volatile("" :: "h"(value));
+}
+void test_launch_bulk_consumer(const uint16_t* data, cudaStream_t stream) {
+  bulk_dependent_consumer<<<64, 256, 0, stream>>>(data);
+  if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("bulk dependent consumer launch failed");
+}
+
+void test_deferred_bulk_timeout(dgpp::net::CollectiveBus& bus);
 void test_stream_boundary_reduce(dgpp::net::CollectiveBus& bus, uint16_t* data, size_t elems, cudaStream_t stream);
 
 namespace {
@@ -1085,6 +1095,13 @@ int distributed_bulk_cases(int rank, int world, const std::string& peer,
   if (!bus.start(&error)) {
     DGPP_LOG_ERROR("distributed bulk rank {}: {}", rank, error);
     return 1;
+  }
+  if (std::getenv("DGPP_BULK_TIMEOUT_TEST")) {
+    test_deferred_bulk_timeout(bus);
+    bus.quiesce();
+    bus.stop();
+    DGPP_LOG_INFO("distributed bulk rank {}: deferred timeout released both waiters", rank);
+    return 0;
   }
   int failures = 0;
   for (const size_t elems : bulk_case_sizes(one_lane)) {

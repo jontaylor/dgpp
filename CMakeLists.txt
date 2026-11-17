@@ -936,7 +936,7 @@ if(DGPP_ENABLE_IBV)
     src/net/bus_kernel.cu
     src/net/nic_visibility.cu)
   target_link_libraries(dgpp_bus
-    PUBLIC dgpp_net CUDA::cudart ${IBVERBS_LIBRARY})
+    PUBLIC dgpp_net CUDA::cudart CUDA::cuda_driver ${IBVERBS_LIBRARY})
   target_include_directories(dgpp_bus SYSTEM PUBLIC ${IBVERBS_INCLUDE_DIR})
   dgpp_set_common(dgpp_bus)
 

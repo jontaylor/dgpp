@@ -16,6 +16,8 @@
 // the transport's send source directly and the collective runs with zero
 // staging copies (the kernel only publishes ready). Boundaries above the
 // slot stay on the device path (chunked, or the bulk collective class).
+#include <cuda.h>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -36,6 +38,7 @@
 #include "sample/sampler.hpp"
 #include "engine/step_timing.hpp"
 #include "net/collective_bus.hpp"
+#include "net/bus_kernel.hpp"
 
 namespace dgpp {
 
@@ -207,6 +210,15 @@ class BusStreamReducer final : public BoundaryReducer {
   explicit BusStreamReducer(net::CollectiveBus& bus, int timeout_ms = 60000)
       : bus_(bus), timeout_ms_(timeout_ms), max_elems_(bus_latency_slot_elems(bus)) {}
   ~BusStreamReducer() override {
+    // Completion events outlive the model stream; the model may destroy it first.
+    if (bulk_pending_) (void)bus_.wait_allreduce(bulk_pending_, timeout_ms_);
+    if (bulk_completion_) {
+      // Retire any GPU wait before releasing its mapped word, including failures.
+      (void)cudaEventSynchronize(bulk_consumed_);
+      cudaFreeHost(bulk_completion_);
+    }
+    if (bulk_ready_) cudaEventDestroy(bulk_ready_);
+    if (bulk_consumed_) cudaEventDestroy(bulk_consumed_);
     if (probe_buf_) cudaFree(probe_buf_);
   }
   BusStreamReducer(const BusStreamReducer&) = delete;
@@ -233,7 +245,31 @@ class BusStreamReducer final : public BoundaryReducer {
     std::string err;
     if (!bus_.graph_replay_finish(timeout_ms_, &err)) throw std::runtime_error("segment finish: " + err);
   }
-  void bind_stream(void* stream) override { stream_ = static_cast<cudaStream_t>(stream); }
+  void bind_stream(void* stream) override {
+    stream_ = static_cast<cudaStream_t>(stream);
+    const char* enabled = std::getenv("DGPP_BULK_STREAM_ORDERED");
+    bulk_stream_ordered_ = stream_ && bus_.world_size() > 1 && enabled && std::atoi(enabled) != 0;
+    if (bulk_stream_ordered_ && !bulk_completion_) {
+      CUmoduleLoadingMode loading;
+      if (cuModuleGetLoadingMode(&loading) != CUDA_SUCCESS || loading != CU_MODULE_EAGER_LOADING)
+        throw std::runtime_error("DGPP_BULK_STREAM_ORDERED requires CUDA_MODULE_LOADING=EAGER before CUDA initialization");
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&bulk_ready_, cudaEventDisableTiming));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&bulk_consumed_, cudaEventDisableTiming));
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&bulk_completion_), sizeof(uint32_t), cudaHostAllocMapped));
+      *bulk_completion_ = 0;
+      void* device = nullptr;
+      DGPP_CUDA_OK(cudaHostGetDevicePointer(&device, bulk_completion_, 0));
+      bulk_completion_device_ = reinterpret_cast<CUdeviceptr>(device);
+      // Prime the actual bulk launch before any consumer can wait for it.
+      // Function attributes alone do not exercise first-use runtime setup.
+      std::string error;
+      const auto warm = bus_.allreduce_bulk(device, device, 2, &error);
+      if (!warm) throw std::runtime_error("bulk warmup submission: " + error);
+      const auto result = bus_.wait_allreduce(warm, timeout_ms_);
+      if (!result.ok) throw std::runtime_error("bulk warmup: " + result.error);
+      wait_bulk_value(0);
+    }
+  }
 
   void probe(int rows, int cols) override {
     if (probe_buf_ == nullptr) {
@@ -253,6 +289,7 @@ class BusStreamReducer final : public BoundaryReducer {
     if (hidden <= 0 || hidden % 2 != 0)
       throw std::invalid_argument("boundary reduce: hidden must be even");
     const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(hidden);
+    retire_bulk();
     if (recording_segment_) {
       for (size_t at = 0; at < total; at += max_elems_)
         issue(partial + at, std::min(max_elems_, total - at));
@@ -270,10 +307,21 @@ class BusStreamReducer final : public BoundaryReducer {
       issue_pair(partial, total);
       return;
     }
-    // Prefill-class boundary: the stream's folds settle, the stream
-    // drains, and the bulk machine takes the buffer (its wait orders the
-    // result for the host and the stream alike).
+    // Prefill-class boundary: settle earlier folds, then hand off either
+    // through a producer event or through the original host drain/wait.
     settle();
+    if (bulk_stream_ordered_) {
+      if (bulk_generation_ == 0x7fffffffu)
+        throw std::runtime_error("bulk stream completion generation exhausted");
+      DGPP_CUDA_OK(cudaEventRecord(bulk_ready_, stream_));
+      std::string error;
+      const uint32_t generation = ++bulk_generation_;
+      bulk_pending_ = bus_.allreduce_bulk(partial, partial, total, &error,
+                                        bulk_ready_, bulk_completion_, generation);
+      if (!bulk_pending_) throw std::runtime_error("boundary deferred bulk: " + error);
+      wait_bulk_value(generation);
+      return;
+    }
     DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
     // A few extra mixed-batch rows can spill a full bulk segment into a
     // second reduce-scatter/allgather wave. Fold a remainder of up to two
@@ -291,6 +339,7 @@ class BusStreamReducer final : public BoundaryReducer {
   }
 
   void settle() override {
+    retire_bulk();
     std::string err;
     if (!bus_.allreduce_settle(timeout_ms_, &err))
       throw std::runtime_error("boundary settle: " + err);
@@ -334,6 +383,24 @@ class BusStreamReducer final : public BoundaryReducer {
   }
 
  private:
+  void wait_bulk_value(uint32_t value) {
+    DGPP_CUDA_OK(net::launch_bus_completion_wait(
+        reinterpret_cast<const uint32_t*>(bulk_completion_device_), value, stream_));
+    DGPP_CUDA_OK(cudaEventRecord(bulk_consumed_, stream_));
+  }
+
+  void retire_bulk() {
+    if (!bulk_pending_) return;
+    const auto result = bus_.wait_allreduce(bulk_pending_, timeout_ms_);
+    if (!result.ok) throw std::runtime_error("boundary deferred bulk: " + result.error);
+    bulk_pending_ = 0;
+  }
+  bool bulk_stream_ordered_ = false;
+  cudaEvent_t bulk_ready_ = nullptr, bulk_consumed_ = nullptr;
+  uint32_t* bulk_completion_ = nullptr;
+  CUdeviceptr bulk_completion_device_ = 0;
+  uint32_t bulk_generation_ = 0;
+  uint64_t bulk_pending_ = 0;
   uint64_t async_id_ = 0;
   bool recording_segment_ = false;
   void issue(uint16_t* at, size_t elems) {

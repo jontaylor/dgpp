@@ -2598,6 +2598,19 @@ cudaError_t bus_globaltimer_offset(int64_t* offset_ns, uint64_t* uncertainty_ns)
   return cudaSuccess;
 }
 
+__global__ void bus_completion_wait_kernel(const uint32_t* word, uint32_t value) {
+  dgpp_pdl_wait();
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> completion(*const_cast<uint32_t*>(word));
+    while (completion.load(cuda::memory_order_acquire) < value) __nanosleep(1000);
+  }
+}
+
+cudaError_t launch_bus_completion_wait(const uint32_t* word, uint32_t value, cudaStream_t stream) {
+  bus_completion_wait_kernel<<<1, 32, 0, stream>>>(word, value);
+  return cudaGetLastError();
+}
+
 cudaError_t bus_preload_kernels() {
   // cudaFuncGetAttributes forces the lazy loader to materialize a kernel
   // NOW, while nothing spins on the device — see the header for why that
@@ -2605,6 +2618,7 @@ cudaError_t bus_preload_kernels() {
   // and a peer's collective kernel spinning on OUR doorbell is never idle).
   cudaFuncAttributes attr{};
   const void* kernels[] = {
+      reinterpret_cast<const void*>(bus_completion_wait_kernel),
       reinterpret_cast<const void*>(bus_consumer_kernel),
       reinterpret_cast<const void*>(bus_allreduce_kernel),
       reinterpret_cast<const void*>(bus_allreduce_graph_kernel<256, true>),

@@ -25,7 +25,8 @@ DEPLOYMENT_ENV_KEYS = (
     "DGPP_DSV41_GPU_CANDIDATES", "DGPP_CSA2_PREFILL_MERGE4",
     "DGPP_MOE_MX_NATIVE_PREFILL", "DGPP_MOE_MX_NATIVE_TILE_ROWS",
     "DGPP_MOE_MX_NATIVE_STAGES", "DGPP_MOE_MX_NATIVE_TAIL_SKIP",
-    "DGPP_DSV41_NATIVE_FP8_PREFILL",
+    "DGPP_DSV41_NATIVE_FP8_PREFILL", "DGPP_BULK_STREAM_ORDERED",
+    "CUDA_MODULE_LOADING", "CUDA_DEVICE_MAX_CONNECTIONS",
 )
 
 SITE_KEYS = (
@@ -180,6 +181,8 @@ def deployment(path):
         raise ValueError("environment may only contain supported deployment execution switches")
     for key, value in execution_env.items():
         allowed = {
+            "CUDA_MODULE_LOADING": ("EAGER", "LAZY"),
+            "CUDA_DEVICE_MAX_CONNECTIONS": tuple(str(n) for n in range(1, 33)),
             "DGPP_EXPERT_READY_WORKER": ("0", "1", "2"),
             "DGPP_CSA2_PREFILL_SPLITS": ("1", "2", "4"),
             "DGPP_MOE_MX_NATIVE_PREFILL": ("0", "1", "2", "3"),

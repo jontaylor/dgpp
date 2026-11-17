@@ -338,7 +338,8 @@ class SiteEnvTest(unittest.TestCase):
         cfg = json.loads(self.config.read_text())
         flags = {"DGPP_MOE_MX_NATIVE_PREFILL": "1", "DGPP_MOE_MX_NATIVE_TILE_ROWS": "128",
                  "DGPP_MOE_MX_NATIVE_STAGES": "2", "DGPP_MOE_MX_NATIVE_TAIL_SKIP": "1",
-                 "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4"}
+                 "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4",
+                 "DGPP_BULK_STREAM_ORDERED": "1", "CUDA_MODULE_LOADING": "EAGER", "CUDA_DEVICE_MAX_CONNECTIONS": "32"}
         cfg["environment"] = flags
         self.config.write_text(json.dumps(cfg))
         resolved = site_env.resolve_config(self.config, self.values())

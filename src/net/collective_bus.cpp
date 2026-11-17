@@ -121,6 +121,9 @@ struct BusRequest {
   // segments of at most bulk_seg_stripes stripes and splits each
   // segment's stripes across the ranks (its plan).
   bool is_bulk = false;
+  cudaEvent_t producer_ready = nullptr;
+  uint32_t* stream_completion = nullptr;
+  uint32_t stream_completion_value = 0;
   uint32_t bulk_stripes = 0;       // C = ceil(elems / stripe_elems)
   uint32_t bulk_seg_stripes = 0;    // bulk_slots * lanes (pool-bounded)
   uint32_t bulk_seg_count = 0;     // ceil(C / bulk_seg_stripes)
@@ -709,6 +712,8 @@ struct CollectiveBus::Impl {
       if (r->done) return;
       r->ok = ok;
       r->error = error;
+      if (r->stream_completion)
+        __atomic_store_n(r->stream_completion, r->stream_completion_value, __ATOMIC_RELEASE);
       r->done = true;
     }
     r->done_flag.store(true, std::memory_order_release);
@@ -1190,6 +1195,16 @@ struct CollectiveBus::Impl {
                       "bulk collective consumer exited on deadline or "
                       "poison");
         return true;
+      }
+      // A GPU done stamp precedes kernel retirement. A stream consumer must
+      // not resume until the final AG kernel has actually left the GPU.
+      if (req.stream_completion && bulk.phase == 1 && bulk.segment + 1 == req.bulk_seg_count) {
+        const auto status = cudaStreamQuery(collective_stream);
+        if (status == cudaErrorNotReady) return worked;
+        if (status != cudaSuccess) {
+          finish_flight(coll.req, false, std::string("bulk completion: ") + cudaGetErrorString(status));
+          return true;
+        }
       }
       ++bulk.segment;
       if (bulk.segment >= req.bulk_seg_count) {
@@ -2143,7 +2158,18 @@ struct CollectiveBus::Impl {
 
     // The prefill-class machine is self-contained (its own claims,
     // posting, and completion); the latency one-shot continues below.
-    if (req.is_bulk) return bulk_collective_pass(req);
+    if (req.is_bulk) {
+      if (req.producer_ready) {
+        const auto status = cudaEventQuery(req.producer_ready);
+        if (status == cudaErrorNotReady) return worked;
+        if (status != cudaSuccess) {
+          finish_flight(coll.req, false, std::string("bulk producer: ") + cudaGetErrorString(status));
+          return true;
+        }
+        req.producer_ready = nullptr;
+      }
+      return bulk_collective_pass(req);
+    }
 
     if (coll.claims.empty()) {
       std::vector<BusStripe> claims;
@@ -3914,7 +3940,14 @@ uint64_t CollectiveBus::allreduce(const void* device_src, void* device_dst,
 }
 
 uint64_t CollectiveBus::allreduce_bulk(const void* device_src, void* device_dst,
-                                      size_t bf16_elems, std::string* error) {
+                                      size_t bf16_elems, std::string* error,
+                                      cudaEvent_t ready, uint32_t* completion,
+                                      uint32_t completion_value) {
+  if ((ready == nullptr) != (completion == nullptr) ||
+      (completion && (completion_value == 0 || impl_->world1))) {
+    *error = "deferred bulk requires world >= 2, a ready event, completion word and nonzero value";
+    return 0;
+  }
   if (impl_->world1) {
     Impl& w = *impl_;
     std::lock_guard<std::mutex> lock(w.w1_mu);
@@ -3991,6 +4024,9 @@ uint64_t CollectiveBus::allreduce_bulk(const void* device_src, void* device_dst,
   req->peer_rank = -1;
   req->is_collective = true;
   req->is_bulk = true;
+  req->producer_ready = ready;
+  req->stream_completion = completion;
+  req->stream_completion_value = completion_value;
   req->dev_src = device_src;
   req->dev_dst = device_dst;
   req->elems = bf16_elems;

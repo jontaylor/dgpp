@@ -476,4 +476,7 @@ inline float bf16_to_f32(uint16_t h) {
 // FLOPs per thread; the result lands in buf[256].
 cudaError_t launch_bus_warm_work(cudaStream_t stream, float* buf, int spins);
 
+// One-warp wait on a host-published bulk completion generation.
+cudaError_t launch_bus_completion_wait(const uint32_t* word, uint32_t value, cudaStream_t stream);
+
 }  // namespace dgpp::net

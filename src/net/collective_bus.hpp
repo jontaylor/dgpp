@@ -221,7 +221,18 @@ class CollectiveBus {
   // 2(W-1)/W of the buffer (one-shot pays W-1; RS+AG halves it at W=4).
   // Same v1 single-outstanding contract; wait via wait_allreduce().
   uint64_t allreduce_bulk(const void* device_src, void* device_dst,
-                          size_t bf16_elems, std::string* error);
+                          size_t bf16_elems, std::string* error,
+                          cudaEvent_t ready = nullptr, uint32_t* completion = nullptr,
+                          uint32_t completion_value = 0);
+  // Optional deferred bulk handoff (world >= 2): ready is recorded by the
+  // producer before submission. The engine polls it without blocking. completion
+  // is a mapped host word, release-stored to completion_value after the final
+  // GPU kernel retires, or on failure to release the consumer's stream wait.
+  // Keep the event alive until wait_allreduce retires the request. Keep the
+  // completion word alive until BOTH the request and its GPU waiter retire.
+  // Use increasing values and a >= wait; never reset a live completion word.
+  // A stream wait orders data, not success: wait_allreduce must check the verdict.
+
 
   // Blocks for the collective; on success the destination is stream-ordered
   // for the caller (waits for the stream after the engine's completion).
@@ -374,6 +385,7 @@ class CollectiveBus {
   // The bulk pacing rate in effect after start() (the derived one when
   // the option was negative), Gb/s per (peer, lane) QP; 0 = unpaced.
   double bulk_pace_gbps() const;
+  int world_size() const { return options_.world_size; }
   int lane_count() const { return static_cast<int>(options_.lane_devices.size()); }
   size_t slot_bytes(BusMessageClass cls) const {
     return cls == BusMessageClass::kLatency ? options_.lat_slot_bytes

@@ -115,6 +115,12 @@ while known baseline optimizations are missing.
 - [ ] **Avoid new CPU decisions and stream drains.** Keep routing/layout metadata
   on the GPU where possible. Do not add host readback, synchronization or
   allocation to resident expert hits or every paging wave.
+- [ ] **Exercise first-use initialization before adding GPU waits.** Lazy CUDA
+  loading and runtime setup can introduce hidden synchronization. Preloading
+  function attributes was insufficient for the deferred bulk path: a real tiny
+  startup reduction was needed before queueing a completion waiter. Test a
+  fresh full-model process, dependent copies and failure release, not only a
+  transport fixture that has already warmed the same operation.
 - [ ] **Preserve CUDA graph replay and shared-expert overlap.** Prepare layouts
   and stable workspaces before capture. Keep the early shared-expert branch
   independent; do not serialize it behind routed expert preparation.
