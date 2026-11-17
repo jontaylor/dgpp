@@ -813,7 +813,11 @@ template <int kTiles, bool kFp8, typename OutT, typename ScaleT>
 void launch_decode(const uint16_t* a, size_t act_stride, const void* w, const ScaleT* scales, OutT* o, int rows,
                    int n, int k, size_t out_stride, int rs, int cs, cudaStream_t stream, void* ws,
                    size_t ws_bytes, const uint16_t* act2 = nullptr, float limit = 0.f) {
-  const int width = decode_width(n);
+  // TP2 Engram Wkv. Four warps improve the four-row grid32 projection
+  // while keeping the unsplit, ascending-K MMA chain for each output.
+  const bool engram = kFp8 && std::is_same_v<OutT, uint16_t> && rows == 4 &&
+                      n == 25600 && k == 3072 && rs == 5 && cs == 5 && !ws;
+  const int width = engram && !g_mma_decode_width ? 4 : decode_width(n);
   if (width == 8)
     launch_decode_form<kTiles, kFp8, 8, OutT, ScaleT>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, stream, ws, ws_bytes, act2, limit);
   else if (width == 4)

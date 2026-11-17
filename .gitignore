@@ -49,6 +49,7 @@ benchmarks/micro/*
 !benchmarks/micro/mxfp4_kernel_bench.cu
 !benchmarks/micro/mxfp4_native_prototype.cuh
 !benchmarks/micro/dsv41_native_dense_bench.cu
+!benchmarks/micro/dsv41_verify_dense_bench.cu
 
 # --- Debug residue ---------------------------------------------------------------
 

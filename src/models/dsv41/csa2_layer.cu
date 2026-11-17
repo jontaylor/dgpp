@@ -625,8 +625,8 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
   const int lh = cfg_.local_heads(), lg = cfg_.local_groups(), hpg = cfg_.heads_per_group();
   const int K = hpg * kCsa2Latent;
   // wo_a is block-diagonal over the groups: group g projects its own heads.
-  // Two groups take one decode launch (the pair form, 2026-10-20: the same
-  // k, each group's chain its own launch's); otherwise one launch per group.
+  // Adjacent groups can share a decode launch. Both retain their own
+  // split-K reduction and write their original strided output slices.
   const size_t act_stride = size_t(lh) * kCsa2Latent;
   if (w_.exl3()) {
     // One EXL3 launch per group (its matrix is its own pack tensor), then wo_b.
@@ -638,14 +638,20 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
     return;
   }
   const size_t row_off1 = size_t(cfg_.o_lora), scale_off1 = (row_off1 / 32) * (size_t(K) / 32);
-  const bool paired = lg == 2 && cfg_.dense_mma && !prefill_tile_ &&
+  const bool paired = (lg == 2 || lg == 4) && cfg_.dense_mma && !prefill_tile_ &&
                       mma_gemv_pair_ok(w_.wo_a.payload, w_.wo_a.payload + row_off1 * K, o_, o_ + K, act_stride, tokens,
                                        cfg_.o_lora, cfg_.o_lora, K, gemm_ws_, gemm_ws_bytes_);
   if (paired) {
-    launch_mma_gemv_fp8_bf16_pair(o_, w_.wo_a.payload, w_.wo_a.scales, oa_, cfg_.o_lora, size_t(lg) * cfg_.o_lora,
-                                  o_ + K, w_.wo_a.payload + row_off1 * K, w_.wo_a.scales + scale_off1, oa_ + row_off1,
-                                  cfg_.o_lora, size_t(lg) * cfg_.o_lora, act_stride, tokens, K, 5, 5, stream, gemm_ws_,
-                                  gemm_ws_bytes_);
+    for (int g = 0; g < lg; g += 2) {
+      const uint16_t* input = o_ + size_t(g) * K;
+      uint16_t* output = oa_ + g * row_off1;
+      const uint8_t* weight = w_.wo_a.payload + g * row_off1 * K;
+      const float* scale = w_.wo_a.scales + g * scale_off1;
+      launch_mma_gemv_fp8_bf16_pair(input, weight, scale, output, cfg_.o_lora, lg * row_off1,
+                                    input + K, weight + row_off1 * K, scale + scale_off1,
+                                    output + row_off1, cfg_.o_lora, lg * row_off1, act_stride,
+                                    tokens, K, 5, 5, stream, gemm_ws_, gemm_ws_bytes_);
+    }
   } else {
     for (int g = 0; g < lg; ++g) {
       const size_t row_off = size_t(g) * cfg_.o_lora;
@@ -655,10 +661,15 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
                              cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_, prefill_tile_);
     }
   }
+  // The TP2 wo_b split gives the four-row projection 160 blocks instead
+  // of 80. Keep its reduction choice consistent for all decode row counts.
+  const bool with_workspace = prefill_tile_ ||
+      (lg == 4 && cfg_.o_lora == 1024 && cfg_.hidden == 5120);
   launch_csa2_projection(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
-                         static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream,
-                         0, 5, 5, cfg_.dense_mma, prefill_tile_ ? gemm_ws_ : nullptr,
-                         prefill_tile_ ? gemm_ws_bytes_ : 0, prefill_tile_);
+                         static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora,
+                         stream, 0, 5, 5, cfg_.dense_mma,
+                         with_workspace ? gemm_ws_ : nullptr, with_workspace ? gemm_ws_bytes_ : 0,
+                         prefill_tile_);
 }
 
 // ---- the decode walk's prefetch windows --------------------------------------------------------

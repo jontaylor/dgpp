@@ -2915,6 +2915,9 @@ if(DGPP_BUILD_BENCHMARKS)
   endfunction()
 
   # Focused MXFP4 kernel alternatives; not deployment benchmark rows.
+  dgpp_add_benchmark(dsv41_verify_dense_bench
+    SOURCES benchmarks/micro/dsv41_verify_dense_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
   dgpp_add_benchmark(dsv41_native_dense_bench
     SOURCES benchmarks/micro/dsv41_native_dense_bench.cu
     LIBRARIES dgpp_kernels CUDA::cudart)
