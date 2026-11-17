@@ -45,6 +45,7 @@ benchmarks/micro/*
 !benchmarks/micro/minimax_moe_bench.cpp
 !benchmarks/micro/mxfp8_gemm_bench.cu
 !benchmarks/micro/mxfp4_backend_bench.cpp
+!benchmarks/micro/mxfp4_weight_scan.cu
 !benchmarks/micro/mxfp4_kernel_bench.cu
 !benchmarks/micro/mxfp4_native_prototype.cuh
 !benchmarks/micro/dsv41_native_dense_bench.cu

@@ -7,14 +7,19 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <random>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "common/cuda_check.hpp"
 #include "kernels/moe_fp4_pack.hpp"
 #include "kernels/sm12x_moe.hpp"
 using namespace dgpp;
+void launch_mxfp4_weight_scan(const uint8_t* storage, size_t bytes, const int* experts,
+                              int count, unsigned* checksums, size_t capacity, cudaStream_t stream);
 template <class T>
 T* alloc(size_t n) {
   T* p;
@@ -22,7 +27,7 @@ T* alloc(size_t n) {
   return p;
 }
 // Each input line is one real four-row target pass at one layer (24 IDs).
-static int replay(const char* path) {
+static int replay(const char* path, bool weight_scan = false) {
   constexpr int H = 5120, I = 1152, E = 384, routes = 24, values = 4 * 7 * H;
   std::ifstream file(path);
   if (!file) throw std::runtime_error("cannot open routes");
@@ -72,12 +77,17 @@ static int replay(const char* path) {
   }
   setenv("DGPP_MX_VERIFY_SINGLETONS", "0", 1);
   Sm12xMoe baseline(32);
-  setenv("DGPP_MX_VERIFY_SINGLETONS", "1", 1);
-  Sm12xMoe hybrid(32);
+  std::unique_ptr<Sm12xMoe> hybrid;
+  if (!weight_scan) {
+    setenv("DGPP_MX_VERIFY_SINGLETONS", "1", 1);
+    hybrid = std::make_unique<Sm12xMoe>(32);
+  }
   cudaEvent_t a, b;
   DGPP_CUDA_OK(cudaEventCreate(&a));
   DGPP_CUDA_OK(cudaEventCreate(&b));
-  std::puts("record,singletons,reused,baseline_us,split_us,singleton_nrmse,reused_nrmse");
+  int* unique_ids = weight_scan ? alloc<int>(routes) : nullptr;
+  std::puts(weight_scan ? "record,unique,weight_bytes,baseline_us,scan_us" :
+            "record,singletons,reused,baseline_us,split_us,singleton_nrmse,reused_nrmse");
   const int samples = std::min<int>(records.size(), 32);
   std::vector<size_t> selected;
   for (int i = 0; i < samples; ++i)
@@ -97,41 +107,70 @@ static int replay(const char* path) {
     if (std::find(selected.begin(), selected.end(), index) == selected.end())
       selected.push_back(index);
   }
+  auto timed_graph = [&](auto launch) {
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    launch();
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, 0, 0, 0));
+    for (int k = 0; k < 4; ++k) DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+    DGPP_CUDA_OK(cudaEventRecord(a, stream));
+    for (int k = 0; k < 32; ++k) DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+    DGPP_CUDA_OK(cudaEventRecord(b, stream));
+    DGPP_CUDA_OK(cudaEventSynchronize(b));
+    float ms;
+    DGPP_CUDA_OK(cudaEventElapsedTime(&ms, a, b));
+    DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    return ms * 1000 / 32;
+  };
   for (size_t i = 0; i < selected.size(); ++i) {
     const size_t record = selected[i];
     const auto& group = records[record];
     DGPP_CUDA_OK(cudaMemcpy(ids, group.data(), sizeof(group), cudaMemcpyHostToDevice));
     std::array<int, E> counts{};
     for (int e : group) ++counts[e];
-    std::vector<float> ref(values), candidate(values);
-    auto measure = [&](Sm12xMoe& moe, std::vector<float>& result) {
+    auto measure = [&](Sm12xMoe& moe, std::span<float> result = {}) {
       moe.prepare(group, addresses, 4, stream);
       DGPP_CUDA_OK(cudaMemsetAsync(out, 0xff, values * sizeof(float), stream));
-      cudaGraph_t graph;
-      cudaGraphExec_t exec;
-      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-      moe.run(input, ids, weights, out, 4, stream);
-      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
-      DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, 0, 0, 0));
-      for (int k = 0; k < 4; ++k) DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
-      DGPP_CUDA_OK(cudaEventRecord(a, stream));
-      for (int k = 0; k < 32; ++k) DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
-      DGPP_CUDA_OK(cudaEventRecord(b, stream));
-      DGPP_CUDA_OK(cudaEventSynchronize(b));
-      float ms;
-      DGPP_CUDA_OK(cudaEventElapsedTime(&ms, a, b));
-      DGPP_CUDA_OK(cudaMemcpy(result.data(), out, values * sizeof(float), cudaMemcpyDeviceToHost));
-      DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
-      DGPP_CUDA_OK(cudaGraphDestroy(graph));
-      return ms * 1000 / 32;
+      const float us = timed_graph([&] { moe.run(input, ids, weights, out, 4, stream); });
+      if (!result.empty())
+        DGPP_CUDA_OK(cudaMemcpy(result.data(), out, result.size_bytes(), cudaMemcpyDeviceToHost));
+      return us;
     };
+    if (weight_scan) {
+      std::vector<int> experts;
+      for (int e = 0; e < E; ++e)
+        if (counts[e]) experts.push_back(e);
+      DGPP_CUDA_OK(cudaMemcpy(unique_ids, experts.data(), experts.size() * sizeof(int),
+                              cudaMemcpyHostToDevice));
+      auto scan = [&] {
+        return timed_graph([&] {
+          launch_mxfp4_weight_scan(storage, bytes, unique_ids, experts.size(),
+                                   reinterpret_cast<unsigned*>(out), values, stream);
+        });
+      };
+      float computation, read;
+      if (i % 2) {
+        read = scan();
+        computation = measure(baseline);
+      } else {
+        computation = measure(baseline);
+        read = scan();
+      }
+      std::printf("%zu,%zu,%zu,%.2f,%.2f\n", record, experts.size(), experts.size() * bytes,
+                  computation, read);
+      continue;
+    }
+    std::vector<float> ref(values), candidate(values);
     float base_us, split_us;
     if (i % 2) {
-      split_us = measure(hybrid, candidate);
+      split_us = measure(*hybrid, candidate);
       base_us = measure(baseline, ref);
     } else {
       base_us = measure(baseline, ref);
-      split_us = measure(hybrid, candidate);
+      split_us = measure(*hybrid, candidate);
     }
     // Splitting the same groups across residency waves must preserve every
     // output bit of the hybrid backend, including its shared-slot sentinel.
@@ -142,8 +181,8 @@ static int replay(const char* path) {
     DGPP_CUDA_OK(cudaMemsetAsync(out, 0xff, values*sizeof(float), stream));
     for (const auto& wave : waves) {
       if (wave.empty()) continue;
-      hybrid.prepare(group, addresses, 4, stream, wave);
-      hybrid.run(input, ids, weights, out, 4, stream);
+      hybrid->prepare(group, addresses, 4, stream, wave);
+      hybrid->run(input, ids, weights, out, 4, stream);
     }
     std::vector<float> combined(values);
     DGPP_CUDA_OK(cudaMemcpyAsync(combined.data(), out, values*sizeof(float), cudaMemcpyDeviceToHost, stream));
@@ -176,6 +215,7 @@ static int replay(const char* path) {
     if (std::max(rms[0], rms[1]) > .02)
       throw std::runtime_error("split verification numerical mismatch");
   }
+  if (unique_ids) DGPP_CUDA_OK(cudaFree(unique_ids));
   DGPP_CUDA_OK(cudaFree(input));
   DGPP_CUDA_OK(cudaFree(ids));
   DGPP_CUDA_OK(cudaFree(out));
@@ -187,8 +227,9 @@ static int replay(const char* path) {
   return 0;
 }
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string_view(argv[1]) == "--weight-scan") return replay(argv[2], true);
   if (argc == 2) return replay(argv[1]);
-  if (argc != 1) throw std::invalid_argument("usage: mxfp4_backend_bench [four-row-route-file]");
+  if (argc != 1) throw std::invalid_argument("usage: mxfp4_backend_bench [--weight-scan] [four-row-route-file]");
   cudaStream_t stream;
   DGPP_CUDA_OK(cudaStreamCreate(&stream));
   constexpr int H = 5120, I = 1152, E = 384, K = 6;

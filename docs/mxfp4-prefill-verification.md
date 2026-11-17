@@ -218,3 +218,120 @@ completed with identical tool arguments, 45 output tokens and 33 accepted
 predictions in 11 passes. A separate two-turn request on the restored
 endpoint listed the source directory and returned its first entry correctly.
 The two-Spark MXFP4 streaming template selects mode 3.
+
+## Four-row verification on 48 SMs
+
+At speculative depth three the target routes four rows to six experts each.
+The packet groups the 24 assignments by expert. An expert with one live
+assignment gets one eight-row tile with seven masked lanes. Across the
+4,480 recorded layers, live assignments filled 17.1% of those tile lanes.
+Each rank reads its local tensor-parallel shard of each selected expert once
+in the ideal weight-traffic model. Padding the row dimension adds arithmetic
+without multiplying the expert's weight size.
+
+The route replay used 32 evenly spaced records and both overlap extremes from
+that trace. The 34 calls averaged 17.59 distinct experts. For a rank-local
+MXFP4 expert, three 5,120 × 1,152 matrices of four-bit weights plus one
+scale byte per 32 weights occupy 9,400,320 bytes. This gives a mean of
+165.34 MB of selected weights and scales per layer per rank.
+
+| Isolated change | 32-block b12x control, µs | Candidate, µs | Faster routes out of 34 |
+| --- | ---: | ---: | ---: |
+| b12x, 40 persistent blocks | 711.94 | 712.29 | 17 |
+| b12x, 48 persistent blocks | 716.48 | 718.75 | 12 |
+| Two launches, grouped live rows in BF16 MMA | 718.24 | 737.47 | 9 |
+| Two launches, FP32 FMAs on live rows only | 718.50 | 758.52 | 0 |
+| Live-row FP32, unrolled accumulators and packed exponent scaling | 715.75 | 746.50 | 0 |
+| Grouped BF16 MMA, software-pipelined register loads | 717.46 | 734.97 | 7 |
+
+The two-launch kernels give each block 64 output channels for one expert.
+The gate/up kernel applies SwiGLU and the down kernel writes the routed
+output slots. Both retain CUDA graph replay, support masked residency waves
+and can spread work across 48 SMs without a device-wide software barrier.
+The MMA version uses the tensor instruction's eight columns and stores the
+live ones. The scalar version skips arithmetic on all padded rows. Changing
+the block size, adjacent channel tiles and weight prefetch distance also
+left mean replay time above the control.
+
+To compare against the cost of reading the same weights, run
+`mxfp4_backend_bench --weight-scan <four-row-route-file>`. Each line supplies
+24 expert IDs in token-major order. The scan deduplicates the IDs and reads
+each selected expert's prepared packed weights and scales with coalesced
+16-byte loads. A warp XORs the words and writes a single result to keep
+the reads observable. The timer includes this reduction. It measures GPU
+memory access on resident synthetic data. SSD record verification is a
+separate option. The first paired replay averaged **708.56 µs for the scan
+and 722.99 µs for the full routed computation**. The scan supplies an
+empirical reference. Cache reuse and the access patterns of each kernel
+affect the result.
+
+The serving diagnostic used two Sparks at concurrency one with mode-3
+prefill and depth three. The test executable was built from `b004bb00` plus
+the experimental grid and tile changes (SHA-256
+`e3455b658677d424ad4e3a5637e522d0953fadefa36984fef08ccc3de56f114e`).
+The 48-block fused kernel stalled on the first 24,317-token tool request.
+Both rank logs continued to report the same graph generation (419) until
+the test was stopped. Isolated replay on an otherwise empty GPU had passed
+for all 34 routes. The b12x software barrier waits for every persistent
+block to arrive, so reserving all 48 SMs creates a forward-progress risk
+when other kernels share the GPU.
+
+A bounded co-residency probe reserved 96 KiB of one SM's shared memory for
+12 ms in a separate stream, then launched b12x on each of three routes.
+The 32- and 40-block kernels finished in 0.76–0.85 ms while the reservation
+was live. The 48-block kernel finished in 12.76–12.84 ms. This reproduces the
+dependence on the last block being able to run. The identity of the kernel
+holding the contested resource in the serving stall was not captured.
+
+### Checklist review of the compact kernels
+
+| Checklist items | Evidence and remaining limits |
+| --- | --- |
+| Execution shape, routes, realistic inputs | The earlier TP2 warm four-row profile identified routed verification as a major cost. The replay used both overlap extremes, real top-six IDs and synthetic BF16 token inputs. Down consumed distinct activations from each routed gate/up. Prefill chunk sizing does not apply to this four-row dispatch. |
+| Packed weights, supported views, vector loads and scale reuse | Both projections read the production K16/N64 layout directly. A warp loads 16 weight bytes per lane and eight packed scale bytes per four-lane group. Each K32 scale supplies both K16 halves. Serving supplies prepared bindings for the current residency wave. Canonical and chunk conversion remain in the existing caller. |
+| Lookahead, staging and pipeline depth | Tested two- and six-iteration L2 lookahead, explicit next-iteration loads into registers and two- and three-stage asynchronous shared-memory rings for weights and scales. The rings averaged 739.10 and 734.82 µs against their respective 722.12 and 720.35 µs controls. |
+| SM resources, ready warps and local-memory traffic | CUDA's occupancy API reported four resident 256-thread blocks/SM for both original grouped projections, three for the two-stage ring and two for the three-stage ring. In the sampled gate/up call, achieved occupancy fell from 64.9% to 47.4% with the two-stage ring. Eligible warps per scheduler were 0.16 and 0.17. Nsight identified thread-local traffic. Storing four route IDs in separately selectable registers removed the 16-byte local allocation and the measured local load/store sectors on both projections. The register-pipelined replay then averaged 722.42 µs against 718.21 µs for b12x. |
+| Tile ordering, sparsity and barriers | A block owns one expert's output channels and reuses each weight fragment across its live rows. Tested 128-, 256- and 512-thread blocks and adjacent channel tiles. Empty and masked groups return as a block. The MMA instruction still has eight columns. The scalar alternative explicitly skips padded arithmetic. Projection launches delimit the gate/up → down dependency. |
+| Routing preparation, scratch and caller overlap | Both kernels reuse the dispatcher's packet and existing activation/output scratch. They add no device allocation, CPU route decision, copy or stream drain to a hit. GPU packet construction and shared-expert scheduling stay in the caller. No new wait gates were added. Graph capture and fresh-process serving were exercised. Per-stream overlap on the new kernels was inspected in source; its duration was not separately measured. BF16 activations need no input quantizer. |
+| Arithmetic, output slots and first use | Synthetic inputs have independent gate, up and down weights with nonuniform scales. Each measured route passed finite-output, shared-slot sentinel and bitwise full-versus-two-wave checks. Reduced error on these inputs does not establish checkpoint-wide scale coverage. The final serving candidate used the original full-range scale decoder. Changing the order of reductions can change continuations and acceptance. |
+| Dispatch, missed experts and user-visible timing | Both ranks' executable hashes and switches were checked from the live processes. Warm probes required zero expert-file reads on both ranks and a 24,448-token prefix attach. Both ranks had zero process swap and matching operation streams on completed arms. Four directory tasks checked the tool arguments and final answer against the local filesystem. Nsight measurements were separate from uninstrumented serving. Broader model quality, concurrency and every possible tail shape remain unmeasured. |
+| Read-only comparison kernel | This benchmark reads the contiguous span of each deduplicated expert, including scales. It launches only in the standalone benchmark and consumes no serving scratch. The final benchmark build repeated the 34-route scan in 712.68 µs against 729.30 µs for full routed computation. |
+
+Each warm continuation below had three measured requests. Milliseconds per
+pass is engine decode time divided by the number of draft passes, including
+draft, verification and other decode work.
+
+| Serving kernel | Prose tok/s | Prose ms/pass | Accepted / passes | Code tok/s | Code ms/pass | Accepted / passes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32-block b12x | 39.16 | 66.45 | 157 / 98 | 42.95 | 65.97 | 165 / 90 |
+| 40-block b12x | 39.68 | 66.26 | 158 / 97 | 40.28 | 65.94 | 160 / 96 |
+| First grouped MMA | 36.69 | 68.28 | 154 / 101 | 42.98 | 67.42 | 168 / 88 |
+| Grouped MMA with register-resident slots and pipelined loads | 37.09 | 67.54 | 154 / 101 | 43.40 | 66.76 | 168 / 88 |
+
+The two grouped versions produced matching continuations and pass counts
+with one another. The correction reduced cycle time on both workloads.
+The code probe accepted three more draft tokens than the 32-block control,
+which accounts for the higher output rate despite longer cycles. The corrected
+executable used the same source base and full-range decoder (SHA-256
+`ffb9495083cd615860290152ecfe00ee7a3dcac4e7376ace0b5a3afc9f8fd78b`).
+The later diagnostic launches used a 3 GiB startup headroom threshold after
+a 4 GiB threshold declined startup. The 114.11 GiB memory plan was identical.
+
+The four directory tasks produced matching arguments, answers, token counts
+and accepted predictions in all four completed configurations. Each task
+had two warmed repetitions with zero expert-file reads on either rank.
+Mean engine decode time summed across the call and answer was 898.59 ms
+for 32 blocks, 893.05 ms for 40 blocks, 921.34 ms for the first grouped
+kernel and 910.86 ms for the corrected grouped kernel. All four tasks
+favored 40 over 32 on this start, by 0.62% in aggregate. The longer code
+continuation favored 32 blocks by 2.67 tok/s. Each configuration had one
+deployment start per workload, so the 0.62% difference still includes
+between-start variability.
+
+A two-projection Nsight sample of the corrected register-pipelined replay
+showed zero thread-local load and store sectors. The down projection had
+948 shared-memory store bank conflicts across its 1,920 launched blocks.
+Padding the reduction scratch by one float per warp row averaged 732.18 µs
+against 722.03 µs for its paired b12x control. The stable mixed-workload
+selection remains 32-block b12x. The two-Spark service resumed with the
+original binary, mode-3 prefill and its 4 GiB startup headroom threshold.

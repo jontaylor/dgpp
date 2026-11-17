@@ -70,6 +70,14 @@ while known baseline optimizations are missing.
   registers and shared memory all constrain residency. A 1,024-thread block
   cannot reach full thread occupancy on GB10; 256 threads only permits full
   occupancy if the other resources allow it. Do not treat a block size as a win.
+- [ ] **Test grid-wide waits with the other serving streams active.** A software
+  barrier holds resident blocks until every participant arrives. On GB10 the
+  48-block b12x replay completed in isolation and stalled during TP2 graph
+  execution. Check progress on both ranks with real traffic.
+- [ ] **Time a read of the same selected weights.** For sparse verification
+  tiles, replay the same expert IDs with a contiguous weight scan alongside
+  the full projections. This measures a practical reference cost for reading
+  the weights even when few of the tile's row lanes are useful.
 - [ ] **Balance pipeline depth against occupancy.** Our native 128-row/three-stage
   variant allowed only one block/SM and lost badly to two stages. Check dynamic
   shared-memory opt-in where required; another stage can make latency worse.

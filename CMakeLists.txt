@@ -2922,7 +2922,7 @@ if(DGPP_BUILD_BENCHMARKS)
     SOURCES benchmarks/micro/mxfp4_kernel_bench.cu
     LIBRARIES dgpp_kernels dgpp_moe_fp4_pack dgpp_moe_mxfp4_native CUDA::cudart)
   dgpp_add_benchmark(mxfp4_backend_bench
-    SOURCES benchmarks/micro/mxfp4_backend_bench.cpp
+    SOURCES benchmarks/micro/mxfp4_backend_bench.cpp benchmarks/micro/mxfp4_weight_scan.cu
     LIBRARIES dgpp_sm12x_moe CUDA::cudart)
 
   dgpp_add_benchmark(host_penalties_bench
