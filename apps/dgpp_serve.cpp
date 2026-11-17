@@ -240,7 +240,16 @@ struct PinnedWords {
 // probes quiet) keeps 1.2–1.8 of margin over it; an overshoot here hangs the
 // fabric rather than erroring, so the head node must not run builds beside
 // a serving world at this margin.
-constexpr size_t kMemoryHeadroomBytes = size_t{4} << 30;
+size_t memory_headroom_bytes() {
+  const char* value = std::getenv("DGPP_MEMORY_HEADROOM_MIB");
+  if (!value) return size_t{4} << 30;
+  unsigned mib = 0;
+  const std::string_view text(value);
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), mib);
+  if (error != std::errc{} || end != text.data() + text.size() || mib < 1024 || mib > 16384)
+    throw std::runtime_error("DGPP_MEMORY_HEADROOM_MIB must be an integer in [1024, 16384]");
+  return static_cast<size_t>(mib) << 20;
+}
 
 std::string gib(double bytes) {
   return std::format("{:.2f} GiB", bytes / (1024.0 * 1024.0 * 1024.0));
@@ -1412,6 +1421,7 @@ void check_memory_plan(
   const size_t available = dgpp::host_memory_available_bytes();
   const size_t budget = std::max(free_bytes, available);
   const size_t need = plan.total_bytes() + prefix_arena_bytes + engine_bytes;
+  const size_t headroom_bytes = memory_headroom_bytes();
   std::string items;
   for (const auto& it : plan.items) {
     if (it.device + it.pinned < (size_t{1} << 20)) continue;
@@ -1427,10 +1437,10 @@ void check_memory_plan(
       "(device free {} of {}, host available {})",
       rank, gib(static_cast<double>(need)), gib(static_cast<double>(plan.device_bytes())),
       gib(static_cast<double>(plan.pinned_bytes() + prefix_arena_bytes + engine_bytes)),
-      gib(static_cast<double>(kMemoryHeadroomBytes)), gib(static_cast<double>(budget)),
+      gib(static_cast<double>(headroom_bytes)), gib(static_cast<double>(budget)),
       gib(static_cast<double>(free_bytes)), gib(static_cast<double>(total_bytes)),
       gib(static_cast<double>(available)));
-  if (need + kMemoryHeadroomBytes <= budget) return;
+  if (need + headroom_bytes <= budget) return;
   // The plan is affine in the context: its slope from two points names the
   // largest context this node could hold with everything else as configured.
   std::string hint;
@@ -1443,7 +1453,7 @@ void check_memory_plan(
       const double fixed = static_cast<double>(plan.total_bytes()) -
                            per * static_cast<double>(plan.context_tokens) +
                            static_cast<double>(prefix_arena_bytes + engine_bytes +
-                                               kMemoryHeadroomBytes);
+                                               headroom_bytes);
       const double room = static_cast<double>(budget) - fixed;
       const int64_t feasible =
           room > 0 ? static_cast<int64_t>(room / per) / block_tokens * block_tokens : 0;
@@ -1467,7 +1477,7 @@ void check_memory_plan(
       "refusing to allocate (the largest items: {}).{} Lower engine.kv_capacity, "
       "engine.max_concurrency or engine.prefix_cache_gib, or choose a smaller "
       "engine.kv_dtype.{}",
-      rank, gib(static_cast<double>(need)), gib(static_cast<double>(kMemoryHeadroomBytes)),
+      rank, gib(static_cast<double>(need)), gib(static_cast<double>(headroom_bytes)),
       gib(static_cast<double>(budget)), top, hint,
       expert_paging ? " For expert paging, also lower engine.expert_streaming.budget_bytes." : ""));
 }

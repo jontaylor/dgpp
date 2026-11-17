@@ -339,7 +339,7 @@ class SiteEnvTest(unittest.TestCase):
         flags = {"DGPP_MOE_MX_NATIVE_PREFILL": "1", "DGPP_MOE_MX_NATIVE_TILE_ROWS": "128",
                  "DGPP_MOE_MX_NATIVE_STAGES": "2", "DGPP_MOE_MX_NATIVE_TAIL_SKIP": "1",
                  "DGPP_CSA2_PREFILL_MERGE4": "1", "DGPP_CSA2_PREFILL_SPLITS": "4",
-                 "DGPP_BULK_STREAM_ORDERED": "1", "CUDA_MODULE_LOADING": "EAGER", "CUDA_DEVICE_MAX_CONNECTIONS": "32"}
+                 "DGPP_BULK_STREAM_ORDERED": "1", "CUDA_MODULE_LOADING": "EAGER", "CUDA_DEVICE_MAX_CONNECTIONS": "32", "DGPP_MEMORY_HEADROOM_MIB": "3072"}
         cfg["environment"] = flags
         self.config.write_text(json.dumps(cfg))
         resolved = site_env.resolve_config(self.config, self.values())
@@ -371,7 +371,9 @@ class SiteEnvTest(unittest.TestCase):
     def test_deployment_execution_environment_rejects_unknown_and_invalid_values(self):
         cfg = json.loads(self.config.read_text())
         for env in ({"HF_TOKEN": "secret"}, {"DGPP_EXPERT_CHUNK_DIRECT": "$(command)"},
-                    {"DGPP_EXPERT_READY_WORKER": "3"}, {"DGPP_EXPERT_CHUNK_DIRECT": True}, []):
+                    {"DGPP_EXPERT_READY_WORKER": "3"}, {"DGPP_EXPERT_CHUNK_DIRECT": True},
+                    {"DGPP_MEMORY_HEADROOM_MIB": "1023"}, {"DGPP_MEMORY_HEADROOM_MIB": "16385"},
+                    {"DGPP_MEMORY_HEADROOM_MIB": "3072junk"}, {"DGPP_MEMORY_HEADROOM_MIB": True}, []):
             with self.subTest(environment=env):
                 cfg["environment"] = env
                 self.config.write_text(json.dumps(cfg))

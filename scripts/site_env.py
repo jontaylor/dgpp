@@ -26,7 +26,7 @@ DEPLOYMENT_ENV_KEYS = (
     "DGPP_MOE_MX_NATIVE_PREFILL", "DGPP_MOE_MX_NATIVE_TILE_ROWS",
     "DGPP_MOE_MX_NATIVE_STAGES", "DGPP_MOE_MX_NATIVE_TAIL_SKIP",
     "DGPP_DSV41_NATIVE_FP8_PREFILL", "DGPP_BULK_STREAM_ORDERED",
-    "CUDA_MODULE_LOADING", "CUDA_DEVICE_MAX_CONNECTIONS",
+    "CUDA_MODULE_LOADING", "CUDA_DEVICE_MAX_CONNECTIONS", "DGPP_MEMORY_HEADROOM_MIB",
 )
 
 SITE_KEYS = (
@@ -180,6 +180,10 @@ def deployment(path):
     if not isinstance(execution_env, dict) or set(execution_env) - set(DEPLOYMENT_ENV_KEYS):
         raise ValueError("environment may only contain supported deployment execution switches")
     for key, value in execution_env.items():
+        if key == "DGPP_MEMORY_HEADROOM_MIB":
+            if not isinstance(value, (str, int)) or not str(value).isascii() or not str(value).isdecimal() or not 1024 <= int(value) <= 16384:
+                raise ValueError("DGPP_MEMORY_HEADROOM_MIB must be an integer in [1024, 16384]")
+            continue
         allowed = {
             "CUDA_MODULE_LOADING": ("EAGER", "LAZY"),
             "CUDA_DEVICE_MAX_CONNECTIONS": tuple(str(n) for n in range(1, 33)),

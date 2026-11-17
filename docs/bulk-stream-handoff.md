@@ -112,3 +112,14 @@ the bus watchdog must report failure and release the completion waiter. It
 covers dependent GPU kernels and pinned-host copies queued before producer
 release. The deployment environment tests cover forwarding the opt-in and
 CUDA settings to both ranks.
+
+## Explicit memory-headroom override
+
+`DGPP_MEMORY_HEADROOM_MIB` overrides the startup reserve (default 4096 MiB).
+It accepts integer values from 1024 to 16384 MiB and is forwarded to every
+rank by the deployment launcher. It does not resize the expert pool, prefix
+cache or KV cache, and the memory-plan check still rejects a plan whose total plus the configured reserve exceeds
+available memory. This reserve covers memory
+outside the model plan; lowering it is an explicit deployment choice, not a
+memory saving. The repeated comparison requested after the initial screen
+uses 3072 MiB and keeps the normal 1 GiB prefix cache in both arms.
