@@ -921,3 +921,40 @@ captured GPU execution, pressure, prepared prefill, chunk-direct misses and
 cache-budget accounting. The b12x output also passed the existing numerical
 budget against canonical expert execution. This establishes execution-path
 coverage, not equal quality or equal speculative acceptance across checkpoints.
+
+A focused C1 rerun on two GB10s used implementation `80453335` and server
+SHA-256 `c870b9f50ed31a6f2e569e2333122e045c34e25225b319cb88bb4b890046513d`.
+It repeated the previous seven fixed tool/prose/code/prefill requests, preserving
+the deployed budget, fixed-depth-three DSpark, packed Engram and client alias.
+This is a diagnostic comparison, not a replacement benchmark campaign. Both
+ranks ran that binary with zero swap throughout, their operation streams
+matched, and no build or other benchmark ran during the requests. MXFP4 was
+left serving under its normal supervision on the existing port and keys.
+
+The initial 24,317-token tool request had zero cached prompt tokens and the
+same normalized output, output length and speculative acceptance as the
+previous MXFP4 run. Prefill fell from 43.982 to 37.281 seconds; engine decode
+rose from 17.05 to 27.10 tokens/s. The final repeated 2,209-token uncached-prompt
+probe took 1.464 seconds to prefill and decoded at 55.30 tokens/s, with zero
+expert reads on either rank. The previous MXFP4 result was 3.447 seconds and
+31.20 tokens/s with 13.27/12.05 GiB of expert reads. This improvement includes
+changed residency behavior as well as faster execution. Continuation responses
+and acceptance differ, so their throughput changes do not isolate kernel cost.
+Live telemetry recorded 15,140 chunk-direct executions per rank, no canonical
+unpacks, and GPU target graph replay. The prepared MXFP4 cache retained 197,749
+chunks (10,986 full-expert equivalents), about 6.1% more than the saved NVFP4
+configuration after all scratch and staging reservations.
+
+The saved NVFP4 fast-path reference (`b752003d`, server SHA-256
+`89105da65cd51d8cf896bf2d136a00e6a37953a3e95dfcf7f2f42a8dfc9b7388`)
+measured 39.041 seconds / 22.73 decode tokens/s on the initial request and
+1.617 seconds / 52.65 decode tokens/s on the final repeated probe, also without
+expert reads in the latter. These are historical controls, not a fresh
+same-binary format comparison. A fresh NVFP4 boot was stopped before any
+request: relocating its source shards to NAS invalidated the source stamp and
+triggered a complete source-set hash over the network. Completing that hash
+would extend this focused validation substantially. No source-identity guard
+was bypassed. A new full campaign and full-model quality evaluation remain
+unrun; the current evidence establishes fast-path coverage and practical
+MXFP4 performance, not a controlled ranking of checkpoint quality or a precise
+format-only speed advantage.
