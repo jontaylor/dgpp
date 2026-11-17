@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
 
@@ -12,9 +13,9 @@ namespace dgpp {
 namespace {
 constexpr int kThreads = 128, kStages = 3;
 
-template <int BM, int BN>
+template <int BM, int BN, bool Wide = false>
 struct Tile {
-  static constexpr int warps = BM == 16 ? (BN < 16 ? 1 : BN / 16) : 4;
+  static constexpr int warps = BM == 16 ? (BN < 16 ? 1 : BN / 16) : (Wide ? 8 : 4);
   static constexpr int threads = warps * 32;
   static constexpr int bk = BM == 16 && BN == 8 ? 512 : BM == 16 && BN == 16 ? 256 : 64;
   static constexpr int stride = bk + 16;
@@ -104,14 +105,16 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
         "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
 }
 
-template <typename Out, int BM, int BN, bool Grid32 = false, typename Scale = uint8_t>
-__global__ __launch_bounds__((Tile<BM, BN>::threads)) void mxfp8_gemm_kernel(
+template <typename Out, int BM, int BN, bool Grid32 = false, typename Scale = uint8_t,
+          bool Wide = false>
+__global__ __launch_bounds__((Tile<BM, BN, Wide>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const Scale* w_scales, Out* out,
     int m, int n, int k, size_t out_stride) {
   dgpp_pdl_wait();
-  constexpr int threads = Tile<BM, BN>::threads;
-  constexpr int BK = Tile<BM, BN>::bk, stride = Tile<BM, BN>::stride;
-  constexpr int warp_m = BM == 16 ? 1 : 2, warp_n = Tile<BM, BN>::warps / warp_m;
+  constexpr int kStages = Wide ? 2 : 3;
+  constexpr int threads = Tile<BM, BN, Wide>::threads;
+  constexpr int BK = Tile<BM, BN, Wide>::bk, stride = Tile<BM, BN, Wide>::stride;
+  constexpr int warp_m = BM == 16 ? 1 : 2, warp_n = Tile<BM, BN, Wide>::warps / warp_m;
   constexpr int MT = BM / warp_m / 16, NT = BN / warp_n / 8;
   constexpr int slot_bytes = (BM + BN) * stride;
   extern __shared__ __align__(16) uint8_t smem[];
@@ -302,10 +305,21 @@ bool native_grid32(const uint16_t* x, size_t x_stride, const uint8_t* w, const S
   mxfp8_quantize_kernel<false>
       <<<quant_grid, kThreads, 0, stream>>>(x, x_stride, k, a, as, nullptr, 0.f, 0.f, 1e-4f);
   constexpr int BM = 64, BN = 128;
-  constexpr int smem = kStages * (BM + BN) * Tile<BM, BN>::stride;
   const unsigned blocks = unsigned(((m + BM - 1) / BM) * ((n + BN - 1) / BN));
-  mxfp8_gemm_kernel<Out, BM, BN, true, Scale><<<blocks, Tile<BM, BN>::threads, smem, stream>>>(
-      a, as, w, ws, out, m, n, k, stride ? stride : size_t(n));
+  static const bool wide = [] {
+    const char* v = std::getenv("DGPP_DSV41_NATIVE_FP8_WIDE");
+    return v && v[0] == '1';
+  }();
+  if (wide) {
+    constexpr int smem = 2 * (BM + BN) * Tile<BM, BN, true>::stride;
+    mxfp8_gemm_kernel<Out, BM, BN, true, Scale, true>
+        <<<blocks, Tile<BM, BN, true>::threads, smem, stream>>>(a, as, w, ws, out, m, n, k,
+                                                                stride ? stride : size_t(n));
+  } else {
+    constexpr int smem = kStages * (BM + BN) * Tile<BM, BN>::stride;
+    mxfp8_gemm_kernel<Out, BM, BN, true, Scale><<<blocks, Tile<BM, BN>::threads, smem, stream>>>(
+        a, as, w, ws, out, m, n, k, stride ? stride : size_t(n));
+  }
   DGPP_CUDA_OK(cudaGetLastError());
   return true;
 }

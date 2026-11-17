@@ -6,6 +6,10 @@ and [execution changes](mxfp4-execution-optimizations.md), on two Sparks on
 rows or a concurrency campaign. The production cache budget and four-row
 DSpark verification shape remain unchanged.
 
+The cache-convergence and native-kernel conclusions below describe the initial
+screen. See [the follow-through](mxfp4-kernel-followthrough.md) for the cache
+capacity explanation and subsequent optimizations.
+
 ## Geometry and hardware corrections
 
 GB10 reports 48 SMs, 1,536 threads per SM, 102,400 bytes of shared memory per
@@ -78,8 +82,7 @@ chunk-direct views. It is not a serving backend.
 
 The prototype is 51–68% slower. Random-input relative L2 difference from
 unquantized BF16 arithmetic was about 2.44%; this is a kernel sanity check,
-not a model-quality evaluation. No serving integration is justified by
-these results. Prepared native layouts, improved weight staging, small-row
+not a model-quality evaluation. These initial results did not establish a serving win. Prepared native layouts, improved weight staging, small-row
 tiles and fused quantization remain possible future work; this prototype
 does not exhaust native W4A8's potential.
 
@@ -171,7 +174,7 @@ The corrected dense screen uses
 `66702e1f496036d8c75c74cbcb5d8c50ebba5395715c083d1f17efd44071cee6`.
 All were built from `5f1c7b5f` plus this change's working diff.
 
-## Retained configuration and remaining work
+## Configuration retained after the initial screen
 
 None of the new alternatives improved the deployed workload overall.
 Production retains MXFP4, four attention splits, early shared-expert prefill,

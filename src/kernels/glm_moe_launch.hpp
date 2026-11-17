@@ -317,13 +317,15 @@ void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride, con
                                      const MoeExpertView* views, int which, uint16_t* out,
                                      size_t out_stride, int n, int k, cudaStream_t stream,
                                      const int32_t* act_rows = nullptr, int fp4_group = kFp4Group,
-                                     int tile_rows = 64);
+                                     int tile_rows = 64, const MoeTile* tiles = nullptr,
+                                     const int32_t* tile_count = nullptr, int tile_capacity = 0);
 void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
                                     int n_segs, int max_rows, int rows_per_block,
                                     const MoeExpertView* views, int which, float* out,
                                     size_t out_stride, int n, int k, cudaStream_t stream,
                                     const int32_t* act_rows = nullptr, int fp4_group = kFp4Group,
-                                    int tile_rows = 64);
+                                    int tile_rows = 64, const MoeTile* tiles = nullptr,
+                                    const int32_t* tile_count = nullptr, int tile_capacity = 0);
 // The reference kernel's grouped form (the microbench's A/B and the gate).
 void launch_moe_grouped_mma_fp4_ref_bf16(const uint16_t* act, size_t act_stride,
                                          const MoeSegment* segs, int n_segs,

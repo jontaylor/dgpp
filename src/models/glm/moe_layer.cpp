@@ -1929,6 +1929,21 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                       d_hidden_qs_, static_cast<size_t>(H / 128), tokens, H, 0, stream);
   hidden_codes_ready_ = false;
   const int fp4_group = fp4_group_of(w_);
+  static const bool compact_fp4 = [] {
+    const char* v = std::getenv("DGPP_MOE_FP4_COMPACT_TILES");
+    return v && v[0] == '1';
+  }();
+  const MoeTile* fp4_tiles = nullptr;
+  int fp4_tile_cap = 0;
+  if (compact_fp4 && fp4 && kernel == MoeExpertKernel::kMma && max_rows > 16 && n_segs > 0) {
+    // The list covers routed segments only; rows_total also includes shared rows.
+    const int rows = activation_rows >= 0 ? activation_rows : tokens * cfg_.top_k;
+    fp4_tile_cap = moe_tile_list_capacity(n_segs, rows, 64);
+    if (fp4_tile_cap > tiles_cap_)
+      throw std::logic_error("FP4 tile list exceeds reserved capacity");
+    launch_moe_tile_list(segs, n_segs, 64, d_tiles_, d_tile_count_, stream);
+    fp4_tiles = d_tiles_;
+  }
   const size_t I_max = static_cast<size_t>(std::max(I_r, I_s));
   const bool w4a4 = fp4 && !packq && !w_.weight_only_fp4 && fp4_group == kFp4Group &&
                     kernel == MoeExpertKernel::kMma && moe_w4a4_eligible(H, I_r, rows_total);
@@ -2046,9 +2061,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
                                    I_max, n, H, stream);
     else if (mma && fp4_w)
-      launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
-                                      which, out, I_max, n, H, stream, d_rows_, fp4_group,
-                                      mr <= 16 ? 16 : 64);
+      launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_, which, out,
+                                      I_max, n, H, stream, d_rows_, fp4_group, mr <= 16 ? 16 : 64,
+                                      routed_arg ? fp4_tiles : nullptr, d_tile_count_,
+                                      fp4_tile_cap);
     else if (mma)
       launch_moe_grouped_mma_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                   which, out, I_max, n, H, stream, d_rows_);
@@ -2102,9 +2118,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
     else if (mma && fp4_w)
-      launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
-                                     2, d_down_, H, H, k, stream, nullptr, fp4_group,
-                                     mr <= 16 ? 16 : 64);
+      launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_, 2, d_down_,
+                                     H, H, k, stream, nullptr, fp4_group, mr <= 16 ? 16 : 64,
+                                     routed_arg ? fp4_tiles : nullptr, d_tile_count_, fp4_tile_cap);
     else if (mma)
       launch_moe_grouped_mma_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                  2, d_down_, H, H, k, stream);

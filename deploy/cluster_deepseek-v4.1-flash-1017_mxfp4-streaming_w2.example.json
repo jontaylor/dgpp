@@ -25,7 +25,7 @@
     "stats_interval_s": 10,
     "expert_streaming": {
       "policy": "whole_expert_cache",
-      "budget_bytes": 107242240000,
+      "budget_bytes": 108047546368,
       "image_directory": "~/.cache/dgpp/expert-streaming-1017-tp2",
       "chunk_intermediate": 64,
       "minimum_fraction": 0,

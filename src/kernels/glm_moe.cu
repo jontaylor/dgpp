@@ -3904,7 +3904,8 @@ __launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_m
     const uint16_t* __restrict__ act, size_t act_stride, int act_vec,
     const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
     const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride,
-    int n, int k, int m_tiles, bool packed_direct) {
+    int n, int k, int m_tiles, bool packed_direct, const MoeTile* tiles,
+    const int32_t* tile_count) {
   dgpp_pdl_wait();
   using namespace fp4_ldm;
   static_assert(TileRows == 16 || TileRows == 64 || TileRows == 128);
@@ -3916,14 +3917,21 @@ __launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_m
   using fp4_pipe3::commit;
   using fp4_pipe3::wait;
   extern __shared__ __align__(16) uint8_t smem[];
-  const MoeSegment seg = segs[blockIdx.y];
+  const int nt = (n + BN - 1) / BN;
+  const int work = tiles ? int(blockIdx.x) / nt : 0;
+  if (tiles && work >= *tile_count) return;
+  const MoeSegment seg = segs[tiles ? tiles[work].seg : blockIdx.y];
   // One m-tile per block, the m-tile the FASTEST grid index: a long
   // segment's m-tiles are launched together and re-read its weight slice
   // through L2 (with z as the m-tile they ran a whole grid apart and the
   // slice came from DRAM each time: 8K tokens, 2026-09-08); its n-tiles
   // are m_tiles blocks apart and still co-resident for the activations.
-  const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
-  const int n_tile = static_cast<int>(blockIdx.x) / m_tiles;
+  const int segment_tiles = (seg.rows + TileRows - 1) / TileRows;
+  // Compact descriptors are contiguous within each segment. Reinterpret
+  // their local linear index with M fastest, preserving weight-tile reuse.
+  const int local = tiles ? (tiles[work].m0 / TileRows) * nt + int(blockIdx.x) % nt : 0;
+  const int m_tile = tiles ? local % segment_tiles : int(blockIdx.x) % m_tiles;
+  const int n_tile = tiles ? local / segment_tiles : int(blockIdx.x) / m_tiles;
   const int z0 = m_tile * TileRows;
   if (z0 >= seg.rows) return;  // beyond this segment's rows (no barrier yet)
   const int z1 = min(seg.rows, z0 + TileRows);
@@ -4240,7 +4248,8 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
                                     const MoeSegment* segs, int n_segs, int max_rows,
                                     int rows_per_block, const MoeExpertView* views, int which,
                                     OutT* out, size_t out_stride, int n, int k, cudaStream_t stream,
-                                    int fp4_group = kFp4Group) {
+                                    int fp4_group = kFp4Group, const MoeTile* tiles = nullptr,
+                                    const int32_t* tile_count = nullptr, int tile_capacity = 0) {
   using namespace fp4_ldm;
   static_assert(TileRows == 16 || TileRows == 64 || TileRows == 128);
   constexpr size_t tile_a_bytes = size_t(TileRows) * A_PAD * 2;
@@ -4256,6 +4265,8 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
   // always runs one m-tile per block (see the kernel).
   (void)rows_per_block;
   if (max_rows <= 0) throw std::invalid_argument("moe grouped mma fp4 ldm: max_rows");
+  if (tiles && (!tile_count || tile_capacity <= 0))
+    throw std::invalid_argument("moe fp4: compact tiles need count and positive capacity");
   const int m_tiles = (max_rows + TileRows - 1) / TileRows;
   const int act_vec =
       (reinterpret_cast<uintptr_t>(act) % 16 == 0 && (act_stride % 8) == 0) ? 1 : 0;
@@ -4273,17 +4284,20 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, cons
     return !value || std::atoi(value) != 0;
   }();
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
-  if (static_cast<size_t>(n_tiles) * m_tiles > 0x7fffffffu)
+  if (static_cast<size_t>(n_tiles) * (tiles ? tile_capacity : m_tiles) > 0x7fffffffu)
     throw std::invalid_argument("moe grouped mma fp4 ldm: grid too large");
-  const dim3 grid(n_tiles * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
+  const dim3 grid(n_tiles * static_cast<unsigned>(tiles ? tile_capacity : m_tiles),
+                  tiles ? 1u : static_cast<unsigned>(n_segs), 1u);
   if (gi == 0)
     moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
-                                                which, out, out_stride, n, k, m_tiles, packed_direct);
+                                                which, out, out_stride, n, k, m_tiles,
+                                                packed_direct, tiles, tile_count);
   else
     moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group, TileRows>
         <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
-                                                which, out, out_stride, n, k, m_tiles, packed_direct);
+                                                which, out, out_stride, n, k, m_tiles,
+                                                packed_direct, tiles, tile_count);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -5010,19 +5024,21 @@ void launch_moe_grouped_mma_fp4(const uint16_t* act, size_t act_stride, const in
                                 const MoeSegment* segs, int n_segs, int max_rows,
                                 int rows_per_block, const MoeExpertView* views, int which,
                                 OutT* out, size_t out_stride, int n, int k, cudaStream_t stream,
-                                int fp4_group, int tile_rows = 64) {
+                                int fp4_group, int tile_rows = 64, const MoeTile* tiles = nullptr,
+                                const int32_t* tile_count = nullptr, int tile_capacity = 0) {
   // MiniMax can use a smaller activation ring for short expert segments.
   // Each dot retains the same ascending-k16 MMA chain and final division.
   const auto launch = [&]<int Rows>() {
     launch_moe_grouped_mma_fp4_ldm<OutT, Rows>(act, act_stride, act_rows, segs, n_segs, max_rows,
                                                rows_per_block, views, which, out, out_stride, n, k,
-                                               stream, fp4_group);
+                                               stream, fp4_group, tiles, tile_count, tile_capacity);
   };
   static const bool wide = [] {
     const char* v = std::getenv("DGPP_MOE_MX_PREFILL_ROWS128");
     return v && v[0] == '1';
   }();
-  if (wide && fp4_group == kMxfp4Group && tile_rows == 64 && max_rows > 64) tile_rows = 128;
+  if (!tiles && wide && fp4_group == kMxfp4Group && tile_rows == 64 && max_rows > 64)
+    tile_rows = 128;
   if (tile_rows == 128)
     launch.template operator()<128>();
   else if (tile_rows == 16)
@@ -5167,20 +5183,24 @@ void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride, con
                                      int n_segs, int max_rows, int rows_per_block,
                                      const MoeExpertView* views, int which, uint16_t* out,
                                      size_t out_stride, int n, int k, cudaStream_t stream,
-                                     const int32_t* act_rows, int fp4_group, int tile_rows) {
+                                     const int32_t* act_rows, int fp4_group, int tile_rows,
+                                     const MoeTile* tiles, const int32_t* tile_count,
+                                     int tile_capacity) {
   launch_moe_grouped_mma_fp4<uint16_t>(act, act_stride, act_rows, segs, n_segs, max_rows,
                                        rows_per_block, views, which, out, out_stride, n, k, stream,
-                                       fp4_group, tile_rows);
+                                       fp4_group, tile_rows, tiles, tile_count, tile_capacity);
 }
 
 void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
                                     int n_segs, int max_rows, int rows_per_block,
                                     const MoeExpertView* views, int which, float* out,
                                     size_t out_stride, int n, int k, cudaStream_t stream,
-                                    const int32_t* act_rows, int fp4_group, int tile_rows) {
+                                    const int32_t* act_rows, int fp4_group, int tile_rows,
+                                    const MoeTile* tiles, const int32_t* tile_count,
+                                    int tile_capacity) {
   launch_moe_grouped_mma_fp4<float>(act, act_stride, act_rows, segs, n_segs, max_rows,
                                     rows_per_block, views, which, out, out_stride, n, k, stream,
-                                    fp4_group, tile_rows);
+                                    fp4_group, tile_rows, tiles, tile_count, tile_capacity);
 }
 
 void launch_moe_grouped_mma_fp4_ref_bf16(const uint16_t* act, size_t act_stride,
