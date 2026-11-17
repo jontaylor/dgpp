@@ -813,3 +813,88 @@ measures the available implementations, not an isolated prediction from the
 4.25-versus-4.5-bit weight ratio. Cache capacity, miss/read counters, prefill and
 decode must be reported separately. No MXFP4 serving speedup has yet been
 established on the current implementation.
+
+### Two-Spark MXFP4 serving result (2026-11-17)
+
+The focused seven-request comparison completed. MXFP4 remains serving on the
+existing port, keys and client-facing model alias, as requested. The underlying
+checkpoint is native MXFP4 for routed experts with the same packed Engram data
+as the NVFP4 baseline. The configured expert budget, resident draft experts,
+fixed depth-three speculation, request slots, KV pool, prefix arena and I/O
+settings are held constant. All sources used during serving are local SSD files.
+
+The NVFP4 baseline uses `b752003d` and binary SHA-256
+`89105da65cd51d8cf896bf2d136a00e6a37953a3e95dfcf7f2f42a8dfc9b7388`.
+MXFP4 uses implementation source `0e4b5e949ccaa83622dab2de0c762c81a013f638`
+and binary SHA-256
+`073efab0fcc4400c7c9e510760c079864ee7bb7e3cf4b2c23fdc2ee3943e148d`
+on both ranks. Changes since the baseline enable native MXFP4 with packed Engram
+and resident drafts, and fix initial expert-image preparation; this is a
+comparison of the available implementations, not a single-binary isolated
+quantization experiment. These focused results do not replace the standard
+campaign rows in `benchmarks.md`.
+
+The target cache has the same 103,632,517,120-byte budget after charging the
+resident drafts. NVFP4 provides 186,465 chunks of 553,728 bytes; MXFP4 provides
+197,965 chunks of 522,240 bytes. At 18 chunks per expert, that is capacity for
+10,359 versus 10,998 whole experts across the 40 target layers: **6.17% more**.
+The difference includes smaller staging/execution reservations and chunk
+alignment, as well as the 4.25-versus-4.5-bit representation.
+
+All decode rates below are C1 engine decode throughput, excluding prefill and
+queueing. Each cell is one focused request, not a repeated campaign mean.
+
+| Request | NVFP4 prefill s | MXFP4 prefill s | NVFP4 decode tok/s | MXFP4 decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Initial 24,317-token tool prompt, zero prefix-cache tokens | 39.041 | 43.982 | 22.73 | 17.05 |
+| Prose tool continuation | 1.830 | 3.396 | 24.96 | 17.91 |
+| Code tool continuation | 2.998 | 3.020 | 28.17 | 22.45 |
+| Repeated prose continuation | 0.437 | 0.258 | 29.52 | 30.39 |
+| 2,209-token uncached probe, first pass | 8.319 | 7.534 | 27.79 | 27.60 |
+| Same uncached probe, second pass | 2.929 | 4.295 | 52.73 | 31.28 |
+| Same uncached probe, third pass | 1.617 | 3.447 | 52.65 | 31.20 |
+
+More capacity did not consistently reduce reads in this implementation. The
+three tool continuations read 78.919 GiB per rank on NVFP4, versus
+141.803 / 135.738 GiB on MXFP4. The final probe read zero expert bytes on NVFP4
+and 13.271 / 12.050 GiB on MXFP4. The latter is therefore not a resident-only
+kernel comparison. Native/generic execution and admission behavior differ,
+and generated continuations diverge; the byte totals alone do not identify
+which mechanism accounts for the extra reads.
+
+The initial tool-call choices match after removing generated call IDs: both
+select `list_directory` with `/home/jon/dgpp`. The other six response choices
+differ. All seven input token counts match, but continuation lengths and
+acceptance differ, so this run establishes neither quality equivalence nor a
+pure weight-format speed effect. Both ranks stayed at zero process swap and
+ran the recorded binary; their operation streams match at the end. The first
+request has zero cached prefix tokens. No build, transfer or other serving
+world ran during the measured requests.
+
+MXFP4's extra capacity is real, but the pair shows no overall serving win for
+its current path. Porting the NVFP4-specific b12x/GPU-paging/chunk-direct path
+remains unaddressed. Broader concurrency, quality and long-context evaluations
+remain unrun. MXFP4 was left serving, rather than switching back to NVFP4.
+
+### Interrupted image preparation fixes
+
+The failed first attempt never reached timing requests. Its ten-minute launcher
+deadline killed image construction, and service restarts accumulated abandoned
+named temporary images until the disks filled. A service EnvironmentFile also
+overrode the initial checkpoint-cache drop-in; the active EnvironmentFile now
+selects the MXFP4 cache directly.
+
+The launcher now accepts an explicit `--startup-timeout`; the successful first
+build used 3,600 seconds with automatic restart disabled. Both models completed
+construction after the old deadline. On filesystems supporting `O_TMPFILE`,
+expert images remain anonymous until publication, so killed builders release
+incomplete images automatically. Complete-image disk allocation is reserved
+before packing where the filesystem supports it; allocation failures such as
+ENOSPC fail before the long write. Filesystems without anonymous-file support
+retain the named temporary-file fallback.
+
+Seven expert-store tests pass on Spark-1, including publication/readback and a
+SIGKILL regression that leaves no partial image. The 28-test launcher suite
+passes with one optional dependency skip. The successful build used one process
+per rank throughout. Normal `Restart=on-failure` supervision was restored after
+the comparison without restarting the running MXFP4 world.
