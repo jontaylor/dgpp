@@ -123,3 +123,15 @@ layout and graph tests plus basic tool behavior have been checked; broad
 checkpoint quality remains unmeasured. The projection gains do not translate
 into a comparable whole-model gain: attention, communication, Engram access,
 other projections and scheduling remain outside this optimization.
+
+The selected binary is deployed with the normal port, keys and service unit.
+Both ranks report its recorded hash, zero process swap and matching operation
+streams. A completed tool round trip produced the correct directory call and,
+after receiving the real listing, a concise 24-token final answer with
+`finish_reason=stop`. The initial smoke helper accidentally retained a forced
+`list_directory` choice on the final-answer request, causing repetitive output
+with and without attention merge. Correcting the follow-up to `tool_choice=auto`
+resolved it in both configurations; that contradictory probe is not quality
+regression evidence. The deployment parser now accepts and propagates the
+selected switches; its 40 Python tests pass, including example-config validation
+and explicit propagation to both ranks.
