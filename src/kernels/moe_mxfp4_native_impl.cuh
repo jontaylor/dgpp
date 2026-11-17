@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 
 #include "common/cuda_check.hpp"
+#include "common/dtypes.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/moe_fp4_layout.cuh"
 #include "kernels/mxfp8_gemm.hpp"
@@ -61,14 +62,48 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
         "h"(static_cast<uint16_t>(0)), "h"(static_cast<uint16_t>(0)));
 }
 
+__device__ __forceinline__ float swiglu_bf16(float gate, float up, float limit) {
+  const float g = gate > limit ? limit : gate;
+  const float clamped = fminf(fmaxf(up, -limit), limit);
+  const uint16_t silu = float_to_bf16_bits(g * (1.f / (1.f + expf(-g))));
+  return bf16_bits_to_float(float_to_bf16_bits(bf16_bits_to_float(silu) * clamped));
+}
+
+// Eight adjacent lanes quantize one row's 32-element scale group.
+__device__ __forceinline__ void quantize_four(const float (&values)[4], uint8_t* codes,
+                                              uint8_t* scale) {
+  float maximum =
+      fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])), fmaxf(fabsf(values[2]), fabsf(values[3])));
+  const unsigned active = __activemask();
+#pragma unroll
+  for (int offset = 4; offset; offset >>= 1)
+    maximum = fmaxf(maximum, __shfl_xor_sync(active, maximum, offset, 8));
+
+  // Exactly ceil(log2(amax / 448)) from IEEE bits, without log2 rounding
+  // at the exponent boundary. Zero groups use scale byte zero and zero codes.
+  const int biased = static_cast<int>((__float_as_uint(maximum) >> 23) & 255);
+  const float threshold = __uint_as_float((static_cast<unsigned>(biased) << 23) | 0x600000u);
+  const int exponent = max(-127, biased - 135 + (maximum > threshold));
+  const float inverse = __uint_as_float(static_cast<unsigned>(127 - exponent) << 23);
+  const uint16_t lo = __nv_cvt_float2_to_fp8x2(
+      make_float2(values[0] * inverse, values[1] * inverse), __NV_SATFINITE, __NV_E4M3);
+  const uint16_t hi = __nv_cvt_float2_to_fp8x2(
+      make_float2(values[2] * inverse, values[3] * inverse), __NV_SATFINITE, __NV_E4M3);
+  *reinterpret_cast<uint32_t*>(codes) =
+      static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+  if ((threadIdx.x & 7) == 0) *scale = static_cast<uint8_t>(exponent + 127);
+}
+
 template <typename Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
           bool WideWarps = false, int Stages = 3, bool StageScales = false,
-          bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false>
+          bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false,
+          bool Paired = false>
 __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const uint8_t* w_scales, Out* out,
     int m, int n, int k, size_t out_stride, const MoeSegment* segs, const MoeExpertView* views,
     int which, const int32_t* act_rows = nullptr, const MoeTile* tiles = nullptr,
-    const int32_t* tile_count = nullptr, int tile_capacity = 0) {
+    const int32_t* tile_count = nullptr, int tile_capacity = 0, uint8_t* output_scales = nullptr,
+    float limit = 0.f) {
   dgpp_pdl_wait();
   constexpr int kStages = Stages;
   constexpr int threads = Tile<BM, BN, WideWarps>::threads;
@@ -84,20 +119,27 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
   extern __shared__ __align__(16) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const int m_tiles = (m + BM - 1) / BM;
-  const int nt = (n + BN - 1) / BN;
+  // A paired CTA computes 64 gate and 64 up columns for the same rows.
+  constexpr int output_cols = Paired ? BN / 2 : BN;
+  static_assert(!Paired || (BN == 128 && SupportsViews && StageScales && PackedPipeline));
+  const int nt = (n + output_cols - 1) / output_cols;
   const int work = tiles ? int(blockIdx.x) / nt : 0;
   if (tiles && work >= *tile_count) return;
   const auto seg = segs[tiles ? tiles[work].seg : blockIdx.y];
   const int segment_tiles = (seg.rows + BM - 1) / BM;
   const int local = tiles ? (tiles[work].m0 / BM) * nt + int(blockIdx.x) % nt : 0;
   const int m0 = (tiles ? local % segment_tiles : int(blockIdx.x) % m_tiles) * BM;
-  const int n0 = (tiles ? local / segment_tiles : int(blockIdx.x) / m_tiles) * BN;
+  const int n0 = (tiles ? local / segment_tiles : int(blockIdx.x) / m_tiles) * output_cols;
   if (m0 >= seg.rows) return;
   m = seg.rows;
   const auto view = views[seg.expert * 3 + which];
   w = view.payload;
   w_scales = view.fp4_scales;
-  const bool prepared = SupportsViews && view.fp4_packed_rows;
+  const bool prepared = Paired || (SupportsViews && view.fp4_packed_rows);
+  // A resident pair uses the single prepared W13 slab and scale table.
+  auto physical_row = [&](int tile_row) {
+    return n0 + (Paired ? tile_row % output_cols + tile_row / output_cols * n : tile_row);
+  };
   auto weight_ptr = [&](int row, int code) -> const uint8_t* {
     if constexpr (SupportsViews) {
       if (view.fp4_chunks) {
@@ -136,9 +178,9 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
     if constexpr (StageScales) {
       for (int r = tid; r < BM + BN; r += threads) {
         const bool is_a = r < BM;
-        const int gr = is_a ? m0 + r : n0 + r - BM;
+        const int gr = is_a ? m0 + r : physical_row(r - BM);
         uint16_t pair = 0x7f7f;
-        if (gr < (is_a ? m : n)) {
+        if (gr < (is_a ? m : (Paired ? 2 * n : n))) {
           const int sr = is_a ? (act_rows ? act_rows[seg.row0 + gr] : seg.row0 + gr) : gr;
           const uint8_t* src =
               (is_a ? a_scales : w_scales) + size_t(sr) * scale_stride + step * (BK / 32);
@@ -168,9 +210,9 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
         if (prepared && !is_a) {
           // Each warp copies a contiguous N64/K16 slab, preserving its packed layout.
           const int slab = at / 32, nc = slab % (BN / 64), kc = slab / (BN / 64);
-          const int pn = n0 + nc * 64 + view.fp4_packed_row0;
+          const int pn = physical_row(nc * 64) + view.fp4_packed_row0;
           const int pk = step * BK + kc * 16;
-          const bool valid = n0 + nc * 64 < n && pk < k;
+          const bool valid = Paired || (n0 + nc * 64 < n && pk < k);
           const size_t word =
               (size_t(pk / 16) * (view.fp4_packed_rows / 64) + pn / 64) * 128 + (at % 32) * 4;
           copy16(smem + slot * slot_bytes + BM * stride + at * 16, valid ? w + word * 4 : w, valid);
@@ -345,52 +387,90 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
     // The next iteration's initial barrier also protects ring reuse.
     if constexpr (!(Schedule & kSingleBarrier)) __syncthreads();
   }
+  if constexpr (Paired) {
+    // The MMA fragments distribute each row across warps. Reuse the spent
+    // pipeline storage to join both halves and quantize complete K32 groups.
+    __syncthreads();
+    // Eight padding elements stagger MMA fragment rows across shared banks.
+    constexpr int pair_stride = BN + 8;
+    auto* pairs = reinterpret_cast<uint16_t*>(smem);
 #pragma unroll
-  for (int i = 0; i < MT; ++i)
+    for (int i = 0; i < MT; ++i)
 #pragma unroll
-    for (int j = 0; j < NT; ++j)
+      for (int j = 0; j < NT; ++j)
 #pragma unroll
-      for (int value = 0; value < 4; ++value) {
-        const int row = m0 + row_base + i * 16 + group + (value / 2) * 8;
-        const int column = n0 + col_base + j * 8 + part * 2 + value % 2;
-        if (row < m && column < n) {
-          if constexpr (std::is_same_v<Out, float>)
-            out[static_cast<size_t>(row) * out_stride + column] = accum[i][j][value];
-          else
-            out[static_cast<size_t>(row) * out_stride + column] =
-                __bfloat16_as_ushort(__float2bfloat16_rn(accum[i][j][value]));
+        for (int v = 0; v < 4; v += 2) {
+          const int row = row_base + i * 16 + group + (v / 2) * 8;
+          const int col = col_base + j * 8 + part * 2;
+          *reinterpret_cast<__nv_bfloat162*>(pairs + row * pair_stride + col) =
+              __floats2bfloat162_rn(accum[i][j][v], accum[i][j][v + 1]);
         }
-      }
+    __syncthreads();
+    const int rows = min(BM, m - m0);
+    for (int at = tid * 4; at < rows * output_cols; at += threads * 4) {
+      const int row = at / output_cols, col = at % output_cols;
+      const auto* g = pairs + row * pair_stride + col;
+      const size_t dest = size_t(m0 + row) * n + n0 + col;
+      float values[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        values[j] =
+            swiglu_bf16(bf16_bits_to_float(g[j]), bf16_bits_to_float(g[output_cols + j]), limit);
+      quantize_four(values, out + dest, output_scales + size_t(seg.row0) * (n / 32) + dest / 32);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+      for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int value = 0; value < 4; ++value) {
+          const int row = m0 + row_base + i * 16 + group + (value / 2) * 8;
+          const int column = n0 + col_base + j * 8 + part * 2 + value % 2;
+          if (row < m && column < n) {
+            if constexpr (std::is_same_v<Out, float>)
+              out[static_cast<size_t>(row) * out_stride + column] = accum[i][j][value];
+            else
+              out[static_cast<size_t>(row) * out_stride + column] =
+                  __bfloat16_as_ushort(__float2bfloat16_rn(accum[i][j][value]));
+          }
+        }
+  }
 }
 
 template <class Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
           bool WideWarps = false, int Stages = 3, bool StageScales = false,
-          bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false>
+          bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false,
+          bool Paired = false>
 void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts, int n, int k,
          cudaStream_t stream, const MoeSegment* segs, const MoeExpertView* views, int which,
          const int32_t* act_rows = nullptr, const MoeTile* tiles = nullptr,
-         const int32_t* tile_count = nullptr, int tile_capacity = 0, size_t output_stride = 0) {
+         const int32_t* tile_count = nullptr, int tile_capacity = 0, size_t output_stride = 0,
+         uint8_t* output_scales = nullptr, float limit = 0.f) {
   constexpr int smem = Stages * (BM * Tile<BM, BN, WideWarps>::stride +
                                  BN * (PackedPipeline ? Tile<BM, BN, WideWarps>::bk / 2 + 16
                                                       : Tile<BM, BN, WideWarps>::stride) +
                                  (StageScales ? (BM + BN) * 4 : 0));
+  static_assert(!Paired || smem >= BM * (BN + 8) * sizeof(uint16_t));
   if constexpr (smem > 48 * 1024) {
     static const bool opted = [] {
       DGPP_CUDA_OK(cudaFuncSetAttribute(
           mxfp8_gemm_kernel<Out, BM, BN, PackedPipeline, MatrixLoads, WideWarps, Stages,
-                            StageScales, ColumnScales, Schedule, SupportsViews>,
+                            StageScales, ColumnScales, Schedule, SupportsViews, Paired>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
       return true;
     }();
     (void)opted;
   }
-  dim3 grid(unsigned((tiles ? tile_capacity : (maxrows + BM - 1) / BM) * ((n + BN - 1) / BN)),
+  constexpr int output_cols = Paired ? BN / 2 : BN;
+  dim3 grid(unsigned((tiles ? tile_capacity : (maxrows + BM - 1) / BM) *
+                     ((n + output_cols - 1) / output_cols)),
             tiles ? 1u : unsigned(experts));
   mxfp8_gemm_kernel<Out, BM, BN, PackedPipeline, MatrixLoads, WideWarps, Stages, StageScales,
-                    ColumnScales, Schedule, SupportsViews>
+                    ColumnScales, Schedule, SupportsViews, Paired>
       <<<grid, Tile<BM, BN, WideWarps>::threads, smem, stream>>>(
           a, as, nullptr, nullptr, out, maxrows, n, k, output_stride ? output_stride : size_t(n),
-          segs, views, which, act_rows, tiles, tile_count, tile_capacity);
+          segs, views, which, act_rows, tiles, tile_count, tile_capacity, output_scales, limit);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace

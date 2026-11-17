@@ -26,7 +26,7 @@ struct Buffer {
 };
 int main() {
   try {
-    constexpr int H = 128, I = 128, C = 64, E = 2, R = 39, K = 128, S = 144;
+    constexpr int H = 128, I = 128, C = 64, E = 2, R = 169, K = 128, S = 144;
     constexpr size_t payload = H * I / 2, scales = H * I / 32;
     std::mt19937 rng(7162);
     std::vector<uint8_t> hw(E * 3 * payload), hs(E * 3 * scales);
@@ -132,6 +132,30 @@ int main() {
         throw std::runtime_error("fused SwiGLU quantization differs from the two-stage chain");
     }
     launch_mxfp8_quantize_rows(x.p, K, R, K, a.p, as.p, stream);
+    // Compare every output byte, including row gaps, against separate gate,
+    // up and activation kernels. Include a second M tile and the small-wave path.
+    Buffer<uint8_t> expected_codes(R * I), expected_scales(R * I / 32);
+    for (int rows : {137, 7}) {
+      hseg[1].rows = rows;
+      seg.write(hseg);
+      launch_moe_tile_list(seg.p, E, 64, tiles.p, count.p, stream);
+      for (auto* buf : {expected_codes.p, qa.p})
+        DGPP_CUDA_OK(cudaMemsetAsync(buf, 0xcc, R * I, stream));
+      for (auto* buf : {expected_scales.p, qas.p})
+        DGPP_CUDA_OK(cudaMemsetAsync(buf, 0xcc, R * I / 32, stream));
+      launch_moe_mxfp4_native_bf16(a.p, as.p, seg.p, E, rows, prepared.p, 0, activation.p, I, I, K,
+                                   stream, map.p);
+      launch_moe_mxfp4_native_bf16(a.p, as.p, seg.p, E, rows, prepared.p, 1, up.p, I, I, K, stream,
+                                   map.p);
+      launch_moe_mxfp8_swiglu_tiles(activation.p, up.p, 0.5f, I, I, expected_codes.p,
+                                    expected_scales.p, seg.p, tiles.p, count.p, stream);
+      launch_moe_mxfp4_packed_gate_up(a.p, as.p, seg.p, E, rows, prepared.p, I, K, map.p, 0.5f,
+                                      qa.p, qas.p, stream);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      if (qa.read(R * I) != expected_codes.read(R * I) ||
+          qas.read(R * I / 32) != expected_scales.read(R * I / 32))
+        throw std::runtime_error("paired gate/up differs from separate projections");
+    }
     for (int active_rows : {19, 7}) {
       hseg[1].rows = active_rows;
       seg.write(hseg);
@@ -160,16 +184,24 @@ int main() {
         }
       }
     }
+    Buffer<uint8_t> replay_codes(R * I), replay_scales(R * I / 32);
     cudaGraph_t graph;
     cudaGraphExec_t exec;
     DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     launch_moe_mxfp8_quantize_tiles(x.p, K, K, qa.p, qas.p, seg.p, tiles.p, count.p, stream);
+    DGPP_CUDA_OK(cudaMemsetAsync(replay_codes.p, 0xcc, R * I, stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(replay_scales.p, 0xcc, R * I / 32, stream));
+    launch_moe_mxfp4_packed_gate_up(a.p, as.p, seg.p, E, 7, prepared.p, I, K, map.p, 0.5f,
+                                    replay_codes.p, replay_scales.p, stream);
     launch_moe_mxfp4_native_f32(a.p, as.p, seg.p, E, 7, direct.p, 2, out.p, S, K, K, stream);
     DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
     DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, 0));
     DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
     DGPP_CUDA_OK(cudaStreamSynchronize(stream));
     if (out.read(R * S) != ref.read(R * S)) throw std::runtime_error("native graph mismatch");
+    if (replay_codes.read(R * I) != expected_codes.read(R * I) ||
+        replay_scales.read(R * I / 32) != expected_scales.read(R * I / 32))
+      throw std::runtime_error("paired gate/up graph mismatch");
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);

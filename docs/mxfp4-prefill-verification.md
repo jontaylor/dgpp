@@ -11,7 +11,11 @@ The 1 GiB prefix cache, one-million-token KV capacity and approximately
   down-input quantizer. Gate and up stay in BF16 through the same clamp and
   intermediate rounding steps. Each live K32 group writes MXFP8 codes and
   its E8M0 scale once. The shared expert retains its own activation. Mode 1
-  uses 96 CTAs and mode 2 uses 384.
+  uses 96 CTAs and mode 2 uses 384. Mode 3 computes 64 gate and 64 up
+  columns together from the resident packed W13 table. Its epilogue applies
+  the same BF16 rounding and emits the down-input codes and scales directly.
+  A wave containing canonical or chunk-direct weights uses mode 2. The
+  launcher determines eligibility from the leases it already holds.
 * `DGPP_CSA2_LISTED_PREFILL=1` scores the candidate blocks from layer 20
   directly against the paged keys at reindex layers 24, 28, 32 and 36.
   It includes the newest incomplete block. Above 32,768 visible entries

@@ -1266,11 +1266,12 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       upload_expert_views(d_views_prefill_, shared, stream, direct_prefill ? prepared_views.data() : nullptr);
       const int first_expert = resident_first ? first : active_experts[first];
       const int expert_span = resident_first ? end-first : active_experts[end-1] - first_expert + 1;
-      grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel,
-          hidden, d_segs_ + first_expert, expert_span, wave_max_rows,
-          shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
-          grouped_decode ? tk : rows_total, stream,
-          nullptr, nullptr, 0, end == n_segs && !early_shared, ready_groups ? -1 : activation_row, wave_rows);
+      grouped_expert_chain(grouped_decode ? MoeExpertKernel::kMma : kernel, hidden,
+                           d_segs_ + first_expert, expert_span, wave_max_rows,
+                           shared && !grouped_decode ? d_segs_ + E : nullptr, tokens,
+                           grouped_decode ? tk : rows_total, stream, nullptr, nullptr, 0,
+                           end == n_segs && !early_shared, ready_groups ? -1 : activation_row,
+                           wave_rows, direct_prefill && leases.empty());
       activation_row += wave_rows;
       cache->release_native_leases(native_leases);
       native_leases.clear();
@@ -1884,14 +1885,12 @@ size_t GlmMoeLayer::w4a4_scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
   return rows * (static_cast<size_t>(k) / 2 + nvfp4_act_scale_stride(k) + sizeof(float));
 }
 
-void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
-                                       const uint16_t* hidden,
-                                       const MoeSegment* segs, int n_segs,
-                                       int max_rows, const MoeSegment* shared_seg,
-                                       int tokens, size_t rows_total,
+void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel, const uint16_t* hidden,
+                                       const MoeSegment* segs, int n_segs, int max_rows,
+                                       const MoeSegment* shared_seg, int tokens, size_t rows_total,
                                        cudaStream_t stream, const MoeTile* tiles,
                                        const int32_t* tile_count, int tile_cap, bool execute_shared,
-                                       int activation_row, int activation_rows) {
+                                       int activation_row, int activation_rows, bool all_prepared) {
   const int H = static_cast<int>(cfg_.hidden);
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
@@ -1969,13 +1968,15 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   auto* native_down_scales = native_down + (native_scratch ? down_bytes : 0);
   const bool native_gate_on = native_mx && native_scratch && native_mode != 3;
   const bool native_down_on = native_mx && native_scratch && native_mode != 2;
-  static const int fuse_mx_blocks = [] {
-    const char* enabled = std::getenv("DGPP_MX_FUSED_ACTIVATION");
-    if (!enabled || std::getenv("DGPP_MOE_CHAIN_DUMP")) return 0;
-    if (enabled[0] == '2') return 384;
-    return enabled[0] == '1' ? 96 : 0;
+  static const int mx_activation_mode = [] {
+    const char* v = std::getenv("DGPP_MX_FUSED_ACTIVATION");
+    return v && !std::getenv("DGPP_MOE_CHAIN_DUMP") ? std::atoi(v) : 0;
   }();
-  const bool fused_mx = fuse_mx_blocks && native_down_on && w_.fp4_of(2) && !packq;
+  const int fuse_mx_blocks = mx_activation_mode == 1 ? 96 : 384;
+  const bool fused_mx = mx_activation_mode >= 1 && mx_activation_mode <= 3 && native_down_on &&
+                        w_.fp4_of(2) && !packq;
+  const bool mx_gate_up = mx_activation_mode == 3 && all_prepared && fused_mx && native_gate_on &&
+                          w_.fp4_of(0) && w_.fp4_of(1);
   if (native_gate_on && !native_hidden_ready_) {
     for (int first = 0; first < tokens; first += 65535) {
       const int count = std::min(65535, tokens - first);
@@ -1984,7 +1985,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     }
     native_hidden_ready_ = true;
   }
-  if (native_down_on && !fp4_tiles)
+  if (native_down_on && !fp4_tiles && !mx_gate_up)
     launch_moe_tile_list(segs, n_segs, 64, d_tiles_, d_tile_count_, stream);
 
   const bool w4a4 = fp4 && !packq && !w_.weight_only_fp4 && fp4_group == kFp4Group &&
@@ -2163,10 +2164,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
     else if (native_down_on && routed_arg && fp4_w) {
-      if (fused_mx)
+      if (!mx_gate_up && fused_mx)
         launch_moe_mxfp8_swiglu_tiles(d_gate_, d_up_, cfg_.swiglu_limit, I_max, k, native_down,
                                      native_down_scales, sg, d_tiles_, d_tile_count_, stream, fuse_mx_blocks);
-      else
+      else if (!mx_gate_up)
         launch_moe_mxfp8_quantize_tiles(d_act_, I_max, k, native_down, native_down_scales,
                                         sg, d_tiles_, d_tile_count_, stream);
       launch_moe_mxfp4_native_f32(native_down, native_down_scales, sg, ns, mr,
@@ -2190,14 +2191,18 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // default (2026-09-30, session P: level to +1 % on the fabric against
   // two launches — the activation re-gather is not what bounds the kernel).
   const bool paired = packq && mma && g_expert_gemm_pair && routed_bits == 4 && !a8;
-  if (paired)
+  if (mx_gate_up)
+    launch_moe_mxfp4_packed_gate_up(native_gate, native_gate_scales, segs, n_segs, max_rows,
+                                    d_views_prefill_, I_r, H, d_rows_, cfg_.swiglu_limit,
+                                    native_down, native_down_scales, stream);
+  else if (paired)
     launch_moe_grouped_mma_packq_bf16(routed_hidden, H, segs, n_segs, max_rows, d_views_prefill_, 0, d_gate_,
                                       I_max, I_r, H, routed_bits, stream, d_rows_, routed_sf, packq_variant,
                                       tiles, tile_count, tile_cap, d_up_, 1);
   else
     gemm_bf16(segs, n_segs, max_rows, 0, 0, d_gate_, I_r, true);
   if (shared_seg && execute_shared) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
-  if (!paired) gemm_bf16(segs, n_segs, max_rows, 0, 1, d_up_, I_r, true);
+  if (!paired && !mx_gate_up) gemm_bf16(segs, n_segs, max_rows, 0, 1, d_up_, I_r, true);
   if (shared_seg && execute_shared) gemm_bf16(shared_seg, 1, tokens, shared_split, 1, d_up_, I_s, false);
   // The down projection's activations to NVFP4 (routed rows; the shared
   // expert's rows, when present, sit past them and keep the bf16 path).

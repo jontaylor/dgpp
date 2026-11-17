@@ -297,14 +297,12 @@ class GlmMoeLayer {
   // `tiles` (with its device count and host capacity): the compact tile
   // list of the routed segments for the wide packed kernel
   // (launch_moe_tile_list; null = the segment-major grid over max_rows).
-  void grouped_expert_chain(MoeExpertKernel kernel, const uint16_t* hidden,
-                            const MoeSegment* segs, int n_segs, int max_rows,
-                            const MoeSegment* shared_seg, int tokens,
-                            size_t rows_total, cudaStream_t stream,
-                            const MoeTile* tiles = nullptr,
+  void grouped_expert_chain(MoeExpertKernel kernel, const uint16_t* hidden, const MoeSegment* segs,
+                            int n_segs, int max_rows, const MoeSegment* shared_seg, int tokens,
+                            size_t rows_total, cudaStream_t stream, const MoeTile* tiles = nullptr,
                             const int32_t* tile_count = nullptr, int tile_cap = 0,
-                            bool execute_shared = true,
-                            int activation_row = 0, int activation_rows = -1);
+                            bool execute_shared = true, int activation_row = 0,
+                            int activation_rows = -1, bool all_prepared = false);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;
