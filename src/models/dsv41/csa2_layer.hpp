@@ -267,8 +267,8 @@ class Csa2Layer {
   void attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, const uint8_t* win_cache, int win_block_tokens,
                    const int32_t* win_table, const int32_t* req_ids_main, const int64_t* pos, int row0, int rows,
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
-                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false);
-  void project_out(int tokens, void* out, cudaStream_t stream);
+                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false, uint8_t* mx_out = nullptr);
+  void project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out = nullptr);
   void validate_pool(const Csa2StatePool& pool) const;
 
   // The decode windows (see set_prefetcher): opened where the chain is

@@ -505,7 +505,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
                             int win_block_tokens, const int32_t* win_table, const int32_t* req_ids_main,
                             const int64_t* pos, int row0, int rows, int n_split_main, cudaStream_t stream,
                             const int32_t* list, int list_stride, const int32_t* counts, bool split_window,
-                            int sel_base, bool flash_window) {
+                            int sel_base, bool flash_window, uint8_t* mx_out) {
   const int lh = cfg_.local_heads();
   if (rows > ws_win_rows_ || rows * n_split_main > ws_slots_) throw std::logic_error("csa2 layer: attention tile too wide");
   const uint16_t* q = q_ + size_t(row0) * lh * kCsa2Latent;
@@ -618,10 +618,10 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   }
   csa2_attn_finish(n_main_pub ? m_main_pub : nullptr, n_main_pub ? l_main_pub : nullptr,
                    n_main_pub ? c_main_pub : nullptr, n_main_pub, m_win_pub, l_win_pub, c_win_pub, n_win_pub,
-                   w_.attn_sink, rows, lh, pos, w_.inv_freq, o_ + size_t(row0) * lh * kCsa2Latent, stream);
+                   w_.attn_sink, rows, lh, pos, w_.inv_freq, o_ + size_t(row0) * lh * kCsa2Latent, stream, mx_out);
 }
 
-void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
+void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out) {
   const int lh = cfg_.local_heads(), lg = cfg_.local_groups(), hpg = cfg_.heads_per_group();
   const int K = hpg * kCsa2Latent;
   // wo_a is block-diagonal over the groups: group g projects its own heads.
@@ -641,7 +641,14 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
   const bool paired = (lg == 2 || lg == 4) && cfg_.dense_mma && !prefill_tile_ &&
                       mma_gemv_pair_ok(w_.wo_a.payload, w_.wo_a.payload + row_off1 * K, o_, o_ + K, act_stride, tokens,
                                        cfg_.o_lora, cfg_.o_lora, K, gemm_ws_, gemm_ws_bytes_);
-  if (paired) {
+  if (mx_out) {
+    static const bool announced = [] {
+      DGPP_LOG_INFO("DSV4.1 decode: fused attention MXFP8 output and grouped wo_a");
+      return true;
+    }();
+    (void)announced;
+    launch_mxfp8_woa_decode(mx_out, w_.wo_a.payload, w_.wo_a.scales, oa_, tokens, lg, cfg_.o_lora, K, stream);
+  } else if (paired) {
     for (int g = 0; g < lg; g += 2) {
       const uint16_t* input = o_ + size_t(g) * K;
       uint16_t* output = oa_ + g * row_off1;
@@ -808,9 +815,18 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
       require_shape(sel_at(0), shape, "the selection");
     }
   }
+  static const bool native_woa = [] {
+    const char* flag = std::getenv("DGPP_DSV41_MX_WOA_DECODE");
+    return flag && std::strcmp(flag, "1") == 0;
+  }();
+  const size_t values = size_t(tokens) * lh * kCsa2Latent;
+  uint8_t* mx_out = nullptr;
+  if (native_woa && !w_.exl3() && cfg_.dense_mma && tokens <= 8 && cfg_.local_groups() == 4 &&
+      cfg_.o_lora == 1024 && cfg_.heads_per_group() == 8 && gemm_ws_bytes_ >= values + values / 32)
+    mx_out = static_cast<uint8_t*>(gemm_ws_);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table(), req_ids, pos, 0, tokens,
-              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true);
-  project_out(tokens, out, stream);
+              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out);
+  project_out(tokens, out, stream, mx_out);
 }
 
 // ---- the DSpark draft --------------------------------------------------------------------------------

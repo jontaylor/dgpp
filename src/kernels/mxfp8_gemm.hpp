@@ -5,6 +5,12 @@
 #include <cuda_runtime.h>
 
 namespace dgpp {
+// Fused attention-finish layout: contiguous [rows,groups,k] codes then their K32 scales.
+// Weight [groups,n,k] has one expanded E8M0 scale per 32x32 block.
+// Supports 1..8 decode rows, k=4096 and n divisible by 32.
+void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const float* ws,
+                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t);
+
 // Dynamic MXFP8: BF16 [rows,k] -> E4M3 [rows,k], E8M0 [rows,k/32].
 // Each 32-value group's scale is ceil-rounded to a power of two, matching
 // the pinned SGLang MiniMax producer. x_stride is in BF16 elements.

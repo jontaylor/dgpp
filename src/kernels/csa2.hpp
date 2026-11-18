@@ -283,10 +283,11 @@ void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride,
 // rotation from the last 64 of every head (the reference's inverse
 // apply_rotary_emb on the bf16 output). out: bf16 [rows, local_heads *
 // 512]; padding rows (pos < 0) are zero.
+// Optional MX buffer receives one E4M3 byte per output followed by one E8M0 byte per 32.
 void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_main,
                       int n_main, const float* m_win, const float* l_win, const float* c_win,
                       int n_win, const float* sink, int rows, int local_heads,
                       const int64_t* pos, const float* inv_freq, void* out,
-                      cudaStream_t stream);
+                      cudaStream_t stream, uint8_t* mx_codes = nullptr);
 
 }  // namespace dgpp

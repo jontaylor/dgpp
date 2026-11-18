@@ -1,4 +1,5 @@
 #include "kernels/csa2.hpp"
+#include "kernels/mxfp8_quant.cuh"
 #include "kernels/pdl.cuh"
 
 #include <cuda_bf16.h>
@@ -976,10 +977,11 @@ __global__ void select_candidates_prefill_kernel(const float* logits, int64_t lo
 // the sums are the full loops' bit for bit.
 constexpr int kFinishMaxSplits = 128;
 constexpr int kFinishBatch = 8;
+template <bool Quantize>
 __global__ void attn_finish_kernel(const float* m_main, const float* l_main, const float* c_main,
                                    int n_main, const float* m_win, const float* l_win, const float* c_win,
                                    int n_win, const float* sink, int local_heads, const int64_t* pos,
-                                   const float* inv_freq, uint16_t* out) {
+                                   const float* inv_freq, uint16_t* out, uint8_t* codes) {
   dgpp_pdl_wait();
   __shared__ float o[kCsa2Latent];
   __shared__ float s_w[kFinishMaxSplits];          // exp(m - mhat) of the live splits, in order
@@ -990,9 +992,16 @@ __global__ void attn_finish_kernel(const float* m_main, const float* l_main, con
   __shared__ int s_live;
   const int r = blockIdx.x, h = blockIdx.y;
   uint16_t* orow = out + (int64_t(r) * local_heads + h) * kCsa2Latent;
+  const size_t offset = (size_t(r) * local_heads + h) * kCsa2Latent + threadIdx.x * 4;
+  uint8_t* scales = nullptr;
+  if constexpr (Quantize) scales = codes + size_t(gridDim.x) * local_heads * kCsa2Latent;
   const int64_t p = pos[r];
   if (p < 0) {
     for (int d = threadIdx.x; d < kCsa2Latent; d += blockDim.x) orow[d] = 0;
+    if constexpr (Quantize) {
+      float zeros[4]{};
+      mxfp8_quantize_four(zeros, 1e-4f, codes + offset, scales + offset / 32);
+    }
     return;
   }
   const int64_t total = int64_t(local_heads) * kCsa2Latent;
@@ -1058,15 +1067,36 @@ __global__ void attn_finish_kernel(const float* m_main, const float* l_main, con
     for (int e = 0; e < 4; ++e) o[d0 + e] = bf16_bits_to_float(float_to_bf16_bits(empty ? 0.0f : num[e] / den));
   }
   __syncthreads();
-  for (int d = threadIdx.x; d < kCsa2Latent - kCsa2Rope; d += blockDim.x) orow[d] = float_to_bf16_bits(o[d]);
+  if constexpr (!Quantize) {
+    for (int d = threadIdx.x; d < kCsa2Latent - kCsa2Rope; d += blockDim.x)
+      orow[d] = float_to_bf16_bits(o[d]);
+  }
   if (threadIdx.x < kCsa2Rope / 2) {
     const int i = threadIdx.x;
     const int d0 = kCsa2Latent - kCsa2Rope + 2 * i;
     const float ang = __fmul_rn(float(p), inv_freq[i]);
     const float c = cosf(ang), s = -sinf(ang);  // the conjugate
     const float x0 = o[d0], x1 = o[d0 + 1];
-    orow[d0] = float_to_bf16_bits(x0 * c - x1 * s);
-    orow[d0 + 1] = float_to_bf16_bits(x1 * c + x0 * s);
+    const uint16_t a = float_to_bf16_bits(x0 * c - x1 * s);
+    const uint16_t b = float_to_bf16_bits(x1 * c + x0 * s);
+    if constexpr (Quantize) {
+      o[d0] = bf16_bits_to_float(a);
+      o[d0 + 1] = bf16_bits_to_float(b);
+    } else {
+      orow[d0] = a;
+      orow[d0 + 1] = b;
+    }
+  }
+  if constexpr (Quantize) {
+    __syncthreads();
+    const int d = threadIdx.x * 4;
+    float values[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      values[i] = o[d + i];
+      orow[d + i] = float_to_bf16_bits(values[i]);  // preserve the attention output probe
+    }
+    mxfp8_quantize_four(values, 1e-4f, codes + offset, scales + offset / 32);
   }
 }
 
@@ -1398,7 +1428,7 @@ void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride, 
 void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_main, int n_main,
                       const float* m_win, const float* l_win, const float* c_win, int n_win,
                       const float* sink, int rows, int local_heads, const int64_t* pos,
-                      const float* inv_freq, void* out, cudaStream_t stream) {
+                      const float* inv_freq, void* out, cudaStream_t stream, uint8_t* mx_codes) {
   if (rows <= 0) return;
   if (local_heads <= 0 || n_main < 0 || n_win < 0 || (n_main > 0 && (m_main == nullptr || c_main == nullptr)) ||
       (n_win > 0 && (m_win == nullptr || c_win == nullptr)))
@@ -1406,9 +1436,13 @@ void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_m
   if (n_main + n_win > kFinishMaxSplits) throw std::invalid_argument("csa2_attn_finish: more splits than the kernel stages");
   if ((n_main > 0 && reinterpret_cast<uintptr_t>(c_main) % 16 != 0) || (n_win > 0 && reinterpret_cast<uintptr_t>(c_win) % 16 != 0))
     throw std::invalid_argument("csa2_attn_finish: the partial rows are read as 16-byte vectors");
-  attn_finish_kernel<<<dim3(unsigned(rows), unsigned(local_heads)), 128, 0, stream>>>(
-      m_main, l_main, c_main, n_main, m_win, l_win, c_win, n_win, sink, local_heads, pos, inv_freq,
-      static_cast<uint16_t*>(out));
+  auto launch = [&]<bool Quantize>() {
+    attn_finish_kernel<Quantize><<<dim3(unsigned(rows), unsigned(local_heads)), 128, 0, stream>>>(
+        m_main, l_main, c_main, n_main, m_win, l_win, c_win, n_win, sink, local_heads, pos, inv_freq,
+        static_cast<uint16_t*>(out), mx_codes);
+  };
+  if (mx_codes) launch.template operator()<true>();
+  else launch.template operator()<false>();
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
