@@ -704,3 +704,74 @@ and finish reasons matched across layouts, excluding generated tool-call IDs.
 Both ranks had zero sampled process swap and matching operation streams
 within every boot. Each configuration had one cold start. Differences below
 one percent in this short C1 comparison have no established error bound.
+
+## FP8 attention output into the TP2 verification projection
+
+`DGPP_DSV41_MX_WOA_DECODE=1` lets the target attention finish emit E4M3
+codes with one E8M0 scale per 32 channels. Normalization, the BF16 rounding
+before inverse rotation, and the BF16 rounding of the rotated pairs precede
+quantization. The scale uses DeepSeek's minimum absolute maximum of 0.0001.
+The producer also preserves the original BF16 attention output for diagnostics.
+The grouped `wo_a` projection reads the codes directly from the existing GEMM
+workspace along with the checkpoint's FP8 weights and expanded grid scales.
+Its matrix multiply accumulates in FP32 and emits BF16 for `wo_b`.
+[DeepSeek reference attention](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/08c8657f02291e11b6f6b63e0e16014f8e748518/inference/model.py#L781-L791)
+
+The dispatch covers one through eight target decode rows, four local groups,
+4,096 input channels and 1,024 output channels per group. Two warps stream
+opposite halves of K for the same 16 output channels. The block double-buffers
+512-byte weight-row windows and prefetches the next window into L2. The 256
+blocks cover all four groups in one launch. No additional expert-cache or
+persistent weight allocation is required. Prefill and the draft block use
+their existing projections.
+
+`dsv41_verify_dense_bench --woa-handoff` times attention finish plus all four
+groups in both CUDA graphs, rotating the weight working set beyond L2.
+It checks the emitted codes and scales against a CPU implementation, including
+inverse rotation and padding, and checks the projection against an FP64 sum
+of the decoded operands. The final four-row replay measured 93.14 µs for
+the paired BF16-input path and 81.93 µs for native FP8. FP8 won all 12
+alternating pairs. The median paired reduction was 9.06%. The normalized
+projection error against the quantized reference was 0.001725, including
+rounding the output to BF16.
+
+A same-binary, concurrency-one serving diagnostic toggled only this path on
+the packed-scale MXFP4 TP2 deployment. Both arms enabled the per-pass DSpark
+timer. The directory and short-code follow-ups attached 24,320 tokens of
+prefix and used seven zero-expert-read repetitions per arm. The 256-token
+probes attached 24,448 and used four repetitions. Both ranks reported zero
+process swap and had matching operation streams within each arm.
+
+| Warm workload | Mean verify ms/pass, BF16 → FP8 | Accepted predictions/pass, BF16 → FP8 | Median engine decode tok/s, BF16 → FP8 |
+|---|---:|---:|---:|
+| Directory result | 58.25 → 58.05 | 2.83 → 2.83 | 57.93 → 57.97 |
+| Complete Python clamp | 59.77 → 59.10 | 3.00 → 3.00 | 59.73 → 59.96 |
+| Prose, 256-token cap | 58.25 → 58.00 | 1.74 → 1.75 | 42.09 → 42.23 |
+| Code review, 256-token cap | 58.76 → 58.02 | 1.78 → 1.93 | 42.21 → 45.11 |
+
+The two short tasks produced identical greedy answers, and the clamp passed
+tests for interior, exterior and boundary values. The longer continuations
+changed. Code review used 87 speculative passes with FP8 and 92 with BF16.
+Both four- and six-row passes occur when the lookup draft extends a proposal.
+The measured sub-percent throughput differences on the short tasks have
+between-start uncertainty. The measured binary used source base `c183bb16` with the FP8 handoff later committed in `7194602d`,
+binary SHA-256 `f20207e86fcd34286d9dabe6374f11433429ece62c3cd82363223c9a561c324e`.
+
+For a completed bounded-LRU implementation, the original projection generated
+502 tokens and took 10.80 s of decode. FP8 generated 658 tokens and took
+14.14 s. Both implementations passed checks for hit promotion, eviction,
+falsy values and a loader exception. These requests attached 24,448 prefix
+tokens and incurred zero expert-file reads on either rank. Mean target
+verification fell from 58.90 to 57.91 ms/pass. Producing the longer answer
+took 218 passes compared with the original 164.
+
+Raising the code-review output cap to 4,096 let both arms finish and pass
+executable checks for cache hits, loader calls, falsy values and the
+capacity bound. Across three repeat requests per arm with 24,448 prefix
+tokens attached, median engine decode was 42.22 s for BF16 (1,691 tokens,
+40.03 tok/s) and 53.73 s for FP8 (2,150 tokens, 39.99 tok/s). Reasoning
+accounted for 422 of the 459 extra tokens. Median expert-file reads were
+11.53 and 14.02 GiB per rank, respectively. On these two completed coding
+tasks the prior BF16-input projection returned passing work sooner. The
+two-Spark serving configuration keeps it selected. Native FP8 verification
+remains available for workloads that benefit from it.
