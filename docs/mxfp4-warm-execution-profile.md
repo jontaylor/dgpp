@@ -176,3 +176,97 @@ proposals is claimed by this profiling pass.
 
 The first three follow-up changes and their focused serving screens are
 described in [MXFP4 execution optimizations](mxfp4-execution-optimizations.md).
+
+## Where a paged decode round waits on the two Sparks
+
+On the 18 November MXFP4 deployment the engine keeps the DSpark draft experts
+resident. It feeds the pending token and three proposals to the target in one
+pass. A matching history continuation can supply two further proposals. All
+608 target passes in the long-tool diagnostic below had four rows and six
+routed assignments per row per layer.
+
+| Stage | Data movement and dependency |
+| --- | --- |
+| Prepare the round | DSpark consumes accepted hidden state and token IDs. The engine assembles the proposed IDs and positions. The GPU gathers embeddings and computes Engram row IDs. A side-stream CPU callback gathers the rows from each rank's local Engram block cache or backing file into mapped staging. Only the two Engram consumers need their tables ready. |
+| Attention | Each rank reads its resident projections and its attention cache, writes new positions and computes its attention output shard. The selected FP8 path packs the attention result for the output projection. The ranks reduce the partial output before the residual update and FFN input normalization. |
+| Shared expert and routing | Both need the same normalized input. The graph forks the shared FP8 expert before top-six routing and writes its contribution into separate FP32 slots. A single GPU block tests the routed IDs against the layer's published native bindings. On a hit it groups just the live assignments and pads each group to eight. The b12x kernel consumes the layer's bindings directly. |
+| Expert miss | The GPU publishes exact IDs in a mapped mailbox. The CPU primes local SSD reads, issues the resident subset and schedules ready misses using the service stream. The rank-local MXFP4 shard occupies 9 MiB on disk. Native binding changes are tracked by layer so the host rebuilds only affected tables. The gate must see completed expert outputs and valid bindings before the main stream can consume them. |
+| Combine and communicate | Routed weights stay packed through the b12x input. The kernel takes BF16 activations and writes unweighted FP32 output slots. After the shared lane joins, the GPU accumulates the slots once in routing order, then the ranks reduce their FFN contributions. The next layer depends on this residual update. Both Sparks work on the same expert IDs using their own weight shards. |
+| Verify and commit | The vocabulary-sharded head scores the rows. The engine obtains each rank's local candidates, applies any grammar constraint, exchanges winners and accepts the matching prefix. It restores the accepted position, retains the accepted hidden state and starts the next draft. These host decisions occur once per speculative round. |
+
+Previously the graph and miss service both ran the shared expert on a serviced
+layer. Each had access to the same input and weights. Giving the graph sole
+ownership also allows its shared work to overlap routing and SSD service.
+Using the published bindings directly removes a copy of 18 KiB at each layer,
+or 720 KiB per rank per 40-layer pass. These are logical pointer-copy bytes.
+
+A 24,292-token uncached tool call and six tool-enabled prose/code follow-ups
+exercised 24,320 target layers per rank. On rank zero, 22,845 layers read zero
+expert shards, 1,225 read one, and 250 read two or more. Mean GPU layer spans
+include routing, computation, communication and any exposed service delay.
+
+| Rank-zero mean layer time | Original | Shared expert once | Also fuse route packet | Also skip unchanged layer scans |
+| --- | ---: | ---: | ---: | ---: |
+| Zero expert reads | 1.404 ms | 1.384 ms | 1.370 ms | 1.369 ms |
+| One expert read | 4.205 ms | 4.124 ms | 4.080 ms | 3.961 ms |
+| Two or more reads | 6.853 ms | 6.797 ms | 6.801 ms | 6.723 ms |
+
+The per-pass GPU timestamps locate 13.84 GiB of expert demand per rank in
+the target verification of the first prose and code follow-ups. Including
+their uncached prompt tails brings the two requests to 22.46 GiB per rank.
+A zero-read layer can still require host service to prepare a resident
+expert's native layout.
+
+### Uninstrumented serving comparison
+
+The last change submits binding transfers immediately behind miss kernels,
+then waits once for both before releasing the graph. Each pass also reuses its
+host hit-accounting buffer and clears only the request flag in each mailbox.
+The production control was built at `1165a662` (SHA-256
+`d697f037cbb5bab6be8da49d70a1f27197957a874b4289015dc414fca201e98f`).
+The selected binary was built from the source committed as `cc20721e`
+(SHA-256 `f606b6210dbf5d86646ee2cc5ce2dd6ff2a7017f1847f0b98d2f967a31c9dd6f`).
+
+Each binary ran the same seven C1 requests on two independent process starts.
+The ranges below are the two observed results. Every start matched the
+generated tokens, tool arguments, finish reasons, accepted predictions,
+round counts, expert read bytes on each rank and rank operation streams.
+The code continuation reached its 320-token cap on every arm. Each serving
+rank had zero process swap. This focused decode comparison used the existing
+11,524-expert pool and fixed DSpark depth three with lookup tail two.
+
+| C1 engine decode | Control tok/s | Selected tok/s | Control ms/round | Selected ms/round |
+| --- | ---: | ---: | ---: | ---: |
+| First prose and code follow-ups, with expert reads | 30.91–30.96 | 31.91–32.07 | 88.80–88.93 | 85.71–86.15 |
+| Last three follow-ups, zero expert reads | 42.53–42.57 | 43.58–43.61 | 64.37–64.43 | 62.84–62.89 |
+| All seven responses, including the tool call | 37.67–37.72 | 38.73–38.78 | 73.44–73.53 | 71.42–71.51 |
+
+Throughput divides tokens produced during decode by total engine decode
+time across the indicated requests. Cold prefill of the tool prompt took
+36.97–36.98 s on the control and 37.03–37.07 s on the selected binary.
+
+### GPU activity and weight traffic
+
+A separate two-rank Nsight Systems capture sampled the `gb20b` hardware
+metrics at 2 kHz. A Rust continuation ran three times with identical output.
+Its first request read 5.06 GiB of expert records per rank and the two repeats
+read zero. Sampling excluded the first and last 300 ms of each engine decode
+window. On the selected binary the graphics/compute engine was active
+98–99% of the time across those windows. On the first request the SM activity
+counter fell below 10% in 11.8% of samples on Spark 1 and 12.7% on Spark 2.
+On the read-free repeats the corresponding ranges were 0.65–0.68% and
+0.93–1.03%. A waiting demand kernel can keep the engine active while most
+SMs have no work. The control exhibited the same pattern. Sampling affected
+latency, so the throughput comparison above uses independent unprofiled runs.
+
+This counter set provides SM, issue, tensor and copy-engine activity. It
+omits physical DRAM throughput. The warm 320-token code response gives a
+separate estimate of the routed weights consumed. A matched one-token request
+with the same cached prefix and 26 uncached prompt tokens isolated prefill
+expert counts. Both requests were read-free. The remaining 78,860 distinct
+(layer, expert) visits counted across 117 target passes represent 6.15 GB of
+packed expert weights per pass per rank, or **98.1 GB/s per Spark** over the
+7.334 seconds of engine decode. This counts the 9,123,840-byte packed codes
+and scales once per selected expert per layer invocation. Cache reuse,
+physical rereads, attention, dense projections, the draft and other traffic
+all affect the memory controller's actual byte count.
