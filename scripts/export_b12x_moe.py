@@ -58,8 +58,8 @@ for method in cls.body:
   # stages eight bytes and the MMA consumer expands a word in registers.
   a = 'Int32(self.sh_s_off) + pipe * Int32(self.s_sh_stage) + tid,'
   b = 'Int32(self.sh_s_off) + pipe * Int32(self.s_sh_stage),'
-  begin = old.index('                s_src_int4 = scales_expert_off')
-  prefix, tail = old[:begin], old[begin:]
+  scale_start = old.index('                s_src_int4 = scales_expert_off')
+  prefix, tail = old[:scale_start], old[scale_start:]
   if tail.count('cp_async4_shared_global(') != 2 or tail.count(a) != 1:
    raise RuntimeError("unsupported b12x scale staging")
   tail = tail.replace(a, b).replace('                if cutlass.const_expr(self.has_logical_tail):',
@@ -125,7 +125,13 @@ for method in cls.body:
   new=prefix+old
  if new!=old:edits.append((begin-start,end-start,new))
 for a,b,new in sorted(edits,reverse=True):body[a:b]=[new]
-path=args.output / 'raw_fp32_kernel_class.py';path.write_text(''.join(body)+'\n')
+path=args.output / 'raw_fp32_kernel_class.py'
+path.write_text(''.join(body)+'\n')
+if nibble_scales:
+ generated = ast.parse(path.read_text()).body[0]
+ stage = next(n for n in generated.body if getattr(n, 'name', '') == '_stage_k_tile_async')
+ if 'cp_async_u64_shared_global' not in ast.unparse(stage).split('s_src_int4 = scales_expert_off')[-1]:
+  raise RuntimeError("packed MX staging was not installed in the exported method")
 exec(compile(path.read_text(),str(path),'exec'),kernel.__dict__)
 fun=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='compile_w4a16_fused_moe')
 body=''.join(lines[fun.lineno-1:fun.end_lineno])
