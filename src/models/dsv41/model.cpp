@@ -44,6 +44,8 @@ struct Dsv41Model::PagedGraphs {
     const float* route_weights = nullptr;
   };
   std::map<std::array<uint64_t, 7>, Graph> graphs;
+  static constexpr size_t max_target_graphs = 8;
+  std::map<std::pair<int, int>, Graph> draft_graphs;
   cudaStream_t service = nullptr;
   cudaEvent_t done = nullptr;
   ExpertDemand* demands = nullptr;
@@ -83,6 +85,7 @@ struct Dsv41Model::PagedGraphs {
   ~PagedGraphs() {
     if (service) (void)cudaStreamSynchronize(service);
     for (auto& [key,g] : graphs) if (g.exec) (void)cudaGraphExecDestroy(g.exec);
+    for (auto& [key,g] : draft_graphs) if (g.exec) (void)cudaGraphExecDestroy(g.exec);
     if (tables) (void)cudaFree(tables);
     if (host_tables) (void)cudaFreeHost(host_tables);
     if (demands) (void)cudaFreeHost(demands);
@@ -423,6 +426,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // A/B switch: the two forms are tolerance-equal, not bitwise, and a
   // request's rows must meet the same form batched and alone).
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
+  if (const char* value = std::getenv("DGPP_DSV41_PAGED_DRAFT_GRAPH"))
+    resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
   gemm_.set_decode_mma(dense_mma_);
@@ -870,7 +875,9 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   else csa2_->set_decode_side(nullptr, nullptr, nullptr);
   if (cfg_.is_draft(r.layer)) {
     if (!draft_moe_) {
-      const int slots = loader_.residency() == Dsv41Residency::Resident && !expert_cache_ ? cfg_.num_nextn_predict_layers : 0;
+      const bool tables = loader_.residency() == Dsv41Residency::Resident &&
+                          (!expert_cache_ || resident_draft_graphs_);
+      const int slots = tables ? cfg_.num_nextn_predict_layers : 0;
       draft_moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), draft_moe_cfg_, max_tokens_, max_decode_rows_, slots);
     } else {
       draft_moe_->rebind(moe_view(r.moe));
@@ -1072,6 +1079,12 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
     draft_chain_row(req, tokens, capture, head_rows, batch_requests);
     return;
   }
+  // The accepted positions and token IDs already live in the session's
+  // device input buffers. Reuse the resident first-block walk at this width.
+  if (resident_draft_graphs_ && paged_graphs_ && decode_row && !capture &&
+      batch_requests == 0 && head_rows == 1 && tokens == d_tokens_ &&
+      !std::getenv("DGPP_DSV41_CAPTURE_DRAFT") && !debug_teacher_ && !debug_capture_ &&
+      enqueue_resident_draft_graph(req, T)) return;
   const int64_t* d_pos = d_step_pos_;
   const int32_t* d_req = d_req_ids_;
   if (!decode_row) {
@@ -1092,7 +1105,8 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
 }
 
 void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T,
-                             bool decode_row, bool capture, int head_rows, int batch_requests, int source_row) {
+                             bool decode_row, bool capture, int head_rows, int batch_requests, int source_row,
+                             bool use_draft_tables) {
   const int H = cfg_.hidden_size;
   const int W = targets_ * H;
   const int block = cfg_.dspark_block_size;
@@ -1163,7 +1177,7 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   wr.capture = capture;
   for (int s = 0; s < stages; ++s) {
     const Dsv41LayerResident& r = loader_.load_layer(cfg_.num_hidden_layers + s);
-    wr.moe_table_slot = capture ? s : -1;
+    wr.moe_table_slot = (capture || use_draft_tables) ? s : -1;
     if (!csa2_->prepare(rows)) throw std::runtime_error("mtp_run_rows: CSA2 GEMM plans unavailable");
     enqueue_layer(r, cfg_.num_hidden_layers + s, rows, wr);
   }
@@ -1191,6 +1205,56 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   if (decode_row && (!capture || decode_tail_mirrors_) && head_rows <= max_decode_rows_)
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, static_cast<size_t>(head_rows) * lm_vocab_count_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream_));
+}
+
+bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows) {
+  auto& p = *paged_graphs_;
+  const auto key = std::pair{req, accepted_rows};
+  auto it = p.draft_graphs.find(key);
+  if (it == p.draft_graphs.end()) {
+    if (p.draft_graphs.size() >= PagedGraphs::max_target_graphs) return false;
+    for (int s = 0; s < cfg_.num_nextn_predict_layers; ++s) {
+      build_layer_objects(loader_.load_layer(cfg_.num_hidden_layers + s));
+      if (!csa2_->prepare(cfg_.dspark_block_size)) throw std::runtime_error("draft graph: CSA2 plans unavailable");
+      draft_moe_->prepare_graph_table(s, stream_);
+    }
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    it = p.draft_graphs.try_emplace(key).first;
+    auto& g = it->second;
+    g.variant = static_cast<int>(PagedGraphs::max_target_graphs + p.draft_graphs.size() - 1);
+    cudaGraph_t graph = nullptr;
+    bool recording = false, capturing = false;
+    try {
+      if (boundary_) { boundary_->graph_segment_begin(g.variant); recording = true; }
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+      capturing = true;
+      // The segment reducer operates in place on model buffers. The ordinary
+      // outer capture requires staged buffers from a different reducer.
+      draft_first(req, d_tokens_, d_step_pos_, d_req_ids_, accepted_rows, true, false, 1, 0, 0, true);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
+      if (boundary_) { boundary_->graph_segment_end(); recording = false; }
+      DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
+      g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
+      DGPP_LOG_INFO("dsv41 GPU paging: captured resident draft graph {}, slot={}, accepted rows={}",
+                    g.variant, req, accepted_rows);
+    } catch (...) {
+      if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
+      if (recording) { try { boundary_->graph_segment_end(); } catch (...) {} }
+      prefetch_.discard_window();
+      if (graph) (void)cudaGraphDestroy(graph);
+      if (g.exec) (void)cudaGraphExecDestroy(g.exec);
+      p.draft_graphs.erase(it);
+      throw;
+    }
+  }
+  const auto& g = it->second;
+  if (boundary_) boundary_->graph_segment_arm(g.variant);
+  DGPP_CUDA_OK(cudaGraphLaunch(g.exec, stream_));
+  if (boundary_) boundary_->graph_segment_finish();
+  cur_ = g.cur; nxt_ = g.next; pre_cur_ = g.pre; pre_nxt_ = g.pre_next;
+  draft_row_ = 1;
+  return true;
 }
 
 void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, int head_rows, int batch_requests) {
@@ -1884,7 +1948,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   auto it = p.graphs.find(key);
   // Bound graph executable memory. Uncached uncommon shapes retain the
   // ordinary eager path; live request IDs/positions remain device inputs.
-  if (it == p.graphs.end() && p.graphs.size() >= 8) return false;
+  if (it == p.graphs.end() && p.graphs.size() >= PagedGraphs::max_target_graphs) return false;
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   if (boundary_) boundary_->settle();
   if (it == p.graphs.end()) {

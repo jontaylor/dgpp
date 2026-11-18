@@ -345,6 +345,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   struct PagedGraphs;
   std::unique_ptr<PagedGraphs> paged_graphs_;
   bool paged_graph_capture_ = false;
+  bool resident_draft_graphs_ = false;
+  bool enqueue_resident_draft_graph(int req, int accepted_rows);
   bool enqueue_paged_graph(int T, const WalkRows& rows);
   void mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode,
                 int decode_prefix = 0);
@@ -408,7 +410,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // The DSpark pieces (mtp): the first draft call of a step (the rings, the
   // block, base_logits_, row 0) and a chain row (block row draft_row_).
   void draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T, bool decode_row,
-                   bool capture, int head_rows, int batch_requests, int source_row = 0);
+                   bool capture, int head_rows, int batch_requests, int source_row = 0, bool use_draft_tables = false);
   void draft_chain_row(int req, const int64_t* tokens, bool capture, int head_rows, int batch_requests);
   const Dsv41DraftResident& draft_stage(int stage);
   // The decode walk's boundary prefetch windows (kernels/l2_prefetch.hpp;
