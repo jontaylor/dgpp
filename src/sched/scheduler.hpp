@@ -156,6 +156,9 @@ class SchedulerEngine {
       bool = false, float = 8, float = 28, float = 0, int = 1, bool = true) {
     throw std::logic_error("engine does not support eager MTP");
   }
+  virtual void configure_eager_lookup(int, int, int, int) {
+    throw std::logic_error("engine does not support eager lookup");
+  }
   // Speculative acceptance by draft position: attempts[p] is
   // the steps that verified draft p (0-based; depth of them), accepts[p]
   // the steps that accepted it. Engine-wide since construction, or per

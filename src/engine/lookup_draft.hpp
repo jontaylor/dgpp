@@ -11,8 +11,10 @@
 // block (a pinned mode; the device chain spans the full width and a strong
 // lookup match fuses over it). Adaptive (triggered) tail sizing is
 // follow-up work.
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <vector>
 
 namespace dgpp {
@@ -87,6 +89,65 @@ inline LookupDraft lookup_propose(const int64_t* history, int64_t n, int max_dra
     out.strong = false;
   }
   return out;
+}
+
+// Incremental index for append-only eager slot histories. Every candidate is
+// checked against the original tokens, including hash collisions. Ties use
+// the latest occurrence, as in lookup_propose. Only accepted tokens enter it.
+class LookupHistoryIndex {
+ public:
+  LookupDraft propose(std::span<const int32_t> history, int width, int nmin, int nstrong) {
+    LookupDraft result;
+    const int size = static_cast<int>(history.size());
+    if (width <= 0 || nmin <= 0 || size <= nmin) return result;
+    const int key_tokens = std::min(nmin, 4);
+    if (key_tokens != key_tokens_ || previous_.size() > history.size()) {
+      heads_.assign(65536, -1);
+      previous_.clear();
+      key_tokens_ = key_tokens;
+    }
+    while (previous_.size() < history.size()) {
+      const int end = static_cast<int>(previous_.size());
+      if (end + 1 < key_tokens) {
+        previous_.push_back(-1);
+        continue;
+      }
+      uint32_t hash = 2166136261u;
+      for (int j = end + 1 - key_tokens; j <= end; ++j)
+        hash = (hash ^ static_cast<uint32_t>(history[j])) * 16777619u;
+      auto& head = heads_[(hash ^ (hash >> 16)) & 65535u];
+      previous_.push_back(head);
+      head = end;
+    }
+    const int cap = std::min(64, size - 1);
+    for (int end = previous_.back(); end >= nmin - 1; end = previous_[end]) {
+      int len = 0;
+      while (len <= end && len < cap && history[end - len] == history[size - 1 - len]) ++len;
+      if (len > result.match_len && len >= nmin) {
+        result.match_len = len;
+        result.match_end = end;
+        if (len == cap) break;
+      }
+    }
+    if (result.match_end >= 0) {
+      const int start = static_cast<int>(result.match_end + 1);
+      result.drafts.assign(history.begin() + start, history.begin() + start + std::min(width, size - start));
+      result.strong = result.match_len >= nstrong;
+    }
+    return result;
+  }
+
+ private:
+  int key_tokens_ = 0;
+  std::vector<int32_t> heads_, previous_;
+};
+
+// Eager DSpark already computed the prefix. Spend the extra verification rows
+// only on a strong continuation that agrees with every one of those tokens.
+inline void lookup_extend(std::vector<int32_t>& drafts, const LookupDraft& copy) {
+  if (copy.strong && copy.drafts.size() > drafts.size() &&
+      std::equal(drafts.begin(), drafts.end(), copy.drafts.begin()))
+    drafts.insert(drafts.end(), copy.drafts.begin() + drafts.size(), copy.drafts.end());
 }
 
 // Fuse MTP drafts with a lookup proposal (same depth, no extra rows).

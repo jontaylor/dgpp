@@ -57,6 +57,41 @@ DGPP_TEST(lookup_propose_overlapping_period) {
   require(lu.drafts[0] == 5, "from its own period");
 }
 
+DGPP_TEST(lookup_index_matches_history_scan_as_slot_grows) {
+  std::vector<int32_t> history;
+  std::vector<int64_t> reference;
+  for (int nmin : {1, 3, 6, 8}) {
+    dgpp::LookupHistoryIndex index;
+    history.clear();
+    reference.clear();
+    for (int i = 0; i < 800; ++i) {
+      // Periodic strips interrupted by unique tokens and short repeats.
+      const int token = (i % 47 == 0) ? 1000 + i : (i % 19) % 11;
+      history.push_back(token);
+      reference.push_back(token);
+      for (int width : {1, 3, 5}) {
+        const auto got = index.propose(history, width, nmin, 8);
+        const auto want = dgpp::lookup_propose(reference.data(), reference.size(), width, nmin);
+        require(got.drafts == want.drafts && got.strong == want.strong &&
+                (want.drafts.empty() || got.match_end == want.match_end), "indexed continuation");
+      }
+    }
+  }
+}
+
+DGPP_TEST(lookup_extends_only_a_fully_matching_strong_prefix) {
+  const std::vector<int32_t> prefix = {1, 2, 3};
+  auto drafts = prefix;
+  for (const dgpp::LookupDraft& copy : {dgpp::LookupDraft{{1, 2, 4, 5}, 8, 12, true},
+                                       dgpp::LookupDraft{{1, 2, 3, 4}, 6, 12, false},
+                                       dgpp::LookupDraft{{1, 2}, 8, 12, true}}) {
+    dgpp::lookup_extend(drafts, copy);
+    require(drafts == prefix, "retain all original DSpark proposals");
+  }
+  dgpp::lookup_extend(drafts, {{1, 2, 3, 4, 5}, 9, 12, true});
+  require(drafts == std::vector<int32_t>({1, 2, 3, 4, 5}), "extend an agreed copy");
+}
+
 DGPP_TEST(lookup_fuse_strong_takes_lookup) {
   const std::vector<int32_t> mtp = {1, 2, 3};
   dgpp::LookupDraft lu;

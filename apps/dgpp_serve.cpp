@@ -3256,8 +3256,9 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("--mtp currently requires --decode-graph");
     return 1;
   }
-  if (expert_streaming && mtp && (lookup_draft || lookup_tail)) {
-    DGPP_LOG_ERROR("eager expert-streaming MTP currently requires lookup_draft=false and lookup_tail=0");
+  if (expert_streaming && mtp && lookup_tail &&
+      (!lookup_draft || mtp_schedule || lookup_tail > dgpp::kSpecRows - 1 - mtp_depth)) {
+    DGPP_LOG_ERROR("eager MTP lookup tail requires lookup drafting, fixed depth and a verification block within kSpecRows");
     return 2;
   }
   // The graph world: the fabric, or a world of one with the
@@ -4279,6 +4280,7 @@ int main(int argc, char** argv) {
                 return dgpp::bus_greedy_pick_rows(*bus, rank, world, rows, pick_scratch, 60000);
               }, mtp_schedule, static_cast<float>(mtp_schedule_row_ms), static_cast<float>(mtp_schedule_base_ms),
               static_cast<float>(mtp_schedule_lambda), mtp_schedule_min_depth, mtp_schedule_adapt);
+          if (mtp && lookup_draft) engine->configure_eager_lookup(lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail);
           knobs.admission = dgpp::serve::resolve_prefill_policy(
               knobs.admission, *engine, prefill_early_admission_override);
           peer_policy = knobs.admission;

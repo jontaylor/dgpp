@@ -1033,6 +1033,12 @@ DGPP_TEST(cluster_expert_streaming_is_strict_and_requires_supported_eager_recipe
   speculative.insert(speculative.find("\"decode_graph\""), "\"mtp\":true,");
   require(dgpp::serve::parse_cluster_config(speculative, "expert-mtp").engine.mtp,
           "eager expert streaming accepts MTP");
+  auto lookup = speculative;
+  lookup.insert(lookup.find("\"decode_graph\""), "\"lookup_draft\":true,\"lookup_tail\":2,");
+  require(dgpp::serve::parse_cluster_config(lookup, "expert-lookup").engine.lookup_tail == 2,
+          "eager fixed-depth MTP accepts the prompt-copy extension");
+  lookup.insert(lookup.find("\"decode_graph\""), "\"mtp_schedule\":true,");
+  require(refusal(lookup).find("lookup") != std::string::npos, "refuse scheduled lookup tail");
   for (const auto* incompatible : {"decode_graph", "prefill_fold_overlap"}) {
     auto bad = json;
     const auto key = std::string("\"") + incompatible + "\":false";

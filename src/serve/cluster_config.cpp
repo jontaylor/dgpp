@@ -617,8 +617,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "engine.expert_streaming requires decode_graph=false, prefill_fold_overlap=false, "
                "runtime_adapters=false and no dflash_model");
   if (c.engine.expert_streaming && c.engine.mtp &&
-      (c.engine.lookup_draft || c.engine.lookup_tail))
-    fail(what, "engine.expert_streaming MTP requires lookup_draft=false and lookup_tail=0");
+      c.engine.lookup_tail && (!c.engine.lookup_draft || c.engine.mtp_schedule))
+    fail(what, "engine.expert_streaming MTP requires lookup_draft and fixed depth for a lookup tail");
   return c;
 }
 

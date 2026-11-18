@@ -469,7 +469,12 @@ advances the live grammar. Other requests retain ordinary decoding.
 `mtp_depth` defaults to the checkpoint's
 DSpark block width. `mtp_schedule: true` enables confidence-based depth
 selection and skips unused draft-chain calls; the default remains fixed depth.
-Keep `lookup_draft: false` and `lookup_tail: 0`. NVFP4 main weights use the existing main-only paged image;
+Set `lookup_draft: true` to use earlier tokens from the same request as proposals.
+With `lookup_tail: 0`, matching text can replace DSpark predictions at the configured depth.
+With a positive tail and fixed depth, eager DSpark keeps its predictions and
+adds up to `lookup_tail` tokens when a strong history match agrees with the
+entire draft. Verification includes the extra rows only on those steps.
+NVFP4 main weights use the existing main-only paged image;
 MXFP4 draft experts stay resident and their exact allocation is deducted from
 the same expert budget. Main-cache telemetry reports the remaining cache budget.
 For the measured NVFP4 C1 b12x workload, use `mtp: true`, `mtp_depth: 3`
@@ -643,7 +648,7 @@ seen in the same request. Sampled requests keep their normal proposals.
 | `engine.lookup_nmin` | Minimum suffix-match length to consider, from 1 to 64 tokens. Higher values skip short, possibly accidental matches but miss some useful repeats. | 6 tokens |
 | `engine.lookup_nstrong` | Match length accepted without agreement from MTP, from 1 to 64 and at least `lookup_nmin`. Higher values demand stronger evidence before replacing drafts outright. | 8 tokens |
 | `engine.lookup_agree` | Number of leading proposals that a shorter match must share with MTP, from 0 to 16. Higher values require stronger agreement. `0` disables the shorter-match path. | 2 tokens |
-| `engine.lookup_tail` | Extra draft positions beyond the normal MTP block. Useful for long copied spans, but every step pays for the wider computation and fewer requests may fit in a batch. Requires native MTP and a total `mtp_depth + lookup_tail` of at most 5 with the current picker. Incompatible with DFlash2 and scheduled depth. `0` adds no tail. | 0 |
+| `engine.lookup_tail` | Extra draft positions beyond the normal MTP block. The graph engine reserves and executes the wider block on each step (up to five draft positions with the graph picker). Eager expert-streaming DSpark reserves capacity for the wider block and executes extra rows only on a fully agreeing strong match (up to seven draft positions, subject to model capacity). A wider reservation can reduce batch capacity. Requires MTP with fixed depth. `0` adds no tail. | 0 |
 
 ### Extended context
 

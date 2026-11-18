@@ -104,6 +104,19 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       throw std::invalid_argument("eager MTP is not supported by this model");
     }
   }
+  void configure_eager_lookup(int nmin, int nstrong, int agree, int tail) override {
+    if (mtp_depth_ == 0 || nmin < 1 || nmin > 64 || nstrong < nmin || nstrong > 64 || agree < 0 ||
+        tail < 0 || tail > kSpecRows - 1 - mtp_depth_)
+      throw std::invalid_argument("eager lookup requires MTP and valid match thresholds");
+    if (tail && mtp_schedule_) throw std::invalid_argument("eager lookup tail requires fixed MTP depth");
+    if constexpr (kEagerMtp)
+      if (mtp_depth_ + tail + 1 > model_->max_decode_rows())
+        throw std::invalid_argument("eager lookup exceeds decode row capacity");
+    lookup_tail_ = tail;
+    lookup_min_ = nmin;
+    lookup_strong_ = nstrong;
+    lookup_agree_ = agree;
+  }
   std::optional<expert::CacheTelemetry> expert_paging_metrics() const override {
     if constexpr (requires { model_->expert_cache(); }) {
       if (const auto* cache = model_->expert_cache()) return cache->telemetry();
@@ -141,6 +154,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     SlotState& s = state_.at(static_cast<size_t>(req));
     s.params = sampling;
     s.rng = sample::Rng{seed, 0};
+    s.lookup = {};
     s.context.clear();
     s.logprobs.clear();
   }
@@ -715,7 +729,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // (max_decode_rows verify rows, a full block per spec slot) bounds it.
   int decode_batch_capacity() const override {
     if constexpr (kEagerMtp)
-      if (mtp_depth_) return std::min(slots_, model_->max_decode_rows() / (mtp_depth_ + 1));
+      if (mtp_depth_) return std::min(slots_, model_->max_decode_rows() / max_tokens_per_step());
     if constexpr (requires { model_->eager_plain_decode_batch_capacity(); })
       if (model_->eager_plain_decode_batch_capacity() > 1)
         return std::min(slots_, model_->eager_plain_decode_batch_capacity());
@@ -729,7 +743,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // A spec step writes up to a full block of positions (the scheduler's
   // reservation window grows accordingly); plain engines keep 1.
   int max_tokens_per_step() const override {
-    if (mtp_depth_) return mtp_depth_ + 1;
+    if (mtp_depth_) return mtp_depth_ + lookup_tail_ + 1;
     if constexpr (requires { model_->dflash2_enabled(); })
       if (model_->dflash2_enabled()) return kSpecRows;
     return 1;
@@ -853,7 +867,19 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       for (size_t i = 0; i < reqs.size(); ++i) {
         const int req = reqs[i];
         feeds.push_back({pending_[req]});
-        if (eligible[i]) feeds.back().insert(feeds.back().end(), mtp_drafts_[req].begin(), mtp_drafts_[req].end());
+        if (!eligible[i]) continue;
+        auto& drafts = mtp_drafts_[req];
+        if (lookup_min_) {
+          auto& slot = state_[req];
+          const int width = static_cast<int>(std::min<int64_t>(
+              drafts.size() + lookup_tail_, model_->max_context() - model_->session_position(req) - 1));
+          auto copy = slot.lookup.propose(slot.context, width, lookup_min_, lookup_strong_);
+          if (lookup_tail_)
+            lookup_extend(drafts, copy);
+          else if (!copy.drafts.empty())
+            drafts = lookup_fuse(drafts, copy, lookup_strong_, lookup_agree_).drafts;
+        }
+        feeds.back().insert(feeds.back().end(), drafts.begin(), drafts.end());
       }
       const auto verify_begin = stamp();
       std::vector<int> offsets;
@@ -1036,6 +1062,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
   }
   struct SlotState {
+    LookupHistoryIndex lookup;
     int mtp_eligibility_reasons = -1;  // Log once per request and on eligibility changes.
     sample::Params params = sample::greedy_params();
     sample::Rng rng;
@@ -1063,6 +1090,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
   int32_t open_slot_finish(int req, const std::vector<int64_t>& prompt, const typename Model::Outputs& out) {
     SlotState& s = state_.at(static_cast<size_t>(req));
+    s.lookup = {};
     s.context.clear();
     s.context.reserve(prompt.size() + 64);
     for (int64_t id : prompt) s.context.push_back(static_cast<int32_t>(id));
@@ -1175,6 +1203,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   double mtp_lambda_ = 0;
   std::vector<float> mtp_confidence_;
   SpecPickRows mtp_pick_rows_;
+  int lookup_min_ = 0, lookup_strong_ = 8, lookup_agree_ = 2, lookup_tail_ = 0;
   std::vector<std::vector<int32_t>> mtp_drafts_;
   std::vector<std::array<uint64_t, 8>> mtp_slot_attempts_, mtp_slot_accepts_;
   Model* model_;
@@ -1295,7 +1324,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   sched::SchedulerEngine::MtpAcceptance mtp_acceptance() const override {
     sched::SchedulerEngine::MtpAcceptance a;
     if (mtp_depth_) {
-      a.depth = mtp_depth_;
+      a.depth = mtp_depth_ + lookup_tail_;
       for (int p = 0; p < 8; ++p) { a.attempts[p] = spec_att_[p]; a.accepts[p] = spec_acc_[p]; }
       return a;
     }
@@ -1317,7 +1346,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   sched::SchedulerEngine::MtpAcceptance mtp_acceptance(int req) const override {
     sched::SchedulerEngine::MtpAcceptance a;
     if (mtp_depth_) {
-      a.depth = mtp_depth_;
+      a.depth = mtp_depth_ + lookup_tail_;
       for (int p = 0; p < 8; ++p) {
         a.attempts[p] = mtp_slot_attempts_.at(req)[p]; a.accepts[p] = mtp_slot_accepts_.at(req)[p];
       }
