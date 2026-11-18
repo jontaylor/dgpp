@@ -123,6 +123,7 @@ struct GlmMoeConfig {
   // other family (no bytes). Set with experts_exl3 bound.
   bool exl3_experts = false;
   MoeRouterMode router_mode = MoeRouterMode::SigmoidBias;
+  bool mx_packed_scales = false;
 
   // Weight bytes of one routed expert (payload + block scales): the number
   // the traffic model charges per selected expert.
@@ -287,6 +288,7 @@ struct MoeExpertView {
   // Gate/up share a 2I-row allocation; up starts at row I.
   int fp4_packed_rows = 0;
   int fp4_packed_row0 = 0;
+  bool fp4_mx_nibbles = false;
   // Canonical FP4 chunks split gate/up rows and down columns. The W4A16
   // tile reads them directly; no intermediate full-expert payload is built.
   const uint8_t* const* fp4_chunks = nullptr;

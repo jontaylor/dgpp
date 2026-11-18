@@ -41,6 +41,8 @@ struct CacheMemory {
   uint64_t budget_bytes = 0, cache_slot_bytes = 0, cache_slots = 0;
   uint64_t execution_slot_bytes = 0, execution_slots = 0;
   uint64_t staging_bytes = 0, unallocated_bytes = 0;
+  uint64_t chunk_scratch_bytes = 0;  // one raw MX chunk for partial-residency migrations
+  bool mx_packed_scales() const { return chunk_scratch_bytes != 0; }
   uint64_t allocated_bytes() const;
   bool operator==(const CacheMemory&) const = default;
 };

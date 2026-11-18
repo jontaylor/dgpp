@@ -59,13 +59,15 @@ struct Fp4PackedExpert {
   uint8_t* w2 = nullptr;
   uint8_t* s2 = nullptr;
   float* g2 = nullptr;
+  bool mx_nibbles = false;
 };
 // Scale group 16 stores raw E4M3 with inverse globals; group 32 stores
-// raw E8M0 without globals. Both retain native scale density.
+// raw E8M0 without globals. The optional MX nibble encoding requires
+// source bytes in 112..127 and keeps their low four bits.
 // One expert's compact prepared representation. It fits inside the existing
 // canonical full-expert allocation; all matrix starts are 16-byte aligned.
-size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group = 16);
-Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group = 16);
+size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group = 16, bool mx_nibbles = false);
+Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group = 16, bool mx_nibbles = false);
 
 // Prepared weights/globals with nibble-encoded scales. This format is valid
 // only after every source scale byte has been checked to satisfy (x & 0x87)==0.
@@ -93,6 +95,10 @@ Fp4PackedExpert launch_moe_fp4_expand_scales(Fp4CompactExpert src, uint8_t* scal
 // Resolve lazily loaded packing kernels before a persistent demand gate can
 // wait for them. CUDA module loading may otherwise synchronize the device.
 void prepare_moe_fp4_pack();
+// Contiguous canonical MX chunk with three equally sized payload/scale pairs.
+// Compression requires every E8M0 byte to have been checked by the reader.
+void launch_mx_chunk_codec(uint8_t* destination, const uint8_t* source,
+                           int payload_bytes, bool expand, cudaStream_t stream);
 
 // Source and destination must be disjoint. All allocations belong to the
 // caller; the launchers allocate nothing and are CUDA-graph capturable.

@@ -3324,13 +3324,14 @@ DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
 
 
 namespace {
-void check_b12x_paging(int group) {
+void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
   using namespace dgpp::expert;
   if (!dgpp::sm12x_moe_enabled(5120, 1152, 384, 6)) dgpp::test::skip("optional b12x AOT path disabled");
   const auto format = group == 32 ? Format::kMxfp4 : Format::kNvfp4;
   constexpr int H = 5120, I = 1152, E = 384, live = 12, M = 256;
   auto c = make_small_case(live, H, I, 6, M, 0xB12C43, true, false, 0, group);
   const bool mixed_scale_screen = group == 16 && std::getenv("DGPP_TEST_MIXED_SCALES") != nullptr;
+  if (compare_mx_nibbles) for (auto& scale : c.host_w.fp4_scales) scale = 0x70 | (scale & 15);
   if (mixed_scale_screen) for (auto& scale : c.host_w.fp4_scales) scale &= 0x78;
   c.cfg.shared_run_lane_min_rows = 1;
   c.alloc();
@@ -3409,6 +3410,32 @@ void check_b12x_paging(int group) {
           execution_slots*2*full.allocation_bytes + cfg.reads.staging_budget_bytes;
       return cfg;
     };
+    if (compare_mx_nibbles) {
+      auto compact_layer_config = c.cfg;
+      compact_layer_config.mx_packed_scales = true;
+      GlmMoeLayer packed_layer(c.dev_w, compact_layer_config, M, 8);
+      for (int capacity : {2, live}) {
+        auto cache_config = config(capacity, 4);
+        ExpertCache raw_cache(store, cache_config, cuda_cache_storage(identity, stream, true));
+        raw_cache.initialize();
+        cache_config.reads.require_mx_nibbles = true;
+        ExpertCache packed_cache(store, cache_config, cuda_cache_storage(identity, stream, true));
+        packed_cache.initialize();
+        require(packed_cache.memory().cache_slot_bytes == 506880 &&
+                    packed_cache.memory().allocated_bytes() <= cache_config.planner.budget_bytes,
+                "nibble cache and migration scratch fit the configured budget");
+        for (int rows : {4, 4, 129, 129, 1}) {
+          const auto kernel = rows > 64 ? dgpp::MoeExpertKernel::kMma : dgpp::MoeExpertKernel::kGemv;
+          layer.enqueue_paged(c.d_hidden, c.d_out, rows, raw_cache, mapping, stream, kernel);
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          const std::vector<uint16_t> raw(c.d_out, c.d_out + rows*H);
+          packed_layer.enqueue_paged(c.d_hidden, c.d_out, rows, packed_cache, mapping, stream, kernel);
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          require(std::equal(raw.begin(), raw.end(), c.d_out), "packed MX serving must be byte exact");
+        }
+      }
+      continue;
+    }
     ExpertCache hot(store,config(live,4),cuda_cache_storage(identity,stream,true)); hot.initialize();
     for (int pass = 0; pass < 3; ++pass) {
       layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
@@ -3680,6 +3707,9 @@ void check_b12x_paging(int group) {
 }  // namespace
 
 DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(16); }
+#ifdef DGPP_TEST_B12X_MX_NIBBLES
+DGPP_TEST(moe_b12x_mx_nibble_cache_matches_byte_scales) { check_b12x_paging(32, true); }
+#endif
 DGPP_TEST(moe_b12x_mxfp4_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(32); }
 
 DGPP_TEST(moe_paged_expert_waves_are_bitwise_the_resident_chain) {

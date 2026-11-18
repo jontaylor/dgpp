@@ -64,6 +64,7 @@ void reader_pause() {
 #endif
 }
 
+template<uint8_t Mask, uint8_t Expected>
 bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout) {
   for (const auto* matrix : {&layout.gate, &layout.up, &layout.down}) {
     if (matrix->scales_offset > data.size() || matrix->scales_bytes > data.size() - matrix->scales_offset)
@@ -74,10 +75,10 @@ bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout
     for (; i + sizeof(uint64_t) <= scales.size(); i += sizeof(uint64_t)) {
       uint64_t word;
       std::memcpy(&word, scales.data() + i, sizeof(word));
-      invalid |= word;
+      invalid |= word ^ (UINT64_C(0x0101010101010101) * Expected);
     }
-    if (invalid & UINT64_C(0x8787878787878787)) return false;
-    for (; i < scales.size(); ++i) if (scales[i] & 0x87) return false;
+    if (invalid & (UINT64_C(0x0101010101010101) * Mask)) return false;
+    for (; i < scales.size(); ++i) if ((scales[i] & Mask) != Expected) return false;
   }
   return true;
 }
@@ -393,8 +394,11 @@ struct ReadQueueImpl {
         if (abandoned) std::rethrow_exception(cancelled());
         auto buffer = std::span<uint8_t>(static_cast<uint8_t*>(pool->buffers[lease->slot_].get()), lease->size_);
         store->read(job->record, buffer);
+        if (config.require_mx_nibbles &&
+            !compactible_scales<0xf0, 0x70>(buffer, store->records()[job->record].layout))
+          throw std::runtime_error("MX scale outside 112..127; disable DGPP_MX_PACKED_SCALES for this checkpoint");
         if (config.scan_nvfp4_scales && store->identity().format == Format::kNvfp4)
-          lease->scale_compactibility_ = compactible_scales(buffer, store->records()[job->record].layout)
+          lease->scale_compactibility_ = compactible_scales<0x87, 0>(buffer, store->records()[job->record].layout)
               ? ScaleCompactibility::kExact : ScaleCompactibility::kUnsupported;
       } catch (...) { failure = std::current_exception(); }
       {

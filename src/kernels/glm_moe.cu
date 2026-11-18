@@ -4111,7 +4111,7 @@ __launch_bounds__(fp4_ldm::kThreads, TileRows == 128 ? 1 : 2) void moe_grouped_m
 #pragma unroll
           for (int gi = 0; gi < kGroupsPerStage; ++gi)
             if (gi < in_groups)
-              word |= uint32_t(v.fp4_scales[(k0/kGroup+gi)*v.fp4_packed_rows+packed_n]) << (8*gi);
+              word |= uint32_t(fp4_layout::mx_scale(v.fp4_scales, (k0/kGroup+gi)*v.fp4_packed_rows+packed_n, v.fp4_mx_nibbles)) << (8*gi);
           *reinterpret_cast<uint32_t*>(sdst) = word;
         } else if (v.fp4_chunks && v.fp4_chunk_columns) {
           const uint8_t* source = v.fp4_scales;

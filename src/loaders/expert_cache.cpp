@@ -30,7 +30,8 @@ std::atomic<uint64_t> next_binding_identity{1};
 constexpr size_t absent = std::numeric_limits<size_t>::max();
 }
 uint64_t CacheMemory::allocated_bytes() const {
-  return add(add(mul(cache_slot_bytes, cache_slots), mul(execution_slot_bytes, execution_slots)), staging_bytes);
+  return add(add(mul(cache_slot_bytes, cache_slots), mul(execution_slot_bytes, execution_slots)),
+             add(staging_bytes, chunk_scratch_bytes));
 }
 
 CacheMemory expert_cache_memory(const StoreIdentity& id, const CacheConfig& cfg) {
@@ -50,12 +51,31 @@ CacheMemory expert_cache_memory(const StoreIdentity& id, const CacheConfig& cfg)
     m.cache_slot_bytes = std::max(m.cache_slot_bytes, c.allocation_bytes);
     record_bytes = std::max(record_bytes, c.record_bytes);
   }
+  if (cfg.reads.require_mx_nibbles) {
+    if (!cfg.packed_fp4 || id.format != Format::kMxfp4)
+      throw std::invalid_argument("MX scale packing requires native MXFP4 expert execution");
+    const auto payload = chunks.front().gate.payload_bytes;
+    const auto scales = payload / 16;
+    for (const auto& c : chunks) {
+      uint64_t offset = 0;
+      for (const auto* matrix : {&c.gate, &c.up, &c.down}) {
+        if (matrix->payload_offset != offset || matrix->payload_bytes != payload ||
+            matrix->scales_offset != offset + payload || matrix->scales_bytes != scales)
+          throw std::invalid_argument("MX scale packing requires uniform contiguous chunks");
+        offset += payload + scales;
+      }
+      if (payload % 512 || c.allocation_bytes != offset)
+        throw std::invalid_argument("MX scale packing requires aligned chunks without padding");
+    }
+    m.chunk_scratch_bytes = m.cache_slot_bytes;
+    m.cache_slot_bytes -= 3 * scales / 2;
+  }
   m.staging_bytes = mul(record_bytes, cfg.reads.buffers);
   if (!cfg.reads.buffers || !cfg.reads.workers || cfg.reads.workers > cfg.reads.buffers ||
       cfg.reads.workers > cfg.reads.max_pending || cfg.reads.max_pending < cfg.reads.buffers ||
       m.staging_bytes > cfg.reads.staging_budget_bytes)
     throw std::invalid_argument("expert cache: invalid bounded read capacity");
-  const uint64_t reserved = add(m.staging_bytes, mul(m.execution_slot_bytes, m.execution_slots));
+  const uint64_t reserved = add(add(m.staging_bytes, m.chunk_scratch_bytes), mul(m.execution_slot_bytes, m.execution_slots));
   if (reserved > m.budget_bytes) throw std::invalid_argument("expert cache: staging/execution exceed budget");
   m.cache_slots = (m.budget_bytes - reserved) / m.cache_slot_bytes;
   m.unallocated_bytes = (m.budget_bytes - reserved) % m.cache_slot_bytes;
@@ -501,7 +521,7 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   s.full = partition(id.hidden, id.intermediate, id.world, id.rank, id.intermediate / id.world, id.format).front();
   s.memory = expert_cache_memory(id, cfg);
   const auto& m = s.memory;
-  const uint64_t reserved = add(m.staging_bytes, mul(m.execution_slot_bytes, m.execution_slots));
+  const uint64_t reserved = add(add(m.staging_bytes, m.chunk_scratch_bytes), mul(m.execution_slot_bytes, m.execution_slots));
   std::map<std::tuple<bool, uint32_t, uint32_t>, size_t> groups;
   s.slots.assign(s.store->records().size(), absent);
   if (cfg.reads.scan_nvfp4_scales)

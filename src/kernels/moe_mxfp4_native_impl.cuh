@@ -157,7 +157,7 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
       if (prepared) {
         const int pn = fp4_layout::swap_scale_pair(
             fp4_layout::transpose_scale_block(row + view.fp4_packed_row0));
-        return w_scales[size_t(code / 32) * view.fp4_packed_rows + pn];
+        return fp4_layout::mx_scale(w_scales, (code / 32) * view.fp4_packed_rows + pn, view.fp4_mx_nibbles);
       }
       if (view.fp4_chunks) {
         const int width = view.fp4_chunk_width;

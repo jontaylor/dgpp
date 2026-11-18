@@ -103,8 +103,8 @@ struct Dsv41Model::PagedGraphs {
       else for (int e = 0; e < experts; ++e) addresses[e] = cache.prepared_address(mapping[l][e]);
       const bool changed = dsv41_detail::update_paged_binding_table(
           std::span<uint64_t>(host_tables + l * words, words), addresses,
-          [hidden, inter, scale_group](const uint8_t* address) {
-            const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter, scale_group);
+          [hidden, inter, scale_group, nibbles = cache.memory().mx_packed_scales()](const uint8_t* address) {
+            const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(address), hidden, inter, scale_group, nibbles);
             return std::array<uint64_t, 6>{reinterpret_cast<uintptr_t>(p.w13),
                 reinterpret_cast<uintptr_t>(p.s13), reinterpret_cast<uintptr_t>(p.g13),
                 reinterpret_cast<uintptr_t>(p.w2), reinterpret_cast<uintptr_t>(p.s2),
@@ -156,6 +156,8 @@ expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, in
   auto cache = paging.cache;
   cache.packed_fp4 = sm12x_moe_enabled(cfg.hidden_size,
       cfg.moe_intermediate_size / world, cfg.n_routed_experts, cfg.num_experts_per_tok);
+  const char* packed = std::getenv("DGPP_MX_PACKED_SCALES");
+  cache.reads.require_mx_nibbles = packed && std::atoi(packed) != 0;
   if (mtp) {
     auto resident = cfg, descriptors = cfg;
     resident.runtime_page_experts = false;
@@ -401,6 +403,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   gemm_.set_decode_rows(max_decode_rows_);
   const Dsv41LocalGeometry& geo = loader_.geometry();
   moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/false);
+  moe_cfg_.mx_packed_scales = expert_cache_ && expert_cache_->memory().mx_packed_scales();
   if (mtp) draft_moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/true);
   mhc_cfg_.hc_mult = cfg_.hc_mult;
   mhc_cfg_.hidden = H;

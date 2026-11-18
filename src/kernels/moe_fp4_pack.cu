@@ -108,7 +108,7 @@ __global__ void unpack_payload(uint8_t* first, uint8_t* second,
   (up ? second : first)[source_n * (k / 2) + code / 2] = lo | (hi << 4);
 }
 
-template <bool Merge, bool Unpack>
+template <bool Merge, bool Unpack, bool Nibbles = false>
 __global__ void move_scales(uint8_t* first, uint8_t* second, uint8_t* packed,
                              const uint8_t* source_first, const uint8_t* source_second,
                              const uint8_t* source_packed, int rows, int k, int group) {
@@ -119,13 +119,53 @@ __global__ void move_scales(uint8_t* first, uint8_t* second, uint8_t* packed,
     const int packed_n = swap_scale_pair(transpose_scale_block(n));
     const bool up = Merge && n >= rows / 2;
     const int source_n = up ? n - rows / 2 : n;
-    (up ? second : first)[source_n * (k / group) + kg] = source_packed[kg * rows + packed_n];
+    (up ? second : first)[source_n * (k / group) + kg] = mx_scale(source_packed, kg * rows + packed_n, Nibbles);
   } else {
     const int kg = idx / rows;
     const int n = transpose_scale_block(swap_scale_pair(idx % rows));
     const bool up = Merge && n >= rows / 2;
     const int source_n = up ? n - rows / 2 : n;
     packed[idx] = (up ? source_second : source_first)[source_n * (k / group) + kg];
+  }
+}
+
+template<bool Merge>
+__global__ void pack_mx_scale_words(uint32_t* packed, const uint8_t* first,
+                                    const uint8_t* second, int rows, int k) {
+  const int word = blockIdx.x * blockDim.x + threadIdx.x;
+  if (word >= rows * (k / 32) / 8) return;
+  const int kg = word * 8 / rows;
+  uint32_t result = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    int n = transpose_scale_block(swap_scale_pair((word * 8 + j) % rows));
+    const bool up = Merge && n >= rows / 2;
+    if (up) n -= rows / 2;
+    result |= uint32_t((up ? second : first)[n * (k / 32) + kg] & 15) << ((j % 4) * 8 + (j & 4));
+  }
+  packed[word] = result;
+}
+
+template<bool Expand>
+__global__ void mx_chunk_codec(uint8_t* destination, const uint8_t* source, int payload) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  const int scales = payload / 16;
+  const auto* src = source + blockIdx.y * (payload + (Expand ? scales / 2 : scales));
+  auto* dst = destination + blockIdx.y * (payload + (Expand ? scales : scales / 2));
+  if (j < payload / 16) {
+    reinterpret_cast<uint4*>(dst)[j] = reinterpret_cast<const uint4*>(src)[j];
+    return;
+  }
+  const int i = j - payload / 16;
+  if (i >= scales / 8) return;
+  auto* out = reinterpret_cast<uint32_t*>(dst + payload);
+  const auto* in = reinterpret_cast<const uint32_t*>(src + payload);
+  constexpr uint32_t mask = 0x0f0f0f0f, base = 0x70707070;
+  if constexpr (Expand) {
+    out[2*i] = (in[i] & mask) | base;
+    out[2*i+1] = ((in[i] >> 4) & mask) | base;
+  } else {
+    out[i] = (in[2*i] & mask) | ((in[2*i+1] & mask) << 4);
   }
 }
 
@@ -138,6 +178,7 @@ void check_geometry(int h, int i) {
 }
 void check_packed(Fp4PackedExpert p, int group = 16) {
   if (group != 16 && group != 32) throw std::invalid_argument("MoE FP4 packing: invalid scale group");
+  if (p.mx_nibbles && group != 32) throw std::invalid_argument("MX nibble scales require group 32");
   if (!p.w13 || !p.s13 || !p.w2 || !p.s2 || (group == 16 && (!p.g13 || !p.g2)) ||
       (reinterpret_cast<uintptr_t>(p.w13) & 15) || (reinterpret_cast<uintptr_t>(p.w2) & 15))
     throw std::invalid_argument("MoE FP4 packing: null or unaligned packed pointers");
@@ -215,23 +256,26 @@ void launch_expert_chunk_scatter_batch(std::span<const ExpertChunkScatter> chunk
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
-size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group) {
+size_t moe_fp4_packed_bytes(int hidden, int intermediate, int scale_group, bool mx_nibbles) {
+  if (mx_nibbles && scale_group != 32) throw std::invalid_argument("MX nibble scales require group 32");
   if (scale_group != 16 && scale_group != 32) throw std::invalid_argument("MoE FP4 packing: invalid scale group");
   check_geometry(hidden, intermediate);
   const size_t matrix = static_cast<size_t>(hidden) * intermediate;
   // W13 codes/scales/globals, alignment, then W2 codes/scales/globals.
-  return matrix + 2*matrix / scale_group + matrix / 2 + matrix / scale_group + (scale_group == 16 ? 32 : 0);
+  const int density = scale_group * (mx_nibbles ? 2 : 1);
+  return matrix + 2*matrix / density + matrix / 2 + matrix / density + (scale_group == 16 ? 32 : 0);
 }
-Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group) {
-  (void)moe_fp4_packed_bytes(hidden, intermediate, scale_group);
+Fp4PackedExpert moe_fp4_packed_view(uint8_t* data, int hidden, int intermediate, int scale_group, bool mx_nibbles) {
+  (void)moe_fp4_packed_bytes(hidden, intermediate, scale_group, mx_nibbles);
+  const int density = scale_group * (mx_nibbles ? 2 : 1);
   const size_t matrix = static_cast<size_t>(hidden) * intermediate;
   auto* s13 = data + matrix;
-  auto* g13 = s13 + 2*matrix / scale_group;
+  auto* g13 = s13 + 2*matrix / density;
   auto* w2 = g13 + (scale_group == 16 ? 16 : 0);
   auto* s2 = w2 + matrix / 2;
-  auto* g2 = s2 + matrix / scale_group;
+  auto* g2 = s2 + matrix / density;
   return {data, s13, scale_group == 16 ? reinterpret_cast<float*>(g13) : nullptr,
-          w2, s2, scale_group == 16 ? reinterpret_cast<float*>(g2) : nullptr};
+          w2, s2, scale_group == 16 ? reinterpret_cast<float*>(g2) : nullptr, mx_nibbles};
 }
 
 size_t moe_fp4_compact_bytes(int hidden, int intermediate) {
@@ -296,8 +340,23 @@ Fp4PackedExpert launch_moe_fp4_expand_scales(Fp4CompactExpert src, uint8_t* scal
   return {src.w13, scales, src.g13, src.w2, scales + matrix / 8, src.g2};
 }
 
+void launch_mx_chunk_codec(uint8_t* destination, const uint8_t* source,
+                           int payload, bool expand, cudaStream_t stream) {
+  if (payload <= 0 || payload % 256) throw std::invalid_argument("MX chunk codec alignment");
+  const dim3 grid(blocks(payload / 16 + payload / 128), 3);
+  if (expand) mx_chunk_codec<true><<<grid, kThreads, 0, stream>>>(destination, source, payload);
+  else mx_chunk_codec<false><<<grid, kThreads, 0, stream>>>(destination, source, payload);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 void prepare_moe_fp4_pack() {
   cudaFuncAttributes attributes{};
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, mx_chunk_codec<true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, mx_chunk_codec<false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_mx_scale_words<true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, pack_mx_scale_words<false>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<true, true, true>));
+  DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, move_scales<false, true, true>));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunk));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, scatter_expert_chunks));
   DGPP_CUDA_OK(cudaFuncGetAttributes(&attributes, compact_scales));
@@ -324,10 +383,17 @@ void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
       reinterpret_cast<uint32_t*>(dst.w13), src.payload[0], src.payload[1], 2 * intermediate, hidden);
   pack_payload<false><<<blocks(hidden * intermediate / 8), kThreads, 0, stream>>>(
       reinterpret_cast<uint32_t*>(dst.w2), src.payload[2], nullptr, hidden, intermediate);
-  move_scales<true, false><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
-      nullptr, nullptr, dst.s13, src.scales[0], src.scales[1], nullptr, 2 * intermediate, hidden, scale_group);
-  move_scales<false, false><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
-      nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate, scale_group);
+  if (dst.mx_nibbles) {
+    pack_mx_scale_words<true><<<blocks(2 * intermediate * (hidden / 32) / 8), kThreads, 0, stream>>>(
+        reinterpret_cast<uint32_t*>(dst.s13), src.scales[0], src.scales[1], 2 * intermediate, hidden);
+    pack_mx_scale_words<false><<<blocks(hidden * (intermediate / 32) / 8), kThreads, 0, stream>>>(
+        reinterpret_cast<uint32_t*>(dst.s2), src.scales[2], nullptr, hidden, intermediate);
+  } else {
+    move_scales<true, false><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+        nullptr, nullptr, dst.s13, src.scales[0], src.scales[1], nullptr, 2 * intermediate, hidden, scale_group);
+    move_scales<false, false><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+        nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate, scale_group);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
   if (scale_group == 16) copy_globals<<<1, 32, 0, stream>>>(dst.g13, dst.g13 + 1, dst.g2,
                                     src.globals[0], src.globals[1], src.globals[2]);
@@ -345,10 +411,17 @@ void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
       dst.payload[0], dst.payload[1], reinterpret_cast<const uint32_t*>(src.w13), 2 * intermediate, hidden);
   unpack_payload<false><<<blocks(hidden * intermediate / 2), kThreads, 0, stream>>>(
       dst.payload[2], nullptr, reinterpret_cast<const uint32_t*>(src.w2), hidden, intermediate);
-  move_scales<true, true><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
-      dst.scales[0], dst.scales[1], nullptr, nullptr, nullptr, src.s13, 2 * intermediate, hidden, scale_group);
-  move_scales<false, true><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
-      dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate, scale_group);
+  if (src.mx_nibbles) {
+    move_scales<true, true, true><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+        dst.scales[0], dst.scales[1], nullptr, nullptr, nullptr, src.s13, 2 * intermediate, hidden, scale_group);
+    move_scales<false, true, true><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+        dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate, scale_group);
+  } else {
+    move_scales<true, true><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+        dst.scales[0], dst.scales[1], nullptr, nullptr, nullptr, src.s13, 2 * intermediate, hidden, scale_group);
+    move_scales<false, true><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+        dst.scales[2], nullptr, nullptr, nullptr, nullptr, src.s2, hidden, intermediate, scale_group);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
   if (scale_group == 16) copy_globals<<<1, 32, 0, stream>>>(dst.globals[0], dst.globals[1], dst.globals[2],
                                     src.g13, src.g13 + 1, src.g2);

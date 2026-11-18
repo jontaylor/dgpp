@@ -1,6 +1,15 @@
 #pragma once
 
+#include <cstdint>
+
 namespace dgpp::fp4_layout {
+// Eight permuted E8M0 bytes become one word. In each byte, the low
+// nibble belongs to channel i, the high nibble to channel i+4.
+__device__ __forceinline__ uint8_t mx_scale(const uint8_t* scales, int i, bool nibbles) {
+  if (!nibbles) return scales[i];
+  return 0x70 | ((scales[(i / 8) * 4 + (i % 4)] >> (i & 4)) & 15);
+}
+
 // The packed word containing source (n,k). Its eight nibbles follow the MMA
 // lane ordering, rather than source K order. K is a code index, not a byte.
 __device__ __forceinline__ int packed_word(int n, int k, int rows) {

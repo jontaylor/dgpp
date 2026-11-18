@@ -155,7 +155,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
     : w_(weights), cfg_(cfg), max_tokens_(max_tokens),
       decode_slots_(decode_slots), graph_table_slots_(graph_table_slots) {
   if (decode_slots > 0 && sm12x_moe_enabled(cfg.hidden, cfg.inter, cfg.n_experts, cfg.top_k))
-    sm12x_moe_ = std::make_unique<Sm12xMoe>(fp4_group_of(w_));
+    sm12x_moe_ = std::make_unique<Sm12xMoe>(fp4_group_of(w_), cfg.mx_packed_scales);
   GlmMoeConfig::validate_config(cfg_);
   if (max_tokens_ <= 0)
     throw std::invalid_argument("GlmMoeLayer: max_tokens must be positive");
@@ -1241,7 +1241,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
           auto lease = cache->acquire(cache_experts[static_cast<size_t>(e)]);
           if (!lease) throw std::runtime_error("GlmMoeLayer: missing prepared execution lease");
           const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(lease.packed_data()),
-              cfg_.hidden, static_cast<int>(full.intermediate_size), fp4_group_of(w_));
+              cfg_.hidden, static_cast<int>(full.intermediate_size), fp4_group_of(w_), cache->memory().mx_packed_scales());
           for (int m = 0; m < 3; ++m) {
             auto& v = prepared_views[static_cast<size_t>(e)*3+m];
             v = MoeExpertView{};
@@ -1249,6 +1249,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
             v.fp4_scales = m == 2 ? p.s2 : p.s13;
             v.fp4_global = m == 2 ? p.g2 : (p.g13 ? p.g13 + m : nullptr);
             v.fp4_packed_rows = m == 2 ? cfg_.hidden : 2*full.intermediate_size;
+            v.fp4_mx_nibbles = p.mx_nibbles;
             v.fp4_packed_row0 = m == 1 ? full.intermediate_size : 0;
           }
           native_leases.push_back(std::move(lease));

@@ -169,6 +169,10 @@ target_link_libraries(dgpp_sm12x_moe PUBLIC dgpp_moe_fp4_pack CUDA::cudart)
 if(DGPP_B12X_AOT_DIR)
   target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_raw_fp32.o"
     "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_fp32.o")
+  if(EXISTS "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_nibble_fp32.o")
+    target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_nibble_fp32.o")
+    target_compile_definitions(dgpp_sm12x_moe PRIVATE DGPP_HAVE_B12X_MX_NIBBLES=1)
+  endif()
   target_include_directories(dgpp_sm12x_moe SYSTEM PRIVATE "${DGPP_B12X_AOT_DIR}")
   target_link_libraries(dgpp_sm12x_moe PUBLIC "${DGPP_B12X_AOT_DIR}/libcuda_dialect_runtime_static.a" CUDA::cuda_driver)
   target_compile_definitions(dgpp_sm12x_moe PRIVATE DGPP_HAVE_B12X_AOT=1)
@@ -2772,6 +2776,12 @@ target_link_libraries(glm_moe_test PRIVATE dgpp_models_glm_loader dgpp_models_gl
 dgpp_set_common(glm_moe_test)
 add_test(NAME glm_moe_test COMMAND glm_moe_test)
 set_tests_properties(glm_moe_test PROPERTIES SKIP_RETURN_CODE 2)
+if(DGPP_B12X_AOT_DIR AND EXISTS "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_nibble_fp32.o")
+  target_compile_definitions(glm_moe_test PRIVATE DGPP_TEST_B12X_MX_NIBBLES=1)
+  add_test(NAME glm_moe_test_mx_nibbles COMMAND ${CMAKE_COMMAND} -E env DGPP_MOE_B12X=1
+    DGPP_TEST_FILTER=moe_b12x_mx_nibble_cache $<TARGET_FILE:glm_moe_test>)
+  set_tests_properties(glm_moe_test_mx_nibbles PROPERTIES SKIP_RETURN_CODE 2 RUN_SERIAL TRUE LABELS "gpu")
+endif()
 add_test(NAME glm_moe_test_mxfp4_early_shared
   COMMAND ${CMAKE_COMMAND} -E env DGPP_MOE_B12X=1 DGPP_EXPERT_SHARED_PREFILL_EARLY=1
     DGPP_TEST_FILTER=moe_b12x_mxfp4_paging $<TARGET_FILE:glm_moe_test>)

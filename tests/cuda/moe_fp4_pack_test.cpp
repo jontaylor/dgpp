@@ -31,7 +31,7 @@ struct Buffer {
     return {all.begin() + 16, all.begin() + 16 + bytes};
   }
 };
-void roundtrip(int h, int i, int group = 16) {
+void roundtrip(int h, int i, int group = 16, bool nibbles = false) {
   std::array<std::unique_ptr<Buffer>, 9> source, restored;
   std::array<std::vector<uint8_t>, 9> original;
   const float globals[3] = {4.f, .25f, 8.f};
@@ -47,6 +47,7 @@ void roundtrip(int h, int i, int group = 16) {
         original[m * 3 + 1][static_cast<size_t>(row) * (k / group) + col] =
             static_cast<uint8_t>(row * 37 + col * 13 + m * 17);
     }
+    if (nibbles) for (auto& x : original[m * 3 + 1]) x = 0x70 | (x & 15);
     original[m * 3 + 2].resize(4);
     std::memcpy(original[m * 3 + 2].data(), &globals[m], 4);
     for (int part = 0; part < 3; ++part) {
@@ -59,7 +60,8 @@ void roundtrip(int h, int i, int group = 16) {
   std::array<std::unique_ptr<Buffer>, 6> packed;
   const size_t sizes[] = {static_cast<size_t>(i) * h, static_cast<size_t>(i) * h * 2 / group, 8,
                            static_cast<size_t>(h) * i / 2, static_cast<size_t>(h) * i / group, 4};
-  for (int j = 0; j < 6; ++j) packed[j] = std::make_unique<Buffer>(sizes[j]);
+  for (int j = 0; j < 6; ++j)
+    packed[j] = std::make_unique<Buffer>(sizes[j] / (nibbles && (j == 1 || j == 4) ? 2 : 1));
   dgpp::Fp4ExpertSource src;
   dgpp::Fp4ExpertDestination dst;
   for (int m = 0; m < 3; ++m) {
@@ -69,7 +71,7 @@ void roundtrip(int h, int i, int group = 16) {
     dst.globals[m] = group == 16 ? reinterpret_cast<float*>(restored[m * 3 + 2]->data()) : nullptr;
   }
   dgpp::Fp4PackedExpert view{packed[0]->data(), packed[1]->data(), reinterpret_cast<float*>(packed[2]->data()),
-                             packed[3]->data(), packed[4]->data(), reinterpret_cast<float*>(packed[5]->data())};
+                             packed[3]->data(), packed[4]->data(), reinterpret_cast<float*>(packed[5]->data()), nibbles};
   cudaStream_t stream;
   DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   if (group == 32) {
@@ -104,7 +106,7 @@ void roundtrip(int h, int i, int group = 16) {
   cudaGraphExec_t exec;
   DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
   for (auto& b : original[0]) b ^= 0xff;
-  for (auto& b : original[1]) b ^= 0xff;
+  for (auto& b : original[1]) b ^= nibbles ? 0xf : 0xff;
   DGPP_CUDA_OK(cudaMemcpyAsync(source[0]->data(), original[0].data(), original[0].size(), cudaMemcpyHostToDevice, stream));
   DGPP_CUDA_OK(cudaMemcpyAsync(source[1]->data(), original[1].data(), original[1].size(), cudaMemcpyHostToDevice, stream));
   DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
@@ -124,6 +126,22 @@ DGPP_TEST(moe_fp4_pack_preserves_scales_globals_and_graph_replay) {
 DGPP_TEST(moe_mxfp4_pack_preserves_native_scales_and_graph_replay) {
   roundtrip(128, 64, 32);
   roundtrip(5120, 1152, 32);
+}
+DGPP_TEST(moe_mx_nibbles_roundtrip_chunk_and_prepared) {
+  roundtrip(128, 64, 32, true);
+  roundtrip(5120, 1152, 32, true);
+  constexpr int payload = 5120 * 64 / 2, scales = payload / 16;
+  Buffer raw(3*(payload+scales)), packed(3*(payload+scales/2)), restored(raw.bytes);
+  std::vector<uint8_t> input(raw.bytes);
+  for (size_t i = 0; i < input.size(); ++i) {
+    input[i] = static_cast<uint8_t>(i*37 + i/11);
+    if (i % (payload+scales) >= payload) input[i] = 0x70 | (input[i] & 15);
+  }
+  DGPP_CUDA_OK(cudaMemcpy(raw.data(), input.data(), input.size(), cudaMemcpyHostToDevice));
+  dgpp::launch_mx_chunk_codec(packed.data(), raw.data(), payload, false, nullptr);
+  dgpp::launch_mx_chunk_codec(restored.data(), packed.data(), payload, true, nullptr);
+  require(restored.read() == input, "canonical MX chunk migration changed bytes");
+  (void)packed.read();
 }
 DGPP_TEST(moe_fp4_compact_preserves_prepared_weights_and_exact_scales) {
   for (const auto& [h,i] : {std::pair{128,64},std::pair{5120,1152}}) {

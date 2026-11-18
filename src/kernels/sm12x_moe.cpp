@@ -13,6 +13,9 @@
 #define CUTE_DSL_CUDA_ERROR_CHECK(err) DGPP_CUDA_OK(err)
 #include "dgpp_b12x_raw_fp32.h"
 #include "dgpp_b12x_mxfp4_fp32.h"
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+#include "dgpp_b12x_mxfp4_nibble_fp32.h"
+#endif
 static_assert(DGPP_B12X_CAPACITY == dgpp::Sm12xMoe::kCapacity, "regenerate the b12x AOT backend");
 #endif
 
@@ -70,12 +73,38 @@ struct MxBackend {
   static constexpr auto launch = cute_dsl_dgpp_b12x_mxfp4_fp32_wrapper;
   void load() { dgpp_b12x_mxfp4_fp32_Kernel_Module_Load(&module); }
 };
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+struct MxNibbleBackend {
+  dgpp_b12x_mxfp4_nibble_fp32_Kernel_Module_t module{};
+  using Fc1 = dgpp_b12x_mxfp4_nibble_fp32_Tensor_fc1_bf16_flat_t;
+  using Act = dgpp_b12x_mxfp4_nibble_fp32_Tensor_activated_bf16_flat_t;
+  using Fc2 = dgpp_b12x_mxfp4_nibble_fp32_Tensor_fc2_bf16_flat_t;
+  using Routes = dgpp_b12x_mxfp4_nibble_fp32_Tensor_packed_route_indices_t;
+  using Experts = dgpp_b12x_mxfp4_nibble_fp32_Tensor_block_expert_ids_t;
+  using Count = dgpp_b12x_mxfp4_nibble_fp32_Tensor_packed_route_count_t;
+  using Amax = dgpp_b12x_mxfp4_nibble_fp32_Tensor_activation_amax_flat_t;
+  using Tmp1 = dgpp_b12x_mxfp4_nibble_fp32_Tensor_fc1_c_tmp_f32_flat_t;
+  using Tmp2 = dgpp_b12x_mxfp4_nibble_fp32_Tensor_fc2_c_tmp_f32_flat_t;
+  using Locks = dgpp_b12x_mxfp4_nibble_fp32_Tensor_locks_i32_flat_t;
+  static constexpr auto launch = cute_dsl_dgpp_b12x_mxfp4_nibble_fp32_wrapper;
+  void load() { dgpp_b12x_mxfp4_nibble_fp32_Kernel_Module_Load(&module); }
+};
+#endif
 struct Sm12xMoe::Impl {
   int32_t* reused = nullptr;
   NvBackend nv;
   MxBackend mx;
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+  MxNibbleBackend nibble;
+#endif
   int group;
-  explicit Impl(int scale_group) : group(scale_group) {
+  bool mx_nibbles;
+  Impl(int scale_group, bool compact) : group(scale_group), mx_nibbles(compact) {
+    if (compact && (group != 32 || verify_split_enabled()))
+      throw std::invalid_argument("MX scale packing requires MXFP4 with unsplit verification");
+#ifndef DGPP_HAVE_B12X_MX_NIBBLES
+    if (compact) throw std::invalid_argument("rebuild with the mxfp4-nibble b12x export");
+#endif
     if (group != 16 && group != 32) throw std::invalid_argument("b12x FP4 scale group");
   }
   uint16_t *fc1 = nullptr, *act = nullptr;
@@ -88,6 +117,10 @@ struct Sm12xMoe::Impl {
     DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)));
   }
   void initialize() {
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+    if (mx_nibbles) nibble.load();
+    else
+#endif
     if (group == 32) mx.load(); else nv.load();
     allocate(fc1, M*K*2*I); allocate(act, M*K*I);
     allocate(tmp1, kTemp); allocate(tmp2, kTemp); allocate(locks, 4*256+2);
@@ -104,11 +137,14 @@ struct Sm12xMoe::Impl {
     if (reused) (void)cudaFree(reused);
     if (host) (void)cudaFreeHost(host);
     if (upload) (void)cudaEventDestroy(upload);
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+    if (nibble.module.module) (void)cudaLibraryUnload(nibble.module.module);
+#endif
     if (nv.module.module) (void)cudaLibraryUnload(nv.module.module);
     if (mx.module.module) (void)cudaLibraryUnload(mx.module.module);
   }
 };
-Sm12xMoe::Sm12xMoe(int group) : impl_(std::make_unique<Impl>(group)) { impl_->initialize(); }
+Sm12xMoe::Sm12xMoe(int group, bool mx_nibbles) : impl_(std::make_unique<Impl>(group, mx_nibbles)) { impl_->initialize(); }
 Sm12xMoe::~Sm12xMoe() = default;
 void Sm12xMoe::prepare_device(const uint64_t* table, const int32_t* ids,
                             const ExpertDemand* demand, int rows, cudaStream_t stream) {
@@ -125,7 +161,7 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   auto* table = reinterpret_cast<uint64_t*>(c.host);
   for (int e = 0; e < E; ++e) {
     if (!addresses[e]) throw std::invalid_argument("b12x MoE: missing prepared expert binding");
-    const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(addresses[e]), H, I, c.group);
+    const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(addresses[e]), H, I, c.group, c.mx_nibbles);
     table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
     table[e*3+1] = reinterpret_cast<uintptr_t>(p.s13);
     table[e*3+2] = reinterpret_cast<uintptr_t>(p.g13);
@@ -193,7 +229,11 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
         const_cast<int32_t*>(ids), c.tmp1, c.tmp1,
         E, 0, rows, 32, stream);
   };
-  const int status = c.group == 32 ? invoke(c.mx) : invoke(c.nv);
+  const int status =
+#ifdef DGPP_HAVE_B12X_MX_NIBBLES
+      c.mx_nibbles ? invoke(c.nibble) :
+#endif
+      c.group == 32 ? invoke(c.mx) : invoke(c.nv);
   if (status) throw std::runtime_error("b12x MoE AOT launch failed: " + std::to_string(status));
 }
 #else
@@ -201,7 +241,7 @@ struct Sm12xMoe::Impl {};
 void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, const ExpertDemand*, int, cudaStream_t) {
   throw std::logic_error("b12x AOT is unavailable");
 }
-Sm12xMoe::Sm12xMoe(int) { throw std::logic_error("b12x AOT is unavailable"); }
+Sm12xMoe::Sm12xMoe(int, bool) { throw std::logic_error("b12x AOT is unavailable"); }
 Sm12xMoe::~Sm12xMoe() = default;
 void Sm12xMoe::prepare(std::span<const int32_t>, std::span<const uint8_t* const>, int, cudaStream_t,
                        std::span<const int>) {

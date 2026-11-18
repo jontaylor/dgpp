@@ -15,7 +15,7 @@ class Sm12xMoe {
   static constexpr int kCapacity = 64;
   static size_t device_bytes();
   static size_t pinned_bytes();
-  explicit Sm12xMoe(int scale_group = 16);
+  explicit Sm12xMoe(int scale_group = 16, bool mx_nibbles = false);
   ~Sm12xMoe();
   Sm12xMoe(const Sm12xMoe&) = delete;
   Sm12xMoe& operator=(const Sm12xMoe&) = delete;

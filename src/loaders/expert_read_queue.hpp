@@ -58,6 +58,7 @@ struct ReadQueueConfig {
   uint64_t staging_budget_bytes = 0;
   uint64_t prefetch_bytes = 0;  // queued + active speculative record bytes
   bool scan_nvfp4_scales = false;  // opt-in; file workers scan completed immutable reads
+  bool require_mx_nibbles = false;  // reject any E8M0 byte outside 112..127 before publication
 };
 struct ReadQueueStats {
   uint64_t accepted = 0, coalesced = 0, promoted = 0, refused = 0;

@@ -21,6 +21,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       : memory_(memory), identity_(identity), stream_(stream), packed_fp4_(packed_fp4) {
     full_ = partition(identity.hidden, identity.intermediate, identity.world, identity.rank,
                       identity.intermediate / identity.world, identity.format).front();
+    if (memory_.mx_packed_scales() && !packed_fp4_)
+      throw std::invalid_argument("expert CUDA cache: MX packed scales require prepared execution");
     if (packed_fp4_ && (memory_.execution_slot_bytes != 2 * full_.allocation_bytes ||
         moe_fp4_packed_bytes(identity.hidden, identity.intermediate / identity.world, scale_group()) > full_.allocation_bytes))
       throw std::invalid_argument("expert CUDA cache: invalid packed FP4 reservation");
@@ -40,6 +42,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       DGPP_CUDA_OK(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
       gpu_scatter_ = integrated != 0;
     }
+    if (memory_.chunk_scratch_bytes) gpu_scatter_ = true;
     if (gpu_scatter_) {
       for (const auto& copies : copies_) {
         scatter_plans_.push_back(expert_chunk_copy_plan(copies));
@@ -75,6 +78,8 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         DGPP_CUDA_OK(cudaMallocHost(reinterpret_cast<void**>(&chunk_sources_),
             memory_.execution_slots * layouts_.size() * sizeof(const uint8_t*)));
       }
+      if (memory_.chunk_scratch_bytes)
+        DGPP_CUDA_OK(cudaMalloc(&chunk_scratch_, memory_.chunk_scratch_bytes));
       if (memory_.cache_slots)
         DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&cache_), memory_.cache_slots * memory_.cache_slot_bytes));
       DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&execution_), memory_.execution_slots * memory_.execution_slot_bytes));
@@ -92,10 +97,15 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   ~CudaCacheStorage() override { cleanup(); }
   const CacheMemory& memory() const override { return memory_; }
   void retain(size_t slot, std::span<const uint8_t> bytes) override {
-    if (slot >= memory_.cache_slots || bytes.size() > memory_.cache_slot_bytes)
+    if (slot >= memory_.cache_slots || (chunk_scratch_ ? bytes.size() != memory_.chunk_scratch_bytes : bytes.size() > memory_.cache_slot_bytes))
       throw std::invalid_argument("expert CUDA cache: invalid retention span");
     wait_cache(slot);
     Transfer transfer(*this, bytes.data());
+    if (chunk_scratch_) {
+      launch_mx_chunk_codec(cache_ + slot * memory_.cache_slot_bytes, mapped_.at(staging_index(bytes.data())),
+                            layouts_.front().gate.payload_bytes, false, copy_stream_);
+      return;
+    }
     DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + slot * memory_.cache_slot_bytes, bytes.data(), bytes.size(),
                                  cudaMemcpyHostToDevice, copy_stream_));
   }
@@ -119,6 +129,10 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       if (*cache_slot >= memory_.cache_slots || !host_bytes.empty())
         throw std::invalid_argument("expert CUDA cache: invalid cache source");
       source = cache_ + *cache_slot * memory_.cache_slot_bytes;
+      if (chunk_scratch_) {
+        launch_mx_chunk_codec(chunk_scratch_, source, layouts_.front().gate.payload_bytes, true, copy_stream_);
+        source = chunk_scratch_;
+      }
       kind = cudaMemcpyDeviceToDevice;
     } else {
       if (host_bytes.size() != layouts_[record.key.chunk].allocation_bytes)
@@ -229,7 +243,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
         out.globals[m] = matrices[m].global_offset ? reinterpret_cast<float*>(destination + *matrices[m].global_offset) : nullptr;
       }
       launch_moe_fp4_unpack(out, moe_fp4_packed_view(source, identity_.hidden,
-          identity_.intermediate / identity_.world, scale_group()), identity_.hidden,
+          identity_.intermediate / identity_.world, scale_group(), memory_.mx_packed_scales()), identity_.hidden,
           identity_.intermediate / identity_.world, copy_stream_, scale_group());
       return;
     }
@@ -255,7 +269,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     check_native(execution_slot, first);
     for (size_t c = 0; c < layouts_.size(); ++c) wait_cache(first+c);
     Transfer transfer(*this);
-    const size_t bytes = moe_fp4_packed_bytes(identity_.hidden, identity_.intermediate / identity_.world, scale_group());
+    const size_t bytes = moe_fp4_packed_bytes(identity_.hidden, identity_.intermediate / identity_.world, scale_group(), memory_.mx_packed_scales());
     DGPP_CUDA_OK(cudaMemcpyAsync(cache_ + first * memory_.cache_slot_bytes,
         execution_ + execution_slot * memory_.execution_slot_bytes + full_.allocation_bytes,
         bytes, cudaMemcpyDeviceToDevice, copy_stream_));
@@ -272,7 +286,9 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     // The gather overwrites every tensor byte; allocation padding is never
     // consumed by a matrix kernel or included in a reconstructed tensor.
     if (gpu_scatter_) {
-      launch_expert_chunk_scatter(dest, source, gather_plans_[record.key.chunk], copy_stream_);
+      launch_expert_chunk_scatter(chunk_scratch_ ? chunk_scratch_ : dest, source, gather_plans_[record.key.chunk], copy_stream_);
+      if (chunk_scratch_)
+        launch_mx_chunk_codec(dest, chunk_scratch_, layouts_.front().gate.payload_bytes, false, copy_stream_);
       return;
     }
     for (const auto& c : copies_[record.key.chunk])
@@ -396,7 +412,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
       in.globals[m] = matrices[m].global_offset ? reinterpret_cast<const float*>(source + *matrices[m].global_offset) : nullptr;
     }
     launch_moe_fp4_pack(moe_fp4_packed_view(destination, identity_.hidden,
-        identity_.intermediate / identity_.world, scale_group()), in, identity_.hidden,
+        identity_.intermediate / identity_.world, scale_group(), memory_.mx_packed_scales()), in, identity_.hidden,
         identity_.intermediate / identity_.world, copy_stream_, scale_group());
   }
   void check_cache(size_t slot) const {
@@ -405,7 +421,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   void check_native(size_t slot, size_t first) const {
     check_execution(slot);
     check_cache(first);
-    if (full_.allocation_bytes > (memory_.cache_slots - first) * memory_.cache_slot_bytes)
+    if (layouts_.size() > memory_.cache_slots - first)
       throw std::invalid_argument("expert CUDA cache: native extent exceeds slab");
   }
   void check_execution(size_t slot) const {
@@ -427,6 +443,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     if (copy_stream_) (void)cudaStreamDestroy(copy_stream_);
     for (auto* ptr : registered_) (void)cudaHostUnregister(ptr);
     registered_.clear();
+    if (chunk_scratch_) (void)cudaFree(chunk_scratch_);
     if (execution_) (void)cudaFree(std::exchange(execution_, nullptr));
     if (cache_) (void)cudaFree(std::exchange(cache_, nullptr));
   }
@@ -445,6 +462,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   bool gpu_scatter_ = false;
   bool batch_scatter_ = false;
   ChunkLayout full_;
+  uint8_t* chunk_scratch_ = nullptr;
   uint8_t* cache_ = nullptr;
   uint8_t* execution_ = nullptr;
   std::vector<void*> registered_;

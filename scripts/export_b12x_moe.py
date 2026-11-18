@@ -14,10 +14,12 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
-parser.add_argument('--format', choices=('nvfp4', 'mxfp4'), default='nvfp4')
+parser.add_argument('--format', choices=('nvfp4', 'mxfp4', 'mxfp4-nibble'), default='nvfp4')
 args = parser.parse_args()
-is_mx = args.format == 'mxfp4'
+nibble_scales = args.format == 'mxfp4-nibble'
+is_mx = args.format != 'nvfp4'
 symbol = 'dgpp_b12x_mxfp4_fp32' if is_mx else 'dgpp_b12x_raw_fp32'
+if nibble_scales: symbol = 'dgpp_b12x_mxfp4_nibble_fp32'
 args.output.mkdir(parents=True, exist_ok=True)
 
 import torch
@@ -49,8 +51,35 @@ for method in cls.body:
         expert_idx = Int32(0)
 '''
   if is_mx: prefix = prefix.replace("self.size_n * self.size_k // 64", "self.size_n * self.size_k // 128")
+  if nibble_scales: prefix = prefix.replace("// 128", "// 256")
   new=prefix+old
- elif method.name=='__cache_key__':new=old.replace('return (','return ("dgpp_native_fp32_v4",',1)
+ elif method.name=='_stage_k_tile_async' and nibble_scales:
+  # Keep the original staging ring and async-copy groups. Each thread now
+  # stages eight bytes and the MMA consumer expands a word in registers.
+  a = 'Int32(self.sh_s_off) + pipe * Int32(self.s_sh_stage) + tid,'
+  b = 'Int32(self.sh_s_off) + pipe * Int32(self.s_sh_stage),'
+  begin = old.index('                s_src_int4 = scales_expert_off')
+  prefix, tail = old[:begin], old[begin:]
+  if tail.count('cp_async4_shared_global(') != 2 or tail.count(a) != 1:
+   raise RuntimeError("unsupported b12x scale staging")
+  tail = tail.replace(a, b).replace('                if cutlass.const_expr(self.has_logical_tail):',
+      '                s_dst = s_dst + tid * Int32(8)\n                if cutlass.const_expr(self.has_logical_tail):')
+  tail = tail.replace('cp_async4_shared_global(', 'cp_async_u64_shared_global(')
+  tail = tail.replace('s_src_int4 * Int32(4)', 's_src_int4 * Int32(2)')
+  tail = tail.replace('st_shared_v4_u32(\n                            s_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)\n                        )',
+      'st_shared_u32(s_dst, Uint32(0))\n                        st_shared_u32(s_dst + Int32(4), Uint32(0))')
+  if 'st_shared_v4_u32' in tail: raise RuntimeError("unsupported scale-tail fill")
+  new = prefix + tail
+ elif method.name=='_load_b_scale_registers' and nibble_scales:
+  addr = '(s_sh_rd + scale_group_id * Int32(2 * self.s_sh_stride)) * Int32(8)'
+  read = 's_pack0, s_pack1 = ld_shared_v2_u32(s_addr)'
+  if old.count(addr) != 1 or old.count(read) != 1: raise RuntimeError("unsupported b12x scale reader")
+  new = old.replace(addr, addr.replace('Int32(8)', 'Int32(4)')).replace(read, '''pair = ld_shared_u32(s_addr)
+            s_pack0 = (pair & Uint32(0x0f0f0f0f)) | Uint32(0x70707070)
+            s_pack1 = ((pair >> Uint32(4)) & Uint32(0x0f0f0f0f)) | Uint32(0x70707070)''')
+ elif method.name=='__cache_key__':
+  version = "dgpp_mx_nibble_fp32_v1" if nibble_scales else "dgpp_native_fp32_v4"
+  new = old.replace('return (', f'return ("{version}",', 1)
  elif method.name=='_dequant_scale_x4_to_elem2x2' and not is_mx:
   new='''        s0, s1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(packed)
         lift = Uint32(0x7B007B00)

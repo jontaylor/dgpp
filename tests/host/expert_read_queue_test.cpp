@@ -34,7 +34,7 @@ struct Fixture {
   std::filesystem::path dir;
   std::string path;
   std::shared_ptr<ExpertStore> store;
-  Fixture() {
+  explicit Fixture(bool incompatible_scale = false) {
     std::string pattern = "/tmp/dgpp-expert-queue-XXXXXX";
     require(::mkdtemp(pattern.data()) != nullptr, "mkdtemp");
     dir = pattern;
@@ -52,7 +52,11 @@ struct Fixture {
                                        {128, 32, Format::kMxfp4, codes, scales, {}},
                                        {32, 128, Format::kMxfp4, codes, scales, {}}}};
     ExpertStoreBuilder writer(path, id, keys);
-    for (size_t i = 0; i < keys.size(); ++i) writer.write(i, pack_chunk(source, keys[i].chunk * 32, 32));
+    for (size_t i = 0; i < keys.size(); ++i) {
+      auto chunk = pack_chunk(source, keys[i].chunk * 32, 32);
+      if (incompatible_scale && i == 1) chunk.bytes[chunk.layout.down.scales_offset + 7] = 128;
+      writer.write(i, chunk);
+    }
     writer.finish();
     store = std::make_shared<ExpertStore>(path, id, keys.size(), IoMode::kBuffered);
   }
@@ -69,6 +73,15 @@ struct Fixture {
 };
 }  // namespace
 
+DGPP_TEST(expert_read_queue_refuses_unrepresentable_mx_scale_before_publication) {
+  Fixture f(true);
+  auto cfg = f.config();
+  cfg.require_mx_nibbles = true;
+  ExpertReadQueue queue(f.store, cfg);
+  require(ready(queue.request(0)) != nullptr, "representable record accepted");
+  refuses([&] { ready(queue.request(1)); });
+  require(ready(queue.request(2)) != nullptr, "later valid record still readable");
+}
 DGPP_TEST(expert_read_queue_classifies_nvfp4_scales_without_changing_record_bytes) {
   Fixture f;
   const auto path = (f.dir / "nvfp4.img").string();
