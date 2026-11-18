@@ -48,6 +48,8 @@ struct Dsv41Model::PagedGraphs {
   std::map<std::pair<int, int>, Graph> draft_graphs;
   cudaStream_t service = nullptr;
   cudaEvent_t done = nullptr;
+  cudaEvent_t ffn_window = nullptr, next_attention_window = nullptr;
+  int ffn_lookahead = 0, attention_lookahead = 0;
   ExpertDemand* demands = nullptr;
   uint64_t *tables = nullptr, *host_tables = nullptr;
   int layers;
@@ -67,6 +69,17 @@ struct Dsv41Model::PagedGraphs {
     profile_publish = profile && std::atoi(profile) != 0;
     const char* bulk = std::getenv("DGPP_EXPERT_BULK_BINDINGS");
     bulk_publish = !bulk || std::atoi(bulk) != 0;
+    const auto lookahead = [](const char* key) {
+      const char* setting = std::getenv(key);
+      if (!setting) return 0;
+      if (setting[0] < '0' || setting[0] > '2' || setting[1] != '\0')
+        throw std::invalid_argument(std::string(key) + " must be 0, 1 or 2");
+      return setting[0] - '0';
+    };
+    ffn_lookahead = lookahead("DGPP_DSV41_FFN_LOOKAHEAD");
+    attention_lookahead = lookahead("DGPP_DSV41_ATTENTION_LOOKAHEAD");
+    if (ffn_lookahead) DGPP_CUDA_OK(cudaEventCreateWithFlags(&ffn_window, cudaEventDisableTiming));
+    if (attention_lookahead) DGPP_CUDA_OK(cudaEventCreateWithFlags(&next_attention_window, cudaEventDisableTiming));
     changed_layers.reserve(n);
     prepare_moe_fp4_pack();
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
@@ -90,6 +103,8 @@ struct Dsv41Model::PagedGraphs {
     if (host_tables) (void)cudaFreeHost(host_tables);
     if (demands) (void)cudaFreeHost(demands);
     if (layer_stamps) (void)cudaFreeHost(layer_stamps);
+    if (ffn_window) (void)cudaEventDestroy(ffn_window);
+    if (next_attention_window) (void)cudaEventDestroy(next_attention_window);
     if (done) (void)cudaEventDestroy(done);
     if (service) (void)cudaStreamDestroy(service);
   }
@@ -1333,9 +1348,9 @@ void Dsv41Model::prefetch_attention_weights(const Dsv41LayerResident& r, int row
 // Before the attention fold: this layer's MoE site — the mHC coefficients,
 // the norm, the router and the shared expert's slices. The routed experts
 // are known only behind the router.
-void Dsv41Model::prefetch_ffn_side(const Dsv41LayerResident& r, int rows) {
+void Dsv41Model::prefetch_ffn_side(const Dsv41LayerResident& r, int rows, cudaEvent_t ready) {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
-  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate());  // the budget: engine.l2_prefetch_window_mib
+  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate(), false, ready);  // the budget: engine.l2_prefetch_window_mib
   prefetch_mhc(r.mhc.ffn_fn, r.ffn_norm, rows);
   prefetch_bf16(r.moe.router, static_cast<size_t>(r.moe.n_experts) * H * 2, rows);
   if (r.moe.router_bias) prefetch_.add(r.moe.router_bias, static_cast<size_t>(r.moe.n_experts) * 4);
@@ -1350,9 +1365,9 @@ void Dsv41Model::prefetch_ffn_side(const Dsv41LayerResident& r, int rows) {
 // next layer's attention side — or, on an Engram layer, the Engram
 // projection that runs first (that layer's own fold then carries its
 // attention side).
-void Dsv41Model::prefetch_attention_side(int layer, int rows) {
+void Dsv41Model::prefetch_attention_side(int layer, int rows, cudaEvent_t ready) {
   const Dsv41LayerResident& r = loader_.load_layer(layer);
-  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate());  // the budget: engine.l2_prefetch_window_mib
+  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate(), false, ready);  // the budget: engine.l2_prefetch_window_mib
   if (r.engram.present) {
     if (r.engram.wkv_x.tiles) prefetch_exl3(r.engram.wkv_x);
     else prefetch_fp8(r.engram.wkv);
@@ -1363,9 +1378,9 @@ void Dsv41Model::prefetch_attention_side(int layer, int rows) {
 
 // The head behind the last layer: the norm and the lm head's first rows
 // (the draft's head screen, when it is on, reads its own copy instead).
-void Dsv41Model::prefetch_head(const uint16_t* norm, bool draft, int rows) {
+void Dsv41Model::prefetch_head(const uint16_t* norm, bool draft, int rows, cudaEvent_t ready) {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
-  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate());  // the budget: engine.l2_prefetch_window_mib
+  prefetch_.open_window(stream_, 0, prefetch_.boundary_rate(), false, ready);  // the budget: engine.l2_prefetch_window_mib
   prefetch_bf16(norm, H * 2, rows);
   if (draft && draft_head_.enabled()) return;
   if (globals_.lm_head_x.tiles) {
@@ -1804,6 +1819,7 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
       ? std::accumulate(rows.span_lens, rows.span_lens + rows.decode_spans, 0) : 0;
   build_layer_objects(r);
   const bool pf = prefetching(rows.decode);
+  const auto* early = pf && paged_graph_capture_ ? paged_graphs_.get() : nullptr;
   // Engram: the hashed rows (staged at the walk's start) gate the streams
   // before this layer's coefficients read them.
   if (r.engram.present) {
@@ -1849,7 +1865,9 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     csa2_->enqueue_draft_block(x_, pool_, rows.req_ids, rows.pos, T, cfg_.dspark_block_size, attn_out, stream_);
   } else if (rows.decode) {
     csa2_->enqueue_decode(x_, pool_, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out, stream_,
-                          (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr, pf, debug_capture_);
+                          (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr, pf, debug_capture_,
+                          early && early->ffn_lookahead == 1 ? early->ffn_window : nullptr,
+                          early && early->ffn_lookahead == 2 ? early->ffn_window : nullptr);
   } else if (rows.num_spans > 0) {
     int row0 = 0;
     if (rows.decode_spans) {
@@ -1871,7 +1889,7 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   } else {
     csa2_->enqueue_prefill(x_, pool_, rows.req, rows.pos0, T, attn_out, stream_, rows.window_floor, rows.publish, 0, debug_capture_);
   }
-  if (pf) prefetch_ffn_side(r, T);
+  if (pf) prefetch_ffn_side(r, T, early ? early->ffn_window : nullptr);
   fold(attn_out, T, H, rows.capture);  // block boundary 1: wo_b's partial
   if (debug_capture_) cap.attn_out = grab(attn_out, static_cast<size_t>(T) * H);
   stream_update(attn_out, T);
@@ -1891,7 +1909,9 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     p.capturing->route_ids = moe_->decode_ids();
     p.capturing->route_weights = moe_->decode_weights();
     moe_->enqueue_paged_device(x_, ffn_out, T, p.tables + layer * PagedGraphs::words,
-                              p.demands + layer, stream_);
+                              p.demands + layer, stream_,
+                              early && early->attention_lookahead == 1 ? early->next_attention_window : nullptr,
+                              early && early->attention_lookahead == 2 ? early->next_attention_window : nullptr);
   } else if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
     if (rows.capture) throw std::logic_error("Dsv41Model: expert paging cannot execute in a captured walk");
     auto& moe = draft ? *draft_moe_ : *moe_;
@@ -1927,9 +1947,9 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     // stage's next stage, or the head behind the last of either.
     const int last = draft ? cfg_.max_layer() - 1 : cfg_.num_hidden_layers - 1;
     if (layer < last)
-      prefetch_attention_side(layer + 1, T);
+      prefetch_attention_side(layer + 1, T, early ? early->next_attention_window : nullptr);
     else
-      prefetch_head(draft ? r.draft.norm : globals_.final_norm, draft, T);
+      prefetch_head(draft ? r.draft.norm : globals_.final_norm, draft, T, early ? early->next_attention_window : nullptr);
   }
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);

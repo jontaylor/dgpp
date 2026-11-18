@@ -334,7 +334,7 @@ void WeightPrefetcher::flush_pending() {
 }
 
 void WeightPrefetcher::open_window(cudaStream_t main, size_t budget_bytes,
-                                   PrefetchRate rate, bool persisting) {
+                                   PrefetchRate rate, bool persisting, cudaEvent_t ready) {
   if (!enabled_) return;
   flush_pending();  // the previous window's tail, at its own rate and policy
   rate_ = rate;
@@ -342,8 +342,8 @@ void WeightPrefetcher::open_window(cudaStream_t main, size_t budget_bytes,
   remaining_ = budget_bytes > 0 ? budget_bytes : window_bytes_;
   window_open_ = true;
   if (rate == PrefetchRate::Off) return;  // no fork: nothing will launch
-  DGPP_CUDA_OK(cudaEventRecord(fork_, main));
-  DGPP_CUDA_OK(cudaStreamWaitEvent(side_, fork_, 0));
+  if (!ready) DGPP_CUDA_OK(cudaEventRecord(fork_, main));
+  DGPP_CUDA_OK(cudaStreamWaitEvent(side_, ready ? ready : fork_, 0));
   forked_ = true;
 }
 

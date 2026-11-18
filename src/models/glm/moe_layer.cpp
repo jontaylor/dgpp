@@ -1303,7 +1303,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
 }
 
 void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
-    const uint64_t* table, ExpertDemand* demand, cudaStream_t stream) {
+    const uint64_t* table, ExpertDemand* demand, cudaStream_t stream,
+    cudaEvent_t before_demand, cudaEvent_t after_routed) {
   if (!sm12x_moe_ || tokens > decode_slots_ || !shared_lane_takes(true, tokens) ||
       shared_aside_takes(true, tokens) || !has_shared() || w_.shared_nvfp4())
     throw std::logic_error("GPU paging requires prepared b12x and the FP8 shared lane");
@@ -1323,8 +1324,10 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
   DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
   // The shared slots are disjoint from routed slots on both execution paths.
   route(hidden, tokens, stream, d_router_counters_);
+  if (before_demand) DGPP_CUDA_OK(cudaEventRecord(before_demand, stream));
   sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream);
   sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream, table);
+  if (after_routed) DGPP_CUDA_OK(cudaEventRecord(after_routed, stream));
   DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
   launch_moe_slot_accum(out, d_slot_down_, d_weights_, tokens, H, K, stream);
 }

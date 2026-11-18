@@ -119,7 +119,8 @@ class WeightPrefetcher {
   // `persisting`: every launch of the window carries the persisting
   // access policy (launch_l2_prefetch).
   void open_window(cudaStream_t main, size_t budget_bytes = 0,
-                   PrefetchRate rate = PrefetchRate::Full, bool persisting = false);
+                   PrefetchRate rate = PrefetchRate::Full, bool persisting = false,
+                   cudaEvent_t ready = nullptr);
   // Adds a range to the open window, clamped to its remaining budget.
   // Adjacent (or nearly adjacent) ranges coalesce into one launch
   //: a window's adds are a layer's tensors in consumption

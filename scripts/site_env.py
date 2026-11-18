@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOYMENT_ENV_KEYS = (
     "DGPP_MOE_B12X", "DGPP_MOE_FP4_GROUPED_DECODE",
     "DGPP_DSV41_PAGED_DRAFT_GRAPH", "DGPP_EXPERT_ADJACENT_READS",
+    "DGPP_DSV41_FFN_LOOKAHEAD", "DGPP_DSV41_ATTENTION_LOOKAHEAD",
     "DGPP_EXPERT_GPU_SCATTER", "DGPP_EXPERT_VERIFY_RECORDS",
     "DGPP_MOE_ASYNC_MISSES", "DGPP_EXPERT_DEMAND_LOOKAHEAD",
     "DGPP_EXPERT_DIRECT_NATIVE_ADMISSION", "DGPP_EXPERT_EARLY_DEMAND",
@@ -190,6 +191,8 @@ def deployment(path):
             "CUDA_MODULE_LOADING": ("EAGER", "LAZY"),
             "CUDA_DEVICE_MAX_CONNECTIONS": tuple(str(n) for n in range(1, 33)),
             "DGPP_EXPERT_ADJACENT_READS": tuple(str(n) for n in range(1, 17)),
+            "DGPP_DSV41_FFN_LOOKAHEAD": ("0", "1", "2"),
+            "DGPP_DSV41_ATTENTION_LOOKAHEAD": ("0", "1", "2"),
             "DGPP_EXPERT_READY_WORKER": ("0", "1", "2"),
             "DGPP_CSA2_PREFILL_SPLITS": ("1", "2", "4"),
             "DGPP_MX_FUSED_ACTIVATION": ("0", "1", "2", "3"),

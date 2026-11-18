@@ -431,9 +431,9 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   void head_logits(const uint16_t* h, int rows, float* out, cudaStream_t stream);
   void prefetch_mhc(const uint16_t* fn, const uint16_t* norm, int rows);
   void prefetch_attention_weights(const Dsv41LayerResident& r, int rows);
-  void prefetch_ffn_side(const Dsv41LayerResident& r, int rows);
-  void prefetch_attention_side(int layer, int rows);
-  void prefetch_head(const uint16_t* norm, bool draft, int rows);
+  void prefetch_ffn_side(const Dsv41LayerResident& r, int rows, cudaEvent_t ready = nullptr);
+  void prefetch_attention_side(int layer, int rows, cudaEvent_t ready = nullptr);
+  void prefetch_head(const uint16_t* norm, bool draft, int rows, cudaEvent_t ready = nullptr);
   WeightPrefetcher prefetch_;
   int target_ordinal(int layer) const;
   int32_t* ctx(int req) const { return d_ctx_ + static_cast<size_t>(req) * 4; }

@@ -622,7 +622,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
                    w_.attn_sink, rows, lh, pos, w_.inv_freq, bf16_out, stream, mx_out);
 }
 
-void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out) {
+void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out, cudaEvent_t before_wo_b) {
   const int lh = cfg_.local_heads(), lg = cfg_.local_groups(), hpg = cfg_.heads_per_group();
   const int K = hpg * kCsa2Latent;
   // wo_a is block-diagonal over the groups: group g projects its own heads.
@@ -634,6 +634,7 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const ui
     for (int g = 0; g < lg; ++g)
       launch_exl3_gemm_bf16(o_ + size_t(g) * K, act_stride, w_.wo_a_x[size_t(g)], oa_ + size_t(g) * cfg_.o_lora, tokens,
                             cfg_.o_lora, K, size_t(lg) * cfg_.o_lora, stream, exl3_ws_, exl3_ws_bytes_);
+    if (before_wo_b) DGPP_CUDA_OK(cudaEventRecord(before_wo_b, stream));
     launch_exl3_gemm_bf16(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b_x, static_cast<uint16_t*>(out), tokens, cfg_.hidden,
                           lg * cfg_.o_lora, 0, stream, exl3_ws_, exl3_ws_bytes_);
     return;
@@ -673,6 +674,7 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const ui
   // of 80. Keep its reduction choice consistent for all decode row counts.
   const bool with_workspace = prefill_tile_ ||
       (lg == 4 && cfg_.o_lora == 1024 && cfg_.hidden == 5120);
+  if (before_wo_b) DGPP_CUDA_OK(cudaEventRecord(before_wo_b, stream));
   launch_csa2_projection(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
                          static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora,
                          stream, 0, 5, 5, cfg_.dense_mma,
@@ -718,7 +720,8 @@ void Csa2Layer::open_output_window(cudaStream_t stream) {
 
 void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
                                const int32_t* req_spans, int num_requests, int tokens, void* out, cudaStream_t stream,
-                               float* tail_snapshots, bool prefetch, bool keep_attn_out) {
+                               float* tail_snapshots, bool prefetch, bool keep_attn_out,
+                               cudaEvent_t before_wo_a, cudaEvent_t before_wo_b) {
   validate_pool(pool);
   if (tokens <= 0 || tokens > max_decode_rows_) throw std::invalid_argument("csa2 layer: decode rows out of range");
   if (num_requests <= 0 || num_requests > pool.shape().max_requests)
@@ -827,7 +830,8 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
     mx_out = static_cast<uint8_t*>(gemm_ws_);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table(), req_ids, pos, 0, tokens,
               decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out, keep_attn_out);
-  project_out(tokens, out, stream, mx_out);
+  if (before_wo_a) DGPP_CUDA_OK(cudaEventRecord(before_wo_a, stream));
+  project_out(tokens, out, stream, mx_out, before_wo_b);
 }
 
 // ---- the DSpark draft --------------------------------------------------------------------------------

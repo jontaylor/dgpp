@@ -161,7 +161,8 @@ class Csa2Layer {
   // tensor even when the output projection consumes packed MXFP8.
   void enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
                       const int32_t* req_spans, int num_requests, int tokens, void* out, cudaStream_t stream,
-                      float* tail_snapshots = nullptr, bool prefetch = true, bool keep_attn_out = true);
+                      float* tail_snapshots = nullptr, bool prefetch = true, bool keep_attn_out = true,
+                      cudaEvent_t before_wo_a = nullptr, cudaEvent_t before_wo_b = nullptr);
 
   // ---- the DSpark draft (plan D8) on a window-only draft layer ----------------
   // append_window_rows: the ring rows of `n` real tokens — x [n, hidden] the
@@ -270,7 +271,7 @@ class Csa2Layer {
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
                    const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false,
                    uint8_t* mx_out = nullptr, bool keep_attn_out = true);
-  void project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out = nullptr);
+  void project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out = nullptr, cudaEvent_t before_wo_b = nullptr);
   void validate_pool(const Csa2StatePool& pool) const;
 
   // The decode windows (see set_prefetcher): opened where the chain is
