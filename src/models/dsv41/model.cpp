@@ -51,6 +51,7 @@ struct Dsv41Model::PagedGraphs {
   int layers;
   Graph* capturing = nullptr;
   uint64_t passes = 0, misses = 0;
+  uint64_t projection_waves = 0, projection_pending = 0;
   uint64_t published_revision = 0;
   std::vector<int> changed_layers;
   bool profile_publish = false;
@@ -1966,14 +1967,21 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
         // The acquire-load above observes exact graph routes. Queue the first
         // known misses before accounting prior layers or rebinding the MoE.
         // This does not change residency; mutation still happens at the gate.
-        if (early) (void)expert_cache_->prime_demand(selected, expert_cache_map_[l]);
+        expert::ProjectionReads split;
+        if (sm12x_projection_mode()) {
+          split = expert_cache_->prime_projections(selected, expert_cache_map_[l]);
+          split.delay_gate = sm12x_projection_mode() == 2;
+        }
+        if (early && split.tickets.empty()) (void)expert_cache_->prime_demand(selected, expert_cache_map_[l]);
         account(l);
         // The graph started the shared expert before routing. Fill only its
         // routed slots here, then release the gate for the ordered sum.
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
-        const GlmMoeLayer::ReadyRoutes ready{selected, g.route_ids, g.route_weights};
+        const GlmMoeLayer::ReadyRoutes ready{selected, g.route_ids, g.route_weights,
+            split.tickets.empty() ? nullptr : &split};
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
                             p.service, MoeExpertKernel::kGemv, nullptr, &ready);
+        if (ready.projections) { ++p.projection_waves; p.projection_pending += split.down_pending_at_gate; }
         // Submit dirty bindings behind the expert kernels. One service-stream
         // fence covers both before the host releases the graph.
         p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
@@ -2025,6 +2033,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
     }
     if (p.passes == 1 || p.passes % 100 == 0)
       DGPP_LOG_INFO("dsv41 GPU paging: {} target replays, {} serviced layer misses", p.passes, p.misses);
+    if (sm12x_projection_mode() && p.passes % 100 == 0)
+      DGPP_LOG_INFO("projection waves: {}, down reads outstanding at gate launch: {}", p.projection_waves, p.projection_pending);
   } catch (...) {
     for (int l = 0; l < p.layers; ++l) __atomic_store_n(&p.demands[l].request, 3u, __ATOMIC_RELEASE);
     if (launched) (void)cudaStreamSynchronize(stream_);

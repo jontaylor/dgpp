@@ -15,6 +15,9 @@
 #include "dgpp_b12x_mxfp4_fp32.h"
 #ifdef DGPP_HAVE_B12X_MX_NIBBLES
 #include "dgpp_b12x_mxfp4_nibble_fp32.h"
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+#include "dgpp_b12x_mxfp4_nibble_fp32_projection.h"
+#endif
 #endif
 static_assert(DGPP_B12X_CAPACITY == dgpp::Sm12xMoe::kCapacity, "regenerate the b12x AOT backend");
 #endif
@@ -28,6 +31,18 @@ bool verify_split_enabled() {
 constexpr int H = 5120, I = 1152, E = 384, K = 6, M = Sm12xMoe::kCapacity, B = 8;
 constexpr size_t kTemp = 4 * 256 * B * 256;
 constexpr size_t kPacket = E * 6 * sizeof(uint64_t) + M * K * (B + 1) * sizeof(int32_t) + sizeof(int32_t);
+}
+int sm12x_projection_mode() {
+  static const int mode = [] {
+    const char* s = std::getenv("DGPP_EXPERT_PROJECTION_SPLIT");
+    if (!s || std::string(s) == "0") return 0;
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+    if (std::string(s) == "1") return 1;
+    if (std::string(s) == "2") return 2;
+#endif
+    throw std::invalid_argument("DGPP_EXPERT_PROJECTION_SPLIT requires mode 1 or 2 and the projection AOT");
+  }();
+  return mode;
 }
 bool sm12x_moe_enabled(int hidden, int intermediate, int experts, int top_k) {
   const char* option = std::getenv("DGPP_MOE_B12X");
@@ -89,6 +104,23 @@ struct MxNibbleBackend {
   static constexpr auto launch = cute_dsl_dgpp_b12x_mxfp4_nibble_fp32_wrapper;
   void load() { dgpp_b12x_mxfp4_nibble_fp32_Kernel_Module_Load(&module); }
 };
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+struct MxProjectionBackend {
+  dgpp_b12x_mxfp4_nibble_fp32_projection_Kernel_Module_t module{};
+  using Fc1 = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_fc1_bf16_flat_t;
+  using Act = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_activated_bf16_flat_t;
+  using Fc2 = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_fc2_bf16_flat_t;
+  using Routes = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_packed_route_indices_t;
+  using Experts = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_block_expert_ids_t;
+  using Count = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_packed_route_count_t;
+  using Amax = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_activation_amax_flat_t;
+  using Tmp1 = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_fc1_c_tmp_f32_flat_t;
+  using Tmp2 = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_fc2_c_tmp_f32_flat_t;
+  using Locks = dgpp_b12x_mxfp4_nibble_fp32_projection_Tensor_locks_i32_flat_t;
+  static constexpr auto launch = cute_dsl_dgpp_b12x_mxfp4_nibble_fp32_projection_wrapper;
+  void load() { dgpp_b12x_mxfp4_nibble_fp32_projection_Kernel_Module_Load(&module); }
+};
+#endif
 #endif
 struct Sm12xMoe::Impl {
   int32_t* reused = nullptr;
@@ -96,6 +128,9 @@ struct Sm12xMoe::Impl {
   MxBackend mx;
 #ifdef DGPP_HAVE_B12X_MX_NIBBLES
   MxNibbleBackend nibble;
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+  MxProjectionBackend projection;
+#endif
 #endif
   int group;
   bool mx_nibbles;
@@ -117,6 +152,9 @@ struct Sm12xMoe::Impl {
     DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)));
   }
   void initialize() {
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+    if (mx_nibbles && sm12x_projection_mode()) projection.load();
+#endif
 #ifdef DGPP_HAVE_B12X_MX_NIBBLES
     if (mx_nibbles) nibble.load();
     else
@@ -137,6 +175,9 @@ struct Sm12xMoe::Impl {
     if (reused) (void)cudaFree(reused);
     if (host) (void)cudaFreeHost(host);
     if (upload) (void)cudaEventDestroy(upload);
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+    if (projection.module.module) (void)cudaLibraryUnload(projection.module.module);
+#endif
 #ifdef DGPP_HAVE_B12X_MX_NIBBLES
     if (nibble.module.module) (void)cudaLibraryUnload(nibble.module.module);
 #endif
@@ -200,7 +241,7 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   c.uploaded = true;
 }
 void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weights,
-                   float* out, int rows, cudaStream_t stream, const uint64_t* bindings) {
+                   float* out, int rows, cudaStream_t stream, const uint64_t* bindings, expert::ExpertProjection part) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x MoE: row count exceeds capacity");
   auto& c = *impl_;
   // Captured layers already own a published device table. Host-serviced
@@ -228,11 +269,14 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
     return Backend::launch(&backend.module, input, input, input,
         table, table+E*3*sizeof(uint64_t), int64_t(E)*2*I*H/8, int64_t(E)*H*I/8,
         &fc1, &act, &fc2, c.tmp1, c.tmp1, c.tmp1, c.tmp1, &routes, &experts, &count, &amax,
-        0, const_cast<float*>(weights), &tmp1, &tmp2, &locks, c.tmp1, c.tmp1, c.tmp1,
+        static_cast<int32_t>(part), const_cast<float*>(weights), &tmp1, &tmp2, &locks, c.tmp1, c.tmp1, c.tmp1,
         const_cast<int32_t*>(ids), c.tmp1, c.tmp1,
         E, 0, rows, 32, stream);
   };
   const int status =
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+      part != expert::ExpertProjection::kAll ? invoke(c.projection) :
+#endif
 #ifdef DGPP_HAVE_B12X_MX_NIBBLES
       c.mx_nibbles ? invoke(c.nibble) :
 #endif
@@ -250,7 +294,7 @@ void Sm12xMoe::prepare(std::span<const int32_t>, std::span<const uint8_t* const>
                        std::span<const int>) {
   throw std::logic_error("b12x AOT is unavailable");
 }
-void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t, const uint64_t*) {
+void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t, const uint64_t*, expert::ExpertProjection) {
   throw std::logic_error("b12x AOT is unavailable");
 }
 #endif

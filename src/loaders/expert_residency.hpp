@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace dgpp::expert {
+enum class ExpertProjection { kAll, kGateUp, kDown };
 
 enum class Format { kMxfp4, kNvfp4 };
 enum class Policy { kWholeExpert, kAdaptiveFractional };

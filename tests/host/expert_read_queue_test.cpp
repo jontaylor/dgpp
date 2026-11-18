@@ -82,6 +82,35 @@ DGPP_TEST(expert_read_queue_refuses_unrepresentable_mx_scale_before_publication)
   refuses([&] { ready(queue.request(1)); });
   require(ready(queue.request(2)) != nullptr, "later valid record still readable");
 }
+DGPP_TEST(expert_read_queue_split_joins_original_record) {
+  Fixture f;
+  const auto path = (f.dir / "projection.img").string();
+  StoreIdentity id; id.checkpoint_sha256.fill(29);
+  id.hidden = 1024; id.intermediate = id.chunk_intermediate = 64;
+  const std::vector<RecordKey> keys{{0,0,0,false}};
+  std::vector<uint8_t> codes(1024*64/2), scales(1024*64/32, 120);
+  for (size_t i = 0; i < codes.size(); ++i) codes[i] = static_cast<uint8_t>(i*37+i/23);
+  std::array<MatrixSource,3> source{{{64,1024,Format::kMxfp4,codes,scales,{}},
+      {64,1024,Format::kMxfp4,codes,scales,{}}, {1024,64,Format::kMxfp4,codes,scales,{}}}};
+  ExpertStoreBuilder writer(path, id, keys);
+  const auto chunk = pack_chunk(source, 0, 64);
+  writer.write(0, chunk); writer.finish();
+  auto store = std::make_shared<ExpertStore>(path, id, 1, IoMode::kDirect, false);
+  const size_t n = chunk.layout.record_bytes, cut = chunk.layout.down.payload_offset;
+  ReadQueueConfig cfg;
+  cfg.buffers = cfg.max_pending = 2; cfg.staging_budget_bytes = 2*n; cfg.require_mx_nibbles = true;
+  const std::array<size_t,1> record{0};
+  ExpertReadQueue queue(store, cfg);
+  const auto tickets = queue.reserve_projections(record);
+  require(tickets.size() == 2, "one reservation for both halves");
+  auto first = ready(tickets[0]), last = ready(tickets[1]);
+  require(std::equal(chunk.bytes.begin(), chunk.bytes.begin()+cut, first->bytes().begin()) &&
+          std::equal(chunk.bytes.begin()+cut, chunk.bytes.end(), last->bytes().begin()+cut),
+          "projection ranges reproduce canonical chunk");
+  require(store->stats().returned_bytes == n && store->stats().calls == 2, "two reads total one record");
+  ExpertStore checked(path, id, 1, IoMode::kDirect, true);
+  require(!checked.can_split(0), "whole-record verification requires full reads");
+}
 DGPP_TEST(expert_read_queue_classifies_nvfp4_scales_without_changing_record_bytes) {
   Fixture f;
   const auto path = (f.dir / "nvfp4.img").string();

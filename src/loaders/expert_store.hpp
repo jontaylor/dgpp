@@ -74,7 +74,10 @@ class ExpertStore {
   // Direct mode also requires 4 KiB pointer alignment. Checksums include
   // padding. Payload checksumming is optional for the serving reader; image
   // identity, metadata, extent and complete-read checks always apply.
-  void read(size_t record, std::span<uint8_t> destination) const;
+  bool can_split(size_t record) const;
+  // A projection read fills only that range at its canonical offset.
+  void read(size_t record, std::span<uint8_t> destination,
+            ExpertProjection projection = ExpertProjection::kAll) const;
   ReadStats stats() const;
 
  private:

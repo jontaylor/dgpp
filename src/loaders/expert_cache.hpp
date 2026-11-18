@@ -81,6 +81,12 @@ class ExpertCacheStorage {
   virtual void assemble_many(std::span<const Assembly> ready) {
     for (const auto& a : ready) assemble(a.execution_slot, *a.record, a.cache_slot, a.host_bytes);
   }
+  virtual bool supports_projection_reads() const { return false; }
+  // Assemble and pack one projection for this expert, ordering the execution
+  // stream behind its copies. The other projection can be read concurrently.
+  virtual const uint8_t* prepare_projection(size_t, std::span<const Assembly>, ExpertProjection) {
+    throw std::logic_error("projection reads unsupported");
+  }
   virtual const uint8_t* execution_data(size_t slot) const = 0;
   virtual const uint8_t* packed_execution_data(size_t) {
     throw std::logic_error("packed NVFP4 execution unsupported");
@@ -191,6 +197,14 @@ struct CacheTelemetry {
   ResourcePressure pressure;
 };
 
+struct ProjectionReads {
+  std::vector<size_t> experts;
+  std::vector<std::shared_ptr<ReadTicket>> tickets;
+  std::chrono::steady_clock::time_point queued;
+  bool delay_gate = false;
+  bool down_pending_at_gate = false;
+};
+using ExecuteProjection = std::function<void(std::span<const uint8_t* const>, ExpertProjection)>;
 class ExpertCache {
  public:
   // Validates the complete population/floor/budget before invoking factory.
@@ -226,7 +240,9 @@ class ExpertCache {
   // leases, mutate/reenter the cache, switch streams, or retain their addresses.
   // Admission follows execution submission and uses the reconstructed payload.
   void execute_ready(std::span<const size_t> selected,
-      const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute);
+      const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute,
+      ProjectionReads* projections = nullptr, const ExecuteProjection& execute_projection = {});
+  ProjectionReads prime_projections(std::span<const int32_t> ids, std::span<const size_t> mapping);
   bool packed_fp4() const;
   // Borrowed metadata, not a lease. Only usable by a quiescent engine-owned
   // walk that stops payload readers before any cache mutation. A revision

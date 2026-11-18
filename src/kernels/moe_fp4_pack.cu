@@ -373,25 +373,32 @@ void prepare_moe_fp4_pack() {
 }
 
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
-                         int hidden, int intermediate, cudaStream_t stream, int scale_group) {
+                         int hidden, int intermediate, cudaStream_t stream, int scale_group,
+                         expert::ExpertProjection projection) {
   check_geometry(hidden, intermediate);
   check_packed(dst, scale_group);
   for (int m = 0; m < 3; ++m)
     if (!src.payload[m] || !src.scales[m] || (scale_group == 16 && !src.globals[m]))
       throw std::invalid_argument("MoE FP4 packing: null source matrix");
-  pack_payload<true><<<blocks(2 * intermediate * hidden / 8), kThreads, 0, stream>>>(
+  if (projection != expert::ExpertProjection::kDown)
+    pack_payload<true><<<blocks(2 * intermediate * hidden / 8), kThreads, 0, stream>>>(
       reinterpret_cast<uint32_t*>(dst.w13), src.payload[0], src.payload[1], 2 * intermediate, hidden);
-  pack_payload<false><<<blocks(hidden * intermediate / 8), kThreads, 0, stream>>>(
+  if (projection != expert::ExpertProjection::kGateUp)
+    pack_payload<false><<<blocks(hidden * intermediate / 8), kThreads, 0, stream>>>(
       reinterpret_cast<uint32_t*>(dst.w2), src.payload[2], nullptr, hidden, intermediate);
   if (dst.mx_nibbles) {
-    pack_mx_scale_words<true><<<blocks(2 * intermediate * (hidden / 32) / 8), kThreads, 0, stream>>>(
+    if (projection != expert::ExpertProjection::kDown)
+      pack_mx_scale_words<true><<<blocks(2 * intermediate * (hidden / 32) / 8), kThreads, 0, stream>>>(
         reinterpret_cast<uint32_t*>(dst.s13), src.scales[0], src.scales[1], 2 * intermediate, hidden);
-    pack_mx_scale_words<false><<<blocks(hidden * (intermediate / 32) / 8), kThreads, 0, stream>>>(
+    if (projection != expert::ExpertProjection::kGateUp)
+      pack_mx_scale_words<false><<<blocks(hidden * (intermediate / 32) / 8), kThreads, 0, stream>>>(
         reinterpret_cast<uint32_t*>(dst.s2), src.scales[2], nullptr, hidden, intermediate);
   } else {
-    move_scales<true, false><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
+    if (projection != expert::ExpertProjection::kDown)
+      move_scales<true, false><<<blocks(2 * intermediate * (hidden / scale_group)), kThreads, 0, stream>>>(
         nullptr, nullptr, dst.s13, src.scales[0], src.scales[1], nullptr, 2 * intermediate, hidden, scale_group);
-    move_scales<false, false><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
+    if (projection != expert::ExpertProjection::kGateUp)
+      move_scales<false, false><<<blocks(hidden * (intermediate / scale_group)), kThreads, 0, stream>>>(
         nullptr, nullptr, dst.s2, src.scales[2], nullptr, nullptr, hidden, intermediate, scale_group);
   }
   DGPP_CUDA_OK(cudaGetLastError());

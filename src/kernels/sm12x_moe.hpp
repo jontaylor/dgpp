@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include "loaders/expert_residency.hpp"
 
 namespace dgpp {
 struct ExpertDemand;
+int sm12x_projection_mode();
 // Optional b12x W4A16 specialization for the TP2 native FP4 target. All preparation
 // precedes graph capture; execution has no Python or JIT dependency.
 bool sm12x_moe_enabled(int hidden, int intermediate, int experts, int top_k);
@@ -29,7 +31,8 @@ class Sm12xMoe {
   // A captured device route uses its layer's published binding table.
   // Host-prepared waves use the private bindings uploaded by prepare().
   void run(const uint16_t* input, const int32_t* ids, const float* weights,
-           float* slots, int rows, cudaStream_t stream, const uint64_t* bindings = nullptr);
+           float* slots, int rows, cudaStream_t stream, const uint64_t* bindings = nullptr,
+           expert::ExpertProjection part = expert::ExpertProjection::kAll);
   void prepare_device(const uint64_t* table, const int32_t* ids,
                       ExpertDemand* demand, int rows, cudaStream_t stream);
  private:

@@ -103,7 +103,8 @@ void launch_mx_chunk_codec(uint8_t* destination, const uint8_t* source,
 // Source and destination must be disjoint. All allocations belong to the
 // caller; the launchers allocate nothing and are CUDA-graph capturable.
 void launch_moe_fp4_pack(Fp4PackedExpert dst, Fp4ExpertSource src,
-                         int hidden, int intermediate, cudaStream_t stream, int scale_group = 16);
+                         int hidden, int intermediate, cudaStream_t stream, int scale_group = 16,
+                         expert::ExpertProjection projection = expert::ExpertProjection::kAll);
 void launch_moe_fp4_unpack(Fp4ExpertDestination dst, Fp4PackedExpert src,
                            int hidden, int intermediate, cudaStream_t stream, int scale_group = 16);
 

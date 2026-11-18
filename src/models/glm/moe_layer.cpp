@@ -828,7 +828,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     cache->observe(selected, kernel == MoeExpertKernel::kMma);
     if (cache->packed_fp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
         (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
-      enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts, ready != nullptr);
+      enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts, ready);
       return;
     }
     // Metadata-only tables are rebound to a live reconstruction before a
@@ -1331,7 +1331,9 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
 
 void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
     cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-    std::span<const int> active_experts, bool graph_finishes) {
+    std::span<const int> active_experts, const ReadyRoutes* ready) {
+  const bool graph_finishes = ready != nullptr;
+  auto* projections = ready ? ready->projections : nullptr;
   if (!sm12x_moe_ || !stream || stream == cudaStreamLegacy || !shared_lane_takes(true, tokens) ||
       shared_aside_takes(true, tokens) || !has_shared() || w_.shared_nvfp4() ||
       w_.shared[0].rows > cfg_.inter)
@@ -1434,7 +1436,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
   // File workers can fill the bounded staging window while the shared and
   // resident experts run. No speculative device allocation or cache binding
   // changes occur here.
-  if (!missing.empty()) {
+  if (!projections && !missing.empty()) {
     if (expert::group_reads_enabled()) {
       std::vector<size_t> next;
       const size_t count = std::min(missing.size(), cache.memory().execution_slots);
@@ -1463,7 +1465,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
     const char* value = std::getenv("DGPP_MOE_ASYNC_MISSES");
     return value && std::atoi(value) != 0;
   }();
-  if (independent_ready && !missing.empty()) {
+  if ((independent_ready || projections) && !missing.empty()) {
     std::vector<size_t> selected;
     for (auto j : missing) selected.push_back(routed[j]);
     cache.execute_ready(selected, [&](std::span<const size_t> inputs,
@@ -1478,6 +1480,18 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       }
       sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
       sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    }, projections, [&](std::span<const uint8_t* const> packed, expert::ExpertProjection part) {
+      if (part == expert::ExpertProjection::kGateUp) {
+        std::vector<int> ids;
+        std::fill(addresses.begin(), addresses.end(), packed.front());
+        for (size_t i = 0; i < missing.size(); ++i) {
+          const int id = active_experts[missing[i]];
+          addresses[id] = packed[i];
+          ids.push_back(id);
+        }
+        sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
+      }
+      sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream, nullptr, part);
     });
     finish();
     return;

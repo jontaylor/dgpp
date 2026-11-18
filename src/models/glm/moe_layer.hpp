@@ -32,7 +32,7 @@
 namespace dgpp {
 class Sm12xMoe;
 struct ExpertDemand;
-namespace expert { class ExpertCache; }
+namespace expert { class ExpertCache; struct ProjectionReads; }
 
 // Caller-owned PINNED staging for enqueue_decode's async route copies:
 // the decode step's D2H copies land here mid-step (stream-ordered, no
@@ -126,6 +126,7 @@ class GlmMoeLayer {
     std::span<const int32_t> ids;
     const int32_t* device_ids;
     const float* device_weights;
+    expert::ProjectionReads* projections = nullptr;
   };
   void enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
                      expert::ExpertCache& cache, std::span<const size_t> cache_experts,
@@ -422,7 +423,7 @@ class GlmMoeLayer {
   std::unique_ptr<Sm12xMoe> sm12x_moe_;
   void enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
       cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-      std::span<const int> active_experts, bool graph_finishes);
+      std::span<const int> active_experts, const ReadyRoutes* ready);
 
   // host staging
   std::vector<int32_t> h_ids_;

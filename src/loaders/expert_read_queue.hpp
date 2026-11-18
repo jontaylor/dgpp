@@ -81,6 +81,9 @@ class ExpertReadQueue {
   // or an already-running/completed read. Empty on capacity backpressure.
   // Unique records only. Reservations are released on cancellation/failure.
   std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records);
+  // Two disjoint reads per record, all gate/up tickets followed by all down
+  // tickets. Reserve the entire wave from the existing bounded worker pool.
+  std::vector<std::shared_ptr<ReadTicket>> reserve_projections(std::span<const size_t> records);
   // Wait for any selected ticket, including failures/cancellation. Returns its
   // index; callers consume the result with wait(). Tickets must belong here.
   size_t wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const;

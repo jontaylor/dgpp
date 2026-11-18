@@ -65,8 +65,11 @@ void reader_pause() {
 }
 
 template<uint8_t Mask, uint8_t Expected>
-bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout) {
+bool compactible_scales(std::span<const uint8_t> data, const ChunkLayout& layout,
+                        ExpertProjection projection = ExpertProjection::kAll) {
   for (const auto* matrix : {&layout.gate, &layout.up, &layout.down}) {
+    if ((matrix == &layout.down && projection == ExpertProjection::kGateUp) ||
+        (matrix != &layout.down && projection == ExpertProjection::kDown)) continue;
     if (matrix->scales_offset > data.size() || matrix->scales_bytes > data.size() - matrix->scales_offset)
       throw std::logic_error("expert read queue: scale span outside record");
     const auto scales = data.subspan(matrix->scales_offset, matrix->scales_bytes);
@@ -178,7 +181,17 @@ struct ReadQueueImpl {
   static std::exception_ptr cancelled() {
     return std::make_exception_ptr(std::runtime_error("expert read queue: cancelled"));
   }
-  uint64_t bytes(const Job& job) const { return store->records()[job.record].layout.record_bytes; }
+  size_t index(size_t key) const {
+    const size_t count = store->records().size();
+    if (key < count) return key;
+    return key < 2 * count ? key - count : key - 2 * count;
+  }
+  ExpertProjection projection(size_t key) const {
+    const size_t count = store->records().size();
+    return key < count ? ExpertProjection::kAll :
+        (key < 2 * count ? ExpertProjection::kGateUp : ExpertProjection::kDown);
+  }
+  uint64_t bytes(const Job& job) const { return store->records()[index(job.record)].layout.record_bytes; }
 
   void retire_locked(const std::shared_ptr<Job>& job) {
     --counters.pending;
@@ -219,7 +232,7 @@ struct ReadQueueImpl {
       ++counters.coalesced;
       return ticket;
     }
-    const uint64_t size = store->records()[record].layout.record_bytes;
+    const uint64_t size = store->records()[index(record)].layout.record_bytes;
     if (priority == ReadPriority::kPrefetch &&
         size > config.prefetch_bytes - counters.speculative_bytes) {
       ++counters.refused;
@@ -267,12 +280,12 @@ struct ReadQueueImpl {
     --reserved_queued;
     pool->available.notify_all();
   }
-  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records) {
+  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records, bool split = false) {
     std::vector<std::shared_ptr<ReadTicket>> result;
     result.reserve(records.size());
     std::vector<size_t> checked(records.begin(), records.end());
     std::sort(checked.begin(), checked.end());
-    if ((!checked.empty() && checked.back() >= store->records().size()) ||
+    if ((!checked.empty() && checked.back() >= store->records().size() * (split ? 3 : 1)) ||
         std::adjacent_find(checked.begin(), checked.end()) != checked.end())
       throw std::invalid_argument("expert read queue: invalid/duplicate reserved record");
     std::lock_guard lock(mutex);
@@ -317,7 +330,7 @@ struct ReadQueueImpl {
     if (job->reserved_slot == SIZE_MAX && pool->free.empty()) return {};
     const bool reserved = job->reserved_slot != SIZE_MAX;
     const auto slot = reserved ? job->reserved_slot : pool->free.back();
-    auto lease = std::shared_ptr<ReadLease>(new ReadLease(pool, slot, store->records()[job->record].layout.record_bytes));
+    auto lease = std::shared_ptr<ReadLease>(new ReadLease(pool, slot, bytes(*job)));
     if (reserved) { job->reserved_slot = SIZE_MAX; --reserved_queued; }
     else { pool->free.pop_back(); pool->used += pool->slot_bytes; }
     pool->peak = std::max(pool->peak, pool->used);
@@ -393,12 +406,14 @@ struct ReadQueueImpl {
         abandoned = job->ticket.use_count() == 1;
         if (abandoned) std::rethrow_exception(cancelled());
         auto buffer = std::span<uint8_t>(static_cast<uint8_t*>(pool->buffers[lease->slot_].get()), lease->size_);
-        store->read(job->record, buffer);
+        const size_t record = this->index(job->record);
+        const auto part = projection(job->record);
+        store->read(record, buffer, part);
         if (config.require_mx_nibbles &&
-            !compactible_scales<0xf0, 0x70>(buffer, store->records()[job->record].layout))
+            !compactible_scales<0xf0, 0x70>(buffer, store->records()[record].layout, part))
           throw std::runtime_error("MX scale outside 112..127; disable DGPP_MX_PACKED_SCALES for this checkpoint");
         if (config.scan_nvfp4_scales && store->identity().format == Format::kNvfp4)
-          lease->scale_compactibility_ = compactible_scales<0x87, 0>(buffer, store->records()[job->record].layout)
+          lease->scale_compactibility_ = compactible_scales<0x87, 0>(buffer, store->records()[record].layout)
               ? ScaleCompactibility::kExact : ScaleCompactibility::kUnsupported;
       } catch (...) { failure = std::current_exception(); }
       {
@@ -454,6 +469,17 @@ ExpertReadQueue::ExpertReadQueue(std::shared_ptr<const ExpertStore> store, ReadQ
 ExpertReadQueue::~ExpertReadQueue() = default;
 std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_demand(std::span<const size_t> records) {
   return impl_->reserve_demand(records);
+}
+std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_projections(std::span<const size_t> records) {
+  const size_t count = impl_->store->records().size();
+  std::vector<size_t> keys;
+  keys.reserve(records.size() * 2);
+  for (const auto r : records) {
+    if (!impl_->store->can_split(r)) return {};
+    keys.push_back(count + r);
+  }
+  for (const auto r : records) keys.push_back(2 * count + r);
+  return impl_->reserve_demand(keys, true);
 }
 std::shared_ptr<ReadTicket> ExpertReadQueue::request(size_t record, ReadPriority priority) { return impl_->request(record, priority); }
 size_t ExpertReadQueue::wait_any(std::span<const std::shared_ptr<ReadTicket>> tickets) const {

@@ -272,7 +272,12 @@ ExpertStore::~ExpertStore() {
   if (trace_fd_ >= 0) ::close(trace_fd_);
   if (fd_ >= 0) ::close(fd_);
 }
-void ExpertStore::read(size_t index, std::span<uint8_t> destination) const {
+bool ExpertStore::can_split(size_t index) const {
+  const auto& layout = records_.at(index).layout;
+  return identity_.format == Format::kMxfp4 && !verify_record_checksums_ &&
+      layout.down.payload_offset > 0 && layout.down.payload_offset % kPage == 0;
+}
+void ExpertStore::read(size_t index, std::span<uint8_t> destination, ExpertProjection projection) const {
   if (index >= records_.size()) error("invalid read index");
   const auto& record = records_[index];
   if (destination.size() != record.layout.record_bytes ||
@@ -284,6 +289,14 @@ void ExpertStore::read(size_t index, std::span<uint8_t> destination) const {
   const uint64_t trace_start = trace_fd_ >= 0 ? timestamp() : 0;
   auto remaining = destination;
   uint64_t offset = record.file_offset;
+  if (projection != ExpertProjection::kAll) {
+    if (!can_split(index)) error("unsupported projection read");
+    const size_t split = record.layout.down.payload_offset;
+    if (projection == ExpertProjection::kGateUp) remaining = remaining.first(split);
+    else { remaining = remaining.subspan(split); offset += split; }
+  }
+  const auto read_size = remaining.size();
+  const auto read_offset = offset;
   try {
     while (!remaining.empty()) {
       calls_.fetch_add(1, std::memory_order_relaxed);
@@ -299,7 +312,7 @@ void ExpertStore::read(size_t index, std::span<uint8_t> destination) const {
       // Native uint64 fields: start/end Unix ns, layer, expert, chunk, draft,
       // record bytes, file offset. Consumers must reject incomplete records.
       const uint64_t event[]{trace_start, timestamp(), record.key.layer, record.key.expert,
-          record.key.chunk, record.key.draft, record.layout.record_bytes, record.file_offset};
+          record.key.chunk, record.key.draft, read_size, read_offset};
       ssize_t written;
       do { written = ::write(trace_fd_, event, sizeof(event)); } while (written < 0 && errno == EINTR);
       if (written != static_cast<ssize_t>(sizeof(event))) error("incomplete diagnostic read trace");

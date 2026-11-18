@@ -15,7 +15,10 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--format', choices=('nvfp4', 'mxfp4', 'mxfp4-nibble'), default='nvfp4')
+parser.add_argument('--split-projections', action='store_true', help='Also export MX nibble gate/up and down entry points')
 args = parser.parse_args()
+if args.split_projections and args.format != 'mxfp4-nibble':
+ raise ValueError('split projection export requires mxfp4-nibble')
 nibble_scales = args.format == 'mxfp4-nibble'
 is_mx = args.format != 'nvfp4'
 symbol = 'dgpp_b12x_mxfp4_fp32' if is_mx else 'dgpp_b12x_raw_fp32'
@@ -141,13 +144,37 @@ body=body.replace(old,'cutlass.Float32,')
 path=args.output / 'raw_fp32_compile.py';path.write_text(body+'\n')
 exec(compile(path.read_text(),str(path),'exec'),kernel.__dict__)
 props=torch.cuda.get_device_properties(0)
-compiled=kernel.compile_w4a16_fused_moe(size_m=64,hidden_size=5120,intermediate_size=1152,num_experts=384,top_k=6,
+def export(name):
+ compiled=kernel.compile_w4a16_fused_moe(size_m=64,hidden_size=5120,intermediate_size=1152,num_experts=384,top_k=6,
  activation='silu',apply_router_weight_on_input=False,zero_fc2_output=False,moe_block_size=8,max_m_blocks=384,
  element_dtype='bf16',sms=48,max_shared_mem=props.shared_memory_per_block_optin,swiglu_limit=10.,
  weight_layout='packed',scale_format='e8m0_k32' if is_mx else 'e4m3_k16',w13_layout='packed',force_tile_config=(128,128,64,256))
-compiled.compiled.export_to_c(str(args.output), symbol)
+ compiled.compiled.export_to_c(str(args.output), name)
+export(symbol)
 with (args.output / (symbol + '.h')).open('a') as header:
  header.write('\n#define DGPP_B12X_CAPACITY 64\n')
+if args.split_projections:
+ import textwrap
+ fused = next(n for n in tree.body if getattr(n, 'name', '') == 'W4A16FusedMoeKernel')
+ method = next(n for n in fused.body if getattr(n, 'name', '') == '_moe_body')
+ body = ''.join(lines[fused.lineno-1:fused.end_lineno])
+ begin = body.index('        if cutlass.const_expr(self.activation_is_gated):', body.index('    def _moe_body('))
+ down = body.index('        fc2_store = fc2_bf16_flat', begin)
+ end = sum(len(line) for line in lines[fused.lineno-1:method.end_lineno])
+ # layer_idx is unused by the no-amax, single-layer DGPP specialization.
+ # The separate optional object leaves ordinary resident replay untouched.
+ body = (body[:begin] + '        if layer_idx == Int32(1):\n' +
+         textwrap.indent(body[begin:down], '    ') + '        else:\n' +
+         textwrap.indent(body[down:end], '    ') + body[end:])
+ # The compiler caches fused kernels by this property, including on disk.
+ key = 'def __cache_key__(self) -> tuple[object, ...]:\n        return ('
+ if body.count(key) != 1:
+  raise RuntimeError('unsupported fused b12x cache key')
+ body = body.replace(key, key + '"dgpp_mx_projection_v1",')
+ path = args.output / 'split_fused_class.py'
+ path.write_text(body)
+ exec(compile(body,str(path),'exec'),kernel.__dict__)
+ export(symbol + '_projection')
 from cutlass.cute.export.aot_config import get_libdir
 shutil.copy2(Path(get_libdir()) / 'libcuda_dialect_runtime_static.a', args.output)
 

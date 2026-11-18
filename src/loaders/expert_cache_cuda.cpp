@@ -46,6 +46,11 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     if (gpu_scatter_) {
       for (const auto& copies : copies_) {
         scatter_plans_.push_back(expert_chunk_copy_plan(copies));
+        if (memory_.mx_packed_scales()) {
+          auto spans = std::span(copies);
+          gate_plans_.push_back(expert_chunk_copy_plan(spans.first(4)));
+          down_plans_.push_back(expert_chunk_copy_plan(spans.subspan(4)));
+        }
         auto reverse = copies;
         for (auto& c : reverse) {
           std::swap(c.source_offset, c.destination_offset);
@@ -196,6 +201,32 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     check_execution(slot);
     publish();
     return execution_ + slot * memory_.execution_slot_bytes;
+  }
+  bool supports_projection_reads() const override { return !gate_plans_.empty(); }
+  const uint8_t* prepare_projection(size_t slot, std::span<const Assembly> ready,
+                                    ExpertProjection part) override {
+    check_execution(slot);
+    wait_execution(slot);
+    auto* canonical = execution_ + slot * memory_.execution_slot_bytes;
+    auto* packed = canonical + full_.allocation_bytes;
+    const auto& plans = part == ExpertProjection::kGateUp ? gate_plans_ : down_plans_;
+    std::array<ExpertChunkScatter, kExpertScatterBatch> chunks;
+    {
+      Transfer transfer(*this);
+      for (size_t base = 0; base < ready.size(); base += chunks.size()) {
+        const size_t n = std::min(chunks.size(), ready.size()-base);
+        for (size_t i = 0; i < n; ++i) {
+          const auto& a = ready[base+i];
+          chunks[i] = {canonical, mapped_.at(staging_index(a.host_bytes.data())), plans.at(a.record->key.chunk)};
+        }
+        launch_expert_chunk_scatter_batch(std::span(chunks).first(n), copy_stream_);
+        for (size_t i = 0; i < n; ++i)
+          DGPP_CUDA_OK(cudaEventRecord(staging_done_.at(staging_index(ready[base+i].host_bytes.data())), copy_stream_));
+      }
+      pack(packed, canonical, part);
+    }
+    publish();
+    return packed;
   }
   const uint8_t* packed_execution_data(size_t slot) override {
     check_execution(slot);
@@ -403,7 +434,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     return index;
   }
   int scale_group() const { return identity_.format == Format::kNvfp4 ? 16 : 32; }
-  void pack(uint8_t* destination, const uint8_t* source) {
+  void pack(uint8_t* destination, const uint8_t* source, ExpertProjection part = ExpertProjection::kAll) {
     Fp4ExpertSource in;
     const std::array<MatrixLayout, 3> matrices{full_.gate, full_.up, full_.down};
     for (size_t m = 0; m < matrices.size(); ++m) {
@@ -413,7 +444,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
     }
     launch_moe_fp4_pack(moe_fp4_packed_view(destination, identity_.hidden,
         identity_.intermediate / identity_.world, scale_group(), memory_.mx_packed_scales()), in, identity_.hidden,
-        identity_.intermediate / identity_.world, copy_stream_, scale_group());
+        identity_.intermediate / identity_.world, copy_stream_, scale_group(), part);
   }
   void check_cache(size_t slot) const {
     if (slot >= memory_.cache_slots) throw std::invalid_argument("expert CUDA cache: cache slot");
@@ -467,7 +498,7 @@ class CudaCacheStorage final : public ExpertCacheStorage {
   uint8_t* execution_ = nullptr;
   std::vector<void*> registered_;
   std::vector<const uint8_t*> mapped_;
-  std::vector<ExpertChunkCopyPlan> scatter_plans_, gather_plans_;
+  std::vector<ExpertChunkCopyPlan> scatter_plans_, gather_plans_, gate_plans_, down_plans_;
   std::vector<ChunkLayout> layouts_;
   std::vector<std::vector<ScatterCopy>> copies_;
 };

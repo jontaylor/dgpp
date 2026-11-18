@@ -3749,6 +3749,51 @@ DGPP_TEST(moe_b12x_graph_route_packet_matches_host_order) {
 }
 DGPP_TEST(moe_b12x_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(16); }
 #ifdef DGPP_TEST_B12X_MX_NIBBLES
+DGPP_TEST(moe_b12x_projection_preserves_masked_slots) {
+  using dgpp::expert::ExpertProjection;
+  if (!std::getenv("DGPP_EXPERT_PROJECTION_SPLIT")) return;
+  constexpr int h = 5120, inter = 1152, rows = 4, topk = 6;
+  std::array<int32_t, rows*topk> ids;
+  for (size_t i = 0; i < ids.size(); ++i) ids[i] = (i + i/topk) % 13;
+  const std::array<int, 3> mask{1, 3, 9};
+  const size_t bytes = dgpp::moe_fp4_packed_bytes(h, inter, 32, true);
+  const size_t slots = rows*(topk+1)*h;
+  uint8_t* packed;
+  uint16_t* input;
+  int32_t* device_ids;
+  float *out, *weights;
+  DGPP_CUDA_OK(cudaMallocManaged(&packed, bytes));
+  DGPP_CUDA_OK(cudaMallocManaged(&input, rows*h*sizeof(*input)));
+  DGPP_CUDA_OK(cudaMallocManaged(&device_ids, sizeof(ids)));
+  DGPP_CUDA_OK(cudaMallocManaged(&out, slots*sizeof(*out)));
+  DGPP_CUDA_OK(cudaMallocManaged(&weights, ids.size()*sizeof(*weights)));
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  dgpp::Sm12xMoe moe(32, true);
+  for (size_t i = 0; i < bytes; ++i) packed[i] = static_cast<uint8_t>(i*31 + i/29);
+  for (int i = 0; i < rows*h; ++i) input[i] = float_to_bf16_bits(float((i*7)%23-11)/32);
+  std::copy(ids.begin(), ids.end(), device_ids);
+  std::fill_n(weights, ids.size(), 1.f);
+  constexpr float sentinel = -12345.0f;
+  std::fill_n(out, slots, sentinel);
+  std::vector<const uint8_t*> addresses(384, packed);
+  moe.prepare(ids, addresses, rows, stream, mask);
+  moe.run(input, device_ids, weights, out, rows, stream, nullptr, ExpertProjection::kGateUp);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  require(std::all_of(out, out+slots, [](float x){ return x == sentinel; }), "gate phase wrote down slots");
+  moe.run(input, device_ids, weights, out, rows, stream, nullptr, ExpertProjection::kDown);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  const std::vector<float> expected(out, out+slots);
+  require(std::any_of(expected.begin(), expected.end(), [](float x){ return x != sentinel && x != 0; }),
+          "masked fused fixture computes active outputs");
+  std::fill_n(out, slots, sentinel);
+  moe.run(input, device_ids, weights, out, rows, stream);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  require(std::memcmp(out, expected.data(), slots*sizeof(float)) == 0, "split down differs from fused b12x");
+  for (void* p : std::array<void*,5>{packed,input,device_ids,out,weights}) DGPP_CUDA_OK(cudaFree(p));
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+}
+
 DGPP_TEST(moe_b12x_mx_nibble_cache_matches_byte_scales) { check_b12x_paging(32, true); }
 #endif
 DGPP_TEST(moe_b12x_mxfp4_paging_uses_identical_miss_and_native_arithmetic) { check_b12x_paging(32); }

@@ -889,7 +889,8 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical, bool ch
   } catch (...) { s.counters.poisoned = true; throw; }
 }
 void ExpertCache::execute_ready(std::span<const size_t> selected,
-    const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute) {
+    const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute,
+    ProjectionReads* projections, const ExecuteProjection& execute_projection) {
   auto& s = *state_;
   s.check();
   if (s.counters.active_execution_slots || s.counters.active_native_leases)
@@ -899,6 +900,9 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
   // so it cannot overwrite an expert which is awaiting admission below.
   const bool fractional = s.config.planner.policy == Policy::kAdaptiveFractional;
   const size_t capacity = s.memory.execution_slots - (fractional ? 1 : 0);
+  if (projections && (!execute_projection || selected.size() > capacity ||
+      !std::equal(selected.begin(), selected.end(), projections->experts.begin(), projections->experts.end())))
+    throw std::logic_error("expert cache: projection reservation no longer matches the missing experts");
   if (!capacity) {
     for (size_t i = 0; i < selected.size(); ++i) {
       auto lease = acquire(selected[i], true);
@@ -918,7 +922,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       std::vector<ExpertExecutionLease> leases;
       std::vector<std::pair<size_t, size_t>> missing;
       jobs.reserve(count); leases.reserve(count);
-      if (group_reads_enabled()) (void)prime_group(selected.subspan(base, count));
+      if (!projections && group_reads_enabled()) (void)prime_group(selected.subspan(base, count));
       // Snapshot every resident source before any admission can evict it.
       for (size_t j = 0; j < count; ++j) {
         const size_t e = selected[base+j];
@@ -980,6 +984,45 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           execute(inputs, std::span<const ExpertExecutionLease>(leases).subspan(first, j-first));
         }
       };
+      if (projections) {
+        if (projections->tickets.size() != 2 * missing.size())
+          throw std::logic_error("expert cache: projection reservation size changed");
+        std::vector<const uint8_t*> addresses(count);
+        for (auto part : {ExpertProjection::kGateUp, ExpertProjection::kDown}) {
+          const bool gate = part == ExpertProjection::kGateUp;
+          size_t idx = 0;
+          for (auto& job : jobs) {
+            ready_assemblies.clear();
+            for (const size_t r : s.experts[job.expert].records) {
+              const auto& record = s.store->records()[r];
+              auto ticket = std::move(projections->tickets[(gate ? 0 : missing.size()) + idx++]);
+              if (gate) {
+                const auto wait = std::chrono::steady_clock::now();
+                s.pending_copies.push_back(ticket->wait());
+                s.counters.read_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait).count();
+              } else {
+                s.pending_copies.push_back(s.read(r, std::move(ticket), projections->queued));
+                s.counters.demand_bytes += record.layout.record_bytes;
+                s.counters.staged_copy_bytes += record.layout.useful_bytes;
+              }
+              ready_assemblies.push_back({job.slot, &record, std::nullopt,
+                  s.pending_copies.back()->bytes().first(record.layout.allocation_bytes)});
+            }
+            addresses[job.slot] = s.storage->prepare_projection(job.slot, ready_assemblies, part);
+            if (!gate) s.execution_packed[job.slot] = true;
+          }
+          if (gate) {
+            const auto down = std::span(projections->tickets).subspan(missing.size());
+            if (projections->delay_gate)
+              for (const auto& ticket : down) (void)ticket->wait();
+            projections->down_pending_at_gate = std::any_of(down.begin(), down.end(),
+                [](const auto& t) { return !t->ready(); });
+          }
+          execute_projection(addresses, part);
+        }
+        launched = count;
+      }
       while (launched < jobs.size()) {
         while (next < missing.size()) {
           const auto [j, r] = missing[next];
@@ -1180,6 +1223,41 @@ size_t ExpertCache::demand_group_capacity() const {
   const size_t chunks = std::max<size_t>(1, s.experts.front().records.size());
   return std::max<size_t>(1, std::min(s.memory.execution_slots / 2,
                                     s.config.reads.buffers / (2*chunks)));
+}
+ProjectionReads ExpertCache::prime_projections(std::span<const int32_t> ids,
+    std::span<const size_t> mapping) {
+  auto& s = *state_;
+  s.check();
+  if (s.config.planner.policy != Policy::kWholeExpert || !s.storage->supports_projection_reads()) return {};
+  std::array<bool, 384> selected{};
+  if (mapping.size() > selected.size()) return {};
+  for (const int id : ids) {
+    if (id < 0 || static_cast<size_t>(id) >= mapping.size())
+      throw std::out_of_range("expert cache: projection route ID");
+    selected[id] = true;
+  }
+  ProjectionReads result;
+  std::vector<size_t> records;
+  for (size_t id = 0; id < mapping.size(); ++id) {
+    if (!selected[id]) continue;
+    const auto e = mapping[id];
+    s.expert_index(e);
+    const auto& chunks = s.experts[e].records;
+    const size_t resident = s.planner->current().chunks[e];
+    if (resident == chunks.size()) continue;
+    if (resident || result.experts.size() == s.memory.execution_slots ||
+        records.size() + chunks.size() > s.config.reads.buffers / 2) return {};
+    for (const auto r : chunks)
+      if (s.slots[r] != absent || s.prefetched.contains(r)) return {};
+    result.experts.push_back(e);
+    records.insert(records.end(), chunks.begin(), chunks.end());
+  }
+  if (records.empty()) return {};
+  s.reap_copies();
+  result.queued = std::chrono::steady_clock::now();
+  result.tickets = s.reads->reserve_projections(records);
+  if (result.tickets.empty()) return {};
+  return result;
 }
 size_t ExpertCache::prime_group(std::span<const size_t> selected) {
   auto& s = *state_;
