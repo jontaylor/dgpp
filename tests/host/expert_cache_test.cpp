@@ -389,6 +389,8 @@ DGPP_TEST(expert_cache_native_layouts_survive_repeated_random_admission_and_adap
           ExpertCache cache(f.store, cfg, host(f, control));
           cache.initialize();
           std::mt19937 rng(1017);
+          std::array<const uint8_t*, 4> prior_addresses{};
+          uint64_t published = 0;
           for (int step = 0; step < 128; ++step) {
             const size_t e = rng() % 4;
             cache.observe(std::array<size_t, 1>{e});
@@ -401,6 +403,13 @@ DGPP_TEST(expert_cache_native_layouts_survive_repeated_random_admission_and_adap
             for (size_t i = 0; i < indices.size(); ++i)
               require(addresses[i] == cache.prepared_address(indices[i]),
                       "bulk bindings match scalar bindings after packing, eviction and relocation");
+            for (size_t i = 0; i < indices.size(); ++i) {
+              const auto layer = cache.experts()[indices[i]].layer;
+              require(prior_addresses[i] == addresses[i] || cache.prepared_layer_revision(layer) > published,
+                      "binding creation, relocation and removal invalidate the layer");
+            }
+            prior_addresses = addresses;
+            published = cache.prepared_revision();
             const auto& p = cache.residency();
             require(p.cache_bytes + p.reserved_bytes <= cfg.planner.budget_bytes, "native layout churn respects hard budget");
             for (size_t count : p.chunks)
@@ -442,6 +451,8 @@ DGPP_TEST(expert_cache_grouped_native_preparation_is_stable_and_retires_with_one
   const auto revision = cache.prepared_revision();
   require(revision > initial_revision && cache.prepared_address(0) && cache.prepared_address(1),
           "native packing publishes addresses with a new revision");
+  require(cache.prepared_layer_revision(0) == revision && cache.prepared_layer_revision(1) == 0,
+          "only the layer with newly prepared addresses needs publication");
   const auto packed = cache.stats();
   for (int repeat = 0; repeat < 4; ++repeat) {
     require(cache.prepare_resident(routed), "stable routed set remains prepared");

@@ -120,7 +120,8 @@ class GlmMoeLayer {
   // cache_experts maps this layer's route IDs to the global cache population.
   // No CUDA graph capture; the cache must own this exact execution stream.
   // Reuse only this executor's captured GPU routes while its demand gate
-  // holds the main stream. Host diagnostics expose IDs but no host weights.
+  // holds the main stream. The service produces routed slots; the graph owns
+  // the concurrent shared lane and the final sum.
   struct ReadyRoutes {
     std::span<const int32_t> ids;
     const int32_t* device_ids;
@@ -421,7 +422,7 @@ class GlmMoeLayer {
   std::unique_ptr<Sm12xMoe> sm12x_moe_;
   void enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
       cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-      std::span<const int> active_experts);
+      std::span<const int> active_experts, bool graph_finishes);
 
   // host staging
   std::vector<int32_t> h_ids_;

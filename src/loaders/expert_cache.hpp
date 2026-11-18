@@ -237,6 +237,8 @@ class ExpertCache {
   void prepared_addresses(std::span<const size_t> experts,
                           std::span<const uint8_t*> addresses) const;
   uint64_t prepared_revision() const;
+  // Last change of a native address in this image layer (target or draft).
+  uint64_t prepared_layer_revision(uint32_t layer) const;
   void set_execution_context(void* context);
   // Account for GPU-executed native hits after the walk has completed.
   void record_native_hits(std::span<const size_t> selected);

@@ -26,10 +26,12 @@ class Sm12xMoe {
   void prepare(std::span<const int32_t> ids, std::span<const uint8_t* const> addresses,
                int rows, cudaStream_t stream, std::span<const int> execute_experts = {});
   // Unweighted FP32 output [rows,top_k+1,H]; shared slots are untouched.
+  // A captured device route uses its layer's published binding table.
+  // Host-prepared waves use the private bindings uploaded by prepare().
   void run(const uint16_t* input, const int32_t* ids, const float* weights,
-           float* slots, int rows, cudaStream_t stream);
+           float* slots, int rows, cudaStream_t stream, const uint64_t* bindings = nullptr);
   void prepare_device(const uint64_t* table, const int32_t* ids,
-                      const ExpertDemand* demand, int rows, cudaStream_t stream);
+                      ExpertDemand* demand, int rows, cudaStream_t stream);
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

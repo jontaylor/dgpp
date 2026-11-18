@@ -122,6 +122,11 @@ struct ExpertCacheState {
   std::map<size_t, QueuedRead> prefetched;
   CacheStats counters;
   uint64_t prepared_revision = 1;
+  std::map<uint32_t, uint64_t> prepared_layer_revisions;
+  void set_native_start(size_t expert, size_t start) {
+    native_start[expert] = start;
+    prepared_layer_revisions.at(experts[expert].layer) = ++prepared_revision;
+  }
   // Optional diagnostics. The engine thread owns this stream; it is never
   // touched by I/O workers or allocated in the normal serving configuration.
   std::unique_ptr<std::ofstream> demand_trace;
@@ -361,8 +366,7 @@ struct ExpertCacheState {
     for (const auto r : experts[expert].records)
       storage->unpack_native_chunk(scratch, store->records()[r], slots[r]);
     storage->order_mutations();
-    native_start[expert] = absent;
-    ++prepared_revision;
+    set_native_start(expert, absent);
     ++counters.native_unpacks;
     counters.native_layout_copy_bytes += full.allocation_bytes;
     for (const auto r : experts[expert].records)
@@ -447,8 +451,7 @@ struct ExpertCacheState {
       slot_records[first + c] = records[c];
     }
     for (const size_t slot : native_holes) add_free_slot(slot);
-    native_start[expert] = first;
-    ++prepared_revision;
+    set_native_start(expert, first);
     ++counters.native_packs;
     counters.native_layout_copy_bytes += full.allocation_bytes;
     for (const auto r : records) counters.native_layout_copy_bytes += store->records()[r].layout.useful_bytes;
@@ -463,7 +466,7 @@ struct ExpertCacheState {
     for (size_t e = 0; e < experts.size(); ++e) {
       if (plan.chunks[e] < previous[e] && native_start[e] != absent) {
         if (plan.chunks[e]) unpack_native(e, scratch);
-        else native_start[e] = absent;
+        else set_native_start(e, absent);
       }
       for (size_t c = plan.chunks[e]; c < previous[e]; ++c) {
         const auto r = experts[e].records[c];
@@ -554,6 +557,7 @@ ExpertCache::ExpertCache(std::shared_ptr<const ExpertStore> source, CacheConfig 
   s.free_positions.assign(static_cast<size_t>(m.cache_slots), absent);
   s.native_holes.reserve(chunks.size());
   s.native_start.assign(s.experts.size(), absent);
+  for (const auto& expert : s.experts) s.prepared_layer_revisions.try_emplace(expert.layer, 0);
   for (size_t slot = 0; slot < m.cache_slots; ++slot) s.add_free_slot(slot);
   s.execution_busy.resize(cfg.execution_slots, false);
   s.execution_packed.resize(cfg.execution_slots, false);
@@ -669,6 +673,10 @@ const uint8_t* ExpertCache::prepared_address(size_t expert) const {
   return s.native_start[expert] == absent ? nullptr : s.storage->cache_data(s.native_start[expert]);
 }
 uint64_t ExpertCache::prepared_revision() const { state_->check(); return state_->prepared_revision; }
+uint64_t ExpertCache::prepared_layer_revision(uint32_t layer) const {
+  state_->check();
+  return state_->prepared_layer_revisions.at(layer);
+}
 void ExpertCache::prepared_addresses(std::span<const size_t> experts,
                                     std::span<const uint8_t*> addresses) const {
   const auto& s = *state_;
@@ -1068,8 +1076,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
             s.remove_free_slot(slot); s.slots[r] = slot; s.slot_records[slot] = r;
             s.counters.retained_bytes += s.store->records()[r].layout.allocation_bytes;
           }
-          s.native_start[job.expert] = native_first;
-          ++s.prepared_revision;
+          s.set_native_start(job.expert, native_first);
           ++s.counters.native_packs;
           s.counters.native_layout_copy_bytes += s.full.allocation_bytes;
         } else {

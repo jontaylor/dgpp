@@ -90,8 +90,11 @@ struct Dsv41Model::PagedGraphs {
     if (service) (void)cudaStreamDestroy(service);
   }
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
-               int hidden, int inter, int scale_group) {
-    if (published_revision == cache.prepared_revision()) return;
+               int hidden, int inter, int scale_group, bool pending_experts = false) {
+    if (published_revision == cache.prepared_revision()) {
+      if (pending_experts) DGPP_CUDA_OK(cudaStreamSynchronize(service));
+      return;
+    }
     const auto started = profile_publish ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
     const bool first = published_revision == 0;
@@ -99,6 +102,7 @@ struct Dsv41Model::PagedGraphs {
     std::array<const uint8_t*, experts> addresses;
     changed_layers.clear();
     for (int l = 0; l < layers; ++l) {
+      if (!first && cache.prepared_layer_revision(l) <= published_revision) continue;
       if (bulk_publish) cache.prepared_addresses(mapping[l], addresses);
       else for (int e = 0; e < experts; ++e) addresses[e] = cache.prepared_address(mapping[l][e]);
       const bool changed = dsv41_detail::update_paged_binding_table(
@@ -1922,7 +1926,9 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   }
   auto& g = it->second;
   cur_ = g.cur; nxt_ = g.next; pre_cur_ = g.pre; pre_nxt_ = g.pre_next;
-  std::fill_n(p.demands, p.layers, ExpertDemand{});
+  // Each layer writes serviced and all live IDs before the host consumes
+  // them. Only the request flag carries state across replays.
+  for (int l = 0; l < p.layers; ++l) p.demands[l].request = 0;
   // Cache changes occur only in the engine thread while a demand gate
   // holds the main stream. Its independent service stream must never wait
   // on that paused stream. Before release, service kernels are completed.
@@ -1934,13 +1940,13 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
   int accounted = 0;
   std::vector<uint64_t> layer_bytes, layer_reads;
   if (p.layer_stamps) { layer_bytes.resize(p.layers); layer_reads.resize(p.layers); }
+  std::vector<size_t> hit_experts(T * cfg_.num_experts_per_tok);
   auto account = [&](int end) {
     for (; accounted < end; ++accounted) {
       if (p.demands[accounted].serviced) continue;
-      std::vector<size_t> selected;
-      for (int j = 0; j < T * cfg_.num_experts_per_tok; ++j)
-        selected.push_back(expert_cache_map_[accounted].at(p.demands[accounted].ids[j]));
-      expert_cache_->record_native_hits(selected);
+      for (size_t j = 0; j < hit_experts.size(); ++j)
+        hit_experts[j] = expert_cache_map_[accounted].at(p.demands[accounted].ids[j]);
+      expert_cache_->record_native_hits(hit_experts);
     }
   };
   bool launched = false;
@@ -1962,20 +1968,20 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
         // This does not change residency; mutation still happens at the gate.
         if (early) (void)expert_cache_->prime_demand(selected, expert_cache_map_[l]);
         account(l);
-        // Reuse the existing exact miss path, including bounded waves,
-        // admissions and shared-expert overlap. The paused GPU skips its
-        // own expert output when this service has supplied it.
+        // The graph started the shared expert before routing. Fill only its
+        // routed slots here, then release the gate for the ordered sum.
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
         const GlmMoeLayer::ReadyRoutes ready{selected, g.route_ids, g.route_weights};
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
-                            p.service, MoeExpertKernel::kGemv, nullptr, early ? &ready : nullptr);
-        DGPP_CUDA_OK(cudaStreamSynchronize(p.service));
+                            p.service, MoeExpertKernel::kGemv, nullptr, &ready);
+        // Submit dirty bindings behind the expert kernels. One service-stream
+        // fence covers both before the host releases the graph.
+        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
+                  cfg_.experts_nvfp4 ? 16 : 32, /*pending_experts=*/true);
         if (p.layer_stamps) {
           layer_bytes[l] = expert_cache_->stats().demand_bytes - bytes_before;
           layer_reads[l] = expert_cache_->read_stats().completed - reads_before;
         }
-        p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
-                  cfg_.experts_nvfp4 ? 16 : 32);
         ++p.misses; accounted = l + 1;
         __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
         break;

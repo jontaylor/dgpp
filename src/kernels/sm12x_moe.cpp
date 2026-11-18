@@ -147,9 +147,9 @@ struct Sm12xMoe::Impl {
 Sm12xMoe::Sm12xMoe(int group, bool mx_nibbles) : impl_(std::make_unique<Impl>(group, mx_nibbles)) { impl_->initialize(); }
 Sm12xMoe::~Sm12xMoe() = default;
 void Sm12xMoe::prepare_device(const uint64_t* table, const int32_t* ids,
-                            const ExpertDemand* demand, int rows, cudaStream_t stream) {
+                            ExpertDemand* demand, int rows, cudaStream_t stream) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x device route row count");
-  launch_expert_route_packet(impl_->packet, table, ids, demand, rows, stream);
+  launch_expert_route_packet(reinterpret_cast<int32_t*>(impl_->packet + E*6*sizeof(uint64_t)), table, ids, demand, rows, stream);
 }
 void Sm12xMoe::prepare(std::span<const int32_t> ids,
     std::span<const uint8_t* const> addresses, int rows, cudaStream_t stream,
@@ -200,16 +200,19 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   c.uploaded = true;
 }
 void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weights,
-                   float* out, int rows, cudaStream_t stream) {
+                   float* out, int rows, cudaStream_t stream, const uint64_t* bindings) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x MoE: row count exceeds capacity");
   auto& c = *impl_;
+  // Captured layers already own a published device table. Host-serviced
+  // waves carry their private masked bindings in the uploaded packet.
+  auto* table = bindings ? reinterpret_cast<uint8_t*>(const_cast<uint64_t*>(bindings)) : c.packet;
   auto invoke = [&]<class Backend>(Backend& backend) {
     typename Backend::Fc1 fc1{c.fc1};
     typename Backend::Act act{c.act};
     typename Backend::Fc2 fc2{out};
     auto* packed = reinterpret_cast<int32_t*>(c.packet + E*6*sizeof(uint64_t));
     if (c.reused && rows == 4) {
-      launch_mxfp4_verify_singletons(hidden, c.act, out, reinterpret_cast<const uint64_t*>(c.packet),
+      launch_mxfp4_verify_singletons(hidden, c.act, out, reinterpret_cast<const uint64_t*>(table),
                                      ids, packed, c.reused, stream);
       packed = c.reused;
     }
@@ -223,7 +226,7 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
     // The generated C ABI does not express read-only pointer qualifiers.
     auto* input = const_cast<uint16_t*>(hidden);
     return Backend::launch(&backend.module, input, input, input,
-        c.packet, c.packet+E*3*sizeof(uint64_t), int64_t(E)*2*I*H/8, int64_t(E)*H*I/8,
+        table, table+E*3*sizeof(uint64_t), int64_t(E)*2*I*H/8, int64_t(E)*H*I/8,
         &fc1, &act, &fc2, c.tmp1, c.tmp1, c.tmp1, c.tmp1, &routes, &experts, &count, &amax,
         0, const_cast<float*>(weights), &tmp1, &tmp2, &locks, c.tmp1, c.tmp1, c.tmp1,
         const_cast<int32_t*>(ids), c.tmp1, c.tmp1,
@@ -238,7 +241,7 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
 }
 #else
 struct Sm12xMoe::Impl {};
-void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, const ExpertDemand*, int, cudaStream_t) {
+void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, ExpertDemand*, int, cudaStream_t) {
   throw std::logic_error("b12x AOT is unavailable");
 }
 Sm12xMoe::Sm12xMoe(int, bool) { throw std::logic_error("b12x AOT is unavailable"); }
@@ -247,7 +250,7 @@ void Sm12xMoe::prepare(std::span<const int32_t>, std::span<const uint8_t* const>
                        std::span<const int>) {
   throw std::logic_error("b12x AOT is unavailable");
 }
-void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t) {
+void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t, const uint64_t*) {
   throw std::logic_error("b12x AOT is unavailable");
 }
 #endif
