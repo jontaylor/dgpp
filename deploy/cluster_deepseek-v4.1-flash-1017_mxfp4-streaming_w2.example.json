@@ -47,7 +47,9 @@
     "prefill_initial_tokens": 4096,
     "prefill_idle_budget_tokens": 4096,
     "prefill_idle_floor_tokens": 4096,
-    "mtp_depth": 3
+    "mtp_depth": 3,
+    "lookup_draft": true,
+    "lookup_tail": 2
   },
   "paths": {
     "resident_cache": ""

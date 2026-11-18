@@ -522,3 +522,124 @@ operation streams and zero process swap. The approximate alternatives won
 individual throughput and repair probes. Exact execution returned a working
 implementation sooner on the longer coding job and led on the prose probe.
 These are concurrency-one diagnostics on a small task set.
+
+## Testing the two-Spark forum recipe on TP2
+
+These diagnostics use the 1017 MXFP4 checkpoint, top-six target routing and
+TP2 rank dimensions of 5,120 hidden by 1,152 intermediate channels. The
+four-row route samples come from actual verification. Input activations are
+synthetic in the single-layer kernel tests. The serving tests exercise the
+complete two-rank model. [Forum recipe](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438/6)
+
+### Lossless scales and the FP8-activation expert kernel
+
+For all 384 routed expert shards on layer 10 of each rank, one base exponent
+per matrix row plus four-bit differences reconstructed all scale bytes.
+The largest observed delta was three. Each shard occupied 9,131,264 bytes
+versus 9,400,320 bytes in DGPP's layout. Keeping 11,071 shards in that
+representation would free 2.77 GiB per Spark. A tightly packed arena of
+the current size would fit 11,397 shards (+326). Aligning each shard to a
+64 KiB page instead would fit 11,343 (+272). The current allocator still
+uses the original slots.
+
+A replay using the residency planner on the larger capacity reduced decode
+misses from 5,195 to 4,443 and prefill misses from 15,715 to 15,093 on one
+saved demand trace. The other trace gave identical miss counts at both
+capacities. These are simulated admission decisions with fixed demand.
+
+The authors' patched TileLang compiler generated the SM121 FP8 × FP4
+instructions. The captured chain included GPU dispatch, input quantization,
+gate/up, SwiGLU and quantization, down and combination. Packing and expanding
+scales inside this chain preserved every output bit against its byte-scale
+control on all tested routes.
+
+| One layer, resident experts | DGPP b12x W4A16 | TileLang W4A8 byte scales | TileLang W4A8 packed scales |
+|---|---:|---:|---:|
+| Four verification rows, median of 33 common routes | 705 µs | 697 µs | 665 µs |
+| One recorded 4,096-token prefill, 328 distinct experts | — | 23.12 ms | 22.89 ms |
+
+The packed chain beat byte scales on 33/33 verification routes, by a median
+4.60% paired by route. Its median paired advantage over b12x was 3.51%.
+Both backends used rank 1's layer-10 weights and matching route IDs. The
+b12x measurement begins after its route preparation and ends at routed
+output slots. TileLang performs dispatch and combination inside its timer.
+The activation inputs differed between backends. The bitwise check tests
+the scale encoding within TileLang. A full-model W4A8 verification comparison
+would also need to measure the effects of activation rounding on routing,
+draft acceptance and completed responses. DGPP's resident prefill and
+verification readers would both need to consume the smaller layout before
+the projected capacity gain could be realized.
+[Scale packing](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438/30)
+
+### Starting gate/up while down weights are in flight
+
+Both local SSDs read the same expert IDs in alternating control and overlap
+trials with eight workers, 512 KiB direct reads and mapped buffers. Each pair
+used the same full expert bytes and produced identical output. The experiment
+repacked one real layer by projection on each node and issued gate/up first
+in both arms. The intervention was when GPU computation could begin.
+
+| Miss wave | Spark 1 wait for all → early gate/up | Spark 2 wait for all → early gate/up |
+|---|---:|---:|
+| One expert, one row | 2.282 → 2.206 ms | 2.378 → 2.166 ms |
+| Six experts, 32 rows per expert | 11.272 → 10.537 ms | 11.312 → 10.756 ms |
+| Six experts, 64 rows per expert | 10.963 → 10.276 ms | 11.317 → 10.852 ms |
+
+Each entry is the median of 60 timed waves from submission through down
+completion on that node. All twelve host/shape combinations improved at the
+median. This measures exposed work within a miss wave. Full-service savings
+depend on which rank is on the critical path, existing overlap and the number
+of exposed misses. The deployed store interleaves the three projections per
+chunk. It would need a suitable read layout and split readiness in the
+production scheduler to exploit this result.
+[Two-rank prototype](https://github.com/christopherowen/spark-ds41f/pull/981)
+
+### Prompt-copy proposals in eager DSpark serving
+
+We compared three lookup rules at DSpark depth three. The first replaced
+proposals at the existing width. The second could also append up to two
+tokens on a strong match. The selected rule preserves all three DSpark
+predictions and appends up to two tokens only when the history matches
+the entire prediction. This recovers the short directory call that took an
+extra pass when lookup could overwrite a correct DSpark token.
+[CopyDrafter workload](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438/138)
+
+Median concurrency-one **engine decode tokens/s** across the final three
+consecutive repeats with zero expert-file reads on both ranks:
+
+| Completed task | Base DSpark | Same-width replacement | Replace and extend | Base DSpark on final build | Extend on full agreement |
+|---|---:|---:|---:|---:|---:|
+| Return an exact edited file | 59.46 | 58.63 | 73.05 | 59.43 | 73.05 |
+| Write the complete edit after a read tool result | 58.50 | 57.61 | 67.77 | 58.50 | 68.76 |
+| Call the directory tool | 60.08 | 54.84 | 54.26 | 60.13 | 59.56 |
+| Answer the prose question | 37.23 | 37.23 | 37.14 | 37.19 | 37.24 |
+
+All four requests used automatic tool choice and were scored through
+completion, including finish reason, file contents and tool name/arguments.
+The final build returned the same decoded messages with lookup on and
+off, excluding generated tool-call IDs. On the file and write tasks,
+verification passes fell from 58 to 40 and from 71 to 53. The selected
+rule used 11 passes on the directory call and 26 on prose in both arms.
+The first three columns used prototype binary SHA-256
+`2bb837026200b337c4eb3de6b377af124364fe58eae4fe9a0cc081f9bf8b4852`
+based on `b972cd84`. The last two used the same `dcda4609` source and binary
+`ee5fabad912d0948d580472cc2fb100e320e86bb7491bd7e73f57c96978c27b2`.
+Each configuration had zero process swap on both ranks and matching rank
+operation streams. Earlier probes with an inherited forced tool choice
+were discarded from this comparison.
+
+On a separate 24,292-token agent prompt, the first prefill with zero cached
+tokens took 21.38 s with lookup off and 21.39 s with the selected rule.
+The real directory listing was fed back to the model. Both configurations
+completed the call and follow-up, named correct directories and produced
+the same final text. On warm repeats the median combined engine decode was
+1.442 versus 1.437 s. Service-level wall time summed over both HTTP requests
+was 2.100 versus 2.093 s. This exchange reused 24,192 prefix tokens on the
+call and 24,448 on the reply. A further simultaneous edit and directory call
+ran in two active slots and both passed their output checks.
+
+The MXFP4 two-Spark template selects `lookup_draft: true`, `lookup_tail: 2`
+and fixed `mtp_depth: 3`, with exact b12x verification. The serving evidence
+covers greedy requests, four short tasks and one long-context tool exchange.
+Broader throughput by concurrency and serving with packed-scale experts or
+projection-level SSD readiness remain unmeasured.
