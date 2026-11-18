@@ -445,6 +445,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_DRAFT_GRAPH"))
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
+  if (const char* value = std::getenv("DGPP_DSV41_PAGED_GRAPH_TAIL")) paged_graph_tail_ = value[0] == '1';
+  if (const char* value = std::getenv("DGPP_DSV41_PAGED_ASYNC_PROLOGUE")) paged_async_prologue_ = value[0] == '1';
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
   gemm_.set_decode_mma(dense_mma_);
@@ -593,6 +595,14 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // head alone and stays off — the draft takes the EXL3 head's logits.)
   if (mtp_ && globals_.lm_head != nullptr)
     draft_head_.init(draft_head_matrix(), max_decode_rows_, loader_.rank(), stream_, /*quiet=*/true);
+}
+
+void Dsv41Model::normalize_head(int first, int count) {
+  const int h = cfg_.hidden_size;
+  const size_t offset = static_cast<size_t>(first) * h;
+  launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, cfg_.rms_norm_eps, collapsed_ + offset,
+                             nullptr, mhc_cfg_, count, stream_);
+  csa2_rmsnorm_bf16(collapsed_ + offset, h, globals_.final_norm, h_ + offset, h, count, h, cfg_.rms_norm_eps, stream_);
 }
 
 void Dsv41Model::head_logits(const uint16_t* h, int rows, float* out, cudaStream_t stream) {
@@ -1961,17 +1971,21 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   if (debug_capture_) debug_sites_.push_back(std::move(cap));
 }
 
-bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
+bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_tail) {
   if (!paged_graphs_) paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers, rank_);
   auto& p = *paged_graphs_;
   const std::array<uint64_t,7> key{static_cast<uint64_t>(T), static_cast<uint64_t>(rows.num_requests),
       static_cast<uint64_t>(rows.snapshots), reinterpret_cast<uintptr_t>(rows.req_ids),
-      reinterpret_cast<uintptr_t>(rows.pos), reinterpret_cast<uintptr_t>(rows.spans), 0};
+      reinterpret_cast<uintptr_t>(rows.pos), reinterpret_cast<uintptr_t>(rows.spans), static_cast<uint64_t>(capture_tail)};
   auto it = p.graphs.find(key);
   // Bound graph executable memory. Uncached uncommon shapes retain the
   // ordinary eager path; live request IDs/positions remain device inputs.
   if (it == p.graphs.end() && p.graphs.size() >= PagedGraphs::max_target_graphs) return false;
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  // During replay the graph follows the embedding on this same stream. The
+  // external Engram event gates each consumer. Capture and sharded embedding
+  // still settle producer work before (re)arming the transport segment.
+  if (it == p.graphs.end() || !paged_async_prologue_ || embed_sharded_)
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   if (boundary_) boundary_->settle();
   if (it == p.graphs.end()) {
     // All plan creation and allocations precede capture. Decode uses device
@@ -1980,6 +1994,9 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       build_layer_objects(loader_.load_layer(l));
       if (!csa2_->prepare(T)) throw std::runtime_error("GPU paging: CSA2 plans unavailable");
     }
+    if (capture_tail && !globals_.lm_head_x.tiles &&
+        !gemm_.ensure_plan(T, lm_vocab_count_, cfg_.hidden_size, DType::BF16, GemmOut::F32, cfg_.hidden_size))
+      return false;
     auto& g = p.graphs[key];
     g.variant = static_cast<int>(p.graphs.size()) - 1;
     g.inputs.resize(p.layers); g.outputs.resize(p.layers);
@@ -2000,14 +2017,20 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       join_comb();
       prefetch_.join(stream_);
       if (p.layer_stamps) launch_expert_layer_stamp(p.layer_stamps + p.layers, stream_);
+      if (capture_tail) {
+        normalize_head(0, T);
+        head_logits(h_, T, logits_, stream_);
+        if (mtp_) store_draft_hidden(main_hidden_, rows.req_ids, rows.pos, T);
+        copy_decode_mirrors(T);
+      }
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
-      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}, L2 prefetch launches={}",
-                    g.variant, T, rows.num_requests, prefetch_.launches() - prefetch_start);
+      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}, L2 prefetch launches={}, output tail={}",
+                    g.variant, T, rows.num_requests, prefetch_.launches() - prefetch_start, capture_tail);
     } catch (...) {
       paged_graph_capture_ = false; p.capturing = nullptr;
       if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
@@ -2348,7 +2371,11 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       !debug_teacher_ && !debug_capture_ && !traces && rows.num_requests == 1 &&
       last_layer == cfg_.num_hidden_layers && T <= 16 &&
       (!boundary_ || boundary_->supports_graph_segments());
-  const bool paged_graph = paged_candidate && enqueue_paged_graph(T, rows);
+  const bool capture_tail = paged_graph_tail_ && !compact_verify_ && !packed_prefill_logits(run) &&
+                            !group && T <= max_decode_rows_ && T <= logits_capacity_rows_;
+  const bool paged_graph = paged_candidate && enqueue_paged_graph(T, rows, capture_tail);
+  const bool tail_ready = paged_graph && capture_tail;
+  if (tail_ready && mtp_) draft_row_ = 0;
   if (!paged_graph && prefetching(run.decode)) prefetch_attention_side(0, T);
   for (int layer = 0; !paged_graph && layer < last_layer; ++layer) {
     const Dsv41LayerResident& r = loader_.load_layer(layer);
@@ -2563,7 +2590,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       }
     }
   }
-  if (head) {
+  if (head && !tail_ready) {
     // The head: the weighted collapse with the last site's pre, the final
     // norm, the lm head on every walked row (bounded: the segment's rows,
     // at the chunk's last rows; the rows before them read as NaN).
@@ -2573,10 +2600,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       DGPP_CUDA_OK(cudaMemsetAsync(logits_, 0xFF, static_cast<size_t>(row_off) * lm_vocab_count_ * sizeof(float), stream_));
       DGPP_CUDA_OK(cudaMemsetAsync(h_, 0xFF, static_cast<size_t>(row_off) * H * 2, stream_));
     }
-    launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, cfg_.rms_norm_eps, collapsed_ + static_cast<size_t>(row_off) * H,
-                               nullptr, mhc_cfg_, walk_rows, stream_);
-    csa2_rmsnorm_bf16(collapsed_ + static_cast<size_t>(row_off) * H, H, globals_.final_norm,
-                      h_ + static_cast<size_t>(row_off) * H, H, walk_rows, H, cfg_.rms_norm_eps, stream_);
+    normalize_head(row_off, walk_rows);
     if (packed_logits) {
       auto selected = run;
       std::vector<uint8_t> keep;
@@ -2668,7 +2692,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
     compact_verify_rows_ = run.T;
   } else {
     out = finish_run(run, std::move(out), packed_logits, -1,
-                     output_hidden_rows.empty() ? nullptr : &output_hidden_rows);
+                     output_hidden_rows.empty() ? nullptr : &output_hidden_rows, tail_ready);
   }
   if (!run.capture && traces) {
     for (size_t l = 0; l < out.route_ids.size(); ++l) {

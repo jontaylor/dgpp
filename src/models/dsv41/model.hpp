@@ -347,7 +347,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
   bool enqueue_resident_draft_graph(int req, int accepted_rows);
-  bool enqueue_paged_graph(int T, const WalkRows& rows);
+  bool paged_graph_tail_ = false;
+  bool paged_async_prologue_ = false;
+  bool enqueue_paged_graph(int T, const WalkRows& rows, bool capture_tail);
+  void normalize_head(int first, int count);
   void mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode,
                 int decode_prefix = 0);
   void stream_update(const uint16_t* sublayer_out, int T);

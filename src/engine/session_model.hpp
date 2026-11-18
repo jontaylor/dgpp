@@ -470,7 +470,14 @@ class SessionModel : public PrefillReporting {
   // A walk's staged inputs (the decode rows' token upload included) and
   // its results (the tail mirrors, the host copies).
   RowInputs begin_run(const RowRun& run);
-  Outputs finish_run(const RowRun& run, Outputs&& out, bool packed_logits = false, int last_packed_row = -1, const std::vector<int>* output_hidden_rows = nullptr);
+  void copy_decode_mirrors(size_t rows) {
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, rows * lm_vocab_count_ * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream_));
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_hidden_, h_, rows * hidden_ * sizeof(uint16_t),
+                                 cudaMemcpyDeviceToHost, stream_));
+  }
+  Outputs finish_run(const RowRun& run, Outputs&& out, bool packed_logits = false, int last_packed_row = -1,
+                     const std::vector<int>* output_hidden_rows = nullptr, bool decode_mirrors_ready = false);
   // The family projects each selected input row into consecutive logits rows.
   // Hidden states remain in place for MTP and the host output mirrors.
   bool packed_prefill_logits(const RowRun& run) const {
@@ -863,7 +870,8 @@ typename SessionModel<D>::RowInputs SessionModel<D>::begin_run(const RowRun& run
 
 template <class D>
 typename SessionModel<D>::Outputs SessionModel<D>::finish_run(const RowRun& run, Outputs&& out,
-                                                            bool packed_logits, int last_packed_row, const std::vector<int>* output_hidden_rows) {
+                                                            bool packed_logits, int last_packed_row, const std::vector<int>* output_hidden_rows,
+                                                            bool decode_mirrors_ready) {
   const int T = run.T;
   if (run.device_decode_outputs && packed_logits) last_packed_row = run.decode_rows();
   const size_t H = static_cast<size_t>(hidden_);
@@ -878,11 +886,8 @@ typename SessionModel<D>::Outputs SessionModel<D>::finish_run(const RowRun& run,
     else for (int s = 0; s < run.decode_spans; ++s) rows_out += run.span_lens[s] - 1;
   }
   const size_t first = every_row ? 0 : static_cast<size_t>(T - 1);
-  if (run.decode && (!run.capture || decode_tail_mirrors_)) {
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, rows_out * lm_vocab_count_ * sizeof(float),
-                                 cudaMemcpyDeviceToHost, stream_));
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_hidden_, h_, rows_out * H * 2, cudaMemcpyDeviceToHost, stream_));
-  }
+  if (run.decode && !decode_mirrors_ready && (!run.capture || decode_tail_mirrors_))
+    copy_decode_mirrors(rows_out);
   if (run.capture) return Outputs{};  // nothing executed, nothing to materialize
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   out.lm_vocab_begin = lm_vocab_begin_;
