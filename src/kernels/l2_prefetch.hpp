@@ -71,7 +71,7 @@ void launch_l2_release(const void* ptr, size_t bytes, cudaStream_t stream);
 // windows inside the attention layers (layer_rate(); light — the Full rate
 // slowed the small kernels it ran beside by as much as it saved on the
 // projection) and whether adjacent ranges merge into one launch.
-enum class L2PrefetchForm { Load, Lines, Touch };  // engine.l2_prefetch_form: load | lines | touch
+enum class L2PrefetchForm { Load, Lines, Touch, Ranges };
 // The full-rate window's shape (engine.l2_prefetch_full_form): 16 blocks x 8
 // loads (512 KB in flight, the DRAM rate at the light form's SM footprint;
 // DeepSeek-V4.1's gap kernels run unstretched beside it) or 48 x 4 (768 KB
@@ -97,6 +97,18 @@ L2PrefetchForm l2_prefetch_form(const std::string& name);
 // "16x8" | "48x4" (throws on anything else).
 L2FullForm l2_prefetch_full_form(const std::string& name);
 const char* l2_prefetch_rate_name(PrefetchRate rate);
+// By-value kernel parameters. Each span stays within its own allocation,
+// including a packed companion whose original BF16 storage was released.
+struct L2PrefetchSpans {
+  struct Span {
+    const uint4* data;
+    size_t vectors;
+  };
+  static constexpr int capacity = 12;
+  Span spans[capacity]{};
+  int count = 0;
+};
+
 class WeightPrefetcher {
  public:
   static constexpr size_t kDefaultWindowBytes = size_t{12} << 20;
@@ -177,6 +189,9 @@ class WeightPrefetcher {
   // yet launched; merge_ is the knob; kMergeGap the largest hole bridged.
   static constexpr size_t kMergeGap = size_t{2} << 20;  // bridged gaps are charged to the budget
   void flush_pending();
+  void add_span(const void* ptr, size_t bytes);
+  L2PrefetchSpans batch_;
+  bool batch_window_ = false;
   bool merge_ = true;
   uintptr_t pending_begin_ = 0, pending_end_ = 0;
   uintptr_t pending_alloc_end_ = 0;  // the end of the pending range's allocation (0: unknown — no hole bridged)

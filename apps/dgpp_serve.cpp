@@ -1886,7 +1886,7 @@ int main(int argc, char** argv) {
       "    [--no-dflash]  run plain from a drafter template on the decode graph (the A/B knob; add --mtp for the MTP world)\n"
       "    [--no-dflash-verify-graph]  the multi-slot verify as an eager batch (engine.dflash_verify_graph)\n"
       "    [--no-prefill-group]  one cold prompt per prefill walk (engine.prefill_group false)\n"
-      "    [--no-l2-prefetch] [--l2-prefetch-form load|lines|touch] [--l2-prefetch-window-mib N]\n"
+      "    [--no-l2-prefetch] [--l2-prefetch-form load|lines|touch|ranges] [--l2-prefetch-window-mib N]\n"
       "    [--l2-prefetch-boundary-window-mib N] [--l2-prefetch-boundary-rate off|light|full]\n"
       "    [--l2-prefetch-layer-rate off|light|full] [--no-l2-prefetch-merge]  the L2 weight prefetcher (engine.l2_prefetch*)\n"
       "    [--no-dflash-draft-batch]  one block forward per slot (engine.dflash_draft_batch)\n"

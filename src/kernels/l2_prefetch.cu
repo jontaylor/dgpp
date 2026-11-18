@@ -48,9 +48,7 @@ int light_blocks() { return kLightBlocksDefault; }
 __device__ uint32_t g_prefetch_sink[2];
 
 template <int kUnroll>
-__global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(
-    const uint4* __restrict__ p, size_t vec_count) {
-  dgpp_pdl_wait();
+__device__ __forceinline__ uint32_t read_weight_vectors(const uint4* p, size_t vec_count) {
   const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
   size_t i = static_cast<size_t>(blockIdx.x) * kThreads + threadIdx.x;
   uint32_t fold = 0;
@@ -65,6 +63,23 @@ __global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(
     const uint4 v = __ldcg(p + i);
     fold ^= v.x ^ v.w;
   }
+  return fold;
+}
+
+template <int kUnroll>
+__global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(const uint4* p, size_t vec_count) {
+  dgpp_pdl_wait();
+  const uint32_t fold = read_weight_vectors<kUnroll>(p, vec_count);
+  if (fold == g_prefetch_sink[0] + 0x9E3779B9u) g_prefetch_sink[1] = fold;
+}
+
+// Every warp traverses the same list in consumption order. A disjoint tensor
+// starts a new coalesced span without draining and relaunching the whole grid.
+__global__ __launch_bounds__(kThreads) void l2_prefetch_spans_kernel(const __grid_constant__ L2PrefetchSpans batch) {
+  dgpp_pdl_wait();
+  uint32_t fold = 0;
+  for (int i = 0; i < batch.count; ++i)
+    fold ^= read_weight_vectors<kLightUnroll>(batch.spans[i].data, batch.spans[i].vectors);
   if (fold == g_prefetch_sink[0] + 0x9E3779B9u) g_prefetch_sink[1] = fold;
 }
 
@@ -140,7 +155,8 @@ L2PrefetchForm l2_prefetch_form(const std::string& name) {
   if (name == "load") return L2PrefetchForm::Load;
   if (name == "lines") return L2PrefetchForm::Lines;
   if (name == "touch") return L2PrefetchForm::Touch;
-  throw std::invalid_argument("l2 prefetch form: load, lines or touch (got '" + name + "')");
+  if (name == "ranges") return L2PrefetchForm::Ranges;
+  throw std::invalid_argument("l2 prefetch form: load, lines, touch or ranges (got '" + name + "')");
 }
 L2FullForm l2_prefetch_full_form(const std::string& name) {
   if (name == "16x8") return L2FullForm::Narrow16x8;
@@ -190,9 +206,7 @@ static bool device_allocation(uintptr_t p, uintptr_t* base, uintptr_t* end) {
   return true;
 }
 
-void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
-                        cudaStream_t stream, bool persisting) {
-  if (ptr == nullptr || bytes == 0 || rate == PrefetchRate::Off) return;
+static L2PrefetchSpans::Span bounded_span(const void* ptr, size_t bytes) {
   // Widen to 16-byte boundaries: the read may cover a few bytes past either
   // end of the request, which is safe for any cudaMalloc'd range (256-byte
   // aligned and sized).
@@ -214,11 +228,17 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
                       reinterpret_cast<uintptr_t>(ptr), bytes, end - alloc_end, base, alloc_end);
       }
       end_clamped = alloc_end & ~uintptr_t{15};
-      if (end_clamped <= begin) return;
+      if (end_clamped <= begin) return {};
     }
   }
-  const uint4* p = reinterpret_cast<const uint4*>(begin);
-  const size_t vecs = (end_clamped - begin) / 16;
+  return {reinterpret_cast<const uint4*>(begin), (end_clamped - begin) / 16};
+}
+
+void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
+                        cudaStream_t stream, bool persisting) {
+  if (ptr == nullptr || bytes == 0 || rate == PrefetchRate::Off) return;
+  const auto [p, vecs] = bounded_span(ptr, bytes);
+  if (!vecs) return;
   if (persisting) {
     if (rate == PrefetchRate::Full && full_form_wide())
       launch_persisting<kWideUnroll>(p, vecs, kWideBlocks, stream);
@@ -235,13 +255,13 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
       l2_prefetch_kernel<kNarrowUnroll><<<kNarrowBlocks, kThreads, 0, stream>>>(p, vecs);
   } else if (env_prefetch_form_touch()) {
     const size_t sb = env_touch_stride_bytes();
-    const size_t touches = (end_clamped - begin + sb - 1) / sb;
+    const size_t touches = (vecs * 16 + sb - 1) / sb;
     l2_touch_pages_kernel<<<static_cast<unsigned>(std::min<size_t>(light_blocks(), (touches + kThreads - 1) / kThreads)),
-                            kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(begin), touches, sb);
+                            kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(p), touches, sb);
   } else if (env_prefetch_form_lines()) {
-    const size_t lines = (end_clamped - begin + 127) / 128;
+    const size_t lines = (vecs * 16 + 127) / 128;
     l2_prefetch_lines_kernel<<<light_blocks(), kThreads, 0, stream>>>(
-        reinterpret_cast<const uint8_t*>(begin), lines);
+        reinterpret_cast<const uint8_t*>(p), lines);
   } else {
     l2_prefetch_kernel<kLightUnroll><<<light_blocks(), kThreads, 0, stream>>>(p, vecs);
   }
@@ -322,7 +342,23 @@ WeightPrefetcher::~WeightPrefetcher() {
   if (side_) cudaStreamDestroy(side_);
 }
 
+void WeightPrefetcher::add_span(const void* ptr, size_t bytes) {
+  const size_t take = std::min(bytes, remaining_);
+  if (!take) return;
+  remaining_ -= take;
+  const auto span = bounded_span(ptr, take);
+  if (!span.vectors) return;
+  batch_.spans[batch_.count++] = span;
+  if (batch_.count == L2PrefetchSpans::capacity) flush_pending();
+}
+
 void WeightPrefetcher::flush_pending() {
+  if (batch_.count) {
+    l2_prefetch_spans_kernel<<<light_blocks(), kThreads, 0, side_>>>(batch_);
+    DGPP_CUDA_OK(cudaGetLastError());
+    batch_.count = 0;
+    ++launches_;
+  }
   if (pending_end_ > pending_begin_) {
     launch_l2_prefetch(reinterpret_cast<const void*>(pending_begin_),
                        pending_end_ - pending_begin_, rate_, side_, persisting_);
@@ -339,6 +375,8 @@ void WeightPrefetcher::open_window(cudaStream_t main, size_t budget_bytes,
   flush_pending();  // the previous window's tail, at its own rate and policy
   rate_ = rate;
   persisting_ = persisting;
+  batch_window_ = merge_ && !persisting && rate == PrefetchRate::Light &&
+                  g_l2_settings.form == L2PrefetchForm::Ranges;
   remaining_ = budget_bytes > 0 ? budget_bytes : window_bytes_;
   window_open_ = true;
   if (rate == PrefetchRate::Off) return;  // no fork: nothing will launch
@@ -351,6 +389,7 @@ void WeightPrefetcher::add(const void* ptr, size_t bytes) {
   if (!enabled_ || !window_open_ || rate_ == PrefetchRate::Off ||
       ptr == nullptr || bytes == 0)
     return;
+  if (batch_window_) return add_span(ptr, bytes);
   if (!merge_) {
     const size_t take = std::min(bytes, remaining_);
     if (take == 0) return;
@@ -391,6 +430,7 @@ void WeightPrefetcher::add(const void* ptr, size_t bytes) {
 void WeightPrefetcher::add_isolated(const void* ptr, size_t bytes) {
   if (!enabled_ || !window_open_ || rate_ == PrefetchRate::Off || ptr == nullptr || bytes == 0)
     return;
+  if (batch_window_) return add_span(ptr, bytes);
   const size_t take = std::min(bytes, remaining_);
   if (take == 0) return;
   remaining_ -= take;
@@ -418,6 +458,7 @@ void WeightPrefetcher::join(cudaStream_t main) {
 }
 
 void WeightPrefetcher::discard_window() {
+  batch_.count = 0;
   pending_begin_ = pending_end_ = pending_alloc_end_ = 0;
   window_open_ = false;
   forked_ = false;

@@ -565,7 +565,7 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_layer_rate":"heavy"}})",
        "'engine.l2_prefetch_layer_rate' must be off, light or full"},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_form":"walk"}})",
-       "'engine.l2_prefetch_form' must be load, lines or touch"},
+       "'engine.l2_prefetch_form' must be load, lines, touch or ranges"},
       {R"({"model":"m","nodes":["h"],"engine":{"l2_prefetch_full_form":"32x8"}})",
        "'engine.l2_prefetch_full_form' must be 16x8 or 48x4"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_sampled_scale":1.5}})",
