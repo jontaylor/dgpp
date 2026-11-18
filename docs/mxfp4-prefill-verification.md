@@ -590,9 +590,66 @@ completion on that node. All twelve host/shape combinations improved at the
 median. This measures exposed work within a miss wave. Full-service savings
 depend on which rank is on the critical path, existing overlap and the number
 of exposed misses. The deployed store interleaves the three projections per
-chunk. It would need a suitable read layout and split readiness in the
-production scheduler to exploit this result.
+chunk. The full-model experiment below uses that existing layout.
 [Two-rank prototype](https://github.com/christopherowen/spark-ds41f/pull/981)
+
+#### Full-model decode using the deployed SSD layout
+
+Two Sparks served the packed-scale MXFP4 checkpoint with the 11,524-expert
+pool, eight read workers per rank and DSpark depth three with lookup tail two.
+The diagnostic used source `859698d6` and binary SHA-256
+`21f175ece2ba54dae0454892aa6a22b7172914e5783eb96195a99e1072b37019`
+on both ranks for all three modes. Seven sequential requests per fresh
+process start exercised a 24,292-token tool prompt, prose, code and warm
+repeats. Decode rates use total generated decode tokens divided by engine
+decode time within each group. The range covers two fresh starts of the
+early mode. Each control had one fresh start.
+
+| C1 scheduling | First prose and code, expert reads (tok/s) | Last three follow-ups, zero reads (tok/s) | Cold prefill (s) |
+| --- | ---: | ---: | ---: |
+| Original fused path | 31.90 | 43.61 | 36.90 |
+| Split reads, wait for down before gate/up | 30.10 | 43.66 | 37.28 |
+| Split reads, start gate/up early | 29.93–30.12 | 43.64–43.68 | 36.74–36.78 |
+
+All modes produced the same token operations, tool arguments, finish reasons,
+draft acceptance and expert bytes on each request. The two rank operation
+streams matched within each start, each cold prompt had zero cached tokens
+and all serving ranks recorded zero process swap. The code response reached
+its 320-token cap in every mode.
+
+The current serving kernels and route order are preserved. Resident hits use
+the fused b12x kernel in graph replay. Misses use the same b12x FC1, SwiGLU
+and FC2 arithmetic, packed scale layout, shared-expert overlap and full-expert
+admission. Both modes use the serving async miss executor. Its original
+path can launch groups of completed experts independently. The split path
+collects each projection for the reserved wave, then launches the masked
+group. The early versus delayed control holds this grouping fixed.
+
+The split path issues exact gate/up ranges for a wave first, then its down
+ranges. Each of the 18 SSD chunks per missing expert contributes two reads.
+Both ranges fit direct I/O and together read the original 512 KiB record.
+The two first follow-ups transferred 22.46 GiB per rank including prompt
+tails. Splitting 1,575 expert loads added 28,350 read calls, taking the total
+from 45,990 to 74,340 per rank. At the 600th replay of the first early run,
+both ranks reported outstanding down reads as the host began launching
+gate/up in all 1,475 split waves. This counter observes host-side readiness.
+The exact time the GPU began gate/up was outside the measurement.
+
+The delayed result falls within the range of the two early runs. Starting
+gate/up sooner gave no repeatable throughput advantage at this read granularity.
+The fused path remains the serving choice. Both timing controls retain the
+existing SSD image. A full-model comparison with projection-major storage
+would answer whether larger contiguous reads change the result.
+
+To reproduce the experimental path, export the optional backend with
+`scripts/export_b12x_moe.py --format mxfp4-nibble --split-projections --output <aot-dir>`
+and build with that `DGPP_B12X_AOT_DIR`. Set `DGPP_EXPERT_PROJECTION_SPLIT=1`
+for early gate/up or `2` for the delayed control. The default is off. Only
+the GPU-paged target graph takes this path, on wholly missing experts with
+a supported MX layout and sufficient staging for the entire wave. Whole-record
+checksum verification uses the original read path. Both split modes keep
+the original fused kernel for resident experts and admit complete experts
+through the existing cache policy.
 
 ### Prompt-copy proposals in eager DSpark serving
 
@@ -641,8 +698,7 @@ ran in two active slots and both passed their output checks.
 The MXFP4 two-Spark template selects `lookup_draft: true`, `lookup_tail: 2`
 and fixed `mtp_depth: 3`, with exact b12x verification. The serving evidence
 covers greedy requests, four short tasks and one long-context tool exchange.
-Broader throughput by concurrency and full-model projection-level SSD
-readiness remain unmeasured.
+Broader throughput by concurrency remains unmeasured for this comparison.
 
 ## Lossless MXFP4 scale packing on the two Sparks
 
