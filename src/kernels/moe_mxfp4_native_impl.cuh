@@ -154,11 +154,6 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
   };
   auto weight_scale = [&](int row, int code) -> uint8_t {
     if constexpr (SupportsViews) {
-      if (prepared) {
-        const int pn = fp4_layout::swap_scale_pair(
-            fp4_layout::transpose_scale_block(row + view.fp4_packed_row0));
-        return fp4_layout::mx_scale(w_scales, (code / 32) * view.fp4_packed_rows + pn, view.fp4_mx_nibbles);
-      }
       if (view.fp4_chunks) {
         const int width = view.fp4_chunk_width;
         const int chunk = view.fp4_chunk_columns ? code / width : row / width;
@@ -185,8 +180,23 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
           const uint8_t* src =
               (is_a ? a_scales : w_scales) + size_t(sr) * scale_stride + step * (BK / 32);
           if (SupportsViews && !is_a) {
-            pair = uint16_t(weight_scale(sr, step * BK)) |
-                   (uint16_t(weight_scale(sr, step * BK + 32)) << 8);
+            if (prepared) {
+              const unsigned pn = fp4_layout::swap_scale_pair(
+                  fp4_layout::transpose_scale_block(sr + view.fp4_packed_row0));
+              const unsigned rows = view.fp4_packed_rows;
+              if (view.fp4_mx_nibbles) {
+                // Both K32 groups have the same permuted channel and nibble.
+                const auto* first = w_scales + step * rows + (pn / 8) * 4 + (pn & 3);
+                const unsigned packed_pair = first[0] | (unsigned(first[rows / 2]) << 8);
+                pair = 0x7070 | ((packed_pair >> (pn & 4)) & 0x0f0f);
+              } else {
+                const auto* first = w_scales + (step * 2) * rows + pn;
+                pair = first[0] | (uint16_t(first[rows]) << 8);
+              }
+            } else {
+              pair = uint16_t(weight_scale(sr, step * BK)) |
+                     (uint16_t(weight_scale(sr, step * BK + 32)) << 8);
+            }
           } else if constexpr (ColumnScales) {
             if (!is_a)
               pair = uint16_t(w_scales[size_t(step * 2) * n + sr]) |
