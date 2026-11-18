@@ -56,6 +56,7 @@
   },
   "environment": {
     "DGPP_MOE_B12X": "1",
+    "DGPP_MX_PACKED_SCALES": "1",
     "DGPP_MOE_FP4_GROUPED_DECODE": "0",
     "DGPP_EXPERT_GPU_SCATTER": "1",
     "DGPP_EXPERT_VERIFY_RECORDS": "0",

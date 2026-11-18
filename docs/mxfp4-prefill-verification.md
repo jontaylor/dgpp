@@ -641,5 +641,66 @@ ran in two active slots and both passed their output checks.
 The MXFP4 two-Spark template selects `lookup_draft: true`, `lookup_tail: 2`
 and fixed `mtp_depth: 3`, with exact b12x verification. The serving evidence
 covers greedy requests, four short tasks and one long-context tool exchange.
-Broader throughput by concurrency and serving with packed-scale experts or
-projection-level SSD readiness remain unmeasured.
+Broader throughput by concurrency and full-model projection-level SSD
+readiness remain unmeasured.
+
+## Lossless MXFP4 scale packing on the two Sparks
+
+The entire routed-expert SSD image on each rank was checked, covering
+276,480 chunk records per rank. E8M0 scale bytes ranged from 117 to 127 on
+rank 0 and 117 to 126 on rank 1. All have the same upper nibble. Storing
+the lower nibble cuts routed-expert storage from 4.25 to 4.125 bits per
+weight. Each local full shard occupies 9,123,840 bytes, down from
+9,400,320. The measured cache allocation changed from 199,291 chunks of
+522,240 bytes to 205,329 chunks of 506,880 bytes, including a separate
+522,240-byte conversion buffer in the same budget. In groups of 18 this
+gives 11,407 complete shards per rank versus 11,071. The ranks hold
+complementary halves of the same experts.
+
+A captured b12x W4A16 verification replay used the same rank-1 layer-10
+weights, four input rows, top-six routes and synthetic BF16 activations
+for both layouts. Across 34 recorded route groups all routed FP32 output
+slots were bit-identical. Median times were 692 µs with byte scales and
+660 µs with packed scales. Packed won 31/34 routes with a median paired
+latency reduction of 4.25%. The single-layer paging test also compared
+complete outputs under whole-expert and fractional policies, including
+cold reconstruction and prepared hits. It covered both W4A16 prefill
+and the deployment's native MX prefill with fused gate/up.
+
+The serving screen used the same two-rank checkpoint, local SSD images,
+expert budget, 1M KV capacity and fixed-depth-three DSpark with a lookup
+tail of two. The byte-scale control and initial packed reader both used
+source `d8e3a350`, executable SHA-256
+`a75d3140f369e2b1d827aaee61682d5b400d2ac09f293757a6c00601e77197d7`.
+The selected prefill reader shares its permuted-channel address and nibble
+selection across adjacent K32 groups. It used source `237461c8`, executable
+SHA-256 `cc76ae9259995db5e2bf70573f721b223a7a2b6c0c687e6647c62ba575c1e7e8`.
+
+| Two-Spark C1 diagnostic | Byte scales | Packed scales | Packed with paired prefill reads |
+|---|---:|---:|---:|
+| Cold 24,292-token prefill, seconds | 34.81 | 35.24 | 35.35 |
+| Resident 24,292-token prefill, seconds | 10.377 | 10.482 | 10.370 |
+| Resident 310-token prefill, seconds | 0.467 | 0.481 | 0.461 |
+| Return to the long prompt after the short workload, prefill seconds | 14.24 | 12.89 | 12.79 |
+| Expert-file reads per rank on that returning request, GiB | 23.04 | 14.92 | 14.92 |
+| Directory call on the long prompt, engine decode tok/s | 55.33 | 55.87 | 55.84 |
+| Answer after the directory result, engine decode tok/s | 57.20 | 57.57 | 57.70 |
+| Complete a short Python function, engine decode tok/s | 59.16 | 59.51 | 59.73 |
+
+The long prompt had zero prefix hits on all four full presentations in each
+boot. Each initial request read 95.61 GiB of expert records per rank. The
+following three presentations read zero on both ranks. Short resident prefill
+uses the median of six complete prompt evaluations. The returning long
+request used zero cached prompt tokens and generated the same 44-token tool
+call in all three boots. The 35.3% read reduction on that request came from
+retaining more experts across the intervening workload. Each SSD read still
+has the original record size.
+
+Decode rates use generated tokens after the first token divided by engine
+decode-step time. Directory call, reply and code medians use three, five
+and five expert-read-free requests, respectively. The follow-ups reused
+24,320 prefix tokens. Greedy tool calls, arguments, final answers, code
+and finish reasons matched across layouts, excluding generated tool-call IDs.
+Both ranks had zero sampled process swap and matching operation streams
+within every boot. Each configuration had one cold start. Differences below
+one percent in this short C1 comparison have no established error bound.

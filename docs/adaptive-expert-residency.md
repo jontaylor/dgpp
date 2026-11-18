@@ -597,11 +597,31 @@ FlashInfer 0.7.4 and Cutlass DSL 4.8.1/CUDA 13 installed:
 ```sh
 python scripts/export_b12x_moe.py --format nvfp4 --output DIR
 python scripts/export_b12x_moe.py --format mxfp4 --output DIR
+# Additional specialization for losslessly packed MXFP4 scales
+python scripts/export_b12x_moe.py --format mxfp4-nibble --output DIR
 ```
 
 Then configure CMake with `-DDGPP_B12X_AOT_DIR=DIR`. The exporter emits the AOT
 header, object and small static CUDA dialect runtime archive. The server needs
 neither Python nor a JIT compiler. Generated files belong in the build directory.
+
+Set `DGPP_MX_PACKED_SCALES=1` on both ranks to use the additional specialization
+for paged MXFP4 target experts. It requires native b12x execution, uniform
+contiguous chunks and E8M0 exponents in the inclusive range 112–127. The SSD
+reader checks the gate, up and down scales before publishing each read. For a
+checkpoint with a wider range, select byte scales with
+`DGPP_MX_PACKED_SCALES=0`. Split-singleton verification requires byte scales.
+
+Prepared experts keep the existing payload order. Within each group of eight
+permuted scales, four bytes store the low four
+bits of each exponent. Channels 0–3 occupy the low nibble of each byte and
+channels 4–7 occupy the high nibble. The verification kernel stages these bytes
+asynchronously and restores the original exponents in registers. Prefill
+reads packed scales through its resident expert views. The cache also stores
+partially resident chunks in compact form and charges one raw chunk of
+conversion scratch against its budget. The local SSD images, read sizes,
+resident DSpark draft weights and activation arithmetic keep their existing
+formats.
 
 The current serving comparison uses two GB10 nodes, a 100 GiB expert
 budget per rank, BF16 activations and fixed-depth-five DSpark without confidence
