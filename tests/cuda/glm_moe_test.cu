@@ -3717,30 +3717,32 @@ DGPP_TEST(moe_b12x_graph_route_packet_matches_host_order) {
   DGPP_CUDA_OK(cudaMallocManaged(&packet, (slots * (block + 1) + 1) * sizeof(*packet)));
   DGPP_CUDA_OK(cudaHostAlloc(&demand, sizeof(*demand), cudaHostAllocMapped));
   std::fill_n(table, experts * 6, uint64_t{1});
-  for (int rows : {1, 4, 6, 16, capacity}) {
-    *demand = {};
-    std::vector<std::vector<int>> groups(experts);
-    for (int i = 0; i < rows * top_k; ++i) {
-      // Mixed singletons, repeated groups spanning several tiles, and high IDs.
-      ids[i] = i % top_k == 0 ? i / top_k : experts - i % top_k;
-      groups[ids[i]].push_back(i);
-    }
-    dgpp::launch_expert_route_packet(packet, table, ids, demand, rows, nullptr);
-    DGPP_CUDA_OK(cudaDeviceSynchronize());
-    require(!demand->request && !demand->serviced &&
-            std::equal(ids, ids + rows * top_k, demand->ids), "hit mailbox preserves every route");
-    int tiles = 0;
-    for (int e = 0; e < experts; ++e) {
-      const auto& group = groups[e];
-      for (size_t first = 0; first < group.size(); first += block, ++tiles) {
-        require(packet[slots * block + tiles] == e, "ordered expert tile");
-        for (size_t j = 0; j < block; ++j) {
-          const int expect = first + j < group.size() ? group[first + j] : rows * top_k;
-          require(packet[tiles * block + j] == expect, "stable routed slot or padding");
+  for (int rows : {1, 4, 5, 6, 16, capacity}) {
+    for (bool one_expert : {false, true}) {
+      *demand = {};
+      std::vector<std::vector<int>> groups(experts);
+      for (int i = 0; i < rows * top_k; ++i) {
+        // Mixed singletons, repeated groups spanning several tiles, and high IDs.
+        ids[i] = one_expert ? 17 : i % top_k == 0 ? i / top_k : experts - i % top_k;
+        groups[ids[i]].push_back(i);
+      }
+      dgpp::launch_expert_route_packet(packet, table, ids, demand, rows, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      require(!demand->request && !demand->serviced &&
+              std::equal(ids, ids + rows * top_k, demand->ids), "hit mailbox preserves every route");
+      int tiles = 0;
+      for (int e = 0; e < experts; ++e) {
+        const auto& group = groups[e];
+        for (size_t first = 0; first < group.size(); first += block, ++tiles) {
+          require(packet[slots * block + tiles] == e, "ordered expert tile");
+          for (size_t j = 0; j < block; ++j) {
+            const int expect = first + j < group.size() ? group[first + j] : rows * top_k;
+            require(packet[tiles * block + j] == expect, "stable routed slot or padding");
+          }
         }
       }
+      require(packet[slots * (block + 1)] == tiles * block, "live packet length");
     }
-    require(packet[slots * (block + 1)] == tiles * block, "live packet length");
   }
   DGPP_CUDA_OK(cudaFreeHost(demand));
   DGPP_CUDA_OK(cudaFree(packet));
