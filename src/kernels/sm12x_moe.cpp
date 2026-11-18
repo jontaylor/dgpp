@@ -244,6 +244,14 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
                    float* out, int rows, cudaStream_t stream, const uint64_t* bindings, expert::ExpertProjection part) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x MoE: row count exceeds capacity");
   auto& c = *impl_;
+  if (part != expert::ExpertProjection::kAll) {
+#ifdef DGPP_HAVE_B12X_PROJECTIONS
+    if (!c.projection.module.module || bindings)
+      throw std::logic_error("b12x projection requires the loaded MX backend and a host-prepared wave");
+#else
+    throw std::logic_error("b12x projection AOT is unavailable");
+#endif
+  }
   // Captured layers already own a published device table. Host-serviced
   // waves carry their private masked bindings in the uploaded packet.
   auto* table = bindings ? reinterpret_cast<uint8_t*>(const_cast<uint64_t*>(bindings)) : c.packet;

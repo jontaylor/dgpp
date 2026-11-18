@@ -1014,8 +1014,12 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           }
           if (gate) {
             const auto down = std::span(projections->tickets).subspan(missing.size());
-            if (projections->delay_gate)
+            if (projections->delay_gate) {
+              const auto wait = std::chrono::steady_clock::now();
               for (const auto& ticket : down) (void)ticket->wait();
+              s.counters.read_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - wait).count();
+            }
             projections->down_pending_at_gate = std::any_of(down.begin(), down.end(),
                 [](const auto& t) { return !t->ready(); });
           }
