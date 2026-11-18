@@ -80,6 +80,7 @@ class ExpertStore {
             ExpertProjection projection = ExpertProjection::kAll) const;
   // Scatter adjacent whole records directly into their independently leased buffers.
   static constexpr size_t max_read_batch = 16;
+  size_t vector_alignment() const;
   bool accepts_read_batch() const { return !verify_record_checksums_ && trace_fd_ < 0; }
   void read_adjacent(size_t first, std::span<const std::span<uint8_t>> destinations) const;
   ReadStats stats() const;

@@ -162,9 +162,10 @@ struct ReadQueueImpl {
     counters.staging_reserved = cfg.buffers * pool->slot_bytes;
     pool->buffers.reserve(cfg.buffers);
     pool->free.reserve(cfg.buffers);
+    const size_t alignment = cfg.adjacent_records > 1 ? store->vector_alignment() : 4096;
     for (size_t b = 0; b < cfg.buffers; ++b) {
       void* data = nullptr;
-      if (::posix_memalign(&data, 4096, pool->slot_bytes) != 0)
+      if (::posix_memalign(&data, alignment, pool->slot_bytes) != 0)
         throw std::bad_alloc();
       pool->buffers.emplace_back(data, &std::free);
       pool->free.push_back(b);

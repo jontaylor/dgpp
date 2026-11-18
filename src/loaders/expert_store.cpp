@@ -323,6 +323,15 @@ void ExpertStore::read(size_t index, std::span<uint8_t> destination, ExpertProje
     throw;
   }
 }
+size_t ExpertStore::vector_alignment() const {
+  // The Spark SMMU maps 64 KiB pages even though the image uses 4 KiB sectors.
+  static const size_t page = [] {
+    const long value = ::sysconf(_SC_PAGESIZE);
+    if (value <= 0) error("cannot determine system page size");
+    return std::max<size_t>(kPage, static_cast<size_t>(value));
+  }();
+  return mode_ == IoMode::kDirect ? page : kPage;
+}
 void ExpertStore::read_adjacent(size_t first, std::span<const std::span<uint8_t>> destinations) const {
   if (!accepts_read_batch() || destinations.empty() || destinations.size() > max_read_batch ||
       first >= records_.size() || destinations.size() > records_.size() - first)
@@ -330,14 +339,24 @@ void ExpertStore::read_adjacent(size_t first, std::span<const std::span<uint8_t>
   std::array<iovec, max_read_batch> vectors;
   uint64_t offset = records_[first].file_offset;
   uint64_t end = offset;
+  const size_t alignment = vector_alignment();
+  bool scalar = false;
   for (size_t i = 0; i < destinations.size(); ++i) {
     const auto& r = records_[first + i];
     auto dst = destinations[i];
     if (r.file_offset != end || dst.size() != r.layout.record_bytes ||
         (mode_ == IoMode::kDirect && reinterpret_cast<uintptr_t>(dst.data()) % kPage))
       error("adjacent read staging size, alignment or offset mismatch");
+    if (mode_ == IoMode::kDirect && (reinterpret_cast<uintptr_t>(dst.data()) % alignment ||
+        (i + 1 < destinations.size() && dst.size() % alignment))) scalar = true;
     vectors[i] = {dst.data(), dst.size()};
     end = add(end, dst.size());
+  }
+  // Independently valid direct reads can form an invalid scatter/gather DMA
+  // list at a subpage boundary. Use the same O_DIRECT fd for such layouts.
+  if (scalar) {
+    for (size_t j = 0; j < destinations.size(); ++j) read(first + j, destinations[j]);
+    return;
   }
   size_t i = 0;
   while (i < destinations.size()) {
