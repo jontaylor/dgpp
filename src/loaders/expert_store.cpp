@@ -346,8 +346,12 @@ void ExpertStore::read_adjacent(size_t first, std::span<const std::span<uint8_t>
                             static_cast<off_t>(offset));
     if (n < 0 && errno == EINTR) continue;
     if (n <= 0) {
+      const int saved_errno = errno;
       failures_.fetch_add(1, std::memory_order_relaxed);
-      error("short or failed adjacent read");
+      error("adjacent read at record " + std::to_string(first + i) +
+            ", file offset " + std::to_string(offset) + ", " +
+            std::to_string(destinations.size() - i) + " remaining buffers: " +
+            (n == 0 ? "unexpected EOF" : std::strerror(saved_errno)));
     }
     bytes_.fetch_add(n, std::memory_order_relaxed);
     offset += n;
