@@ -414,6 +414,11 @@ void WeightPrefetcher::join(cudaStream_t main) {
   flush_pending();
   DGPP_CUDA_OK(cudaEventRecord(join_, side_));
   DGPP_CUDA_OK(cudaStreamWaitEvent(main, join_, 0));
+  discard_window();
+}
+
+void WeightPrefetcher::discard_window() {
+  pending_begin_ = pending_end_ = pending_alloc_end_ = 0;
   window_open_ = false;
   forked_ = false;
 }

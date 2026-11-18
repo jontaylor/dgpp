@@ -160,6 +160,9 @@ class WeightPrefetcher {
   // before a capture ends (a forked stream must rejoin the origin); a
   // no-op when nothing was forked.
   void join(cudaStream_t main);
+  // A failed stream capture discarded its nodes. Drop its pending range and
+  // fork state before the caller attempts a fresh capture.
+  void discard_window();
   // Launches (and cumulative bytes) issued so far — the merge's evidence.
   size_t launches() const { return launches_; }
   // The persisting lines the recent persisting windows filled, released

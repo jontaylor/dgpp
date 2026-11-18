@@ -1903,11 +1903,16 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       if (boundary_) { boundary_->graph_segment_begin(g.variant); recording = true; }
       DGPP_CUDA_OK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       capturing = true; paged_graph_capture_ = true; p.capturing = &g;
+      // Capture the first window as well as the per-layer boundary windows.
+      // Their side stream must fork and rejoin within this graph on every replay.
+      const size_t prefetch_start = prefetch_.launches();
+      if (prefetching(rows.decode)) prefetch_attention_side(0, T);
       for (int l = 0; l < p.layers; ++l) {
         if (p.layer_stamps) launch_expert_layer_stamp(p.layer_stamps + l, stream_);
         enqueue_layer(loader_.load_layer(l), l, T, rows);
       }
       join_comb();
+      prefetch_.join(stream_);
       if (p.layer_stamps) launch_expert_layer_stamp(p.layer_stamps + p.layers, stream_);
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
@@ -1915,11 +1920,15 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows) {
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
-      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}", g.variant, T, rows.num_requests);
+      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}, L2 prefetch launches={}",
+                    g.variant, T, rows.num_requests, prefetch_.launches() - prefetch_start);
     } catch (...) {
       paged_graph_capture_ = false; p.capturing = nullptr;
       if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
+      prefetch_.discard_window();
       if (graph) (void)cudaGraphDestroy(graph);
+      if (g.exec) (void)cudaGraphExecDestroy(g.exec);
+      p.graphs.erase(key);
       if (recording) { try { boundary_->graph_segment_end(); } catch (...) {} }
       throw;
     }
@@ -2121,7 +2130,6 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       prestage_due_ = {run.next_ids, run.next_T, run.next_pos0, req, run.ids + T - n_prefix, n_prefix};
   }
   gather_embedding(in.tokens, T, run.capture);
-  if (prefetching(run.decode)) prefetch_attention_side(0, T);
   Outputs out;
   const bool traces = !run.decode && route_traces_;
   const size_t K = static_cast<size_t>(cfg_.num_experts_per_tok);
@@ -2255,6 +2263,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       last_layer == cfg_.num_hidden_layers && T <= 16 &&
       (!boundary_ || boundary_->supports_graph_segments());
   const bool paged_graph = paged_candidate && enqueue_paged_graph(T, rows);
+  if (!paged_graph && prefetching(run.decode)) prefetch_attention_side(0, T);
   for (int layer = 0; !paged_graph && layer < last_layer; ++layer) {
     const Dsv41LayerResident& r = loader_.load_layer(layer);
     if (debug_teacher_ && layer > 0) teach(layer - 1);
