@@ -1633,7 +1633,8 @@ void Dsv41Model::enqueue_layer_overlap(const Dsv41LayerResident& r, int layer, i
       if (r0 == 0) {
         if (!csa2_->prepare(decode_prefix)) throw std::runtime_error("mixed CSA2 plans unavailable");
         csa2_->enqueue_decode(x_, pool_, rows.req_ids, rows.pos, rows.spans, rows.decode_spans, decode_prefix, attn_out,
-                              stream_, (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr);
+                              stream_, (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr,
+                              /*prefetch=*/true, debug_capture_);
       }
       span0 = decode_prefix;
     }
@@ -1777,14 +1778,15 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     csa2_->enqueue_draft_block(x_, pool_, rows.req_ids, rows.pos, T, cfg_.dspark_block_size, attn_out, stream_);
   } else if (rows.decode) {
     csa2_->enqueue_decode(x_, pool_, rows.req_ids, rows.pos, rows.spans, rows.num_requests, T, attn_out, stream_,
-                          (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr, pf);
+                          (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr, pf, debug_capture_);
   } else if (rows.num_spans > 0) {
     int row0 = 0;
     if (rows.decode_spans) {
       for (int s = 0; s < rows.decode_spans; ++s) row0 += rows.span_lens[s];
       if (!csa2_->prepare(row0)) throw std::runtime_error("mixed CSA2 plans unavailable");
       csa2_->enqueue_decode(x_, pool_, rows.req_ids, rows.pos, rows.spans, rows.decode_spans,
-                            row0, attn_out, stream_, (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr);
+                            row0, attn_out, stream_, (rows.snapshots && tail >= 0) ? spec_tails(tail, 0) : nullptr,
+                            /*prefetch=*/true, debug_capture_);
     }
     for (int s = rows.decode_spans; s < rows.num_spans; ++s) {
       const int len = rows.span_lens[s];

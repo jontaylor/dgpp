@@ -90,10 +90,23 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
 // four (up to eight) activation rows for every output tile in the group.
 // All four TP2 groups share the grid; the two warp partials meet within the CTA.
 constexpr int woa_warps = 2, woa_step = 512;
-template <bool AlignedScales>
+// Eight live token rows use the complete B fragment. Bring their activation
+// window into registers while the asynchronous weight copies are outstanding.
+struct WoaActivationWindow {
+  uint2 codes[woa_step / 32];
+  uint32_t scales[woa_step / 128];
+};
+
+__device__ __forceinline__ uint2 woa_token_pair(const uint8_t* token) {
+  return make_uint2(*reinterpret_cast<const uint32_t*>(token), *reinterpret_cast<const uint32_t*>(token + 16));
+}
+
+template <bool AlignedScales, int FixedRows>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
-    const float* weight_scale, uint16_t* out, int rows, int groups, int n, int k) {
+    const float* weight_scale, uint16_t* out, int rows, int groups, int n) {
+  constexpr int k = 4096;
+  if constexpr (FixedRows != 0) rows = FixedRows;
   dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int row8 = lane / 4, part = lane % 4;
@@ -143,21 +156,36 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
       }
     }
   };
+  const bool live = row8 < rows;
+  const size_t token_row = (size_t(live ? row8 : 0) * groups + group) * k;
   float acc[4]{};
   issue(k0, 0);
   for (int step = 0; step < span / woa_step; ++step) {
     const int base = k0 + step * woa_step, slot = step & 1;
     if (step + 1 < span / woa_step) issue(base + woa_step, slot ^ 1);
+    const size_t token_base = token_row + base;
+    WoaActivationWindow activation;
+    if constexpr (FixedRows == 8) {
+#pragma unroll
+      for (int q = 0; q < woa_step / 32; ++q) {
+        const size_t off = token_base + q * 32;
+        activation.codes[q] = woa_token_pair(codes + off + part * 4);
+        if (q % 4 == 0) activation.scales[q / 4] = *reinterpret_cast<const uint32_t*>(scales + off / 32);
+      }
+      // Keep these independent global reads ahead of the weight-ready wait.
+      asm volatile("" ::: "memory");
+    }
     unsigned done;
     do {
       asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
                    : "=r"(done) : "r"(barrier_address(slot)), "r"((step / 2) & 1) : "memory");
     } while (!done);
     __syncwarp();
-    const size_t token_base = (size_t(row8 < rows ? row8 : 0) * groups + group) * k + base;
 #pragma unroll
     for (int chunk = 0; chunk < woa_step; chunk += 128) {
-      const uint32_t token_scales = *reinterpret_cast<const uint32_t*>(scales + (token_base + chunk) / 32);
+      uint32_t token_scales = 0;
+      if constexpr (FixedRows == 8) token_scales = activation.scales[chunk / 128];
+      else if (live) token_scales = *reinterpret_cast<const uint32_t*>(scales + (token_base + chunk) / 32);
       const float* ws = weight_scale + size_t(column / 32) * (k / 32) + (base + chunk) / 32;
       float4 four;
       if constexpr (AlignedScales) four = *reinterpret_cast<const float4*>(ws);
@@ -171,10 +199,10 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
         uint32_t a[4];
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(address));
-        const uint8_t* token = codes + token_base + kk + part * 4;
-        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(token);
-        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(token + 16);
-        mma(acc, a, b0, b1, (__float_as_uint(weight_scales[j]) >> 23) & 255, (token_scales >> (8 * j)) & 255);
+        uint2 token{};
+        if constexpr (FixedRows == 8) token = activation.codes[kk / 32];
+        else if (live) token = woa_token_pair(codes + token_base + kk + part * 4);
+        mma(acc, a, token.x, token.y, (__float_as_uint(weight_scales[j]) >> 23) & 255, (token_scales >> (8 * j)) & 255);
       }
     }
     __syncwarp();
@@ -351,8 +379,17 @@ void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const floa
   if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
     throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
   auto launch = [&]<bool AlignedScales>() {
-    woa_decode_kernel<AlignedScales><<<groups * n / 16, woa_warps * 32, 0, stream>>>(
-        packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, k);
+    auto emit = [&]<int FixedRows>() {
+      woa_decode_kernel<AlignedScales, FixedRows><<<groups * n / 16, woa_warps * 32, 0, stream>>>(
+          packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n);
+    };
+    switch (rows) {
+      case 1: return emit.template operator()<1>();
+      case 4: return emit.template operator()<4>();
+      case 6: return emit.template operator()<6>();
+      case 8: return emit.template operator()<8>();
+      default: return emit.template operator()<0>();
+    }
   };
   if (reinterpret_cast<uintptr_t>(ws) % alignof(float4) == 0) launch.template operator()<true>();
   else launch.template operator()<false>();

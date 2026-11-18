@@ -505,7 +505,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
                             int win_block_tokens, const int32_t* win_table, const int32_t* req_ids_main,
                             const int64_t* pos, int row0, int rows, int n_split_main, cudaStream_t stream,
                             const int32_t* list, int list_stride, const int32_t* counts, bool split_window,
-                            int sel_base, bool flash_window, uint8_t* mx_out) {
+                            int sel_base, bool flash_window, uint8_t* mx_out, bool keep_attn_out) {
   const int lh = cfg_.local_heads();
   if (rows > ws_win_rows_ || rows * n_split_main > ws_slots_) throw std::logic_error("csa2 layer: attention tile too wide");
   const uint16_t* q = q_ + size_t(row0) * lh * kCsa2Latent;
@@ -616,9 +616,10 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
     DGPP_CUDA_OK(cudaEventRecord(side_join_, side_stream_));
     DGPP_CUDA_OK(cudaStreamWaitEvent(stream, side_join_, 0));
   }
+  uint16_t* bf16_out = (!mx_out || keep_attn_out) ? o_ + size_t(row0) * lh * kCsa2Latent : nullptr;
   csa2_attn_finish(n_main_pub ? m_main_pub : nullptr, n_main_pub ? l_main_pub : nullptr,
                    n_main_pub ? c_main_pub : nullptr, n_main_pub, m_win_pub, l_win_pub, c_win_pub, n_win_pub,
-                   w_.attn_sink, rows, lh, pos, w_.inv_freq, o_ + size_t(row0) * lh * kCsa2Latent, stream, mx_out);
+                   w_.attn_sink, rows, lh, pos, w_.inv_freq, bf16_out, stream, mx_out);
 }
 
 void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out) {
@@ -717,7 +718,7 @@ void Csa2Layer::open_output_window(cudaStream_t stream) {
 
 void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
                                const int32_t* req_spans, int num_requests, int tokens, void* out, cudaStream_t stream,
-                               float* tail_snapshots, bool prefetch) {
+                               float* tail_snapshots, bool prefetch, bool keep_attn_out) {
   validate_pool(pool);
   if (tokens <= 0 || tokens > max_decode_rows_) throw std::invalid_argument("csa2 layer: decode rows out of range");
   if (num_requests <= 0 || num_requests > pool.shape().max_requests)
@@ -825,7 +826,7 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
       cfg_.o_lora == 1024 && cfg_.heads_per_group() == 8 && gemm_ws_bytes_ >= values + values / 32)
     mx_out = static_cast<uint8_t*>(gemm_ws_);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table(), req_ids, pos, 0, tokens,
-              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out);
+              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out, keep_attn_out);
   project_out(tokens, out, stream, mx_out);
 }
 

@@ -284,6 +284,7 @@ void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride,
 // apply_rotary_emb on the bf16 output). out: bf16 [rows, local_heads *
 // 512]; padding rows (pos < 0) are zero.
 // Optional MX buffer receives one E4M3 byte per output followed by one E8M0 byte per 32.
+// With an MX buffer, a null out omits the BF16 copy and preserves both reference rounding steps.
 void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_main,
                       int n_main, const float* m_win, const float* l_win, const float* c_win,
                       int n_win, const float* sink, int rows, int local_heads,

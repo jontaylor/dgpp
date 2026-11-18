@@ -215,7 +215,7 @@ void woa_handoff(int l2, cudaStream_t stream, int rows, int main_splits, int win
                      window_splits, sink.p, rows, heads, pos.p, freq.p, out, stream, codes);
   };
   auto launch = [&](int variant, int copy) {
-    finish(attention.p, variant ? packed.p : nullptr);
+    finish(variant ? nullptr : attention.p, variant ? packed.p : nullptr);
     auto* w = weights.p + copy * matrix;
     auto* ws = scales.p + copy * matrix / 1024;
     if (variant) {
@@ -239,9 +239,12 @@ void woa_handoff(int l2, cudaStream_t stream, int rows, int main_splits, int win
   };
   launch(0, 0);
   auto ref = read(attention.p, values);
-  launch(1, 0);
+  finish(attention.p, packed.p);
   if (ref != read(attention.p, values)) throw std::runtime_error("attention finish changed");
   auto q = read(packed.p, values + values / 32);
+  DGPP_CUDA_OK(cudaMemsetAsync(packed.p, 0xa5, q.size(), stream));
+  launch(1, 0);
+  if (q != read(packed.p, q.size())) throw std::runtime_error("omitting the BF16 output changed MXFP8");
   auto weight = read(weights.p, matrix);
   auto ws = read(scales.p, matrix / 1024);
   auto out = read(y.p, rows * groups * n);

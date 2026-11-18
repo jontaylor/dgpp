@@ -984,7 +984,7 @@ __device__ __forceinline__ ushort2 finish_rotate_pair(float x, float y, int64_t 
   return make_ushort2(float_to_bf16_bits(x * c - y * s), float_to_bf16_bits(y * c + x * s));
 }
 
-template <bool Quantize>
+template <bool Quantize, bool StoreBf16>
 __global__ void attn_finish_kernel(const float* m_main, const float* l_main, const float* c_main,
                                    int n_main, const float* m_win, const float* l_win, const float* c_win,
                                    int n_win, const float* sink, int local_heads, const int64_t* pos,
@@ -998,13 +998,15 @@ __global__ void attn_finish_kernel(const float* m_main, const float* l_main, con
   __shared__ float s_den;
   __shared__ int s_live;
   const int r = blockIdx.x, h = blockIdx.y;
-  uint16_t* orow = out + (int64_t(r) * local_heads + h) * kCsa2Latent;
+  uint16_t* orow = nullptr;
+  if constexpr (StoreBf16) orow = out + (int64_t(r) * local_heads + h) * kCsa2Latent;
   const size_t offset = (size_t(r) * local_heads + h) * kCsa2Latent + threadIdx.x * 4;
   uint8_t* scales = nullptr;
   if constexpr (Quantize) scales = codes + size_t(gridDim.x) * local_heads * kCsa2Latent;
   const int64_t p = pos[r];
   if (p < 0) {
-    for (int d = threadIdx.x; d < kCsa2Latent; d += blockDim.x) orow[d] = 0;
+    if constexpr (StoreBf16)
+      for (int d = threadIdx.x; d < kCsa2Latent; d += blockDim.x) orow[d] = 0;
     if constexpr (Quantize) {
       float zeros[4]{};
       mxfp8_quantize_four(zeros, 1e-4f, codes + offset, scales + offset / 32);
@@ -1086,13 +1088,15 @@ __global__ void attn_finish_kernel(const float* m_main, const float* l_main, con
       }
       const float values[4] = {bf16_bits_to_float(bits[0]), bf16_bits_to_float(bits[1]),
                                bf16_bits_to_float(bits[2]), bf16_bits_to_float(bits[3])};
-      // Model buffers allow a vector store. A caller can also pass a BF16 slice.
-      if (reinterpret_cast<uintptr_t>(orow) % alignof(uint2) == 0) {
-        *reinterpret_cast<uint2*>(orow + d0) = make_uint2(unsigned(bits[0]) | (unsigned(bits[1]) << 16),
-                                                         unsigned(bits[2]) | (unsigned(bits[3]) << 16));
-      } else {
+      if constexpr (StoreBf16) {
+        // Model buffers allow a vector store. A caller can also pass a BF16 slice.
+        if (reinterpret_cast<uintptr_t>(orow) % alignof(uint2) == 0) {
+          *reinterpret_cast<uint2*>(orow + d0) = make_uint2(unsigned(bits[0]) | (unsigned(bits[1]) << 16),
+                                                           unsigned(bits[2]) | (unsigned(bits[3]) << 16));
+        } else {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) orow[d0 + e] = bits[e];
+          for (int e = 0; e < 4; ++e) orow[d0 + e] = bits[e];
+        }
       }
       mxfp8_quantize_four(values, 1e-4f, codes + offset, scales + offset / 32);
     } else {
@@ -1449,13 +1453,15 @@ void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_m
   if (n_main + n_win > kFinishMaxSplits) throw std::invalid_argument("csa2_attn_finish: more splits than the kernel stages");
   if ((n_main > 0 && reinterpret_cast<uintptr_t>(c_main) % 16 != 0) || (n_win > 0 && reinterpret_cast<uintptr_t>(c_win) % 16 != 0))
     throw std::invalid_argument("csa2_attn_finish: the partial rows are read as 16-byte vectors");
-  auto launch = [&]<bool Quantize>() {
-    attn_finish_kernel<Quantize><<<dim3(unsigned(rows), unsigned(local_heads)), 128, 0, stream>>>(
+  if (!out && !mx_codes) throw std::invalid_argument("csa2_attn_finish: missing output");
+  auto launch = [&]<bool Quantize, bool StoreBf16>() {
+    attn_finish_kernel<Quantize, StoreBf16><<<dim3(unsigned(rows), unsigned(local_heads)), 128, 0, stream>>>(
         m_main, l_main, c_main, n_main, m_win, l_win, c_win, n_win, sink, local_heads, pos, inv_freq,
         static_cast<uint16_t*>(out), mx_codes);
   };
-  if (mx_codes) launch.template operator()<true>();
-  else launch.template operator()<false>();
+  if (!mx_codes) launch.template operator()<false, true>();
+  else if (out) launch.template operator()<true, true>();
+  else launch.template operator()<true, false>();
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

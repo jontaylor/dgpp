@@ -157,10 +157,11 @@ class Csa2Layer {
   // contract: contiguous rows per request in position order, pos -1
   // padding rows, all-padding spans allowed). tail_snapshots (optional):
   // fp32 [tokens, 2, 512] per-row compressor-tail snapshots on the
-  // ratio-2 kv sources.
+  // ratio-2 kv sources. keep_attn_out materializes the BF16 debug_attn_out()
+  // tensor even when the output projection consumes packed MXFP8.
   void enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
                       const int32_t* req_spans, int num_requests, int tokens, void* out, cudaStream_t stream,
-                      float* tail_snapshots = nullptr, bool prefetch = true);
+                      float* tail_snapshots = nullptr, bool prefetch = true, bool keep_attn_out = true);
 
   // ---- the DSpark draft (plan D8) on a window-only draft layer ----------------
   // append_window_rows: the ring rows of `n` real tokens — x [n, hidden] the
@@ -267,7 +268,8 @@ class Csa2Layer {
   void attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, const uint8_t* win_cache, int win_block_tokens,
                    const int32_t* win_table, const int32_t* req_ids_main, const int64_t* pos, int row0, int rows,
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
-                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false, uint8_t* mx_out = nullptr);
+                   const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false,
+                   uint8_t* mx_out = nullptr, bool keep_attn_out = true);
   void project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out = nullptr);
   void validate_pool(const Csa2StatePool& pool) const;
 
