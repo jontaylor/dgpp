@@ -270,3 +270,52 @@ packed expert weights per pass per rank, or **98.1 GB/s per Spark** over the
 and scales once per selected expert per layer invocation. Cache reuse,
 physical rereads, attention, dense projections, the draft and other traffic
 all affect the memory controller's actual byte count.
+
+### Prefetching resident weights during decode collectives
+
+Each rank can start reading the next known weights into its own L2 while
+the current layer waits for its tensor-parallel reduction. The attention
+reduction provides a window for the FFN norm, router and shared expert. The
+FFN reduction provides a window for the next layer's attention or Engram
+projection. Window size is a byte cap per boundary per rank. Routed experts
+continue to use the existing demand path and local SSD cache policy.
+
+The paged target graph captures the side stream's first window and joins
+the stream once at the end of the layer loop. Replay therefore issues the
+boundary reads without a per-layer CPU launch or host barrier. The serving
+setting also enables boundary prefetch in the draft. The diagnostic used the
+light issue rate with attention-internal prefetch off.
+
+The C1 comparison used the same two-Spark binary on every start, built at
+`fafa9116` (SHA-256
+`e9b2eaff13e4e0e7e5ab0eb830ee0ba784ce6d797cc62694e69f45b268bc904c`).
+Each start began with the 24,292-token tool prompt at zero cached tokens,
+then the same six prose and code continuations. The two first continuations
+exercise SSD demand. The final three read zero expert bytes on both ranks.
+Engine decode throughput divides the total tokens generated after prefill
+by the total decode time for the indicated group.
+
+| Boundary window per rank | Warm decode, zero expert reads (tok/s) | Decode with expert reads (tok/s) | All seven responses, decode only (tok/s) |
+| --- | ---: | ---: | ---: |
+| Off, two starts | 43.49–43.60 | 31.79–32.10 | 38.68–38.79 |
+| 4 MiB | 43.86 | 32.23 | 39.04 |
+| 8 MiB | 44.42 | 32.45 | 39.47 |
+| 12 MiB | 44.41 | 32.44 | 39.41 |
+| 16 MiB | 44.63 | 31.90 | 39.23 |
+| 20 MiB | 44.88 | 32.61 | 39.75 |
+| 24 MiB | 44.82 | 32.38 | 39.63 |
+
+20 MiB led the width comparison on both decode groups. The 0.06 tok/s warm
+difference between 20 and 24 MiB is smaller than the spread of the two off
+starts. Cold tool prefill took 36.89–36.90 s with prefetch off, 36.96 s
+at 20 MiB, and 36.79–40.23 s across the other widths. These boundary reads
+run only during decode.
+
+The canonical deployment repeated the 20 MiB workload at 44.83 tok/s warm
+and 32.78 tok/s with reads. Its cold prefill took 36.93 s. Separate timed
+starts isolated the change within the speculative round. Across the same 316
+read-free rounds, mean target verification fell from 55.91 to 54.14 ms and
+drafting took 6.67 ms in both configurations. The two ranks generated matching
+operation streams, accepted the same proposals, and agreed with the control
+on outputs and expert bytes. Both ranks had zero process swap. These timings
+measure latency and throughput; physical DRAM bandwidth was unavailable.
