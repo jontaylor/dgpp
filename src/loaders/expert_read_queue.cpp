@@ -149,6 +149,7 @@ struct ReadQueueImpl {
   ReadQueueImpl(std::shared_ptr<const ExpertStore> source, ReadQueueConfig cfg)
       : store(std::move(source)), config(cfg) {
     if (!store || !cfg.buffers || !cfg.workers || !cfg.max_pending ||
+        !cfg.adjacent_records || cfg.adjacent_records > ExpertStore::max_read_batch ||
         cfg.workers > cfg.max_pending || cfg.workers > cfg.buffers)
       throw std::invalid_argument("expert read queue: invalid worker/buffer capacity");
     for (const auto& r : store->records()) {
@@ -346,7 +347,81 @@ struct ReadQueueImpl {
     }
     if (active) work.notify_all();
   }
+  void check_scales(size_t record, std::span<uint8_t> buffer, ExpertProjection part, ReadLease& lease) {
+    if (config.require_mx_nibbles &&
+        !compactible_scales<0xf0, 0x70>(buffer, store->records()[record].layout, part))
+      throw std::runtime_error("MX scale outside 112..127; disable DGPP_MX_PACKED_SCALES for this checkpoint");
+    if (config.scan_nvfp4_scales && store->identity().format == Format::kNvfp4)
+      lease.scale_compactibility_ = compactible_scales<0x87, 0>(buffer, store->records()[record].layout)
+          ? ScaleCompactibility::kExact : ScaleCompactibility::kUnsupported;
+  }
+  void finish_locked(const std::shared_ptr<Job>& job, const std::shared_ptr<ReadLease>& lease,
+                     std::exception_ptr failure, bool abandoned) {
+    release_reservation(job);
+    retire_locked(job);
+    if (stopping || abandoned) {
+      failure = cancelled();
+      ++counters.cancelled;
+    } else if (failure) {
+      ++counters.failed;
+    } else {
+      ++counters.completed;
+    }
+    // On failure, don't make future callers coalesce into a permanently
+    // failed ticket. Existing consumers still receive this same failure.
+    if (failure) tickets.erase(job->record);
+    if (failure) job->ticket->completion_.set_exception(failure);
+    else job->ticket->completion_.set_value(lease);
+  }
+  // Caller holds both queue and pool locks. Take only immediately runnable
+  // demand records; a worker must never hold a partial batch waiting for room.
+  void take_adjacent(std::deque<std::shared_ptr<Job>>::iterator first,
+                     std::vector<std::shared_ptr<Job>>& batch) {
+    if (config.adjacent_records == 1 || !store->accepts_read_batch()) return;
+    auto next = first;
+    const auto start = (*first)->record;
+    while (next != demand.end() && batch.size() < config.adjacent_records &&
+           (*next)->record == start + batch.size() && (*next)->record < store->records().size() &&
+           (*next)->reserved_slot != SIZE_MAX && (*next)->ticket.use_count() > 1) {
+      batch.push_back(*next++);
+    }
+    if (batch.size() < 2) {
+      batch.clear();
+      return;
+    }
+    for (auto& job : batch) job->started = true;
+    queued -= batch.size();
+    counters.active += batch.size();
+    demand.erase(first, next);
+  }
+  void read_reserved_batch(std::span<const std::shared_ptr<Job>> batch) {
+    std::array<std::shared_ptr<ReadLease>, ExpertStore::max_read_batch> leases;
+    std::array<std::span<uint8_t>, ExpertStore::max_read_batch> buffers;
+    std::exception_ptr read_failure;
+    try {
+      for (size_t i = 0; i < batch.size(); ++i) {
+        leases[i] = acquire(batch[i]);
+        if (!leases[i]) throw std::logic_error("reserved adjacent read lost its staging buffer");
+        buffers[i] = {static_cast<uint8_t*>(pool->buffers[leases[i]->slot_].get()), leases[i]->size_};
+      }
+      store->read_adjacent(batch.front()->record, std::span(buffers).first(batch.size()));
+    } catch (...) { read_failure = std::current_exception(); }
+    // Scales and ticket failures belong to individual chunks, even when the
+    // SSD delivered several in one call. Keep the scale scans outside the lock.
+    for (size_t i = 0; i < batch.size(); ++i) {
+      auto failure = read_failure;
+      if (!failure) {
+        try { check_scales(batch[i]->record, buffers[i], ExpertProjection::kAll, *leases[i]); }
+        catch (...) { failure = std::current_exception(); }
+      }
+      std::lock_guard lock(mutex);
+      finish_locked(batch[i], leases[i], failure, batch[i]->ticket.use_count() == 1);
+      completed.notify_all();
+    }
+  }
   void run(size_t index) {
+    std::vector<std::shared_ptr<Job>> batch;
+    batch.reserve(config.adjacent_records);
     for (;;) {
       if (index == 0) {
         while (demand_window_active.load() && !stopping.load() && queued.load() == 0) {
@@ -378,13 +453,23 @@ struct ReadQueueImpl {
           const auto ready = std::find_if(queue.begin(), queue.end(), [](const auto& j) {
             return j->reserved_slot != SIZE_MAX;
           });
-          if (ready != queue.end()) chosen = ready;
+          if (ready != queue.end()) {
+            chosen = ready;
+            take_adjacent(ready, batch);
+          }
         }
-        job = std::move(*chosen);
-        queue.erase(chosen);
-        --queued;
-        job->started = true;
-        ++counters.active;
+        if (batch.empty()) {
+          job = std::move(*chosen);
+          queue.erase(chosen);
+          --queued;
+          job->started = true;
+          ++counters.active;
+        }
+      }
+      if (!batch.empty()) {
+        read_reserved_batch(batch);
+        batch.clear();
+        continue;
       }
       std::shared_ptr<ReadLease> lease;
       std::exception_ptr failure;
@@ -409,30 +494,11 @@ struct ReadQueueImpl {
         const size_t record = this->index(job->record);
         const auto part = projection(job->record);
         store->read(record, buffer, part);
-        if (config.require_mx_nibbles &&
-            !compactible_scales<0xf0, 0x70>(buffer, store->records()[record].layout, part))
-          throw std::runtime_error("MX scale outside 112..127; disable DGPP_MX_PACKED_SCALES for this checkpoint");
-        if (config.scan_nvfp4_scales && store->identity().format == Format::kNvfp4)
-          lease->scale_compactibility_ = compactible_scales<0x87, 0>(buffer, store->records()[record].layout)
-              ? ScaleCompactibility::kExact : ScaleCompactibility::kUnsupported;
+        check_scales(record, buffer, part, *lease);
       } catch (...) { failure = std::current_exception(); }
       {
         std::lock_guard lock(mutex);
-        release_reservation(job);
-        retire_locked(job);
-        if (stopping || abandoned) {
-          failure = cancelled();
-          ++counters.cancelled;
-        } else if (failure) {
-          ++counters.failed;
-        } else {
-          ++counters.completed;
-        }
-        // On failure, don't make future callers coalesce into a permanently
-        // failed ticket. Existing consumers still receive this same failure.
-        if (failure) tickets.erase(job->record);
-        if (failure) job->ticket->completion_.set_exception(failure);
-        else job->ticket->completion_.set_value(lease);
+        finish_locked(job, lease, failure, abandoned);
         completed.notify_all();
       }
     }

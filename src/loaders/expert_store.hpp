@@ -78,6 +78,10 @@ class ExpertStore {
   // A projection read fills only that range at its canonical offset.
   void read(size_t record, std::span<uint8_t> destination,
             ExpertProjection projection = ExpertProjection::kAll) const;
+  // Scatter adjacent whole records directly into their independently leased buffers.
+  static constexpr size_t max_read_batch = 16;
+  bool accepts_read_batch() const { return !verify_record_checksums_ && trace_fd_ < 0; }
+  void read_adjacent(size_t first, std::span<const std::span<uint8_t>> destinations) const;
   ReadStats stats() const;
 
  private:

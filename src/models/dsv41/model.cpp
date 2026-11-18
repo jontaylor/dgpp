@@ -166,6 +166,8 @@ expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, in
       cfg.moe_intermediate_size / world, cfg.n_routed_experts, cfg.num_experts_per_tok);
   const char* packed = std::getenv("DGPP_MX_PACKED_SCALES");
   cache.reads.require_mx_nibbles = packed && std::atoi(packed) != 0;
+  if (const char* batch = std::getenv("DGPP_EXPERT_ADJACENT_READS"))
+    cache.reads.adjacent_records = std::stoi(batch);
   if (mtp) {
     auto resident = cfg, descriptors = cfg;
     resident.runtime_page_experts = false;

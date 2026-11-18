@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <tuple>
 #include <unistd.h>
 
@@ -320,6 +321,45 @@ void ExpertStore::read(size_t index, std::span<uint8_t> destination, ExpertProje
   } catch (...) {
     failures_.fetch_add(1, std::memory_order_relaxed);
     throw;
+  }
+}
+void ExpertStore::read_adjacent(size_t first, std::span<const std::span<uint8_t>> destinations) const {
+  if (!accepts_read_batch() || destinations.empty() || destinations.size() > max_read_batch ||
+      first >= records_.size() || destinations.size() > records_.size() - first)
+    error("invalid adjacent read");
+  std::array<iovec, max_read_batch> vectors;
+  uint64_t offset = records_[first].file_offset;
+  uint64_t end = offset;
+  for (size_t i = 0; i < destinations.size(); ++i) {
+    const auto& r = records_[first + i];
+    auto dst = destinations[i];
+    if (r.file_offset != end || dst.size() != r.layout.record_bytes ||
+        (mode_ == IoMode::kDirect && reinterpret_cast<uintptr_t>(dst.data()) % kPage))
+      error("adjacent read staging size, alignment or offset mismatch");
+    vectors[i] = {dst.data(), dst.size()};
+    end = add(end, dst.size());
+  }
+  size_t i = 0;
+  while (i < destinations.size()) {
+    calls_.fetch_add(1, std::memory_order_relaxed);
+    const auto n = ::preadv(fd_, vectors.data() + i, static_cast<int>(destinations.size() - i),
+                            static_cast<off_t>(offset));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      failures_.fetch_add(1, std::memory_order_relaxed);
+      error("short or failed adjacent read");
+    }
+    bytes_.fetch_add(n, std::memory_order_relaxed);
+    offset += n;
+    size_t consumed = static_cast<size_t>(n);
+    while (i < destinations.size() && consumed >= vectors[i].iov_len) {
+      consumed -= vectors[i].iov_len;
+      ++i;
+    }
+    if (consumed) {
+      vectors[i].iov_base = static_cast<uint8_t*>(vectors[i].iov_base) + consumed;
+      vectors[i].iov_len -= consumed;
+    }
   }
 }
 ReadStats ExpertStore::stats() const {

@@ -82,6 +82,29 @@ DGPP_TEST(expert_read_queue_refuses_unrepresentable_mx_scale_before_publication)
   refuses([&] { ready(queue.request(1)); });
   require(ready(queue.request(2)) != nullptr, "later valid record still readable");
 }
+DGPP_TEST(expert_read_queue_vectors_reserved_records_and_checks_each_lease) {
+  Fixture f(true);
+  auto store = std::make_shared<ExpertStore>(f.path, f.store->identity(), 8, IoMode::kBuffered, false);
+  auto cfg = f.config();
+  cfg.buffers = cfg.adjacent_records = 4;
+  cfg.staging_budget_bytes *= cfg.buffers;
+  cfg.require_mx_nibbles = true;
+  ExpertReadQueue queue(store, cfg);
+  const std::array<size_t,4> records{0, 1, 2, 3};
+  auto tickets = queue.reserve_demand(records);
+  require(tickets.size() == 4, "all four records have staging");
+  auto first = ready(tickets[0]);
+  refuses([&] { (void)ready(tickets[1]); });
+  auto third = ready(tickets[2]);
+  auto fourth = ready(tickets[3]);
+  require(store->stats().calls == 1 && queue.stats().failed == 1, "one vectored read, one bad scale");
+  require(first->bytes().data() != third->bytes().data() && third->bytes().data() != fourth->bytes().data(),
+          "each successful ticket owns a distinct buffer");
+  tickets.clear();
+  third.reset();
+  fourth.reset();
+  eventually([&] { return queue.stats().staging_in_use == first->bytes().size(); });
+}
 DGPP_TEST(expert_read_queue_split_joins_original_record) {
   Fixture f;
   const auto path = (f.dir / "projection.img").string();
