@@ -387,3 +387,138 @@ independent readiness flags on H200. Here the depth-three verifier supplies four
 rows on each GB10 and runs alongside the shared expert and TP2 communication.
 [FlashDecoding++, pp. 7–9](https://arxiv.org/pdf/2311.01282#page=7) ·
 [MonoMoE, pp. 8–9](https://arxiv.org/pdf/2609.04244#page=8)
+
+### Selecting intermediate channels during verification
+
+Each four-row forward has 24 expert assignments. For each token and TP rank,
+the reader scores the 6 × 1,152 local intermediate channels and keeps a fixed
+quota across its six assigned experts. The gate score uses the activated gate,
+routing weight and down-column norm. The product score also uses the up value.
+The sketch estimates gate and up from compressed weights and recovers a
+low-rank approximation to the contribution from omitted channels. Only the
+four-row target path changes. The grouped implementation applies the same rule
+on a cache hit and miss. An initial implementation switched back to exact
+computation on a miss and returned different greedy continuations across
+repeats. It was excluded from the comparison.
+
+The archive reader transposes down weights to make each selected channel
+contiguous and charges every touched 32-byte sector. Its sketch adds about 7%
+of a BF16 checkpoint and its recovery map another 0.5%. In this TP2 deployment,
+reserving memory for per-resident metadata reduces capacity from 11,071 to
+8,513 complete expert shards per rank. An exact-computation control with that
+smaller pool read 12.08 and 5.81 GiB per rank on two code continuations after
+prefix attachment. With the full pool the exact control read zero bytes.
+The lighter gate and product readers retain the full pool. Their norm table
+occupies 67.5 MiB per rank. The diagnostic also reserves scratch for the 24
+active expert shards on a missed verification pass.
+[Kim and Hwang, pp. 3, 8–10](https://arxiv.org/pdf/2610.37386#page=8)
+
+The isolated replay sampled twelve verification passes each from layers 6,
+20 and 36. It used rank-0 checkpoint weights, captured activations and routing
+weights for the readers. The b12x benchmark used the same route IDs and
+geometry with synthetic weights and activations. On layer 20, gate selection
+at 12.5% took 501 µs with channel-contiguous weights and 619 µs on the
+K16/N64 serving layout. A profiled serving-layout replay spent 249 µs on the
+gate, 151 µs on selected up weights, and 175 µs on down. The corresponding
+b12x mean was 709 µs per layer call.
+
+On the same layer, unioning the selected channels for rows routed to the
+same expert covered 14.5% of its channels on average. From the packed addresses,
+that selection touched 57.6% of the up and down weight sectors for those
+experts. These are address-coverage estimates. The gate projection still reads
+all its weights. Choosing sector-aligned groups of 32 channels by summed squared
+score at the same quota raised the mean relative error on the rank-local routed
+output from 45.1% to 72.9%. Group selection was an offline calculation. The
+256-token code continuation can use the entire allowance on reasoning, so it
+measures generation speed and acceptance separately from a completed code edit.
+[Park et al., p. 9](https://arxiv.org/pdf/2605.08575#page=9) ·
+[Lan, pp. 3–6](https://arxiv.org/pdf/2610.34440#page=5)
+
+| Rank-local routed operation, µs | Layer 6 | Layer 20 | Layer 36 |
+| --- | ---: | ---: | ---: |
+| Exact b12x | 643 | 709 | 756 |
+| Gate, 12.5%, serving layout | 577 | 619 | 618 |
+| Gate, 25%, serving layout | 639 | 698 | 689 |
+| Gate × up, 25%, serving layout | 679 | 739 | 770 |
+| Sketch and recovery, 12.5%, serving layout | 1,172 | 1,243 | 1,261 |
+
+The reader entries are medians of timed CUDA graph replays over the twelve
+inputs. The b12x entries are means of the timings for the twelve routes.
+In a separate layer-20 profile, the sketch screen itself took 580 µs per
+pass. Computing the selected gate/up projection took another 321 µs, and
+down took 190 µs. This isolates a compute cost even at full residency.
+On the first serving start for each reader, two prefix-attached continuations
+gave the following pooled engine decode rates. Rates include misses after
+prefix attachment. The automatic tool tasks required the correct tool,
+arguments and answer. They used deterministic tool-result fixtures. The
+directory exchanges separately used a live filesystem listing.
+
+| Four-row reader | Prose tok/s | Code tok/s | Prose accepted/pass | Code accepted/pass | Automatic tools |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gate 12.5% | 36.62 | 43.23 | 1.45 | 1.90 | 4/4 |
+| Gate 25% | 36.47 | 44.74 | 1.58 | 2.19 | 4/4 |
+| Gate × up 25% | 33.33 | 38.51 | 1.41 | 1.78 | 4/4 |
+| Sketch and recovery 12.5% | 18.38 | 16.98 | 1.75 | 1.97 | 3/4 |
+
+The sketch run read 12.95 and 6.76 GiB per rank on those two code requests.
+Its failed automatic task chose the right search tool but exhausted its
+256-token allowance before returning the requested count. Both gate settings
+and product ranking reached zero reads on the second code repeat. These
+arms used diagnostic executable `2b45204764e4` and reader `2767aaba53ff`,
+built from source base `9771204e` with experimental hooks.
+
+Against the kernel checklist, the grouped reader consumes the existing packed
+weights, reuses a fragment across all rows routed to that expert, pipelines
+vector loads, and retains the shared-expert stream and graph replay. Scores
+and selection stay on the GPU. The exact path still handles prefill and the
+other target widths. The miss path snapshots the selected experts into bounded
+scratch before scoring the whole top-six set. The checkpoint comparison,
+sector estimates and component timings cover four-row TP2 verification.
+Compiled occupancy and spill counters for each reader variant, other
+concurrencies and general model quality were not measured.
+
+#### Warm repeats and completed tool workloads
+
+The two gate readers and a fresh build of the exact dense-split configuration
+each ran in a second deployment. The table pools the last three consecutive
+read-free continuations per workload on both ranks, after a 24,448-token
+prefix attach. Directory times average eight read-free two-turn exchanges.
+Repair times sum engine decode time over four three-turn tasks. All three
+configurations read the requested source, selected the correct repair ID and
+returned the tool receipt on all four tasks.
+
+| Four-row verification | Prose tok/s | Prose ms/pass | Code tok/s | Code ms/pass | Directory decode ms | Four repairs decode s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Exact, dense split | 41.56 | 65.97 | 42.66 | 65.69 | 889 | 23.74 |
+| Gate 12.5% | 39.05 | 62.79 | 46.00 | 62.99 | 857 | 22.60 |
+| Gate 25% | 38.98 | 66.08 | 48.31 | 65.99 | 896 | 28.57 |
+
+The 25% reader accepted 2.19 code predictions/pass against 1.80 for exact,
+with similar cycle times. At 12.5%, the shorter cycle helped both the code
+continuation and directory exchanges. Prose accepted 1.45 predictions/pass
+at 12.5%, 1.58 at 25%, and 1.74 with exact verification. On the separate
+automatic tool-choice cases all three chose the correct tool and arguments
+four times. The exact model returned `7 matches` when asked to return only
+`7`, giving it three of four strict final answers. Both gate readers returned
+all four in the requested format.
+
+The completed-code task used a 24k tool-enabled conversation and required a
+three-entry LRU function. A separate Python process checked hit promotion,
+eviction, falsy values, number of loader calls and preservation on a loader
+exception. With a 1,536-token limit the exact model produced a passing function
+in 653 tokens (19.76 s engine decode, 36.24 s wall). Both approximate readers
+exhausted the limit. A 4,096-token retry let the 25% reader finish in 1,776
+tokens and 58.12 s of decode. The retry reused a prefix. Engine decode time
+and generated tokens are the comparable figures across the two budgets.
+At 12.5% the longer retry consumed all 4,096 tokens and 130.01 s of decode
+without emitting the function.
+
+For the two-Spark MXFP4 deployment, the selected configuration uses exact
+b12x routed experts, paired CSA2 output groups, the TP2 output split and
+four-warp Engram verification. The release build from `411476b8` has
+SHA-256 `91170e2e77c33dba62b581689ca38365afb1a44450e049252e81d5486b3ed70e`.
+The second deployment used this executable on both ranks with matching
+operation streams and zero process swap. The approximate alternatives won
+individual throughput and repair probes. Exact execution returned a working
+implementation sooner on the longer coding job and led on the prose probe.
+These are concurrency-one diagnostics on a small task set.
