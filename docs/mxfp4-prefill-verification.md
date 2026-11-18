@@ -772,6 +772,58 @@ tokens attached, median engine decode was 42.22 s for BF16 (1,691 tokens,
 40.03 tok/s) and 53.73 s for FP8 (2,150 tokens, 39.99 tok/s). Reasoning
 accounted for 422 of the 459 extra tokens. Median expert-file reads were
 11.53 and 14.02 GiB per rank, respectively. On these two completed coding
-tasks the prior BF16-input projection returned passing work sooner. The
-two-Spark serving configuration keeps it selected. Native FP8 verification
-remains available for workloads that benefit from it.
+tasks the BF16-input projection returned passing work sooner because its
+greedy completions were shorter.
+
+### Optimized FP8 verification on two Sparks
+
+The TP2 MXFP4 streaming template selects native FP8 for the target attention
+output projection. Attention finish keeps each lane's four values in registers
+through rotation, BF16 rounding and K32 quantization. Each projection warp
+stages 16 weight rows using asynchronous 512-byte copies, alternates between
+two shared-memory buffers, and uses `ldmatrix.x4` to feed the tensor cores.
+It reads four adjacent scales together. At the last K window it directs its
+L2 prefetch to the first window of the output tile 96 blocks ahead. These
+changes preserve the original FP8 path's quantization and accumulation order.
+
+In 20 interleaved graph timing samples per shape on GB10, median attention finish
+plus projection time changed as follows. Each replay rotated seven copies of
+the weights. The percentages are medians of paired reductions.
+
+| Target rows | Main + window splits | Original FP8, µs | Optimized FP8, µs | Reduction |
+|---:|---:|---:|---:|---:|
+| 4 | 0 + 1 | 74.43 | 69.62 | 6.48% |
+| 4 | 4 + 1 | 75.38 | 70.41 | 6.60% |
+| 6 | 4 + 1 | 77.09 | 71.66 | 7.07% |
+
+The release build reproduced the optimized timings at 69.52, 70.25 and
+72.41 µs, respectively. For four rows with four main splits and one window
+split, its BF16-input control took 88.28 µs. Codes and scales matched the
+CPU quantizer, and the normalized RMS projection error against decoded
+operands summed in FP64 was 0.00163 for this shape.
+
+In a full-model concurrency-one diagnostic, each FP8 build ran the same
+directory tool round trip followed by the bounded-LRU coding task. We timed
+the last four consecutive LRU completions per build with 24,448 cached prefix
+tokens and zero expert-file reads on both ranks. Every completion generated the
+same 658 tokens, including 389 reasoning tokens, passed the executable checks,
+and accepted 439 predictions over 218 speculative passes. The rank operation
+streams matched within each run and both ranks reported zero process swap.
+
+| Warm coding diagnostic | Original FP8 | Optimized FP8 |
+|---|---:|---:|
+| Mean target verification, all passes | 57.972 ms | 57.768 ms |
+| Mean four-row verification, 852 passes per build | 57.624 ms | 57.412 ms |
+| Mean six-row verification, 20 passes per build | 72.819 ms | 72.951 ms |
+| Median engine decode | 46.44 tok/s | 46.57 tok/s |
+| Engine decode range over four completions | 46.34–46.51 tok/s | 46.54–46.65 tok/s |
+| Median engine decode time | 14.148 s | 14.107 s |
+| Median request wall time | 14.499 s | 14.464 s |
+
+The 0.29% engine throughput gain measures this completed answer on one
+server start per build. Four-row passes accounted for 213 of 218 passes per
+answer. The six-row serving sample was small and its mean rose 0.13 ms.
+The optimized binary used revision `781f2da9a57f`, SHA-256
+`1bd1025c27bd742b7d824fa783dc90140b3d7e4dcef29b1a8cd238eb42e1145b`.
+The per-pass timer was enabled for both diagnostic runs and disabled for
+normal serving.
