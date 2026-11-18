@@ -105,9 +105,9 @@ template <bool AlignedScales, int FixedRows>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
     const float* weight_scale, uint16_t* out, int rows, int groups, int n) {
+  dgpp_pdl_wait();
   constexpr int k = 4096;
   if constexpr (FixedRows != 0) rows = FixedRows;
-  dgpp_pdl_wait();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int row8 = lane / 4, part = lane % 4;
   const int column = blockIdx.x * 16;

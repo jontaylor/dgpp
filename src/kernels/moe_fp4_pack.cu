@@ -7,12 +7,14 @@
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
+#include "kernels/pdl.cuh"
 
 namespace dgpp {
 namespace {
 constexpr int kThreads = 256;
 
 __global__ void compact_scales(const uint32_t* source, uint16_t* destination, int words) {
+  dgpp_pdl_wait();
   const int j = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
   if (j >= words) return;
   const uint32_t x = source[j];
@@ -20,6 +22,7 @@ __global__ void compact_scales(const uint32_t* source, uint16_t* destination, in
                    ((x >> 11) & 0xf00) | ((x >> 15) & 0xf000);
 }
 __global__ void expand_compact_scales(const uint16_t* source, uint32_t* destination, int words) {
+  dgpp_pdl_wait();
   const int j = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
   if (j >= words) return;
   const uint32_t x = source[j];
@@ -31,6 +34,7 @@ __global__ void expand_compact_scales(const uint16_t* source, uint32_t* destinat
 // copy-engine operation between packing and its consumer.
 __global__ void copy_globals(float* d0, float* d1, float* d2,
                              const float* s0, const float* s1, const float* s2) {
+  dgpp_pdl_wait();
   if (threadIdx.x == 0) { *d0 = *s0; *d1 = *s1; *d2 = *s2; }
 }
 
@@ -57,10 +61,12 @@ __device__ __forceinline__ void scatter_chunk_bytes(uint8_t* destination, const 
 
 __global__ void scatter_expert_chunk(uint8_t* destination, const uint8_t* source,
                                      ExpertChunkCopyPlan plan) {
+  dgpp_pdl_wait();
   scatter_chunk_bytes(destination, source, plan);
 }
 struct ExpertScatterBatch { ExpertChunkScatter chunks[kExpertScatterBatch]; };
 __global__ void scatter_expert_chunks(const __grid_constant__ ExpertScatterBatch batch) {
+  dgpp_pdl_wait();
   const auto& chunk = batch.chunks[blockIdx.y];
   scatter_chunk_bytes(chunk.destination, chunk.source, chunk.plan);
 }
@@ -70,6 +76,7 @@ using namespace fp4_layout;
 template <bool Merge>
 __global__ void pack_payload(uint32_t* out, const uint8_t* first,
                               const uint8_t* second, int rows, int k) {
+  dgpp_pdl_wait();
   const int idx = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
   if (idx >= rows * k / 8) return;
   const int kt = idx / ((rows / 64) * 128);
@@ -97,6 +104,7 @@ __global__ void pack_payload(uint32_t* out, const uint8_t* first,
 template <bool Merge>
 __global__ void unpack_payload(uint8_t* first, uint8_t* second,
                                 const uint32_t* in, int rows, int k) {
+  dgpp_pdl_wait();
   const int idx = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
   if (idx >= rows * k / 2) return;
   const int n = idx / (k / 2), code = idx % (k / 2) * 2;
@@ -112,6 +120,7 @@ template <bool Merge, bool Unpack, bool Nibbles = false>
 __global__ void move_scales(uint8_t* first, uint8_t* second, uint8_t* packed,
                              const uint8_t* source_first, const uint8_t* source_second,
                              const uint8_t* source_packed, int rows, int k, int group) {
+  dgpp_pdl_wait();
   const int idx = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
   if (idx >= rows * (k / group)) return;
   if constexpr (Unpack) {
@@ -132,6 +141,7 @@ __global__ void move_scales(uint8_t* first, uint8_t* second, uint8_t* packed,
 template<bool Merge>
 __global__ void pack_mx_scale_words(uint32_t* packed, const uint8_t* first,
                                     const uint8_t* second, int rows, int k) {
+  dgpp_pdl_wait();
   const int word = blockIdx.x * blockDim.x + threadIdx.x;
   if (word >= rows * (k / 32) / 8) return;
   const int kg = word * 8 / rows;
@@ -148,6 +158,7 @@ __global__ void pack_mx_scale_words(uint32_t* packed, const uint8_t* first,
 
 template<bool Expand>
 __global__ void mx_chunk_codec(uint8_t* destination, const uint8_t* source, int payload) {
+  dgpp_pdl_wait();
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   const int scales = payload / 16;
   const auto* src = source + blockIdx.y * (payload + (Expand ? scales / 2 : scales));

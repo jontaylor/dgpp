@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 
 #include "common/cuda_check.hpp"
+#include "kernels/pdl.cuh"
 #include "common/dtypes.hpp"
 #include "kernels/mxfp4_verify.hpp"
 
@@ -8,6 +9,7 @@ namespace dgpp {
 namespace {
 constexpr int H = 5120, I = 1152, E = 384, slots = 24, B = 8, capacity = 64 * 6;
 __global__ void partition(const int32_t* routes, const int32_t* ids, int32_t* reused) {
+  dgpp_pdl_wait();
   const int lane = threadIdx.x;
   const auto* experts = routes + capacity * B;
   const int count = experts[capacity] / B;
@@ -50,6 +52,7 @@ template <bool Gate>
 __global__ __launch_bounds__(256) void singleton_projection(const uint16_t* input, uint16_t* act,
                                                             float* out, const uint64_t* table,
                                                             const int32_t* routes) {
+  dgpp_pdl_wait();
   constexpr int N = Gate ? 2 * I : H, K = Gate ? H : I, partitions = Gate ? 4 : 8;
   const int group = blockIdx.y;
   const int* experts = routes + capacity * B;

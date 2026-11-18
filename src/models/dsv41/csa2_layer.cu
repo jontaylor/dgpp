@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/cuda_check.hpp"
+#include "kernels/pdl.cuh"
 #include "common/log.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/exl3_gemv.hpp"
@@ -881,6 +882,7 @@ void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, 
 namespace {
 __global__ void prefill_metadata_kernel(int64_t* positions, int32_t* requests,
                                        int tokens, int req, int64_t pos0) {
+  dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < tokens) { positions[i] = pos0 + i; requests[i] = req; }
 }

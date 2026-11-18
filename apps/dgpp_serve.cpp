@@ -3099,6 +3099,7 @@ int main(int argc, char** argv) {
   dgpp::Dsv41Model::set_default_prefill_fold_overlap(prefill_fold_overlap);
   dgpp::Dsv41Model::set_default_prefill_window_flash(prefill_window == "flash");
   dgpp::Dsv41Model::set_default_decode_window_flash(decode_window == "flash");
+  dgpp::Dsv41Model::set_default_paged_pdl(decode_pdl);
   dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
   {
     // The L2 weight prefetcher's settings, before any model builds its prefetcher.

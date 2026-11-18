@@ -1,5 +1,6 @@
 #include "models/dsv41/model.hpp"
 #include "models/dsv41/paged_binding_table.hpp"
+#include "engine/graph_pdl.hpp"
 #include "kernels/sm12x_moe.hpp"
 #include "kernels/expert_demand.hpp"
 #include "kernels/moe_fp4_pack.hpp"
@@ -447,6 +448,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_GRAPH_TAIL")) paged_graph_tail_ = value[0] == '1';
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_ASYNC_PROLOGUE")) paged_async_prologue_ = value[0] == '1';
+  if (const char* value = std::getenv("DGPP_DSV41_PAGED_PDL")) paged_pdl_ = s_default_paged_pdl && value[0] == '1';
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
   gemm_.set_decode_mma(dense_mma_);
@@ -1260,6 +1262,10 @@ bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows) {
       draft_first(req, d_tokens_, d_step_pos_, d_req_ids_, accepted_rows, true, false, 1, 0, 0, true);
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
+      if (paged_pdl_) {
+        const auto stats = pdl::programmatic_edges(graph);
+        DGPP_LOG_INFO("dsv41 draft graph {}: {} programmatic edges", g.variant, stats.converted);
+      }
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
@@ -2026,6 +2032,10 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
+      if (paged_pdl_) {
+        const auto stats = pdl::programmatic_edges(graph);
+        DGPP_LOG_INFO("dsv41 target graph {}: {} programmatic edges", g.variant, stats.converted);
+      }
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;

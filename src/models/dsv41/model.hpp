@@ -150,6 +150,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // flash listed kernel unsplit on a side stream beside the main source
   // (true, the default) or the scalar partial kernel split eight ways.
   static void set_default_decode_window_flash(bool on) { s_default_decode_window_flash = on; }
+  static void set_default_paged_pdl(bool on) { s_default_paged_pdl = on; }
   void set_decode_window_flash(bool on) {
     decode_window_flash_ = on;
     if (csa2_) csa2_->set_decode_window_flash(on);
@@ -349,6 +350,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool enqueue_resident_draft_graph(int req, int accepted_rows);
   bool paged_graph_tail_ = false;
   bool paged_async_prologue_ = false;
+  inline static bool s_default_paged_pdl = true;
+  bool paged_pdl_ = false;
   bool enqueue_paged_graph(int T, const WalkRows& rows, bool capture_tail);
   void normalize_head(int first, int count);
   void mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode,

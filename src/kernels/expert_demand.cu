@@ -1,5 +1,6 @@
 #include "kernels/expert_demand.hpp"
 #include "common/cuda_check.hpp"
+#include "kernels/pdl.cuh"
 #include <cub/block/block_scan.cuh>
 #include <cstdlib>
 
@@ -7,6 +8,7 @@ namespace dgpp {
 namespace {
 constexpr int E = 384, K = 6, M = 64, B = 8;
 __global__ void layer_stamp_kernel(uint64_t* stamp) {
+  dgpp_pdl_wait();
   unsigned long long now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
   *stamp = now;
@@ -41,6 +43,7 @@ __device__ void service_miss(ExpertDemand* demand, int32_t* count) {
 // the same tile and accumulation order as the full histogram path.
 __global__ void warp_packet_kernel(int32_t* routes, const uint64_t* table,
                                    const int32_t* ids, ExpertDemand* demand, int rows) {
+  dgpp_pdl_wait();
   constexpr unsigned mask = 0xffffffff;
   const int lane = threadIdx.x, assignments = rows * K;
   const int expert = lane < assignments ? ids[lane] : E;
@@ -88,6 +91,7 @@ __global__ void warp_packet_kernel(int32_t* routes, const uint64_t* table,
 constexpr int threads = 128;
 __global__ void packet_kernel(int32_t* routes, const uint64_t* table,
                               const int32_t* ids, ExpertDemand* demand, int rows) {
+  dgpp_pdl_wait();
   using Scan = cub::BlockScan<int, threads>;
   static_assert(E == threads * 3);
   __shared__ typename Scan::TempStorage scan;
