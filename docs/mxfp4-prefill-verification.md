@@ -711,7 +711,7 @@ one percent in this short C1 comparison have no established error bound.
 codes with one E8M0 scale per 32 channels. Normalization, the BF16 rounding
 before inverse rotation, and the BF16 rounding of the rotated pairs precede
 quantization. The scale uses DeepSeek's minimum absolute maximum of 0.0001.
-The producer also preserves the original BF16 attention output for diagnostics.
+The producer can also write the original BF16 attention output for diagnostics.
 The grouped `wo_a` projection reads the codes directly from the existing GEMM
 workspace along with the checkpoint's FP8 weights and expanded grid scales.
 Its matrix multiply accumulates in FP32 and emits BF16 for `wo_b`.
@@ -827,3 +827,83 @@ The optimized binary used revision `781f2da9a57f`, SHA-256
 `1bd1025c27bd742b7d824fa783dc90140b3d7e4dcef29b1a8cd238eb42e1145b`.
 The per-pass timer was enabled for both diagnostic runs and disabled for
 normal serving.
+
+### Activation lookahead, diagnostic writes and weight pipeline depth
+
+On the TP2 FP8 decode path, ordinary serving emits the packed attention
+output alone. Layer diagnostics can request both outputs. Omitting the
+BF16 copy saves 128 KiB of stores per layer per rank at four rows and
+192 KiB at six. The normalization and rotation still round at the same
+points. At four main splits and one window split, 32 alternating
+producer-only timing pairs measured median attention finish times of
+3.326 → 3.212 µs at four rows and 3.711 → 3.615 µs at six.
+
+The projection now skips activation code and scale loads for lanes beyond
+the supplied token row count. A padding position inside that count receives
+zeros from attention finish. All lanes still participate in the matrix multiply.
+With eight rows, the kernel issues the current 512-channel activation
+window's loads before waiting for the weight copy. The GB10 disassembly
+shows predicated global loads at four rows and 36 activation load
+instructions before the first weight wait at eight.
+
+The following comparisons use the same four main splits and one window
+split. Times are medians in µs for attention finish plus projection. Each
+pair shares its run, weight working set and producer setting. The activation
+comparisons use the known K of 4,096 in both arms.
+
+| Trial | Four rows | Six rows | Eight rows |
+|---|---:|---:|---:|
+| Load the current activation window before the weight wait | 72.14 → 72.04 | 73.11 → 73.05 | 72.27 → 72.15 |
+| Specialize the four- and six-row loads to skip unused lanes | 72.14 → 72.02 | 73.11 → 73.03 | All lanes have live rows |
+| Three 512-byte weight stages, one resident block per SM | 70.59 → 76.70 | 71.03 → 77.35 | 71.64 → 77.84 |
+| Three compact 512-byte stages, two resident blocks per SM | 72.66 → 77.40 | 72.02 → 77.48 | 71.55 → 77.26 |
+
+In the three-stage tests, the third buffer let each warp issue two future
+weight windows. Recovering two resident blocks still left the compact
+kernel slower. Three stages of 256 bytes fit three blocks per SM and took
+74.94 µs at four rows, versus 70.49 µs for the two-stage 512-byte control.
+The register lookahead trials also covered loading the next full window
+and the next 128 channels. Copying activations into shared memory alongside
+weights took 76.40 µs at eight rows versus 71.55 µs for its control.
+The selected kernel uses two weight stages at every width.
+
+In the final comparison against the deployed FP8 kernel, each shape ran
+60 interleaved timing pairs with seven rotating weight copies. At four,
+six and eight rows the median paired reductions were 0.41%, 0.32% and
+0.47%. The FP8 codes, scales and BF16 projection outputs matched exactly
+at every supported width from one through eight, including a padded
+position where the shape allowed it. The production binary used revision
+`1165a6626080`, SHA-256
+`d697f037cbb5bab6be8da49d70a1f27197957a874b4289015dc414fca201e98f`.
+
+The first candidate server start generated a different passing LRU answer.
+Its greedy token stream diverged at the third token and it accepted 479
+predictions across 215 passes, producing 695 tokens at a median 49.90
+engine decode tok/s. A second start of the very same binary reproduced
+the incumbent's 658-token answer. The cause of the between-start variation
+is unresolved. In a separate diagnostic, both kernels executed on the
+same real inputs on each rank throughout the tool and coding requests.
+The FP8 codes, scales, BF16 projections and BF16-only attention finish
+outputs agreed byte for byte. Feeding either path's results onward
+produced the 658-token answer in that diagnostic.
+
+For the matching-answer comparison, each release produced the same text and
+reasoning and accepted 439 predictions over 218 passes. Each column uses 12
+warm concurrency-one requests from one server start, 24,448 cached prompt
+tokens, zero expert-file reads and zero process swap on both ranks. Both
+ranks recorded the same operation stream within each run. The DSpark
+per-pass timer was enabled on both builds.
+
+| Warm 658-token coding task | Previous FP8 | Selected FP8 |
+|---|---:|---:|
+| Median engine decode tok/s | 46.646 | 46.590 |
+| Engine decode tok/s range | 46.535–46.763 | 46.476–46.686 |
+| Median engine decode seconds | 14.085 | 14.102 |
+| Mean target verification ms/pass | 57.682 | 57.766 |
+| Median request wall seconds | 14.442 | 14.454 |
+
+The selected kernel reduced the measured handoff time and memory traffic.
+Matched-answer serving throughput was 0.12% lower in this comparison;
+overlapping run ranges and variation across starts leave the effect on
+full-model decode inconclusive. Normal serving uses the selected binary
+with per-pass diagnostic timing disabled.
