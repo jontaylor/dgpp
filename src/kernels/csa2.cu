@@ -977,6 +977,13 @@ __global__ void select_candidates_prefill_kernel(const float* logits, int64_t lo
 // the sums are the full loops' bit for bit.
 constexpr int kFinishMaxSplits = 128;
 constexpr int kFinishBatch = 8;
+// Apply the conjugate rotation to two already BF16-rounded components.
+__device__ __forceinline__ ushort2 finish_rotate_pair(float x, float y, int64_t pos, float inv_freq) {
+  const float angle = __fmul_rn(float(pos), inv_freq);
+  const float c = cosf(angle), s = -sinf(angle);
+  return make_ushort2(float_to_bf16_bits(x * c - y * s), float_to_bf16_bits(y * c + x * s));
+}
+
 template <bool Quantize>
 __global__ void attn_finish_kernel(const float* m_main, const float* l_main, const float* c_main,
                                    int n_main, const float* m_win, const float* l_win, const float* c_win,
@@ -1061,42 +1068,48 @@ __global__ void attn_finish_kernel(const float* m_main, const float* l_main, con
         num[3] += w * v[b].w;
       }
     }
-    // The attention output rounds to bf16; the inverse rotation then reads
-    // that bf16 (the reference's two steps).
+    if constexpr (Quantize) {
+      // Every lane owns two complete rotation pairs and four values of a K32 group.
+      // Keep them local through both rounding boundaries and the FP8 conversion.
+      uint16_t bits[4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) o[d0 + e] = bf16_bits_to_float(float_to_bf16_bits(empty ? 0.0f : num[e] / den));
+      for (int e = 0; e < 4; ++e) bits[e] = float_to_bf16_bits(empty ? 0.f : num[e] / den);
+      if (d0 >= kCsa2Latent - kCsa2Rope) {
+#pragma unroll
+        for (int e = 0; e < 4; e += 2) {
+          const int pair = (d0 + e - (kCsa2Latent - kCsa2Rope)) / 2;
+          const ushort2 rotated = finish_rotate_pair(bf16_bits_to_float(bits[e]), bf16_bits_to_float(bits[e + 1]),
+                                                     p, inv_freq[pair]);
+          bits[e] = rotated.x;
+          bits[e + 1] = rotated.y;
+        }
+      }
+      const float values[4] = {bf16_bits_to_float(bits[0]), bf16_bits_to_float(bits[1]),
+                               bf16_bits_to_float(bits[2]), bf16_bits_to_float(bits[3])};
+      // Model buffers allow a vector store. A caller can also pass a BF16 slice.
+      if (reinterpret_cast<uintptr_t>(orow) % alignof(uint2) == 0) {
+        *reinterpret_cast<uint2*>(orow + d0) = make_uint2(unsigned(bits[0]) | (unsigned(bits[1]) << 16),
+                                                         unsigned(bits[2]) | (unsigned(bits[3]) << 16));
+      } else {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) orow[d0 + e] = bits[e];
+      }
+      mxfp8_quantize_four(values, 1e-4f, codes + offset, scales + offset / 32);
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) o[d0 + e] = bf16_bits_to_float(float_to_bf16_bits(empty ? 0.f : num[e] / den));
+    }
   }
-  __syncthreads();
   if constexpr (!Quantize) {
+    __syncthreads();
     for (int d = threadIdx.x; d < kCsa2Latent - kCsa2Rope; d += blockDim.x)
       orow[d] = float_to_bf16_bits(o[d]);
-  }
-  if (threadIdx.x < kCsa2Rope / 2) {
-    const int i = threadIdx.x;
-    const int d0 = kCsa2Latent - kCsa2Rope + 2 * i;
-    const float ang = __fmul_rn(float(p), inv_freq[i]);
-    const float c = cosf(ang), s = -sinf(ang);  // the conjugate
-    const float x0 = o[d0], x1 = o[d0 + 1];
-    const uint16_t a = float_to_bf16_bits(x0 * c - x1 * s);
-    const uint16_t b = float_to_bf16_bits(x1 * c + x0 * s);
-    if constexpr (Quantize) {
-      o[d0] = bf16_bits_to_float(a);
-      o[d0 + 1] = bf16_bits_to_float(b);
-    } else {
-      orow[d0] = a;
-      orow[d0 + 1] = b;
+    if (threadIdx.x < kCsa2Rope / 2) {
+      const int i = threadIdx.x, d = kCsa2Latent - kCsa2Rope + 2 * i;
+      const ushort2 rotated = finish_rotate_pair(o[d], o[d + 1], p, inv_freq[i]);
+      orow[d] = rotated.x;
+      orow[d + 1] = rotated.y;
     }
-  }
-  if constexpr (Quantize) {
-    __syncthreads();
-    const int d = threadIdx.x * 4;
-    float values[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      values[i] = o[d + i];
-      orow[d + i] = float_to_bf16_bits(values[i]);  // preserve the attention output probe
-    }
-    mxfp8_quantize_four(values, 1e-4f, codes + offset, scales + offset / 32);
   }
 }
 

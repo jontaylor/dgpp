@@ -90,6 +90,7 @@ __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint3
 // four (up to eight) activation rows for every output tile in the group.
 // All four TP2 groups share the grid; the two warp partials meet within the CTA.
 constexpr int woa_warps = 2, woa_step = 512;
+template <bool AlignedScales>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
     const float* weight_scale, uint16_t* out, int rows, int groups, int n, int k) {
@@ -104,42 +105,77 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
   constexpr int pitch = woa_step + 16;
   __shared__ __align__(16) uint8_t stage[woa_warps][2][16][pitch];
   __shared__ float partial[woa_warps][16][8];
+  __shared__ uint64_t ready[woa_warps][2];
+  auto barrier_address = [&](int slot) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(&ready[warp][slot]));
+  };
+  // Each warp owns two independent stages. One arrival and 16 completed
+  // row copies advance the barrier by one phase on each use of a stage.
+  if (lane < 2)
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(barrier_address(lane)) : "memory");
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  __syncwarp();
+
   auto issue = [&](int base, int slot) {
-#pragma unroll
-    for (int v = lane; v < 16 * (woa_step / 16); v += 32) {
-      const int row = v / (woa_step / 16), kk = 16 * (v % (woa_step / 16));
-      const uint8_t* src = weight + size_t(column + row) * k + base + kk;
-      copy16(&stage[warp][slot][row][kk], src, true);
-      if ((kk % 128) == 0 && base + woa_step < k0 + span)
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(src + woa_step));
+    const unsigned bar = barrier_address(slot);
+    if (lane == 0)
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                   :: "r"(bar), "r"(16 * woa_step) : "memory");
+    __syncwarp();
+    if (lane < 16) {
+      const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(&stage[warp][slot][lane][0]));
+      const uint8_t* src = weight + size_t(column + lane) * k + base;
+      asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                   :: "r"(dst), "l"(src), "r"(woa_step), "r"(bar) : "memory");
     }
-    commit();
+    // On the last window, point the L2 lookahead at the first window of a
+    // later output tile. GB10 admits two of these blocks on each of 48 SMs.
+    constexpr int ahead = 96;
+    const bool next_window = base + woa_step < k0 + span;
+    if (next_window || blockIdx.x + ahead < gridDim.x) {
+      const int next_column = next_window ? column : column + 16 * ahead;
+      const int next_k = next_window ? base + woa_step : k0;
+#pragma unroll
+      for (int v = lane; v < 16 * (woa_step / 128); v += 32) {
+        const int row = v / (woa_step / 128), off = (v % (woa_step / 128)) * 128;
+        const uint8_t* src = weight + size_t(next_column + row) * k + next_k + off;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(src));
+      }
+    }
   };
   float acc[4]{};
   issue(k0, 0);
   for (int step = 0; step < span / woa_step; ++step) {
     const int base = k0 + step * woa_step, slot = step & 1;
-    if (step + 1 < span / woa_step) {
-      issue(base + woa_step, slot ^ 1);
-      wait_pending<1>();
-    } else {
-      wait_pending<0>();
-    }
+    if (step + 1 < span / woa_step) issue(base + woa_step, slot ^ 1);
+    unsigned done;
+    do {
+      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                   : "=r"(done) : "r"(barrier_address(slot)), "r"((step / 2) & 1) : "memory");
+    } while (!done);
     __syncwarp();
+    const size_t token_base = (size_t(row8 < rows ? row8 : 0) * groups + group) * k + base;
 #pragma unroll
-    for (int kk = 0; kk < woa_step; kk += 32) {
-      const auto* top = &stage[warp][slot][row8][kk + part * 4];
-      const auto* bottom = top + 8 * pitch;
-      uint32_t a[4] = {*reinterpret_cast<const uint32_t*>(top),
-                       *reinterpret_cast<const uint32_t*>(bottom),
-                       *reinterpret_cast<const uint32_t*>(top + 16),
-                       *reinterpret_cast<const uint32_t*>(bottom + 16)};
-      const size_t offset = (size_t(row8 < rows ? row8 : 0) * groups + group) * k + base + kk;
-      const auto* token = codes + offset + part * 4;
-      const uint32_t b0 = *reinterpret_cast<const uint32_t*>(token);
-      const uint32_t b1 = *reinterpret_cast<const uint32_t*>(token + 16);
-      const float ws = weight_scale[size_t(column / 32) * (k / 32) + (base + kk) / 32];
-      mma(acc, a, b0, b1, (__float_as_uint(ws) >> 23) & 255, scales[offset / 32]);
+    for (int chunk = 0; chunk < woa_step; chunk += 128) {
+      const uint32_t token_scales = *reinterpret_cast<const uint32_t*>(scales + (token_base + chunk) / 32);
+      const float* ws = weight_scale + size_t(column / 32) * (k / 32) + (base + chunk) / 32;
+      float4 four;
+      if constexpr (AlignedScales) four = *reinterpret_cast<const float4*>(ws);
+      else four = make_float4(ws[0], ws[1], ws[2], ws[3]);
+      const float weight_scales[4] = {four.x, four.y, four.z, four.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kk = chunk + j * 32;
+        const uint8_t* source = &stage[warp][slot][lane % 16][kk + (lane / 16) * 16];
+        const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(source));
+        uint32_t a[4];
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(address));
+        const uint8_t* token = codes + token_base + kk + part * 4;
+        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(token);
+        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(token + 16);
+        mma(acc, a, b0, b1, (__float_as_uint(weight_scales[j]) >> 23) & 255, (token_scales >> (8 * j)) & 255);
+      }
     }
     __syncwarp();
   }
@@ -314,8 +350,12 @@ void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const floa
                              uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream) {
   if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
     throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
-  woa_decode_kernel<<<groups * n / 16, woa_warps * 32, 0, stream>>>(
-      packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, k);
+  auto launch = [&]<bool AlignedScales>() {
+    woa_decode_kernel<AlignedScales><<<groups * n / 16, woa_warps * 32, 0, stream>>>(
+        packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, k);
+  };
+  if (reinterpret_cast<uintptr_t>(ws) % alignof(float4) == 0) launch.template operator()<true>();
+  else launch.template operator()<false>();
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

@@ -191,9 +191,13 @@ __global__ void fill_partials(float* c, float* m, float* l, float* sink, float* 
   if (i < entries / heads / splits) pos[i] = i == 2 ? -1 : 24317 + i;
 }
 
-void woa_handoff(int l2, cudaStream_t stream) {
-  constexpr int groups = 4, n = 1024, k = 4096, heads = 32, splits = 8;
-  constexpr int stride = groups * k, values = rows * stride, entries = rows * heads * splits;
+void woa_handoff(int l2, cudaStream_t stream, int rows, int main_splits, int window_splits) {
+  if (rows < 1 || rows > 8 || main_splits < 0 || main_splits > 127 ||
+      window_splits < 1 || window_splits > 128 - main_splits)
+    throw std::invalid_argument("wo_a handoff requires 1..8 rows and at most 128 main and window splits");
+  constexpr int groups = 4, n = 1024, k = 4096, heads = 32;
+  const int splits = main_splits + window_splits;
+  const int stride = groups * k, values = rows * stride, entries = rows * heads * splits;
   constexpr size_t matrix = size_t(groups) * n * k;
   const int copies = std::max(3, int(4 * size_t(l2) / matrix) + 1);
   Device<uint8_t> weights(matrix * copies), packed(values + values / 32), scratch(workspace_bytes);
@@ -205,9 +209,13 @@ void woa_handoff(int l2, cudaStream_t stream) {
       weights.p, matrix * copies, scales.p, matrix / 1024 * copies, attention.p, values);
   fill_partials<<<(entries * 512 + 255) / 256, 256, 0, stream>>>(c.p, m.p, l.p, sink.p, freq.p,
                                                                  pos.p, entries, heads, splits);
+  auto finish = [&](uint16_t* out, uint8_t* codes) {
+    const int window = rows * heads * main_splits;
+    csa2_attn_finish(m.p, l.p, c.p, main_splits, m.p + window, l.p + window, c.p + window * 512,
+                     window_splits, sink.p, rows, heads, pos.p, freq.p, out, stream, codes);
+  };
   auto launch = [&](int variant, int copy) {
-    csa2_attn_finish(nullptr, nullptr, nullptr, 0, m.p, l.p, c.p, splits, sink.p, rows, heads,
-                     pos.p, freq.p, attention.p, stream, variant ? packed.p : nullptr);
+    finish(attention.p, variant ? packed.p : nullptr);
     auto* w = weights.p + copy * matrix;
     auto* ws = scales.p + copy * matrix / 1024;
     if (variant) {
@@ -237,6 +245,17 @@ void woa_handoff(int l2, cudaStream_t stream) {
   auto weight = read(weights.p, matrix);
   auto ws = read(scales.p, matrix / 1024);
   auto out = read(y.p, rows * groups * n);
+  // The public finish and projection interfaces also accept sliced output and scale buffers.
+  {
+    Device<uint16_t> sliced_attention(values + 1);
+    Device<float> sliced_scales(matrix / 1024 + 1);
+    finish(sliced_attention.p + 1, packed.p);
+    DGPP_CUDA_OK(cudaMemcpyAsync(sliced_scales.p + 1, scales.p, ws.size() * sizeof(float),
+                                 cudaMemcpyDeviceToDevice, stream));
+    launch_mxfp8_woa_decode(packed.p, weights.p, sliced_scales.p + 1, y.p, rows, groups, n, k, stream);
+    if (read(sliced_attention.p + 1, values) != ref || read(y.p, out.size()) != out)
+      throw std::runtime_error("sliced buffers changed wo_a handoff");
+  }
   for (int i = 0; i < values; i += 32) {
     float amax = 1e-4f;
     for (int j = 0; j < 32; ++j) amax = std::max(amax, std::abs(bf16_bits_to_float(ref[i + j])));
@@ -288,7 +307,7 @@ void woa_handoff(int l2, cudaStream_t stream) {
     }
   }
   const int64_t live = 24319;
-  DGPP_CUDA_OK(cudaMemcpyAsync(pos.p + 2, &live, sizeof(live), cudaMemcpyHostToDevice, stream));
+  if (rows > 2) DGPP_CUDA_OK(cudaMemcpyAsync(pos.p + 2, &live, sizeof(live), cudaMemcpyHostToDevice, stream));
   cudaGraphExec_t graphs[2]{};
   cudaEvent_t start, end;
   DGPP_CUDA_OK(cudaEventCreate(&start));
@@ -327,8 +346,11 @@ int main(int argc, char** argv) {
     DGPP_CUDA_OK(cudaGetDeviceProperties(&prop, 0));
     cudaStream_t stream;
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    if (argc == 2 && std::string(argv[1]) == "--woa-handoff") {
-      woa_handoff(prop.l2CacheSize, stream);
+    if (argc >= 2 && std::string(argv[1]) == "--woa-handoff") {
+      if (argc != 2 && argc != 5)
+        throw std::invalid_argument("--woa-handoff [rows main_splits window_splits]");
+      woa_handoff(prop.l2CacheSize, stream, argc == 5 ? std::stoi(argv[2]) : 4,
+                  argc == 5 ? std::stoi(argv[3]) : 0, argc == 5 ? std::stoi(argv[4]) : 8);
       DGPP_CUDA_OK(cudaStreamDestroy(stream));
       return 0;
     }
