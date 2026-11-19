@@ -307,7 +307,8 @@ __device__ __forceinline__ float scale_at(const uint8_t* __restrict__ row, int i
   return b ? __uint_as_float(b << 23) : __uint_as_float(0x00400000u);
 }
 
-template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT, bool kBf12 = false, bool kCompactA = false>
+template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT, bool kBf12 = false,
+          bool kCompactA = false, bool kWarpScales = false>
 __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __restrict__ act_in,
                                                             size_t act_stride,
                                                             const void* __restrict__ wv_in,
@@ -455,6 +456,15 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   __syncthreads();
   int buf = 0;
   for (int base = win0 * W::kK, base_end = win1 * W::kK; base < base_end; base += W::kK, buf ^= 1) {
+    float window_scale = 0.f;
+    if constexpr (kWarpScales) {
+      static_assert(kTiles == 1 && kFp8 && W::kK == 256 && kRowsPerWarp == 8);
+      // All eight weight rows belong to one 32-row scale group. Load the
+      // window's eight contiguous scales before waiting for the weight ring.
+      const int group = (base >> 5) + (lane & 7);
+      if (n0 < n && group < scale_cols)
+        window_scale = scales[static_cast<size_t>(n0 >> 5) * scale_cols + group];
+    }
     uint4 wv4[kGroups][F::kVecs];
     if constexpr (kBf12) {
       // A super-block's first window: the lane's 24 units of its row (a
@@ -544,7 +554,12 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
           }
           w[0] = e.x; w[1] = e.y; w[2] = e.z; w[3] = e.w;
         } else if (kFp8) {
-          const float s = (row_live && c0 < k) ? scale_at(scale_row, (c0 + v * F::kPerVec) >> cs) : 0.f;
+          float s;
+          if constexpr (kWarpScales) {
+            s = __shfl_sync(0xffffffffu, window_scale, 2 * g + (t >> 1));
+          } else {
+            s = (row_live && c0 < k) ? scale_at(scale_row, (c0 + v * F::kPerVec) >> cs) : 0.f;
+          }
           chunk_to_bf16x8(wv4[g][v], s, w);
         } else {
           w[0] = wv4[g][v].x; w[1] = wv4[g][v].y; w[2] = wv4[g][v].z; w[3] = wv4[g][v].w;
@@ -693,7 +708,7 @@ int split_k_for(int n, int k, const void* ws, size_t ws_bytes) {
 
 // Pick one kernel and its dynamic shared footprint before graph capture.
 template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT>
-auto decode_entry(int rows, size_t& smem) {
+auto decode_entry(int rows, int rs, int cs, size_t& smem) {
   using L = WarpLoads<kTiles, kFp8, kW>;
   using W = Win<kTiles, kFp8>;
   auto kernel = mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT>;
@@ -709,6 +724,19 @@ auto decode_entry(int rows, size_t& smem) {
       static_assert(L::kBlockBytes + 2 * 8 * W::kStride * sizeof(uint16_t) <= 48 * 1024);
       smem = L::kBlockBytes + 2 * rows * W::kStride * sizeof(uint16_t);
       return mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, true>;
+    }
+    static const bool warp_scales = [] {
+      const char* value = std::getenv("DGPP_MMA_WARP_SCALES");
+      return value && value[0] == '1';
+    }();
+    if (warp_scales && rs == 5 && cs == 5 && rows <= 8) {
+      auto selected = mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, false, true>;
+      static const bool opted_in = [selected] {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(selected, cudaFuncAttributeMaxDynamicSharedMemorySize, L::kSmemBytes));
+        return true;
+      }();
+      (void)opted_in;
+      return selected;
     }
   }
   static bool opted_in = false;
@@ -727,7 +755,7 @@ void launch_decode_form(const uint16_t* a, size_t act_stride, const void* w, con
                         int rows, int n, int k, size_t out_stride, int rs, int cs, cudaStream_t stream,
                         void* ws, size_t ws_bytes, const uint16_t* act2 = nullptr, float limit = 0.f) {
   size_t smem;
-  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, smem);
+  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, rs, cs, smem);
   const int blocks = (n + kW * kRowsPerWarp - 1) / (kW * kRowsPerWarp);
   const int splits = split_k_for(n, k, ws, ws_bytes);
   if (splits > 1) {
@@ -813,7 +841,7 @@ void launch_decode_form_pair(const uint16_t* a0, const void* w0, const ScaleT* s
                              size_t act_stride, int rows, int k, int rs, int cs, cudaStream_t stream, void* ws,
                              size_t ws_bytes) {
   size_t smem;
-  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, smem);
+  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, rs, cs, smem);
   const int per_block = kW * kRowsPerWarp;
   const int blocks0 = (n0 + per_block - 1) / per_block, blocks1 = (n1 + per_block - 1) / per_block;
   const int splits = split_k_for(n0, k, ws, ws_bytes);
