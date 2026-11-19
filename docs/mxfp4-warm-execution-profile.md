@@ -351,3 +351,35 @@ extending cold prefill. The phase-specific controls select the maximum
 prefill group with `DGPP_EXPERT_PREFILL_ADJACENT_READS` and decode group
 with `DGPP_EXPERT_ADJACENT_READS`. Omitting the prefill override uses the
 decode setting for both phases.
+
+### Where warm verification spends time between GPU launches
+
+A two-rank Nsight Systems capture followed the same 96-token code completion
+through 31 speculative rounds. Both ranks served every routed expert from the
+resident cache. The capture used the paged target graph, resident draft replay,
+20 MiB boundary prefetch and four-row verification. The target accepted 65
+proposals in each capture.
+
+From the first route packet in layer 0 to the end of the routed kernel in
+layer 39, the baseline averaged 53.46 ms per pass on each rank. Taking the
+union of the GPU kernel intervals leaves 0.225 ms on rank 0 and 0.220 ms on
+rank 1 with no kernel running. Between the end of that span and the next
+pass's first packet, the 30 complete intervals averaged 10.52 ms. The
+corresponding kernel-free times were 1.14 and 1.39 ms. That interval includes
+the target vocabulary projection, distributed token selection, drafting and
+the beginning of the next target pass. A kernel can be waiting for memory or
+its peer while it appears active. These intervals measure GPU scheduling
+and overlap, with profiler overhead included.
+
+The packed b12x reader also ran with lower L2 retention on its weight codes.
+Across the 40 routed kernels per pass, rank 0 went from 28.93 to 28.52 ms
+and rank 1 from 28.59 to 28.97 ms. The first-packet-to-last-routed interval
+was 53.82 ms with the hint. The two ranks execute concurrently, so adding
+their kernel times would misstate the latency seen by a request.
+
+The baseline serving binary was built from `2df097cf`, SHA-256
+`ed15cfc94f1a7b2ff8ec444ba075ddbdebac20bbabe2036104bb8d0b59583bbe`.
+The comparison linked the low-retention b12x export from `37de8533`, SHA-256
+`fb50bffe2dc673c30f13670265749050a78d29303db3bb0c31a63047731a0e3c`.
+These are single-request diagnostic traces. Uninstrumented serving runs
+determine the deployment choice.
