@@ -213,6 +213,9 @@ class GrammarVocab {
   // boot rather than on the first json request. Copies share them.
   void prepare_json() const;
   const JsonTables& json_tables() const;
+  // Append all nonempty token spellings that are prefixes of the literal.
+  // Equal spellings can correspond to more than one vocabulary id.
+  void append_literal_prefixes(std::string_view literal, std::vector<int64_t>& ids) const;
 
  private:
   struct JsonHolder;

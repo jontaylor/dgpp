@@ -1,6 +1,7 @@
 #include "text/tool_grammar.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -15,6 +16,7 @@ namespace dgpp::text {
 struct GrammarVocab::JsonHolder {
   std::once_flag once;
   std::unique_ptr<JsonTables> tables;
+  std::atomic<bool> ready{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -80,13 +82,35 @@ GrammarVocab GrammarVocab::from_tokenizer(const Tokenizer& tok,
 }
 
 void GrammarVocab::prepare_json() const {
-  std::call_once(json_->once,
-                 [&] { json_->tables = std::make_unique<JsonTables>(*this); });
+  std::call_once(json_->once, [&] {
+    json_->tables = std::make_unique<JsonTables>(*this);
+    json_->ready.store(true, std::memory_order_release);
+  });
 }
 
 const JsonTables& GrammarVocab::json_tables() const {
   prepare_json();
   return *json_->tables;
+}
+
+void GrammarVocab::append_literal_prefixes(std::string_view literal, std::vector<int64_t>& ids) const {
+  if (literal.empty()) return;
+  // Serving prepares these tables at startup. Tool-only library callers
+  // can still match a literal without building the JSON grammar tables.
+  if (!json_->ready.load(std::memory_order_acquire)) {
+    for (int32_t id : ids_starting_with(static_cast<unsigned char>(literal.front())))
+      if (literal.starts_with(text(id))) ids.push_back(id);
+    return;
+  }
+  const auto& trie = json_->tables->token_trie();
+  int node = 0;
+  for (unsigned char byte : literal) {
+    const auto& edges = trie[node].children;
+    const auto next = std::find_if(edges.begin(), edges.end(), [byte](const auto& edge) { return edge.first == byte; });
+    if (next == edges.end()) break;
+    node = next->second;
+    ids.insert(ids.end(), trie[node].ids.begin(), trie[node].ids.end());
+  }
 }
 
 bool GrammarVocab::is_eos(int64_t id) const {
@@ -902,13 +926,15 @@ int32_t GrammarState::literal_proposal() const {
   }
   if (common.empty()) return -1;
   if (common.front() == kDsmlSentinel) return static_cast<int32_t>(vocab_->markers().dsml.id);
+  std::vector<int64_t> prefixes;
+  vocab_->append_literal_prefixes(common, prefixes);
   int32_t best = -1;
   size_t length = 0;
-  for (int32_t token : vocab_->ids_starting_with(static_cast<unsigned char>(common.front()))) {
-    const auto& text = vocab_->text(token);
-    if (text.size() > length && common.starts_with(text)) {
-      best = token;
-      length = text.size();
+  for (int64_t token : prefixes) {
+    const auto size = vocab_->text(token).size();
+    if (size > length || (size == length && token < best)) {
+      best = static_cast<int32_t>(token);
+      length = size;
     }
   }
   return best;
@@ -924,10 +950,7 @@ std::vector<int64_t> GrammarState::match_ids(const TextMatch& m,
       out.push_back(vocab_->markers().dsml.id);
       continue;
     }
-    for (const int32_t id : vocab_->ids_starting_with(static_cast<unsigned char>(piece.front()))) {
-      if (piece.starts_with(vocab_->text(id)))
-        out.push_back(id);
-    }
+    vocab_->append_literal_prefixes(piece, out);
   }
   if (m.complete() && closer >= 0) out.push_back(closer);
   std::sort(out.begin(), out.end());

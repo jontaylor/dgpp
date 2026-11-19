@@ -525,6 +525,20 @@ GrammarVocab dsml_vocab(dgpp::text::DsmlDialect dialect = dgpp::text::DsmlDialec
   return GrammarVocab(std::move(texts), m, {kEosText}, kVocab, kEosText);
 }
 
+DGPP_TEST(tool_grammar_literal_prefixes_match_before_and_after_preparing_json) {
+  const std::string bytes("\x80\0", 2);
+  const GrammarVocab vocab({"", "a", "a", "ab", "ac", bytes, bytes + "x", "aba"}, {}, {}, 7);
+  for (int prepared = 0; prepared < 2; ++prepared) {
+    if (prepared) vocab.prepare_json();
+    std::vector<int64_t> ids{99};
+    vocab.append_literal_prefixes("", ids);
+    vocab.append_literal_prefixes("aba", ids);
+    vocab.append_literal_prefixes(bytes + "y", ids);
+    std::sort(ids.begin(), ids.end());
+    require(ids == std::vector<int64_t>({1, 2, 3, 5, 99}), "all aliases and prefixes inside the served vocabulary");
+  }
+}
+
 DGPP_TEST(tool_grammar_dsml_point_queries_agree_with_the_full_mask_through_a_call) {
   const GrammarVocab vocab = dsml_vocab();
   GrammarState grammar(&vocab, spec_of(GrammarSpec::Mode::kRequired), false);
