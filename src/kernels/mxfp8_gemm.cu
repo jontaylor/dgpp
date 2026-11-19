@@ -101,7 +101,7 @@ __device__ __forceinline__ uint2 woa_token_pair(const uint8_t* token) {
   return make_uint2(*reinterpret_cast<const uint32_t*>(token), *reinterpret_cast<const uint32_t*>(token + 16));
 }
 
-template <bool AlignedScales, int FixedRows>
+template <bool AlignedScales, int FixedRows, bool StreamWeights>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
     const float* weight_scale, uint16_t* out, int rows, int groups, int n, bool early_weight_copy) {
@@ -139,8 +139,17 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     if (lane < 16) {
       const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(&stage[warp][slot][lane][0]));
       const uint8_t* src = weight + size_t(column + lane) * k + base;
-      asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                   :: "r"(dst), "l"(src), "r"(woa_step), "r"(bar) : "memory");
+      if constexpr (StreamWeights) {
+        // This tile consumes its weight rows once. Leave the activation,
+        // scale and lookahead fetches at their normal retention priority.
+        asm volatile("{ .reg .b64 policy; createpolicy.fractional.L2::evict_first.b64 policy, 1.0;\n"
+                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+                     "[%0], [%1], %2, [%3], policy; }"
+                     :: "r"(dst), "l"(src), "r"(woa_step), "r"(bar) : "memory");
+      } else {
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     :: "r"(dst), "l"(src), "r"(woa_step), "r"(bar) : "memory");
+      }
     }
     // On the last window, point the L2 lookahead at the first window of a
     // later output tile. GB10 admits two of these blocks on each of 48 SMs.
@@ -382,9 +391,15 @@ void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const floa
                              uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream, bool early_weight_copy) {
   if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
     throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
+  static const bool stream_weights = [] {
+    const char* setting = std::getenv("DGPP_MX_WOA_STREAM_WEIGHTS");
+    return setting && setting[0] == '1';
+  }();
   auto launch = [&]<bool AlignedScales>() {
     auto emit = [&]<int FixedRows>() {
-      woa_decode_kernel<AlignedScales, FixedRows><<<groups * n / 16, woa_warps * 32, 0, stream>>>(
+      auto kernel = stream_weights ? woa_decode_kernel<AlignedScales, FixedRows, true>
+                                   : woa_decode_kernel<AlignedScales, FixedRows, false>;
+      kernel<<<groups * n / 16, woa_warps * 32, 0, stream>>>(
           packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, early_weight_copy);
     };
     switch (rows) {
