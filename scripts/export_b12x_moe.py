@@ -18,6 +18,8 @@ parser.add_argument('--format', choices=('nvfp4', 'mxfp4', 'mxfp4-nibble'), defa
 parser.add_argument('--split-projections', action='store_true', help='Also export MX nibble gate/up and down entry points')
 parser.add_argument('--pipeline-stages', type=int, choices=(2, 3, 4, 5),
                     help='Override the b12x asynchronous weight-copy pipeline depth for both projections')
+parser.add_argument('--stream-weight-codes', action='store_true',
+                    help='Give packed expert weight codes low L2 retention priority on both projections')
 args = parser.parse_args()
 if args.split_projections and args.format != 'mxfp4-nibble':
  raise ValueError('split projection export requires mxfp4-nibble')
@@ -35,6 +37,20 @@ start=cls.lineno-1;body=lines[start:cls.end_lineno]
 # Method replacements are derived from the installed source, retained as their
 # own source file for CuTe's source inspection. No installed files are changed.
 edits=[]
+if args.stream_weight_codes:
+ # Only the packed B operand is consumed once per output tile. Keep the
+ # existing policy on reused activations, scales and the route packet.
+ path = args.output / 'stream_weight_codes.py'
+ path.write_text('''@dsl_user_op
+def copy_streaming_weight(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [smem_addr.ir_value(loc=loc, ip=ip), gmem_addr.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b64 p; createpolicy.fractional.L2::evict_first.b64 p, 1.0; "
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, 16, p; }",
+        "r,l", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+''')
+ exec(compile(path.read_text(), str(path), 'exec'), kernel.__dict__)
 for method in cls.body:
  if not isinstance(method,ast.FunctionDef):continue
  begin=method.body[0].lineno-1;end=method.end_lineno
@@ -84,6 +100,7 @@ for method in cls.body:
             s_pack1 = ((pair >> Uint32(4)) & Uint32(0x0f0f0f0f)) | Uint32(0x70707070)''')
  elif method.name=='__cache_key__':
   version = "dgpp_mx_nibble_fp32_v1" if nibble_scales else "dgpp_native_fp32_v4"
+  if args.stream_weight_codes: version += "_stream_b"
   new = old.replace('return (', f'return ("{version}",', 1)
  elif method.name=='_dequant_scale_x4_to_elem2x2' and not is_mx:
   new='''        s0, s1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(packed)
@@ -128,6 +145,10 @@ for method in cls.body:
             return
 '''
   new=prefix+old
+ if method.name == '_stage_k_tile_async' and args.stream_weight_codes:
+  packed = 'if cutlass.const_expr(self.weight_layout == "packed"):\n                cp_async4_shared_global('
+  if new.count(packed) != 1: raise RuntimeError('unsupported b12x packed-weight copy')
+  new = new.replace(packed, packed.replace('cp_async4_shared_global', 'copy_streaming_weight'))
  if new!=old:edits.append((begin-start,end-start,new))
 for a,b,new in sorted(edits,reverse=True):body[a:b]=[new]
 path=args.output / 'raw_fp32_kernel_class.py'
