@@ -1305,7 +1305,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
 
 void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
     const uint64_t* table, ExpertDemand* demand, cudaStream_t stream,
-    cudaEvent_t before_demand, cudaEvent_t after_routed) {
+    cudaEvent_t before_demand, cudaEvent_t after_routed, bool resident_wave) {
   if (!sm12x_moe_ || tokens > decode_slots_ || !shared_lane_takes(true, tokens) ||
       shared_aside_takes(true, tokens) || !has_shared() || w_.shared_nvfp4())
     throw std::logic_error("GPU paging requires prepared b12x and the FP8 shared lane");
@@ -1338,8 +1338,9 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
   // The shared slots are disjoint from routed slots on both execution paths.
   route(hidden, tokens, stream, d_router_counters_);
   if (before_demand) DGPP_CUDA_OK(cudaEventRecord(before_demand, stream));
-  sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream);
+  sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream, resident_wave);
   sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream, table);
+  if (resident_wave) launch_expert_resident_gate(demand, stream);
   if (after_routed) DGPP_CUDA_OK(cudaEventRecord(after_routed, stream));
   DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
   launch_moe_slot_accum(out, d_slot_down_, d_weights_, tokens, H, K, stream);
@@ -1360,6 +1361,19 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
   std::vector<size_t> routed;
   for (const int e : active_experts) routed.push_back(cache_experts[static_cast<size_t>(e)]);
   const bool resident = cache.prepare_resident(routed);
+  // Keep cache observations, lease order and admission identical. Skip only
+  // the slots the graph already produced from its published pointers.
+  auto run_complete = [&](std::span<const int> group, const auto& addresses) {
+    std::vector<int> remaining;
+    if (ready && ready->executed_bindings) {
+      for (int id : group)
+        if (!ready->executed_bindings[id * 3]) remaining.push_back(id);
+      if (remaining.empty()) return;
+      group = remaining;
+    }
+    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, group);
+    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+  };
   std::vector<const uint8_t*> addresses(static_cast<size_t>(E), nullptr);
   auto shared = [&] {
     if (graph_finishes) return;
@@ -1391,13 +1405,13 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       if (j == 0) std::fill(addresses.begin(), addresses.end(), data);
       addresses[static_cast<size_t>(active_experts[j])] = data;
     }
-    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream);
     if (graph_finishes) {
-      // An admission may have prepared the whole set after the GPU found a miss.
-      sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+      // A complete cold layout can become executable while servicing the miss.
+      run_complete(active_experts, addresses);
       cache.release_native_leases(leases);
       return;
     }
+    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream);
     auto& binding = paged_bindings_[cache_experts.front()];
     if (binding.cache_identity != cache.binding_identity()) {
       for (auto& [rows, graph] : binding.decode_graphs) DGPP_CUDA_OK(cudaGraphExecDestroy(graph.exec));
@@ -1471,8 +1485,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       if (j == 0) std::fill(addresses.begin(), addresses.end(), data);
       addresses[static_cast<size_t>(complete_ids[j])] = data;
     }
-    sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, complete_ids);
-    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    run_complete(complete_ids, addresses);
     cache.release_native_leases(leases);
   }
   // Optional independent completion path; retain grouped baseline until a

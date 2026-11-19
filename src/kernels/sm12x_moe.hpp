@@ -34,7 +34,7 @@ class Sm12xMoe {
            float* slots, int rows, cudaStream_t stream, const uint64_t* bindings = nullptr,
            expert::ExpertProjection part = expert::ExpertProjection::kAll);
   void prepare_device(const uint64_t* table, const int32_t* ids,
-                      ExpertDemand* demand, int rows, cudaStream_t stream);
+                      ExpertDemand* demand, int rows, cudaStream_t stream, bool resident_wave = false);
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

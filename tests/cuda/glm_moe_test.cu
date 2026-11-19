@@ -3527,15 +3527,16 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
         DGPP_CUDA_OK(cudaMemcpyAsync(table,bindings.data(),bindings.size()*8,cudaMemcpyHostToDevice,service));
         DGPP_CUDA_OK(cudaStreamSynchronize(service));
       };
+      const bool resident_wave = std::getenv("DGPP_TEST_RESIDENT_WAVE") != nullptr;
       publish();
       *demand={};
       DGPP_CUDA_OK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-      layer.enqueue_paged_device(c.d_hidden,c.d_out,6,table,demand,stream);
+      layer.enqueue_paged_device(c.d_hidden,c.d_out,6,table,demand,stream,nullptr,nullptr,resident_wave);
       cudaGraph_t graph=nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream,&graph));
       cudaGraphExec_t exec=nullptr;
       DGPP_CUDA_OK(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-      for (int pass=0;pass<4;++pass) {
+      for (int pass=0;pass<5;++pass) {
         if (pass==3) {
           for (int j=0;j<6*H;++j) c.d_hidden[j]=float_to_bf16_bits(-bf16_bits_to_float(c.d_hidden[j]));
           layer.enqueue_paged(c.d_hidden,c.d_out,6,hot,mapping,stream);
@@ -3549,17 +3550,34 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
           demand->pending_layer=signal;
           demand->layer_plus_one=7;
         }
-        if (pass==1 || pass==3) DGPP_CUDA_OK(cudaMemsetAsync(table,0,E*6*sizeof(uint64_t),stream));
+        const bool partial = pass == 3;
+        const bool all_missing = pass == 1 || pass == 4;
+        if (partial || all_missing) {
+          if (all_missing) std::fill(bindings.begin(), bindings.end(), 0);
+          else bindings[3*layer.last_ids().front()] = 0;
+          DGPP_CUDA_OK(cudaMemcpyAsync(table,bindings.data(),bindings.size()*sizeof(uint64_t),
+                                       cudaMemcpyHostToDevice,stream));
+        }
         hot.set_execution_context(service);
         DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
         DGPP_CUDA_OK(cudaEventRecord(done,stream));
         for (;;) {
           if (pass>=2 ? __atomic_load_n(signal,__ATOMIC_ACQUIRE)==7
                       : __atomic_load_n(&demand->request,__ATOMIC_ACQUIRE)==1) {
-            auto& selected_cache = (pass==1 || pass==3) ? *cold : hot;
+            auto& selected_cache = all_missing ? *cold : hot;
             const auto ids=std::span<const int32_t>(demand->ids,6*6);
             selected_cache.prime_demand(ids,mapping);
-            const dgpp::GlmMoeLayer::ReadyRoutes ready{ids,layer.decode_ids(),layer.decode_weights()};
+            if (resident_wave) {
+              while (!__atomic_load_n(&demand->resident_done, __ATOMIC_ACQUIRE)) {
+                const auto status = cudaEventQuery(done);
+                if (status != cudaErrorNotReady) DGPP_CUDA_OK(status);
+              }
+              const auto bound = std::count_if(ids.begin(),ids.end(),[&](int id){return bindings[id*3] != 0;});
+              require(partial ? bound > 0 && bound < ids.size() : bound == 0,
+                      "service observes the same injected misses as the graph");
+            }
+            const dgpp::GlmMoeLayer::ReadyRoutes ready{ids,layer.decode_ids(),layer.decode_weights(),
+                nullptr,resident_wave ? bindings.data() : nullptr};
             layer.enqueue_paged(c.d_hidden,c.d_out,6,selected_cache,mapping,service,
                                 dgpp::MoeExpertKernel::kGemv,nullptr,&ready);
             require(layer.last_weights().empty(),"supplied routes clear stale host weight diagnostics");
@@ -3576,7 +3594,7 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
         std::memcpy(got.data(),c.d_out,got.size()*2);
         require(got==expected,"GPU resident/miss graph and CPU path are bitwise identical");
         if (pass==0 || pass==2) require(!demand->serviced,"resident graph needs no host service");
-        if (pass==1 || pass==3) require(demand->serviced,"missing/changed routes take the supplied-route service path");
+        if (all_missing || partial) require(demand->serviced,"missing/changed routes take the supplied-route service path");
         if (pass==1) require(cold->telemetry().file.calls > 0,"GPU demand service performs actual cold reads");
       }
       // Restore the fixture's original inputs and reference for later cases.
@@ -3735,22 +3753,27 @@ DGPP_TEST(moe_b12x_graph_route_packet_matches_host_order) {
         ids[i] = one_expert ? 17 : i % top_k == 0 ? i / top_k : experts - i % top_k;
         groups[ids[i]].push_back(i);
       }
-      dgpp::launch_expert_route_packet(packet, table, ids, demand, rows, nullptr);
-      DGPP_CUDA_OK(cudaDeviceSynchronize());
-      require(!demand->request && !demand->serviced &&
-              std::equal(ids, ids + rows * top_k, demand->ids), "hit mailbox preserves every route");
-      int tiles = 0;
-      for (int e = 0; e < experts; ++e) {
-        const auto& group = groups[e];
-        for (size_t first = 0; first < group.size(); first += block, ++tiles) {
-          require(packet[slots * block + tiles] == e, "ordered expert tile");
-          for (size_t j = 0; j < block; ++j) {
-            const int expect = first + j < group.size() ? group[first + j] : rows * top_k;
-            require(packet[tiles * block + j] == expect, "stable routed slot or padding");
+      for (bool mask_missing : {false,true}) {
+        *demand = {};
+        table[3*ids[0]] = mask_missing ? 0 : 1;
+        dgpp::launch_expert_route_packet(packet, table, ids, demand, rows, nullptr, mask_missing);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        require(bool(demand->request) == mask_missing && bool(demand->serviced) == mask_missing &&
+                std::equal(ids, ids + rows * top_k, demand->ids), "mailbox preserves every route");
+        int tiles = 0;
+        for (int e = 0; e < experts; ++e) {
+          const auto& group = groups[e];
+          for (size_t first = 0; first < group.size(); first += block, ++tiles) {
+            require(packet[slots * block + tiles] == (table[3*e] ? e : -1), "ordered expert tile");
+            for (size_t j = 0; j < block; ++j) {
+              const int expect = table[3*e] && first + j < group.size() ? group[first + j] : rows * top_k;
+              require(packet[tiles * block + j] == expect, "stable routed slot or padding");
+            }
           }
         }
+        require(packet[slots * (block + 1)] == tiles * block, "live packet length");
+        table[3*ids[0]] = 1;
       }
-      require(packet[slots * (block + 1)] == tiles * block, "live packet length");
     }
   }
   DGPP_CUDA_OK(cudaFreeHost(demand));

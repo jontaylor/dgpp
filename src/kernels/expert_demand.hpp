@@ -13,10 +13,12 @@ struct alignas(64) ExpertDemand {
   // The layer-local request still carries the host's completion or abort.
   uint32_t* pending_layer = nullptr;
   uint32_t layer_plus_one = 0;
+  uint32_t resident_done = 0;  // GPU releases the published bindings after its resident wave
 };
 // Opt-in graph-compatible diagnostic; timestamps use the GPU nanosecond clock.
 void launch_expert_layer_stamp(uint64_t* stamp, cudaStream_t stream);
 void launch_expert_route_packet(int32_t* routes, const uint64_t* table,
                                const int32_t* ids, ExpertDemand* demand,
-                               int rows, cudaStream_t stream);
+                               int rows, cudaStream_t stream, bool resident_wave = false);
+void launch_expert_resident_gate(ExpertDemand* demand, cudaStream_t stream);
 }  // namespace dgpp

@@ -188,9 +188,9 @@ struct Sm12xMoe::Impl {
 Sm12xMoe::Sm12xMoe(int group, bool mx_nibbles) : impl_(std::make_unique<Impl>(group, mx_nibbles)) { impl_->initialize(); }
 Sm12xMoe::~Sm12xMoe() = default;
 void Sm12xMoe::prepare_device(const uint64_t* table, const int32_t* ids,
-                            ExpertDemand* demand, int rows, cudaStream_t stream) {
+                            ExpertDemand* demand, int rows, cudaStream_t stream, bool resident_wave) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x device route row count");
-  launch_expert_route_packet(reinterpret_cast<int32_t*>(impl_->packet + E*6*sizeof(uint64_t)), table, ids, demand, rows, stream);
+  launch_expert_route_packet(reinterpret_cast<int32_t*>(impl_->packet + E*6*sizeof(uint64_t)), table, ids, demand, rows, stream, resident_wave);
 }
 void Sm12xMoe::prepare(std::span<const int32_t> ids,
     std::span<const uint8_t* const> addresses, int rows, cudaStream_t stream,
@@ -301,7 +301,7 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
 }
 #else
 struct Sm12xMoe::Impl {};
-void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, ExpertDemand*, int, cudaStream_t) {
+void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, ExpertDemand*, int, cudaStream_t, bool) {
   throw std::logic_error("b12x AOT is unavailable");
 }
 Sm12xMoe::Sm12xMoe(int, bool) { throw std::logic_error("b12x AOT is unavailable"); }

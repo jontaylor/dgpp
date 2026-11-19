@@ -127,6 +127,7 @@ class GlmMoeLayer {
     const int32_t* device_ids;
     const float* device_weights;
     expert::ProjectionReads* projections = nullptr;
+    const uint64_t* executed_bindings = nullptr;  // frozen layer table used by the GPU's completed wave
   };
   void enqueue_paged(const uint16_t* hidden, uint16_t* out, int tokens,
                      expert::ExpertCache& cache, std::span<const size_t> cache_experts,
@@ -136,7 +137,7 @@ class GlmMoeLayer {
   // the engine services it on a separate stream before the GPU continues.
   void enqueue_paged_device(const uint16_t* hidden, uint16_t* out, int tokens,
                             const uint64_t* table, ExpertDemand* demand, cudaStream_t stream,
-                            cudaEvent_t before_demand = nullptr, cudaEvent_t after_routed = nullptr);
+                            cudaEvent_t before_demand = nullptr, cudaEvent_t after_routed = nullptr, bool resident_wave = false);
   // The host path with the fp32 chain handed back UNROUNDED (out
   // [tokens, hidden] f32) — the Qwen MoE continues it with its BF16 shared
   // expert and rounds once after (models/qwen/moe_layer.hpp).

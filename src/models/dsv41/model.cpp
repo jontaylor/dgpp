@@ -65,6 +65,7 @@ struct Dsv41Model::PagedGraphs {
   std::vector<int> changed_layers;
   bool profile_publish = false;
   bool bulk_publish = true;
+  bool gpu_resident_wave = false;
   uint64_t publish_calls = 0, publish_build_ns = 0, publish_transfer_wait_ns = 0;
   uint64_t publish_bytes = 0, profiled_walk_ns = 0;
   uint64_t* layer_stamps = nullptr;
@@ -1995,7 +1996,7 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     moe_->enqueue_paged_device(x_, ffn_out, T, p.tables + layer * PagedGraphs::words,
                               p.demands + layer, stream_,
                               early && early->attention_lookahead == 1 ? early->next_attention_window : nullptr,
-                              early && early->attention_lookahead == 2 ? early->next_attention_window : nullptr);
+                              early && early->attention_lookahead == 2 ? early->next_attention_window : nullptr, p.gpu_resident_wave);
   } else if (expert_cache_ && !(draft && cfg_.runtime_resident_draft_experts)) {
     if (rows.capture) throw std::logic_error("Dsv41Model: expert paging cannot execute in a captured walk");
     auto& moe = draft ? *draft_moe_ : *moe_;
@@ -2046,7 +2047,14 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
 }
 
 bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_tail) {
-  if (!paged_graphs_) paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers, rank_);
+  if (!paged_graphs_) {
+    paged_graphs_ = std::make_unique<PagedGraphs>(cfg_.num_hidden_layers, rank_);
+    const char* flag = std::getenv("DGPP_EXPERT_GPU_RESIDENT_WAVE");
+    paged_graphs_->gpu_resident_wave = flag && flag[0] == '1' &&
+        expert_cache_->memory().mx_packed_scales() && !sm12x_projection_mode();
+    if (paged_graphs_->gpu_resident_wave)
+      DGPP_LOG_INFO("dsv41 GPU paging: execute published experts while demanded records are in flight");
+  }
   auto& p = *paged_graphs_;
   const std::array<uint64_t,7> key{static_cast<uint64_t>(T), static_cast<uint64_t>(rows.num_requests),
       static_cast<uint64_t>(rows.snapshots), reinterpret_cast<uintptr_t>(rows.req_ids),
@@ -2173,11 +2181,25 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
         }
         if (early && split.tickets.empty()) (void)expert_cache_->prime_demand(selected, expert_cache_map_[l]);
         account(l);
+        // Reads into staging can overlap the graph wave. Wait for its last
+        // weight and slot access before service reuses the packet or admits
+        // an expert into a slot that the graph might still be reading.
+        if (p.gpu_resident_wave) {
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+          while (!__atomic_load_n(&demand.resident_done, __ATOMIC_ACQUIRE)) {
+            const auto status = cudaEventQuery(p.done);
+            if (status != cudaErrorNotReady) DGPP_CUDA_OK(status);
+            if (std::chrono::steady_clock::now() >= deadline)
+              throw std::runtime_error("GPU paging: resident wave did not complete");
+            std::this_thread::yield();
+          }
+        }
         // The graph started the shared expert before routing. Fill only its
         // routed slots here, then release the gate for the ordered sum.
         moe_->rebind(moe_view(loader_.load_layer(l).moe));
         const GlmMoeLayer::ReadyRoutes ready{selected, g.route_ids, g.route_weights,
-            split.tickets.empty() ? nullptr : &split};
+            split.tickets.empty() ? nullptr : &split,
+            p.gpu_resident_wave ? p.host_tables + l * PagedGraphs::words : nullptr};
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
                             p.service, MoeExpertKernel::kGemv, nullptr, &ready);
         if (ready.projections) { ++p.projection_waves; p.projection_pending += split.down_pending_at_gate; }
