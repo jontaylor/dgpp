@@ -71,6 +71,29 @@ __global__ __launch_bounds__(kThreads) void l2_prefetch_kernel(const uint4* p, s
   if (fold == g_prefetch_sink[0] + 0x9E3779B9u) g_prefetch_sink[1] = fold;
 }
 
+// One compulsory four-byte load for each 32-byte sector. The first sector
+// may start half a sector into an allocation; all sampled words stay inside
+// the caller's vector span. Independent loads preserve memory-level parallelism.
+__global__ __launch_bounds__(kThreads) void l2_prefetch_sectors_kernel(
+    const uint32_t* words, size_t sectors, unsigned first_word) {
+  dgpp_pdl_wait();
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint32_t fold = 0;
+  for (; i + (kLightUnroll-1) * stride < sectors; i += kLightUnroll * stride) {
+    uint32_t values[kLightUnroll];
+#pragma unroll
+    for (int j = 0; j < kLightUnroll; ++j) {
+      const size_t sector = i + j*stride;
+      values[j] = __ldcg(words + (sector ? sector*8-first_word : 0));
+    }
+#pragma unroll
+    for (int j = 0; j < kLightUnroll; ++j) fold ^= values[j];
+  }
+  for (; i < sectors; i += stride) fold ^= __ldcg(words + (i ? i*8-first_word : 0));
+  if (fold == g_prefetch_sink[0] + 0x9E3779B9u) g_prefetch_sink[1] = fold;
+}
+
 // Every warp traverses the same list in consumption order. A disjoint tensor
 // starts a new coalesced span without draining and relaunching the whole grid.
 __global__ __launch_bounds__(kThreads) void l2_prefetch_spans_kernel(const __grid_constant__ L2PrefetchSpans batch) {
@@ -170,8 +193,9 @@ L2PrefetchForm l2_prefetch_form(const std::string& name) {
   if (name == "lines") return L2PrefetchForm::Lines;
   if (name == "touch") return L2PrefetchForm::Touch;
   if (name == "ranges") return L2PrefetchForm::Ranges;
+  if (name == "sectors") return L2PrefetchForm::Sectors;
   if (name == "bulk") return L2PrefetchForm::Bulk;
-  throw std::invalid_argument("l2 prefetch form: load, lines, touch, ranges or bulk (got '" + name + "')");
+  throw std::invalid_argument("l2 prefetch form: load, lines, touch, ranges, sectors or bulk (got '" + name + "')");
 }
 L2FullForm l2_prefetch_full_form(const std::string& name) {
   if (name == "16x8") return L2FullForm::Narrow16x8;
@@ -268,6 +292,11 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
       l2_prefetch_kernel<kWideUnroll><<<kWideBlocks, kThreads, 0, stream>>>(p, vecs);
     else
       l2_prefetch_kernel<kNarrowUnroll><<<kNarrowBlocks, kThreads, 0, stream>>>(p, vecs);
+  } else if (g_l2_settings.form == L2PrefetchForm::Sectors) {
+    const unsigned first = (reinterpret_cast<uintptr_t>(p) % 32) / sizeof(uint32_t);
+    const size_t sectors = (vecs*4 + first + 7)/8;
+    l2_prefetch_sectors_kernel<<<light_blocks(), kThreads, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(p), sectors, first);
   } else if (g_l2_settings.form == L2PrefetchForm::Bulk) {
     constexpr unsigned warp_vectors = 32 * kBulkVectors;
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>(light_blocks(), (vecs + warp_vectors - 1) / warp_vectors));
