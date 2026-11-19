@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include <cuda_bf16.h>
@@ -61,7 +62,7 @@ __device__ __forceinline__ float sqrt_softplus_acc(float x) {
   const float sp = x > 20.f ? x : log1pf(expf(x));
   return sqrtf(sp);
 }
-template <int kMode>
+template <int kMode, int Rows>
 __device__ __forceinline__ void router_dot(const uint16_t* __restrict__ hidden,
                                            const uint16_t* __restrict__ gate,
                                            const float* __restrict__ bias,
@@ -83,7 +84,7 @@ __device__ __forceinline__ void router_select_warp(
 // separate select launch (5 us + a graph gap per MoE layer) disappears.
 // The fence/ticket order is the mHC finish's: a block fences its scores
 // before its ticket; the last block fences again before reading them.
-template <int kMode>
+template <int kMode, int Rows = 1>
 __global__ void moe_router_dots_kernel(const uint16_t* __restrict__ hidden,
                                        const uint16_t* __restrict__ gate,
                                        const float* __restrict__ bias,
@@ -101,10 +102,10 @@ __global__ void moe_router_dots_kernel(const uint16_t* __restrict__ hidden,
   __shared__ int s_last;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int e = blockIdx.x * kRouterDotWarps + warp;
-  const int token = blockIdx.y;
+  const int token = blockIdx.y * Rows;
   if (token >= tokens) return;
   if (e < n_experts)
-    router_dot<kMode>(hidden, gate, bias, scores, biased, token, e,
+    router_dot<kMode, Rows>(hidden, gate, bias, scores, biased, token, e,
                          hidden_dim, n_experts, vector_loads, lane);
   if (sel_ids == nullptr) return;
   __syncthreads();  // every warp's score is written
@@ -121,26 +122,24 @@ __global__ void moe_router_dots_kernel(const uint16_t* __restrict__ hidden,
   // warp 0's own strided __ldcg loop was 16 dependent L2 round trips per
   // lane at E = 512 — the router's 21.7 us was half select); the values
   // are the same bytes, so the select is unchanged.
-  {
-    const size_t row = static_cast<size_t>(token) * n_experts;
-    float* s_scores = sel_smem;
-    float* s_biased = sel_smem + n_experts;
-    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
-      s_scores[e] = __ldcg(scores + row + e);
-      s_biased[e] = __ldcg(biased + row + e);
-    }
+  const size_t first = static_cast<size_t>(token) * n_experts;
+  const int entries = n_experts * Rows;
+  float* s_biased = sel_smem + entries;
+  for (int idx = threadIdx.x; idx < entries; idx += blockDim.x) {
+    sel_smem[idx] = __ldcg(scores + first + idx);
+    s_biased[idx] = __ldcg(biased + first + idx);
   }
   __syncthreads();
-  if (warp != 0) return;
-  router_select_warp<kMode>(scores, biased, sel_ids, sel_weights, token,
-                               n_experts, top_k, routed_scaling_factor,
-                               norm_topk, sel_smem, sel_smem + n_experts, lane,
-                               /*staged=*/true);
+  if (warp >= Rows) return;
+  router_select_warp<kMode>(scores, biased, sel_ids, sel_weights, token + warp,
+                            n_experts, top_k, routed_scaling_factor, norm_topk,
+                            sel_smem + warp * n_experts, s_biased + warp * n_experts,
+                            lane, /*staged=*/true);
 }
 
 // One warp's dot for (token, expert e): sigmoid(dot) and the biased copy
 // (the softmax mode: the bf16-rounded logit in both rows).
-template <int kMode>
+template <int kMode, int Rows>
 __device__ __forceinline__ void router_dot(const uint16_t* __restrict__ hidden,
                                            const uint16_t* __restrict__ gate,
                                            const float* __restrict__ bias,
@@ -152,47 +151,48 @@ __device__ __forceinline__ void router_dot(const uint16_t* __restrict__ hidden,
   const uint16_t* x = hidden + static_cast<size_t>(token) * hidden_dim;
   const uint16_t* w = gate + static_cast<size_t>(e) * hidden_dim;
 
-  float dot = 0.f;
-  if (vector_loads) {
-    // 16-byte vectors: the launcher verified 16B alignment of both bases
-    // and hidden_dim % 8 == 0 (row strides stay aligned).
-    const uint4* xv = reinterpret_cast<const uint4*>(x);
-    const uint4* wv = reinterpret_cast<const uint4*>(w);
+  float dots[Rows]{};
+  if (Rows > 1 || vector_loads) {
     const int vecs = hidden_dim / 8;
 #pragma unroll 4
     for (int v = lane; v < vecs; v += 32) {
-      const uint4 xq = xv[v];
-      const uint4 wq = wv[v];
-      const uint32_t xw[4] = {xq.x, xq.y, xq.z, xq.w};
+      const uint4 wq = reinterpret_cast<const uint4*>(w)[v];
       const uint32_t ww[4] = {wq.x, wq.y, wq.z, wq.w};
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        dot = __fmaf_rn(bf16_bits_to_float(static_cast<uint16_t>(xw[i] & 0xFFFFu)),
-                        bf16_bits_to_float(static_cast<uint16_t>(ww[i] & 0xFFFFu)),
-                        dot);
-        dot = __fmaf_rn(bf16_bits_to_float(static_cast<uint16_t>(xw[i] >> 16)),
-                        bf16_bits_to_float(static_cast<uint16_t>(ww[i] >> 16)),
-                        dot);
+      for (int row = 0; row < Rows; ++row) {
+        const uint4 xq = reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * hidden_dim)[v];
+        const uint32_t xw[4] = {xq.x, xq.y, xq.z, xq.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          dots[row] = __fmaf_rn(bf16_bits_to_float(static_cast<uint16_t>(xw[i])),
+                                bf16_bits_to_float(static_cast<uint16_t>(ww[i])), dots[row]);
+          dots[row] = __fmaf_rn(bf16_bits_to_float(static_cast<uint16_t>(xw[i] >> 16)),
+                                bf16_bits_to_float(static_cast<uint16_t>(ww[i] >> 16)), dots[row]);
+        }
       }
     }
   } else {
     for (int k = lane; k < hidden_dim; k += 32)
-      dot = __fmaf_rn(bf16_bits_to_float(x[k]), bf16_bits_to_float(w[k]), dot);
+      dots[0] = __fmaf_rn(bf16_bits_to_float(x[k]), bf16_bits_to_float(w[k]), dots[0]);
   }
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
-  if (lane != 0) return;
-  const size_t at = static_cast<size_t>(token) * n_experts + e;
-  if constexpr (kMode == kRouterSoftmax) {
-    const float l = bf16_bits_to_float(float_to_bf16_bits(dot));
-    scores[at] = l;
-    biased[at] = l;
-  } else {
-    const float s = kMode == kRouterSqrtSoftplus ? sqrt_softplus_acc(dot)
-                                                 : 1.0f / (1.0f + expf(-dot));
-    scores[at] = s;
-    biased[at] = s + bias[e];
+  for (int row = 0; row < Rows; ++row) {
+    float dot = dots[row];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+    if (lane == 0) {
+      const size_t at = static_cast<size_t>(token + row) * n_experts + e;
+      if constexpr (kMode == kRouterSoftmax) {
+        const float l = bf16_bits_to_float(float_to_bf16_bits(dot));
+        scores[at] = l;
+        biased[at] = l;
+      } else {
+        const float score = kMode == kRouterSqrtSoftplus ? sqrt_softplus_acc(dot) : sigmoidf_acc(dot);
+        scores[at] = score;
+        biased[at] = score + bias[e];
+      }
+    }
   }
 }
 
@@ -888,6 +888,30 @@ void launch_router_mode(const uint16_t* hidden, const uint16_t* gate,
       static_cast<unsigned>(tokens));
   const size_t sel_smem = 2 * static_cast<size_t>(cfg.n_experts) * sizeof(float);
   if (counters != nullptr) {
+    // On the four-row TP2 verifier a warp can reuse each gate vector across
+    // rows. The per-row FMA order and warp reduction are identical. One
+    // ticket per row group elects the block that selects all of its rows.
+    if constexpr (kMode == kRouterSqrtSoftplus) {
+      if (allow_tiled && vector_loads && tokens == 4 && cfg.n_experts == 384) {
+        static const int group = [] {
+          const char* flag = std::getenv("DGPP_EXPERT_ROUTER_ROWS");
+          if (!flag || std::string_view(flag) == "1") return 1;
+          if (std::string_view(flag) == "2") return 2;
+          if (std::string_view(flag) == "4") return 4;
+          throw std::invalid_argument("DGPP_EXPERT_ROUTER_ROWS must be 1, 2 or 4");
+        }();
+        auto launch = [&]<int Rows>() {
+          const dim3 grid(dots_grid.x, tokens / Rows);
+          moe_router_dots_kernel<kMode, Rows><<<grid, kRouterDotThreads, Rows * sel_smem, stream>>>(
+              hidden, gate, bias, scores, biased, tokens, cfg.hidden, cfg.n_experts,
+              vector_loads, ids, weights, cfg.top_k, cfg.routed_scaling_factor,
+              cfg.norm_topk_prob ? 1 : 0, counters);
+          DGPP_CUDA_OK(cudaGetLastError());
+        };
+        if (group == 2) return launch.template operator()<2>();
+        if (group == 4) return launch.template operator()<4>();
+      }
+    }
     // Fused: the last dots block per token selects.
     moe_router_dots_kernel<kMode><<<dots_grid, kRouterDotThreads, sel_smem, stream>>>(
         hidden, gate, bias, scores, biased, tokens, cfg.hidden, cfg.n_experts,

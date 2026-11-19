@@ -1501,7 +1501,7 @@ DGPP_TEST(moe_router_matches_oracle_real_geometry) {
   sp.top_k = 6;
   sp.hidden = 5120;
   sp.routed_scaling_factor = 1.5f;
-  for (int tokens : {1, 5, 70}) check_router(sp, tokens, 0x5A5A + tokens);
+  for (int tokens : {1, 4, 5, 70}) check_router(sp, tokens, 0x5A5A + tokens);
 }
 
 DGPP_TEST(moe_router_ties_break_to_lower_expert_id) {
