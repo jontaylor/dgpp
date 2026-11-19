@@ -200,7 +200,7 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   auto& c = *impl_;
   if (c.uploaded) DGPP_CUDA_OK(cudaEventSynchronize(c.upload));
   auto* table = reinterpret_cast<uint64_t*>(c.host);
-  for (int e = 0; e < E; ++e) {
+  auto bind = [&](int e) {
     if (!addresses[e]) throw std::invalid_argument("b12x MoE: missing prepared expert binding");
     const auto p = moe_fp4_packed_view(const_cast<uint8_t*>(addresses[e]), H, I, c.group, c.mx_nibbles);
     table[e*3] = reinterpret_cast<uintptr_t>(p.w13);
@@ -209,24 +209,16 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
     table[E*3+e*3] = reinterpret_cast<uintptr_t>(p.w2);
     table[E*3+e*3+1] = reinterpret_cast<uintptr_t>(p.s2);
     table[E*3+e*3+2] = reinterpret_cast<uintptr_t>(p.g2);
-  }
+  };
   auto* routes = reinterpret_cast<int32_t*>(c.host + E*6*sizeof(uint64_t));
   auto* experts = routes + M*K*B;
   auto* count = experts + M*K;
-  std::fill_n(routes, M*K*B, rows*K);
-  std::fill_n(experts, M*K, 0);
-  std::array<std::vector<int32_t>,E> groups;
   std::array<bool,E> execute;
   execute.fill(execute_experts.empty());
   for (const int e : execute_experts) {
     if (e < 0 || e >= E) throw std::invalid_argument("b12x MoE: invalid wave expert ID");
     execute[e] = true;
   }
-  for (int j = 0; j < rows*K; ++j) {
-    if (ids[j] < 0 || ids[j] >= E) throw std::invalid_argument("b12x MoE: invalid expert ID");
-    groups[ids[j]].push_back(j);
-  }
-  int blocks = 0;
   static const bool skip_masked_tiles = [] {
     const char* flag = std::getenv("DGPP_EXPERT_SKIP_MASKED_TILES");
     return flag && flag[0] == '1';
@@ -235,14 +227,53 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   // in the schedule so the split-K slices of every active tile stay identical.
   // The optional singleton partition uses original expert IDs even on masked tiles.
   const bool skip = skip_masked_tiles && !(c.reused && rows == 4);
-  for (int e = 0; e < E; ++e)
-    for (size_t begin = 0; begin < groups[e].size(); begin += B) {
-      experts[blocks] = skip && !execute[e] ? -1 : e;
-      if (execute[e])
-        for (int j = 0; j < B && begin+j < groups[e].size(); ++j)
-          routes[blocks*B+j] = groups[e][begin+j];
-      ++blocks;
+  static const bool small_packet = [] {
+    const char* value = std::getenv("DGPP_EXPERT_SMALL_HOST_PACKET");
+    return value && value[0] == '1';
+  }();
+  int blocks = 0;
+  if (small_packet && rows <= 8) {
+    // The AOT reads only the sorted live tiles. Bind just their experts,
+    // including the fallback binding used for masked tiles. Encode the slot
+    // in the low bits to preserve stable order across repeated expert IDs.
+    constexpr int max_slots = 8*K;
+    std::array<int, max_slots> keys;
+    const int n = rows*K;
+    for (int j = 0; j < n; ++j) {
+      if (ids[j] < 0 || ids[j] >= E) throw std::invalid_argument("b12x MoE: invalid expert ID");
+      keys[j] = ids[j]*max_slots + j;
     }
+    std::sort(keys.begin(), keys.begin()+n);
+    for (int j = 0; j < n;) {
+      const int e = keys[j]/max_slots;
+      bind(e);
+      do {
+        experts[blocks] = skip && !execute[e] ? -1 : e;
+        auto* tile = routes + blocks*B;
+        std::fill_n(tile, B, n);
+        for (int pos = 0; pos < B && j < n && keys[j]/max_slots == e; ++j, ++pos)
+          if (execute[e]) tile[pos] = keys[j]%max_slots;
+        ++blocks;
+      } while (j < n && keys[j]/max_slots == e);
+    }
+  } else {
+    for (int e = 0; e < E; ++e) bind(e);
+    std::fill_n(routes, M*K*B, rows*K);
+    std::fill_n(experts, M*K, 0);
+    std::array<std::vector<int32_t>,E> groups;
+    for (int j = 0; j < rows*K; ++j) {
+      if (ids[j] < 0 || ids[j] >= E) throw std::invalid_argument("b12x MoE: invalid expert ID");
+      groups[ids[j]].push_back(j);
+    }
+    for (int e = 0; e < E; ++e)
+      for (size_t begin = 0; begin < groups[e].size(); begin += B) {
+        experts[blocks] = skip && !execute[e] ? -1 : e;
+        if (execute[e])
+          for (int j = 0; j < B && begin+j < groups[e].size(); ++j)
+            routes[blocks*B+j] = groups[e][begin+j];
+        ++blocks;
+      }
+  }
   *count = blocks*B;
   DGPP_CUDA_OK(cudaMemcpyAsync(c.packet, c.host, kPacket, cudaMemcpyHostToDevice, stream));
   DGPP_CUDA_OK(cudaEventRecord(c.upload, stream));
