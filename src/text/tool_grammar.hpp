@@ -253,8 +253,8 @@ class GrammarState {
   GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
                bool prompt_opens_thinking, bool model_may_open_thinking = false);
 
-  bool active() const { return vocab_ != nullptr && spec_.active() && !dead_; }
-  const GrammarSpec& spec() const { return spec_; }
+  bool active() const { return vocab_ != nullptr && spec().active() && !dead_; }
+  const GrammarSpec& spec() const { return definition_->spec; }
 
   // The mask for the next position. An unconstrained position (a free
   // state with nothing forbidden, or an inactive grammar) leaves
@@ -368,11 +368,17 @@ class GrammarState {
   std::vector<int64_t> match_ids(const TextMatch& m, int64_t closer) const;
 
   const GrammarVocab* vocab_ = nullptr;
-  GrammarSpec spec_;
+  // Draft and verification cursors branch independently while sharing the
+  // request's tool definitions and compiled argument schemas.
+  struct Definition {
+    GrammarSpec spec;
+    std::vector<std::vector<std::shared_ptr<const JsonSchema>>> arg_schemas;
+  };
+  std::shared_ptr<const Definition> definition_;
   State state_ = State::kTop;
   bool dead_ = false;
   int calls_ = 0;          // calls closed so far
-  int tool_ = -1;          // the open call's tool (index into spec_.tools)
+  int tool_ = -1;          // the open call's tool (index into spec().tools)
   TextMatch match_;        // kName / kKey / a kText value
   std::string key_;        // the open argument's key (kAfterKey / kValue)
   std::string term_;       // kQValue / kDValue (JSON, or a free DSML value past its "</" tag): the terminator emitted so far
@@ -385,9 +391,6 @@ class GrammarState {
   JsonMachine value_json_; // a kJson argument's machine
   // Immutable when shared by speculative copies; advance detaches its cursor.
   std::shared_ptr<MiniMaxToolGrammar> minimax_;
-  // The compiled schemas of every kJson argument, [tool][arg] (null
-  // where the argument is not kJson).
-  std::vector<std::vector<std::shared_ptr<const JsonSchema>>> arg_schemas_;
 };
 
 }  // namespace dgpp::text

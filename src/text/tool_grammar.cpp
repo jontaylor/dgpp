@@ -293,23 +293,26 @@ GrammarTool grammar_tool_from_function(const minijson::Value& def,
 // GrammarState
 // ---------------------------------------------------------------------------
 
-GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
+GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec request,
                            bool prompt_opens_thinking, bool model_may_open_thinking)
-    : vocab_(vocab), spec_(std::move(spec)) {
-  if (!spec_.active()) return;
+    : vocab_(vocab) {
+  auto definition = std::make_shared<Definition>();
+  definition->spec = std::move(request);
+  definition_ = definition;
+  if (!spec().active()) return;
   think_openable_ = model_may_open_thinking && !prompt_opens_thinking && vocab_ != nullptr &&
                     vocab_->markers().think_open.available() && vocab_->markers().think_close.available();
-  if (spec_.has_json()) {
+  if (spec().has_json()) {
     if (vocab_ == nullptr || vocab_->eos_ids().empty())
       throw std::invalid_argument(
           "GrammarState: a JSON grammar needs a vocabulary with an EOS id");
     std::shared_ptr<const JsonSchema> schema;
-    if (spec_.json_schema.empty()) {
+    if (spec().json_schema.empty()) {
       schema = std::make_shared<const JsonSchema>(json_object_schema());
     } else {
       minijson::ParseResult parsed;
       try {
-        parsed = minijson::parse(spec_.json_schema);
+        parsed = minijson::parse(spec().json_schema);
       } catch (const std::exception& e) {
         throw std::invalid_argument(
             std::string("GrammarState: the JSON schema text does not parse: ") +
@@ -321,28 +324,28 @@ GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
     state_ = prompt_opens_thinking && vocab_->markers().think_close.available()
                  ? State::kThink
                  : State::kJsonBody;
-    if (spec_.mode == GrammarSpec::Mode::kJson) return;
+    if (spec().mode == GrammarSpec::Mode::kJson) return;
   }
   if (vocab_ == nullptr || !vocab_->usable())
     throw std::invalid_argument(
         "GrammarState: an active grammar needs a vocabulary with the "
         "tool-call markers and an EOS id");
-  if (spec_.mode == GrammarSpec::Mode::kNamed) {
+  if (spec().mode == GrammarSpec::Mode::kNamed) {
     bool found = false;
-    for (const GrammarTool& t : spec_.tools) found = found || t.name == spec_.named;
+    for (const GrammarTool& t : spec().tools) found = found || t.name == spec().named;
     if (!found)
       throw std::invalid_argument(
           "GrammarState: the named function is not among the tools");
   }
-  if ((spec_.mode == GrammarSpec::Mode::kRequired ||
-       spec_.mode == GrammarSpec::Mode::kNamed) &&
-      spec_.tools.empty())
+  if ((spec().mode == GrammarSpec::Mode::kRequired ||
+       spec().mode == GrammarSpec::Mode::kNamed) &&
+      spec().tools.empty())
     throw std::invalid_argument("GrammarState: a required call needs tools");
   // The typed arguments' schemas, compiled once per request.
-  arg_schemas_.resize(spec_.tools.size());
-  for (size_t t = 0; t < spec_.tools.size(); ++t) {
-    const GrammarTool& tool = spec_.tools[t];
-    arg_schemas_[t].resize(tool.args.size());
+  definition->arg_schemas.resize(spec().tools.size());
+  for (size_t t = 0; t < spec().tools.size(); ++t) {
+    const GrammarTool& tool = spec().tools[t];
+    definition->arg_schemas[t].resize(tool.args.size());
     for (size_t a = 0; a < tool.args.size(); ++a) {
       const GrammarArg& arg = tool.args[a];
       if (arg.kind != GrammarArg::Kind::kJson) continue;
@@ -358,14 +361,14 @@ GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
       // non-strict definition carries (a strict one passed the strict
       // compile at its definition; the value's type is what the mask uses).
       std::vector<std::string> unenforced;
-      arg_schemas_[t][a] = std::make_shared<const JsonSchema>(
+      definition->arg_schemas[t][a] = std::make_shared<const JsonSchema>(
           compile_json_schema(parsed.root, &unenforced));
     }
   }
   state_ = prompt_opens_thinking && vocab_->markers().think_close.available() ? State::kThink
                                                                               : State::kTop;
   if (vocab_->markers().tool_format() == ToolFormat::kMiniMax)
-    minimax_ = std::make_shared<MiniMaxToolGrammar>(vocab_, spec_);
+    minimax_ = std::make_shared<MiniMaxToolGrammar>(vocab_, spec());
 }
 
 const GrammarArg* GrammarState::current_arg() const {
@@ -492,8 +495,8 @@ bool GrammarState::compact_xml_text(const std::string& text) {
                                   match_.emitted.size() - std::strlen(xml_function_open()) - 1);
         tool_ = -1;
         used_keys_.clear();
-        for (size_t i = 0; i < spec_.tools.size(); ++i)
-          if (spec_.tools[i].name == name) tool_ = static_cast<int>(i);
+        for (size_t i = 0; i < spec().tools.size(); ++i)
+          if (spec().tools[i].name == name) tool_ = static_cast<int>(i);
         enter(State::kQKeyOrClose);
       } else if (match_.emitted == xml_function_end()) {
         enter(State::kQClose);
@@ -662,20 +665,20 @@ void GrammarState::free_mask_in_call(TokenMask* out) const {
 }
 
 bool GrammarState::obligation_open() const {
-  if (spec_.mode == GrammarSpec::Mode::kJson) return !json_.done();
-  if (spec_.mode == GrammarSpec::Mode::kJsonOrTools) return calls_ == 0 && !json_.done();
-  return (spec_.mode == GrammarSpec::Mode::kRequired ||
-          spec_.mode == GrammarSpec::Mode::kNamed) &&
+  if (spec().mode == GrammarSpec::Mode::kJson) return !json_.done();
+  if (spec().mode == GrammarSpec::Mode::kJsonOrTools) return calls_ == 0 && !json_.done();
+  return (spec().mode == GrammarSpec::Mode::kRequired ||
+          spec().mode == GrammarSpec::Mode::kNamed) &&
          calls_ == 0;
 }
 
 bool GrammarState::calls_remaining() const {
-  switch (spec_.mode) {
+  switch (spec().mode) {
     case GrammarSpec::Mode::kNone: return true;
     case GrammarSpec::Mode::kForbidCalls: return false;
-    case GrammarSpec::Mode::kAuto: return spec_.parallel || calls_ == 0;
-    case GrammarSpec::Mode::kJsonOrTools: return spec_.parallel || calls_ == 0;
-    case GrammarSpec::Mode::kRequired: return spec_.parallel || calls_ == 0;
+    case GrammarSpec::Mode::kAuto: return spec().parallel || calls_ == 0;
+    case GrammarSpec::Mode::kJsonOrTools: return spec().parallel || calls_ == 0;
+    case GrammarSpec::Mode::kRequired: return spec().parallel || calls_ == 0;
     case GrammarSpec::Mode::kNamed: return calls_ == 0;
     case GrammarSpec::Mode::kJson: return false;
   }
@@ -683,8 +686,8 @@ bool GrammarState::calls_remaining() const {
 }
 
 const GrammarTool* GrammarState::current_tool() const {
-  return tool_ >= 0 && tool_ < static_cast<int>(spec_.tools.size())
-             ? &spec_.tools[static_cast<size_t>(tool_)]
+  return tool_ >= 0 && tool_ < static_cast<int>(spec().tools.size())
+             ? &spec().tools[static_cast<size_t>(tool_)]
              : nullptr;
 }
 
@@ -711,7 +714,7 @@ bool GrammarState::call_closable() const {
 
 bool GrammarState::call_closable_for(const std::string& name) const {
   // At the name, before any key: closable unless a strict tool requires one.
-  for (const GrammarTool& t : spec_.tools)
+  for (const GrammarTool& t : spec().tools)
     if (t.name == name)
       return (!t.strict && !vocab_->markers().xml_compact) || t.required_keys.empty();
   return true;
@@ -722,10 +725,10 @@ void GrammarState::enter(State s) {
   match_ = TextMatch{};
   term_.clear();
   if (s == State::kQName) {
-    if (spec_.mode == GrammarSpec::Mode::kNamed) {
-      match_.targets.push_back(std::string(xml_function_open()) + spec_.named + xml_header_end());
+    if (spec().mode == GrammarSpec::Mode::kNamed) {
+      match_.targets.push_back(std::string(xml_function_open()) + spec().named + xml_header_end());
     } else {
-      for (const GrammarTool& t : spec_.tools)
+      for (const GrammarTool& t : spec().tools)
         match_.targets.push_back(std::string(xml_function_open()) + t.name + xml_header_end());
     }
     tool_ = -1;
@@ -747,10 +750,10 @@ void GrammarState::enter(State s) {
         if (!d.empty_invoke_close.empty() && call_closable_for(name))
           match_.targets.push_back(d.invoke_open + name + kDInvokeHeadEnd + d.empty_invoke_close);
       };
-      if (spec_.mode == GrammarSpec::Mode::kNamed) {
-        add(spec_.named);
+      if (spec().mode == GrammarSpec::Mode::kNamed) {
+        add(spec().named);
       } else {
-        for (const GrammarTool& t : spec_.tools) add(t.name);
+        for (const GrammarTool& t : spec().tools) add(t.name);
       }
     }
     if (s == State::kDInvokeOrClose) match_.targets.push_back(dsml_literals(vocab_).calls_close);
@@ -798,7 +801,7 @@ void GrammarState::enter(State s) {
       for (const std::string& text : a->texts) match_.targets.push_back(text + dsml_literals(vocab_).param_close);
     } else if (a != nullptr && a->kind == GrammarArg::Kind::kJson) {
       value_json_ = JsonMachine(
-          arg_schemas_[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
+          definition_->arg_schemas[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
           &vocab_->json_tables());
     }
     return;
@@ -825,16 +828,16 @@ void GrammarState::enter(State s) {
       for (const std::string& text : a->texts) match_.targets.push_back(text + xml_parameter_end());
     } else if (a != nullptr && a->kind == GrammarArg::Kind::kJson) {
       value_json_ = JsonMachine(
-          arg_schemas_[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
+          definition_->arg_schemas[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
           &vocab_->json_tables());
     }
     return;
   }
   if (s == State::kName) {
-    if (spec_.mode == GrammarSpec::Mode::kNamed) {
-      match_.targets.push_back(spec_.named);
+    if (spec().mode == GrammarSpec::Mode::kNamed) {
+      match_.targets.push_back(spec().named);
     } else {
-      for (const GrammarTool& t : spec_.tools) match_.targets.push_back(t.name);
+      for (const GrammarTool& t : spec().tools) match_.targets.push_back(t.name);
     }
     tool_ = -1;
   } else if (s == State::kKey) {
@@ -855,7 +858,7 @@ void GrammarState::enter(State s) {
       match_.targets = a->texts;
     } else if (a != nullptr && a->kind == GrammarArg::Kind::kJson) {
       value_json_ = JsonMachine(
-          arg_schemas_[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
+          definition_->arg_schemas[static_cast<size_t>(tool_)][static_cast<size_t>(arg_)],
           &vocab_->json_tables());
     }
   } else if (s == State::kTop) {
@@ -965,7 +968,7 @@ void GrammarState::mask(TokenMask* out) const {
   }
   if (minimax_ && state_ == State::kTop) {
     minimax_->mask(out);
-    if (spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started()) {
+    if (spec().mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started()) {
       TokenMask json;
       json_mask(json_, -1, &json);
       for (int id = 0; id < out->vocab; ++id)
@@ -984,7 +987,7 @@ void GrammarState::mask(TokenMask* out) const {
       free_mask(out, /*extra_allowed=*/-1, /*forbid_markers=*/false);
       return;
     case State::kTop: {
-      if (spec_.mode == GrammarSpec::Mode::kJsonOrTools) {
+      if (spec().mode == GrammarSpec::Mode::kJsonOrTools) {
         if (dsml() && top_lt_) {
           list_mask(out, {m.dsml.id});
           return;
@@ -1032,8 +1035,8 @@ void GrammarState::mask(TokenMask* out) const {
       // MiMo's compact dialect keeps it too: its template leaves the
       // opening to the model (it opens <think> itself), pinned by
       // tool_grammar_mimo_modelOpensThinkingAndStraddledTerminator.
-      const bool free_top = dsml() || spec_.mode == GrammarSpec::Mode::kAuto ||
-                            spec_.mode == GrammarSpec::Mode::kForbidCalls ||
+      const bool free_top = dsml() || spec().mode == GrammarSpec::Mode::kAuto ||
+                            spec().mode == GrammarSpec::Mode::kForbidCalls ||
                             (qwen() && (!obligation_open() || m.xml_compact));
       if (free_top) {
         // DSML: the text may carry on; the tag opens a block right after a
@@ -1232,7 +1235,7 @@ bool GrammarState::json_allows(const JsonMachine& machine, int64_t closer,
 }
 
 bool GrammarState::keys_possible_for(const std::string& name) const {
-  for (const GrammarTool& t : spec_.tools)
+  for (const GrammarTool& t : spec().tools)
     if (t.name == name) return !t.constrain_keys || !t.keys.empty();
   return true;
 }
@@ -1254,7 +1257,7 @@ bool GrammarState::allows(int64_t id) const {
   }
   if (minimax_ && state_ == State::kTop) {
     if (minimax_->allows(id)) return true;
-    return spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
+    return spec().mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
            json_allows(json_, -1, id);
   }
   if (state_ == State::kJsonBody) return json_allows(json_, -1, id);
@@ -1311,7 +1314,7 @@ void GrammarState::advance(int64_t id) {
     if (m.minimax_namespace.available() && id == m.think_close.id) return;
   }
   if (minimax_ && state_ == State::kTop) {
-    if (spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
+    if (spec().mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
         !minimax_->allows(id)) {
       state_ = State::kJsonBody;
       for (unsigned char byte : vocab_->text(id))
@@ -1334,7 +1337,7 @@ void GrammarState::advance(int64_t id) {
   switch (state_) {
     case State::kThink:
       if (id == m.think_close.id)
-        enter(spec_.mode == GrammarSpec::Mode::kJson ? State::kJsonBody
+        enter(spec().mode == GrammarSpec::Mode::kJson ? State::kJsonBody
                                                      : State::kTop);
       return;
     case State::kJsonBody:
@@ -1349,7 +1352,7 @@ void GrammarState::advance(int64_t id) {
         }
       return;
     case State::kTop:
-      if (spec_.mode == GrammarSpec::Mode::kJsonOrTools && calls_ == 0 &&
+      if (spec().mode == GrammarSpec::Mode::kJsonOrTools && calls_ == 0 &&
           !top_lt_ && id != m.tool_call_open.id) {
         const std::string& text = vocab_->text(id);
         const size_t first = text.find_first_not_of(" \n\r\t");
@@ -1408,8 +1411,8 @@ void GrammarState::advance(int64_t id) {
       const std::string name = match_.emitted.substr(open, match_.emitted.size() - open - kDInvokeHeadEnd.size());
       tool_ = -1;
       used_keys_.clear();
-      for (size_t i = 0; i < spec_.tools.size(); ++i)
-        if (spec_.tools[i].name == name) tool_ = static_cast<int>(i);
+      for (size_t i = 0; i < spec().tools.size(); ++i)
+        if (spec().tools[i].name == name) tool_ = static_cast<int>(i);
       enter(State::kDParamOrClose);
       return;
     }
@@ -1496,8 +1499,8 @@ void GrammarState::advance(int64_t id) {
                                       std::strlen(xml_header_end()));
         tool_ = -1;
         used_keys_.clear();
-        for (size_t i = 0; i < spec_.tools.size(); ++i)
-          if (spec_.tools[i].name == name) tool_ = static_cast<int>(i);
+        for (size_t i = 0; i < spec().tools.size(); ++i)
+          if (spec().tools[i].name == name) tool_ = static_cast<int>(i);
         enter(State::kQKeyOrClose);
       }
       return;
@@ -1569,8 +1572,8 @@ void GrammarState::advance(int64_t id) {
         // The name is complete: bind the tool; the call's key ledger opens.
         tool_ = -1;
         used_keys_.clear();
-        for (size_t i = 0; i < spec_.tools.size(); ++i)
-          if (spec_.tools[i].name == match_.emitted) tool_ = static_cast<int>(i);
+        for (size_t i = 0; i < spec().tools.size(); ++i)
+          if (spec().tools[i].name == match_.emitted) tool_ = static_cast<int>(i);
         if (id == m.arg_key_open.id)
           enter(State::kKey);
         else
