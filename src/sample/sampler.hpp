@@ -47,6 +47,7 @@
 // loader contract already grants CPU-readable resident buffers), so a
 // rank samples its vocab slice without a staging copy.
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -568,11 +569,45 @@ inline Result sample_reference(const float* logits, int vocab,
 
 // Path 1 — greedy. Each rank contributes its slice maximum.
 inline Candidate local_max(const float* logits, int n, int slice_begin) {
-  // Ascending scan with strict '>' keeps the LOWEST id on ties — the
-  // canonical order's tie-break, for free.
+  // Test whole blocks against the running winner. This comparison vectorizes
+  // without reassociating floating point maxima. Only a block with a new
+  // winner needs the serial, lowest-token-on-ties scan.
+  constexpr int block = 64;
   Candidate best{slice_begin, logits[0]};
-  for (int i = 1; i < n; ++i) {
+  int i = 0;
+  for (; i <= n - block; i += block) {
+    unsigned improves = 0;
+    for (int lane = 0; lane < block; ++lane)
+      improves |= static_cast<unsigned>(logits[i + lane] > best.logit);
+    if (improves)
+      for (int j = i; j < i + block; ++j)
+        if (logits[j] > best.logit) best = {slice_begin + j, logits[j]};
+  }
+  for (; i < n; ++i) {
     if (logits[i] > best.logit) best = {slice_begin + i, logits[i]};
+  }
+  return best;
+}
+
+// Equivalent to masking a copy of the shard followed by local_max. Tool
+// syntax often permits only a few IDs. Visit them in token order directly.
+inline Candidate local_masked_max(const float* logits, int n, int slice_begin,
+                                  const uint32_t* words, int vocab) {
+  if (!words) return local_max(logits, n, slice_begin);
+  Candidate best{slice_begin, -INFINITY};
+  const int end = std::min(vocab, slice_begin + n);
+  for (int id = slice_begin; id < end;) {
+    const int word = id / 32;
+    uint32_t bits = words[word] & (~uint32_t{0} << (id % 32));
+    const int count = std::min(32, end - word * 32);
+    if (count < 32) bits &= (uint32_t{1} << count) - 1;
+    while (bits) {
+      const int token = word * 32 + std::countr_zero(bits);
+      const float value = logits[token - slice_begin];
+      if (token == slice_begin || value > best.logit) best = {token, value};
+      bits &= bits - 1;
+    }
+    id = word * 32 + count;
   }
   return best;
 }

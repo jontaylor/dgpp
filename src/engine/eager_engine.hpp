@@ -811,10 +811,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
     text::TokenMask mask;
     grammar->mask(&mask);
-    std::vector<float> masked(logits, logits + out.lm_vocab_count);
-    sample::apply_mask(masked.data(), out.lm_vocab_count, out.lm_vocab_begin,
-                       mask.constrained() ? mask.words.data() : nullptr, mask.vocab);
-    return sample::local_max(masked.data(), out.lm_vocab_count, out.lm_vocab_begin);
+    return sample::local_masked_max(logits, out.lm_vocab_count, out.lm_vocab_begin,
+                                    mask.constrained() ? mask.words.data() : nullptr, mask.vocab);
   }
 
   // All target rows share one forward and one distributed row pick. Restore

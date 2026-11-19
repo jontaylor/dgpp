@@ -326,6 +326,32 @@ DGPP_TEST(distributed_greedy_matches_oracle_with_cross_shard_ties) {
   }
 }
 
+DGPP_TEST(greedy_block_scan_and_masked_scan_match_scalar_order) {
+  constexpr int vocab = 147;
+  for (int begin : {0, 1, 31, 32, 96, 148}) {
+    for (int n : {1, 32, 63, 64, 65, 129, 146}) {
+      for (float initial : {-0.0f, -INFINITY, INFINITY, NAN}) {
+        std::vector<float> logits(n, -INFINITY);
+        logits.front() = initial;
+        for (int i = 1; i < n; ++i)
+          logits[i] = i % 17 == 0 ? NAN : static_cast<float>(i % 11);
+        for (uint32_t pattern : {0u, 0x80000001u, 0x55aa55aau, ~0u}) {
+          std::vector<uint32_t> mask((vocab + 31) / 32, pattern);
+          for (const uint32_t* words : {static_cast<const uint32_t*>(nullptr), static_cast<const uint32_t*>(mask.data())}) {
+            auto reference = logits;
+            dgpp::sample::apply_mask(reference.data(), n, begin, words, vocab);
+            int at = 0;
+            for (int i = 1; i < n; ++i)
+              if (reference[i] > reference[at]) at = i;
+            const Candidate got = dgpp::sample::local_masked_max(logits.data(), n, begin, words, vocab);
+            require(got.id == begin + at && same_bits(got.logit, reference[at]), "greedy shard maximum changed");
+          }
+        }
+      }
+    }
+  }
+}
+
 DGPP_TEST(distributed_topk_matches_oracle_bitwise_across_params) {
   FixtureRng fx;
   int cases = 0;
