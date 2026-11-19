@@ -1,6 +1,11 @@
 #pragma once
 #include "kernels/glm_moe_launch.hpp"
 namespace dgpp {
+// Small TP2 target waves over live b12x bindings, with nibble-packed MX scales.
+// x and intermediate each contain FP8 rows followed by their block-32 scales.
+void launch_moe_mxfp4_verify(const uint8_t* x, uint8_t* intermediate, float* slots,
+                             const uint64_t* bindings, const int32_t* packet,
+                             int rows, cudaStream_t stream);
 void launch_moe_mxfp8_quantize_tiles(const uint16_t*, size_t, int, uint8_t*, uint8_t*,
                                      const MoeSegment*, const MoeTile*, const int32_t*,
                                      cudaStream_t);

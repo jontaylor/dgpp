@@ -24,6 +24,73 @@ struct Buffer {
     return v;
   }
 };
+// Exercise the serving packet (including a masked expert and an unused tile)
+// against the ordinary grouped chain on the same FP4 weights.
+static void verify_packet(const std::vector<MoeExpertView>& canonical,
+                          const uint8_t* a, const uint8_t* as, cudaStream_t stream) {
+  constexpr int dim = 128, rows = 4, slots = 6 * rows, capacity = 64 * 6;
+  const size_t bytes = moe_fp4_packed_bytes(dim, dim, 32, true);
+  Buffer<uint8_t> storage(bytes);
+  auto packed = moe_fp4_packed_view(storage.p, dim, dim, 32, true);
+  Fp4ExpertSource src{};
+  for (int i = 0; i < 3; ++i) {
+    src.payload[i] = canonical[i].payload;
+    src.scales[i] = canonical[i].fp4_scales;
+  }
+  launch_moe_fp4_pack(packed, src, dim, dim, stream, 32);
+  std::vector<uint64_t> bindings(384 * 6);
+  bindings[0] = reinterpret_cast<uint64_t>(packed.w13);
+  bindings[1] = reinterpret_cast<uint64_t>(packed.s13);
+  bindings[384*3] = reinterpret_cast<uint64_t>(packed.w2);
+  bindings[384*3+1] = reinterpret_cast<uint64_t>(packed.s2);
+  Buffer<uint64_t> table(bindings.size());
+  table.write(bindings);
+  std::vector<int32_t> routes(capacity * 9 + 1, slots);
+  const std::vector<int32_t> selected{1, 11, 18};
+  std::copy(selected.begin(), selected.end(), routes.begin());
+  routes[capacity * 8] = 0;
+  routes[capacity * 8 + 1] = -1;
+  routes.back() = 16;
+  Buffer<int32_t> packet(routes.size());
+  packet.write(routes);
+  Buffer<MoeExpertView> views(3);
+  std::vector<MoeExpertView> pv(3);
+  for (int i = 0; i < 3; ++i) {
+    pv[i].payload = i == 2 ? packed.w2 : packed.w13;
+    pv[i].fp4_scales = i == 2 ? packed.s2 : packed.s13;
+    pv[i].fp4_packed_rows = i == 2 ? dim : 2 * dim;
+    pv[i].fp4_packed_row0 = i == 1 ? dim : 0;
+    pv[i].fp4_mx_nibbles = true;
+  }
+  views.write(pv);
+  Buffer<MoeSegment> seg(1);
+  seg.write({{0, 3, 0}});
+  Buffer<int32_t> map(3);
+  map.write({0, 1, 3});
+  Buffer<uint8_t> intermediate(slots * dim), scales(slots * dim / 32);
+  Buffer<float> expected(3 * dim), actual(rows * 7 * dim);
+  launch_moe_mxfp4_packed_gate_up(a, as, seg.p, 1, 3, views.p, dim, dim, map.p, 10.f,
+                                  intermediate.p, scales.p, stream);
+  launch_moe_mxfp4_native_f32(intermediate.p, scales.p, seg.p, 1, 3, views.p, 2,
+                              expected.p, dim, dim, dim, stream);
+  DGPP_CUDA_OK(cudaMemsetAsync(actual.p, 0, rows * 7 * dim * sizeof(float), stream));
+  constexpr int schedule = 27;
+  mx4native::run<uint8_t,16,128,true,true,true,2,true,false,schedule,true,true,true>(
+      a, as, intermediate.p, rows, slots, dim, dim, stream, nullptr, nullptr, 0, nullptr,
+      nullptr, nullptr, 0, dim, scales.p, 10.f, packet.p, table.p);
+  mx4native::run<float,16,128,true,true,true,2,true,false,schedule,true,false,true>(
+      intermediate.p, scales.p, actual.p, rows, slots, dim, dim, stream, nullptr, nullptr, 2,
+      nullptr, nullptr, nullptr, 0, dim, nullptr, 0.f, packet.p, table.p);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  const auto result = expected.read(3 * dim);
+  std::vector<float> scattered(rows * 7 * dim);
+  for (size_t i = 0; i < selected.size(); ++i) {
+    const int slot = selected[i];
+    std::copy_n(result.begin() + i * dim, dim, scattered.begin() + (slot + slot / 6) * dim);
+  }
+  if (actual.read(scattered.size()) != scattered)
+    throw std::runtime_error("verification packet differs from grouped native projections");
+}
 int main() {
   try {
     constexpr int H = 128, I = 128, C = 64, E = 2, R = 169, K = 128, S = 144;
@@ -103,6 +170,7 @@ int main() {
     prepared.write(pv);
     direct.write(dv);
     launch_mxfp8_quantize_rows(x.p, K, R, K, a.p, as.p, stream);
+    verify_packet(cv, a.p, as.p, stream);
     Buffer<MoeTile> tiles(4);
     Buffer<int32_t> count(1);
     launch_moe_tile_list(seg.p, 2, 64, tiles.p, count.p, stream);

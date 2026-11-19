@@ -9,6 +9,8 @@
 #include "kernels/moe_fp4_pack.hpp"
 #include "kernels/expert_demand.hpp"
 #include "kernels/mxfp4_verify.hpp"
+#include "kernels/moe_mxfp4_native.hpp"
+#include "kernels/mxfp8_gemm.hpp"
 #ifdef DGPP_HAVE_B12X_AOT
 #define CUTE_DSL_CUDA_ERROR_CHECK(err) DGPP_CUDA_OK(err)
 #include "dgpp_b12x_raw_fp32.h"
@@ -134,7 +136,10 @@ struct Sm12xMoe::Impl {
 #endif
   int group;
   bool mx_nibbles;
+  bool native_verify = false;
   Impl(int scale_group, bool compact) : group(scale_group), mx_nibbles(compact) {
+    const char* flag = std::getenv("DGPP_MX_NATIVE_VERIFY");
+    native_verify = compact && flag && flag[0] == '1' && !sm12x_projection_mode();
     if (compact && (group != 32 || verify_split_enabled()))
       throw std::invalid_argument("MX scale packing requires MXFP4 with unsplit verification");
 #ifndef DGPP_HAVE_B12X_MX_NIBBLES
@@ -187,6 +192,22 @@ struct Sm12xMoe::Impl {
 };
 Sm12xMoe::Sm12xMoe(int group, bool mx_nibbles) : impl_(std::make_unique<Impl>(group, mx_nibbles)) { impl_->initialize(); }
 Sm12xMoe::~Sm12xMoe() = default;
+const uint8_t* Sm12xMoe::prepared_verify_input(int rows) const {
+  // Both buffers are disjoint from the shared lane. The native kernel replaces
+  // b12x for the whole wave, so its FC1 and SwiGLU scratch can be reused.
+  constexpr int max_rows = 8;
+  static_assert(max_rows * H * 33 / 32 <= M*K*2*I*sizeof(uint16_t));
+  static_assert(max_rows * K * I * 33 / 32 <= M*K*I*sizeof(uint16_t));
+  return impl_->native_verify && rows >= 2 && rows <= max_rows
+      ? reinterpret_cast<const uint8_t*>(impl_->fc1) : nullptr;
+}
+const uint8_t* Sm12xMoe::prepare_verify_input(const uint16_t* hidden, int rows, cudaStream_t stream) {
+  if (auto* codes = const_cast<uint8_t*>(prepared_verify_input(rows))) {
+    launch_mxfp8_quantize_rows(hidden, H, rows, H, codes, codes + rows * H, stream);
+    return codes;
+  }
+  return nullptr;
+}
 void Sm12xMoe::prepare_device(const uint64_t* table, const int32_t* ids,
                             ExpertDemand* demand, int rows, cudaStream_t stream, bool resident_wave) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x device route row count");
@@ -280,7 +301,7 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
   c.uploaded = true;
 }
 void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weights,
-                   float* out, int rows, cudaStream_t stream, const uint64_t* bindings, expert::ExpertProjection part) {
+                   float* out, int rows, cudaStream_t stream, const uint64_t* bindings, expert::ExpertProjection part, const uint8_t* verify_input) {
   if (rows < 1 || rows > M) throw std::invalid_argument("b12x MoE: row count exceeds capacity");
   auto& c = *impl_;
   if (part != expert::ExpertProjection::kAll) {
@@ -294,6 +315,14 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
   // Captured layers already own a published device table. Host-serviced
   // waves carry their private masked bindings in the uploaded packet.
   auto* table = bindings ? reinterpret_cast<uint8_t*>(const_cast<uint64_t*>(bindings)) : c.packet;
+  if (verify_input) {
+    if (verify_input != prepared_verify_input(rows) || part != expert::ExpertProjection::kAll)
+      throw std::logic_error("invalid native MX verification input");
+    launch_moe_mxfp4_verify(verify_input, reinterpret_cast<uint8_t*>(c.act), out,
+        reinterpret_cast<const uint64_t*>(table),
+        reinterpret_cast<const int32_t*>(c.packet + E*6*sizeof(uint64_t)), rows, stream);
+    return;
+  }
   auto invoke = [&]<class Backend>(Backend& backend) {
     typename Backend::Fc1 fc1{c.fc1};
     typename Backend::Act act{c.act};
@@ -332,6 +361,8 @@ void Sm12xMoe::run(const uint16_t* hidden, const int32_t* ids, const float* weig
 }
 #else
 struct Sm12xMoe::Impl {};
+const uint8_t* Sm12xMoe::prepared_verify_input(int) const { return nullptr; }
+const uint8_t* Sm12xMoe::prepare_verify_input(const uint16_t*, int, cudaStream_t) { return nullptr; }
 void Sm12xMoe::prepare_device(const uint64_t*, const int32_t*, ExpertDemand*, int, cudaStream_t, bool) {
   throw std::logic_error("b12x AOT is unavailable");
 }
@@ -341,7 +372,7 @@ void Sm12xMoe::prepare(std::span<const int32_t>, std::span<const uint8_t* const>
                        std::span<const int>) {
   throw std::logic_error("b12x AOT is unavailable");
 }
-void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t, const uint64_t*, expert::ExpertProjection) {
+void Sm12xMoe::run(const uint16_t*, const int32_t*, const float*, float*, int, cudaStream_t, const uint64_t*, expert::ExpertProjection, const uint8_t*) {
   throw std::logic_error("b12x AOT is unavailable");
 }
 #endif

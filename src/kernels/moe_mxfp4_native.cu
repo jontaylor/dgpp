@@ -80,6 +80,22 @@ void launch(const uint8_t* a, const uint8_t* as, const MoeSegment* segs, int cou
   }
 }
 }  // namespace
+void launch_moe_mxfp4_verify(const uint8_t* x, uint8_t* intermediate, float* slots,
+                             const uint64_t* bindings, const int32_t* packet,
+                             int rows, cudaStream_t stream) {
+  constexpr int hidden = 5120, inter = 1152, top_k = 6;
+  const auto* xs = x + rows * hidden;
+  auto* scales = intermediate + rows * top_k * inter;
+  constexpr int schedule = mx4native::kSingleBarrier | mx4native::kSkipEmptyRows |
+                           mx4native::kPrefetchWeights | mx4native::kOnePrefetchLine;
+  // One CTA owns an expert packet tile and 64 paired gate/up or 128 down columns.
+  mx4native::run<uint8_t, 16, 128, true, true, true, 2, true, false, schedule, true, true, true>(
+      x, xs, intermediate, rows, rows * top_k, inter, hidden, stream, nullptr, nullptr, 0,
+      nullptr, nullptr, nullptr, 0, inter, scales, 10.f, packet, bindings);
+  mx4native::run<float, 16, 128, true, true, true, 2, true, false, schedule, true, false, true>(
+      intermediate, scales, slots, rows, rows * top_k, hidden, inter, stream, nullptr, nullptr, 2,
+      nullptr, nullptr, nullptr, 0, hidden, nullptr, 0.f, packet, bindings);
+}
 void launch_moe_mxfp8_quantize_tiles(const uint16_t* x, size_t stride, int k, uint8_t* codes,
                                      uint8_t* scales, const MoeSegment* segs, const MoeTile* tiles,
                                      const int32_t* count, cudaStream_t stream) {

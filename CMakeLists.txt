@@ -165,7 +165,7 @@ dgpp_set_common(dgpp_moe_fp4_pack)
 
 set(DGPP_B12X_AOT_DIR "" CACHE PATH "Optional b12x SM121 AOT header, object and CUDA dialect runtime archive directory")
 add_library(dgpp_sm12x_moe STATIC src/kernels/sm12x_moe.cpp)
-target_link_libraries(dgpp_sm12x_moe PUBLIC dgpp_moe_fp4_pack CUDA::cudart)
+target_link_libraries(dgpp_sm12x_moe PUBLIC dgpp_moe_fp4_pack dgpp_moe_mxfp4_native dgpp_kernels CUDA::cudart)
 if(DGPP_B12X_AOT_DIR)
   target_sources(dgpp_sm12x_moe PRIVATE "${DGPP_B12X_AOT_DIR}/dgpp_b12x_raw_fp32.o"
     "${DGPP_B12X_AOT_DIR}/dgpp_b12x_mxfp4_fp32.o")

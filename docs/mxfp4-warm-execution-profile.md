@@ -1120,3 +1120,40 @@ W4A8 within the existing budget needs a common expert layout across
 prefill, verification and paging, or a reader that consumes the existing
 cache addresses. Whole-model throughput, acceptance and tool quality with
 that arithmetic remain open. The serving configuration keeps b12x.
+
+#### FP8 verification directly from the serving cache
+
+`DGPP_MX_NATIVE_VERIFY=1` enables mixed FP8 × FP4 execution for two through
+eight rows in the packed MXFP4 target path with projection splitting off.
+Each layer quantizes the hidden rows once, before it publishes demand.
+The captured resident wave and subsequent miss waves share those codes and
+block-32 scales. Gate/up reads the prepared 4.125-bit cache, decodes the scale
+nibbles and arranges FP4 register operands for the native multiply. Its
+SwiGLU epilogue writes scaled FP8 directly. Down writes unweighted FP32 into
+the original routing slots. The shared expert, ordered combination and TP2
+fold keep their existing scheduling and arithmetic. Both buffers reuse b12x
+scratch and the reader uses the existing SSD and resident layouts.
+
+The preceding replay suggested about 0.38 ms per target pass if its advantage
+transferred to the serving layout and FP32 output. A C1 diagnostic compared
+both settings on one binary built from `57565632` plus this implementation
+(SHA-256 `01cd14f70efbb7f5333dfba739468d1534ede8b0304ca4b24e95f52c6b119c11`).
+Both ranks had zero process swap and matched operation streams within each
+run. Two warm 160-token repeats per workload read zero expert bytes on both
+ranks. Median four-row verification went from 53.90 to 55.93 ms on prose
+and 53.48 to 55.84 ms on code. Accepted predictions per round increased
+from 1.69 to 1.84 and from 1.82 to 1.91 respectively. Engine decode went
+from 45.25 to 45.15 tokens/s on prose and 46.63 to 46.81 on code.
+Both versions completed the directory tool exchange. The capped continuations
+differed between versions. The single 24,292-token cold prefill took
+36.54 and 36.51 seconds respectively.
+
+The difference was already visible before the TP fold. On seven identical
+four-row route sets using the rank-1 layer-10 weights, the native routed
+chain took a paired median 2.4% longer than b12x and won two sets. Four
+copy stages took 9.7% longer than b12x and won none. A separate graph-node
+capture of the two-stage version averaged 1.8 µs quantizing the input,
+476 µs for gate/up through SwiGLU and 238 µs for down, against 686 µs
+for fused b12x. A masked two-wave replay reproduced the single-wave native
+outputs bit for bit. The two-stage path remains opt-in and the Sparks run
+b12x for verification.

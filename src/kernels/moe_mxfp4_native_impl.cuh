@@ -97,13 +97,13 @@ __device__ __forceinline__ void quantize_four(const float (&values)[4], uint8_t*
 template <typename Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
           bool WideWarps = false, int Stages = 3, bool StageScales = false,
           bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false,
-          bool Paired = false>
+          bool Paired = false, bool Verify = false>
 __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm_kernel(
     const uint8_t* a, const uint8_t* a_scales, const uint8_t* w, const uint8_t* w_scales, Out* out,
     int m, int n, int k, size_t out_stride, const MoeSegment* segs, const MoeExpertView* views,
     int which, const int32_t* act_rows = nullptr, const MoeTile* tiles = nullptr,
     const int32_t* tile_count = nullptr, int tile_capacity = 0, uint8_t* output_scales = nullptr,
-    float limit = 0.f) {
+    float limit = 0.f, const int32_t* packet = nullptr, const uint64_t* bindings = nullptr) {
   dgpp_pdl_wait();
   constexpr int kStages = Stages;
   constexpr int threads = Tile<BM, BN, WideWarps>::threads;
@@ -123,19 +123,48 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
   constexpr int output_cols = Paired ? BN / 2 : BN;
   static_assert(!Paired || (BN == 128 && SupportsViews && StageScales && PackedPipeline));
   const int nt = (n + output_cols - 1) / output_cols;
-  const int work = tiles ? int(blockIdx.x) / nt : 0;
-  if (tiles && work >= *tile_count) return;
-  const auto seg = segs[tiles ? tiles[work].seg : blockIdx.y];
-  const int segment_tiles = (seg.rows + BM - 1) / BM;
-  const int local = tiles ? (tiles[work].m0 / BM) * nt + int(blockIdx.x) % nt : 0;
-  const int m0 = (tiles ? local % segment_tiles : int(blockIdx.x) % m_tiles) * BM;
-  const int n0 = (tiles ? local / segment_tiles : int(blockIdx.x) / m_tiles) * output_cols;
-  if (m0 >= seg.rows) return;
+  MoeSegment seg{};
+  MoeExpertView view{};
+  int m0, n0;
+  if constexpr (Verify) {
+    // Same eight-slot packet for captured hits and host-prepared miss waves.
+    // A masked block may have a live fallback binding but no live route.
+    constexpr int capacity = 64 * 6, block_slots = 8, experts = 384;
+    const int tile = blockIdx.y;
+    const auto* expert_ids = packet + capacity * block_slots;
+    if (tile * block_slots >= expert_ids[capacity]) return;
+    const int expert = expert_ids[tile];
+    act_rows = packet + tile * block_slots;
+    if (expert < 0 || act_rows[0] >= m * 6) return;
+    const bool live = lane < block_slots && act_rows[lane] < m * 6;
+    seg.rows = __popc(__ballot_sync(0xffffffff, live));
+    const auto* binding = bindings + ((Paired ? 0 : experts) + expert) * 3;
+    view.payload = reinterpret_cast<const uint8_t*>(binding[0]);
+    view.fp4_scales = reinterpret_cast<const uint8_t*>(binding[1]);
+    view.fp4_packed_rows = Paired ? 2 * n : n;
+    view.fp4_mx_nibbles = true;
+    m0 = 0;
+    n0 = blockIdx.x * output_cols;
+  } else {
+    const int work = tiles ? int(blockIdx.x) / nt : 0;
+    if (tiles && work >= *tile_count) return;
+    seg = segs[tiles ? tiles[work].seg : blockIdx.y];
+    const int segment_tiles = (seg.rows + BM - 1) / BM;
+    const int local = tiles ? (tiles[work].m0 / BM) * nt + int(blockIdx.x) % nt : 0;
+    m0 = (tiles ? local % segment_tiles : int(blockIdx.x) % m_tiles) * BM;
+    n0 = (tiles ? local / segment_tiles : int(blockIdx.x) / m_tiles) * output_cols;
+    if (m0 >= seg.rows) return;
+    view = views[seg.expert * 3 + which];
+  }
   m = seg.rows;
-  const auto view = views[seg.expert * 3 + which];
+  auto input_row = [&](int row) {
+    const int index = act_rows ? act_rows[seg.row0 + row] : seg.row0 + row;
+    if constexpr (Verify && Paired) return index / 6;
+    return index;
+  };
   w = view.payload;
   w_scales = view.fp4_scales;
-  const bool prepared = Paired || (SupportsViews && view.fp4_packed_rows);
+  const bool prepared = Verify || Paired || (SupportsViews && view.fp4_packed_rows);
   // A resident pair uses the single prepared W13 slab and scale table.
   auto physical_row = [&](int tile_row) {
     return n0 + (Paired ? tile_row % output_cols + tile_row / output_cols * n : tile_row);
@@ -176,7 +205,7 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
         const int gr = is_a ? m0 + r : physical_row(r - BM);
         uint16_t pair = 0x7f7f;
         if (gr < (is_a ? m : (Paired ? 2 * n : n))) {
-          const int sr = is_a ? (act_rows ? act_rows[seg.row0 + gr] : seg.row0 + gr) : gr;
+          const int sr = is_a ? input_row(gr) : gr;
           const uint8_t* src =
               (is_a ? a_scales : w_scales) + size_t(sr) * scale_stride + step * (BK / 32);
           if (SupportsViews && !is_a) {
@@ -245,7 +274,7 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
         uint8_t* dst =
             smem + slot * slot_bytes + (is_a ? row * stride : BM * stride + row * wstride) + col;
         const int ar = valid && is_a
-                           ? (act_rows ? act_rows[seg.row0 + global_row] : seg.row0 + global_row)
+                           ? input_row(global_row)
                            : 0;
         const uint8_t* src = is_a ? a + size_t(ar) * k + step * BK + col
                                   : weight_ptr(valid ? global_row : 0, step * BK + col * 2);
@@ -274,7 +303,7 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
         auto* dst = smem + slot * slot_bytes + row * stride + column;
         if (is_a) {
           const int ar =
-              valid ? (act_rows ? act_rows[seg.row0 + global_row] : seg.row0 + global_row) : 0;
+              valid ? input_row(global_row) : 0;
           const uint8_t* src = a + size_t(ar) * k;
           copy16(dst, valid ? src + step * BK + column : src, valid);
         } else {
@@ -420,7 +449,8 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
     for (int at = tid * 4; at < rows * output_cols; at += threads * 4) {
       const int row = at / output_cols, col = at % output_cols;
       const auto* g = pairs + row * pair_stride + col;
-      const size_t dest = size_t(m0 + row) * n + n0 + col;
+      const int output_row = Verify ? act_rows[row] : m0 + row;
+      const size_t dest = size_t(output_row) * n + n0 + col;
       float values[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
@@ -438,7 +468,10 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
           const int row = m0 + row_base + i * 16 + group + (value / 2) * 8;
           const int column = n0 + col_base + j * 8 + part * 2 + value % 2;
           if (row < m && column < n) {
-            if constexpr (std::is_same_v<Out, float>)
+            if constexpr (Verify) {
+              const int slot = act_rows[row];
+              out[size_t(slot + slot / 6) * out_stride + column] = accum[i][j][value];
+            } else if constexpr (std::is_same_v<Out, float>)
               out[static_cast<size_t>(row) * out_stride + column] = accum[i][j][value];
             else
               out[static_cast<size_t>(row) * out_stride + column] =
@@ -451,12 +484,12 @@ __global__ __launch_bounds__((Tile<BM, BN, WideWarps>::threads)) void mxfp8_gemm
 template <class Out, int BM, int BN, bool PackedPipeline = false, bool MatrixLoads = false,
           bool WideWarps = false, int Stages = 3, bool StageScales = false,
           bool ColumnScales = false, int Schedule = 0, bool SupportsViews = false,
-          bool Paired = false>
+          bool Paired = false, bool Verify = false>
 void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts, int n, int k,
          cudaStream_t stream, const MoeSegment* segs, const MoeExpertView* views, int which,
          const int32_t* act_rows = nullptr, const MoeTile* tiles = nullptr,
          const int32_t* tile_count = nullptr, int tile_capacity = 0, size_t output_stride = 0,
-         uint8_t* output_scales = nullptr, float limit = 0.f) {
+         uint8_t* output_scales = nullptr, float limit = 0.f, const int32_t* packet = nullptr, const uint64_t* bindings = nullptr) {
   constexpr int smem = Stages * (BM * Tile<BM, BN, WideWarps>::stride +
                                  BN * (PackedPipeline ? Tile<BM, BN, WideWarps>::bk / 2 + 16
                                                       : Tile<BM, BN, WideWarps>::stride) +
@@ -466,7 +499,7 @@ void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts
     static const bool opted = [] {
       DGPP_CUDA_OK(cudaFuncSetAttribute(
           mxfp8_gemm_kernel<Out, BM, BN, PackedPipeline, MatrixLoads, WideWarps, Stages,
-                            StageScales, ColumnScales, Schedule, SupportsViews, Paired>,
+                            StageScales, ColumnScales, Schedule, SupportsViews, Paired, Verify>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
       return true;
     }();
@@ -477,10 +510,10 @@ void run(const uint8_t* a, const uint8_t* as, Out* out, int maxrows, int experts
                      ((n + output_cols - 1) / output_cols)),
             tiles ? 1u : unsigned(experts));
   mxfp8_gemm_kernel<Out, BM, BN, PackedPipeline, MatrixLoads, WideWarps, Stages, StageScales,
-                    ColumnScales, Schedule, SupportsViews, Paired>
+                    ColumnScales, Schedule, SupportsViews, Paired, Verify>
       <<<grid, Tile<BM, BN, WideWarps>::threads, smem, stream>>>(
           a, as, nullptr, nullptr, out, maxrows, n, k, output_stride ? output_stride : size_t(n),
-          segs, views, which, act_rows, tiles, tile_count, tile_capacity, output_scales, limit);
+          segs, views, which, act_rows, tiles, tile_count, tile_capacity, output_scales, limit, packet, bindings);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 }  // namespace

@@ -1345,8 +1345,10 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
   // The shared slots are disjoint from routed slots on both execution paths.
   if (!route_first) route(hidden, tokens, stream, d_router_counters_);
   if (before_demand) DGPP_CUDA_OK(cudaEventRecord(before_demand, stream));
+  const auto* verify_input = sm12x_moe_->prepare_verify_input(hidden, tokens, stream);
   sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream, resident_wave);
-  sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream, table);
+  sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream, table,
+                   expert::ExpertProjection::kAll, verify_input);
   if (resident_wave) launch_expert_resident_gate(demand, stream);
   if (after_routed) DGPP_CUDA_OK(cudaEventRecord(after_routed, stream));
   DGPP_CUDA_OK(cudaStreamWaitEvent(stream, sh_lane_join_));
@@ -1365,6 +1367,12 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
   const int E = cfg_.n_experts, K = cfg_.top_k, H = cfg_.hidden, I = cfg_.inter;
   auto* const slots = tokens <= decode_slots_ ? d_slot_down_ : d_down_;
   auto* const shared_act = tokens <= decode_slots_ ? d_slot_act_ : d_act_;
+  // A paused graph has already produced its input before publishing demand.
+  const auto* verify_input = ready ? sm12x_moe_->prepared_verify_input(tokens)
+                                  : sm12x_moe_->prepare_verify_input(hidden, tokens, stream);
+  auto run_wave = [&](expert::ExpertProjection part = expert::ExpertProjection::kAll) {
+    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream, nullptr, part, verify_input);
+  };
   std::vector<size_t> routed;
   for (const int e : active_experts) routed.push_back(cache_experts[static_cast<size_t>(e)]);
   const bool resident = cache.prepare_resident(routed);
@@ -1379,7 +1387,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       group = remaining;
     }
     sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, group);
-    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    run_wave();
   };
   std::vector<const uint8_t*> addresses(static_cast<size_t>(E), nullptr);
   auto shared = [&] {
@@ -1442,7 +1450,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
       try {
         shared();
-        sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+        run_wave();
         finish();
       } catch (...) {
         (void)cudaStreamEndCapture(stream, &captured);
@@ -1515,7 +1523,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
         ids.push_back(id);
       }
       sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
-      sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+      run_wave();
     }, projections, [&](std::span<const uint8_t* const> packed, expert::ExpertProjection part) {
       if (part == expert::ExpertProjection::kGateUp) {
         std::vector<int> ids;
@@ -1527,7 +1535,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
         }
         sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
       }
-      sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream, nullptr, part);
+      run_wave(part);
     }, prefill);
     finish();
     return;
@@ -1567,7 +1575,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       leases.push_back(std::move(lease));
     }
     sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, wave_ids);
-    sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream);
+    run_wave();
     for (auto& lease : leases) lease.release();
     leases.clear();
     wave_ids.clear();
