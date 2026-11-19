@@ -57,7 +57,7 @@ struct Arm {
   int warps;
 };
 
-void measure(const Shape& shape, int l2, cudaStream_t stream) {
+void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = false) {
   int total_n = shape.second_n ? shape.n + shape.second_n : shape.groups * shape.n;
   int xs = shape.joined_input ? shape.k : shape.groups * shape.k;
   int os = total_n;
@@ -82,11 +82,20 @@ void measure(const Shape& shape, int l2, cudaStream_t stream) {
   }
   if (shape.groups > 1) arms.push_back({"pair", true, true, false, 0});
 
+  if (native_wob) {
+    arms.resize(1);
+    arms.push_back({"mxfp8-input", false, false, false, 0});
+  }
   auto launch = [&](const Arm& a, int copy, int first, int m) {
     void* ws = a.workspace ? scratch.p : nullptr;
     const auto* input = x.p + first * xs;
     auto* w = weights.p + copy * matrix;
     auto* sc = scales.p + copy * scale_matrix;
+    if (native_wob && !a.workspace) {
+      launch_mxfp8_quantize_rows(input, xs, m, shape.k, scratch.p, scratch.p + size_t(m) * shape.k, stream);
+      launch_mxfp8_woa_decode(scratch.p, w, sc, y.p + first * os, m, 1, shape.n, shape.k, stream);
+      return;
+    }
     for (int g = 0; g < shape.groups;) {
       auto* in0 = input + (shape.joined_input ? 0 : g * shape.k);
       size_t offset = size_t(g) * shape.n * shape.k;
@@ -138,7 +147,7 @@ void measure(const Shape& shape, int l2, cudaStream_t stream) {
       norm += b * b;
     }
     errors[i] = std::sqrt(err / norm);
-    if (!(errors[i] < 0.01)) throw std::runtime_error("projection outside reference tolerance");
+    if (!(errors[i] < (native_wob && i == 1 ? 0.05 : 0.01))) throw std::runtime_error("projection outside reference tolerance");
     DGPP_CUDA_OK(cudaMemsetAsync(y.p, 0xfe, rows * os * 2, stream));
     for (int r = 0; r < rows; ++r) launch(arm, 0, r, 1);
     if (output != result()) throw std::runtime_error("batched and standalone rows diverged");
@@ -349,6 +358,12 @@ int main(int argc, char** argv) {
     DGPP_CUDA_OK(cudaGetDeviceProperties(&prop, 0));
     cudaStream_t stream;
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    if (argc == 2 && std::string(argv[1]) == "--wo-b-mxfp8") {
+      std::puts("projection,variant,weight_copies,p25_us,median_us,p75_us,rel_l2");
+      measure({"wo_b", 1, 5120, 4096, true, false, true}, prop.l2CacheSize, stream, true);
+      DGPP_CUDA_OK(cudaStreamDestroy(stream));
+      return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--woa-handoff") {
       if (argc != 2 && argc != 5)
         throw std::invalid_argument("--woa-handoff [rows main_splits window_splits]");
