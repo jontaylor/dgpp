@@ -37,9 +37,7 @@ constexpr int kNarrowUnroll = 8;
 constexpr int kWideBlocks = 48;
 constexpr int kWideUnroll = 4;
 constexpr int kLightUnroll = 2;
-constexpr int kLightBlocksDefault = 16;
-// DGPP_L2_PREFETCH_LIGHT_BLOCKS: the Light rate's grid (tuning knob).
-int light_blocks() { return kLightBlocksDefault; }
+int light_blocks() { return l2_prefetch_settings().light_blocks; }
 
 // A device word the kernel compares its fold against. Nothing sets it and
 // the fold is arbitrary, so the compare (almost) never matches — and when
@@ -141,6 +139,8 @@ void l2_prefetch_configure(const L2PrefetchSettings& s) {
     throw std::invalid_argument("l2_prefetch_configure: the window budget must be 1..64 MiB");
   if (s.boundary_window_bytes > (size_t{64} << 20))
     throw std::invalid_argument("l2_prefetch_configure: the boundary window budget must be 0..64 MiB");
+  if (s.light_blocks < 1 || s.light_blocks > 64)
+    throw std::invalid_argument("l2_prefetch_configure: light grid must be 1..64 blocks");
   g_l2_settings = s;
 }
 const L2PrefetchSettings& l2_prefetch_settings() { return g_l2_settings; }
@@ -331,9 +331,9 @@ WeightPrefetcher::WeightPrefetcher() {
   DGPP_CUDA_OK(cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming));
   DGPP_CUDA_OK(cudaEventCreateWithFlags(&join_, cudaEventDisableTiming));
   DGPP_LOG_INFO("l2 prefetch: on, window budget {} MiB, boundary rate {}, "
-                "layer rate {}",
+                "layer rate {}, light blocks {}",
                 window_bytes_ >> 20, rate_name(boundary_rate_),
-                rate_name(layer_rate_));
+                rate_name(layer_rate_), s.light_blocks);
 }
 
 WeightPrefetcher::~WeightPrefetcher() {

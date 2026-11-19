@@ -87,6 +87,7 @@ struct L2PrefetchSettings {
   size_t boundary_window_bytes = size_t{20} << 20;  // engine.l2_prefetch_boundary_window_mib (0: the window budget)
   PrefetchRate boundary_rate = PrefetchRate::Light;
   PrefetchRate layer_rate = PrefetchRate::Light;
+  int light_blocks = 16;
 };
 void l2_prefetch_configure(const L2PrefetchSettings& s);
 const L2PrefetchSettings& l2_prefetch_settings();

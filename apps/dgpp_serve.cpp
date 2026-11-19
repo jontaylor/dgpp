@@ -1954,6 +1954,7 @@ int main(int argc, char** argv) {
   bool l2_prefetch = true, l2_prefetch_merge = true;  // engine.l2_prefetch*
   std::string l2_prefetch_form = "load", l2_prefetch_full_form = "16x8", l2_prefetch_boundary_rate = "light",
               l2_prefetch_layer_rate = "light";
+  int l2_prefetch_light_blocks = 16;
   int l2_prefetch_window_mib = 12, l2_prefetch_boundary_window_mib = 20;
   int dflash_depth = 0;
   std::string dflash_weights = "checkpoint";  // engine.dflash_weights: checkpoint | fp8
@@ -2191,6 +2192,7 @@ int main(int argc, char** argv) {
     l2_prefetch_form = e.l2_prefetch_form;
     l2_prefetch_full_form = e.l2_prefetch_full_form;
     l2_prefetch_window_mib = e.l2_prefetch_window_mib;
+    l2_prefetch_light_blocks = e.l2_prefetch_light_blocks;
     l2_prefetch_boundary_window_mib = e.l2_prefetch_boundary_window_mib;
     l2_prefetch_boundary_rate = e.l2_prefetch_boundary_rate;
     l2_prefetch_layer_rate = e.l2_prefetch_layer_rate;
@@ -2358,6 +2360,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-l2-prefetch") l2_prefetch = false;
     else if (a == "--l2-prefetch-form") l2_prefetch_form = next();
     else if (a == "--l2-prefetch-full-form") l2_prefetch_full_form = next();
+    else if (a == "--l2-prefetch-light-blocks") l2_prefetch_light_blocks = std::stoi(next());
     else if (a == "--l2-prefetch-window-mib") l2_prefetch_window_mib = std::stoi(next());
     else if (a == "--l2-prefetch-boundary-window-mib") l2_prefetch_boundary_window_mib = std::stoi(next());
     else if (a == "--l2-prefetch-boundary-rate") l2_prefetch_boundary_rate = next();
@@ -2753,6 +2756,7 @@ int main(int argc, char** argv) {
         ws.l2_prefetch_form = l2_prefetch_form;
         ws.l2_prefetch_full_form = l2_prefetch_full_form;
         ws.l2_prefetch_window_mib = l2_prefetch_window_mib;
+        ws.l2_prefetch_light_blocks = l2_prefetch_light_blocks;
         ws.l2_prefetch_boundary_window_mib = l2_prefetch_boundary_window_mib;
         ws.l2_prefetch_boundary_rate = l2_prefetch_boundary_rate;
         ws.l2_prefetch_layer_rate = l2_prefetch_layer_rate;
@@ -2880,6 +2884,7 @@ int main(int argc, char** argv) {
         l2_prefetch_form = ws.l2_prefetch_form;
         l2_prefetch_full_form = ws.l2_prefetch_full_form;
         l2_prefetch_window_mib = ws.l2_prefetch_window_mib;
+        l2_prefetch_light_blocks = ws.l2_prefetch_light_blocks;
         l2_prefetch_boundary_window_mib = ws.l2_prefetch_boundary_window_mib;
         l2_prefetch_boundary_rate = ws.l2_prefetch_boundary_rate;
         l2_prefetch_layer_rate = ws.l2_prefetch_layer_rate;
@@ -3111,6 +3116,7 @@ int main(int argc, char** argv) {
     }
     dgpp::L2PrefetchSettings l2;
     l2.enabled = l2_prefetch;
+    l2.light_blocks = l2_prefetch_light_blocks;
     l2.merge = l2_prefetch_merge;
 
     l2.window_bytes = static_cast<size_t>(l2_prefetch_window_mib) << 20;

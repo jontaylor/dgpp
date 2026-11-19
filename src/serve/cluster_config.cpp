@@ -428,6 +428,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.l2_prefetch_full_form != "16x8" && e.l2_prefetch_full_form != "48x4")
             fail(what, "'" + ek + "' must be 16x8 or 48x4");
         }
+        else if (p.key == "l2_prefetch_light_blocks") e.l2_prefetch_light_blocks = static_cast<int>(integer(x, ek, what, 1, 64));
         else if (p.key == "l2_prefetch_window_mib") e.l2_prefetch_window_mib = static_cast<int>(integer(x, ek, what, 1, 64));
         else if (p.key == "l2_prefetch_boundary_window_mib")
           e.l2_prefetch_boundary_window_mib = static_cast<int>(integer(x, ek, what, 0, 64));
