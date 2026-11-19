@@ -230,6 +230,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   Outputs run_rows(const RowRun& run);
   void reset_slot_state(int req);
   GlmSpecSegments spec_segments(int req, int snapshot_row0 = 0) const;
+  bool restore_eager_row(int req, int row, int64_t restored_position);
   size_t snapshot_state_bytes() const;
   size_t draft_state_bytes() const { return 0; }
   void write_state_snapshot(int req, uint8_t* dst, int spec_row);
@@ -354,6 +355,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
   int async_draft_append_ = 0;
+  bool fused_rollback_ = false;
   size_t draft_pick_prefetch_bytes_ = 0;
   void prefetch_draft_input_weights();
   int eager_draft_head_rows_ = 0, draft_rows_scored_ = 0;

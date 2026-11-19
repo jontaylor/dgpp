@@ -1469,6 +1469,13 @@ void SessionModel<D>::session_rollback(int req, int accepted, int rows, int snap
     throw std::invalid_argument("session_rollback: accepted rows must be in [1, " + std::to_string(T) + "]");
   const int64_t pos = session_pos_[static_cast<size_t>(req)];
   if (pos < T) throw std::invalid_argument("session_rollback: no verify to retract");
+  if constexpr (requires { derived().restore_eager_row(req, snapshot_base, pos); }) {
+    const int64_t restored_position = pos - (T - accepted);
+    if (accepted < T && derived().restore_eager_row(req, snapshot_base + accepted - 1, restored_position)) {
+      session_pos_[static_cast<size_t>(req)] = restored_position;
+      return;
+    }
+  }
   const GlmSpecSegments segs = derived().spec_segments(req, snapshot_base);
   if (segs.replay_dst != nullptr) {
     // A checkpoint-and-replay family (kernels/glm_spec.hpp): this pass's

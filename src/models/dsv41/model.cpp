@@ -521,6 +521,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_DRAFT_GRAPH"))
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
+  if (const char* value = std::getenv("DGPP_DSV41_FUSED_ROLLBACK"))
+    fused_rollback_ = std::string_view(value) == "1";
   if (const char* value = std::getenv("DGPP_DSV41_ASYNC_DRAFT_APPEND")) {
     const std::string_view mode(value);
     if (mode != "0" && mode != "1" && mode != "2")
@@ -1105,6 +1107,17 @@ GlmSpecSegments Dsv41Model::spec_segments(int req, int snapshot_row0) const {
     add(pool_.tails(t) + static_cast<size_t>(req) * 2 * kCsa2Latent, spec_tails(t, snapshot_row0), tail_bytes, tail_bytes);
   if (engram_) add(ctx(req), spec_ctx_ + static_cast<size_t>(snapshot_row0) * 4, 16, 16);
   return segs;
+}
+
+bool Dsv41Model::restore_eager_row(int req, int row, int64_t restored_position) {
+  if (!fused_rollback_) return false;
+  if (row < 0 || row >= max_decode_rows_) throw std::out_of_range("rollback snapshot row");
+  csa2_restore_verification_row(tails_, max_requests_, max_decode_rows_,
+      tails_ ? pool_.tails(0) + size_t(req) * 2 * kCsa2Latent : nullptr,
+      tails_ ? spec_tails(0, row) : nullptr, engram_ ? ctx(req) : nullptr,
+      engram_ ? spec_ctx_ + size_t(row) * 4 : nullptr, d_session_pos_ + req,
+      restored_position, stream_);
+  return true;
 }
 
 void Dsv41Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {

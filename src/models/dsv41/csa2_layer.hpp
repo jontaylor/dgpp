@@ -44,6 +44,10 @@ namespace dgpp {
 void csa2_stage_contiguous_rows(int64_t* positions, int32_t* requests, int req, int64_t pos0,
                                 int rows, cudaStream_t stream, int64_t* next_position = nullptr);
 
+void csa2_restore_verification_row(int tails, int request_stride, int snapshot_stride,
+                                   float* live_tail, const float* saved_tail,
+                                   int32_t* context, const int32_t* saved_context,
+                                   int64_t* position, int64_t restored_position, cudaStream_t stream);
 
 struct Csa2Config {
   // The dense fp8 projections' decode form: the streaming tensor-core GEMM

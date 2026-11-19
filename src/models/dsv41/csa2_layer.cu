@@ -934,6 +934,23 @@ void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, 
 // ---- prefill --------------------------------------------------------------------------------------
 
 namespace {
+// Source and destination already point to this request and verification row.
+__global__ void restore_verification_row_kernel(int tails, int request_stride, int snapshot_stride,
+                                                uint4* live, const uint4* saved, int4* context,
+                                                const int4* saved_context, int64_t* position,
+                                                int64_t restored_position) {
+  dgpp_pdl_wait();
+  constexpr int vectors = 2 * kCsa2Latent / 4;
+  if (blockIdx.x < tails) {
+    const size_t src = size_t(blockIdx.x) * snapshot_stride * vectors + threadIdx.x;
+    const size_t dst = size_t(blockIdx.x) * request_stride * vectors + threadIdx.x;
+    live[dst] = saved[src];
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (context) *context = *saved_context;
+    *position = restored_position;
+  }
+}
 __global__ void prefill_metadata_kernel(int64_t* positions, int32_t* requests,
                                        int tokens, int req, int64_t pos0, int64_t* next_position) {
   dgpp_pdl_wait();
@@ -941,6 +958,16 @@ __global__ void prefill_metadata_kernel(int64_t* positions, int32_t* requests,
   if (i < tokens) { positions[i] = pos0 + i; requests[i] = req; }
   if (i == 0 && next_position) *next_position = pos0 + tokens;
 }
+}
+void csa2_restore_verification_row(int tails, int request_stride, int snapshot_stride,
+                                   float* live_tail, const float* saved_tail,
+                                   int32_t* context, const int32_t* saved_context,
+                                   int64_t* position, int64_t restored_position, cudaStream_t stream) {
+  restore_verification_row_kernel<<<std::max(1, tails), 2 * kCsa2Latent / 4, 0, stream>>>(
+      tails, request_stride, snapshot_stride, reinterpret_cast<uint4*>(live_tail),
+      reinterpret_cast<const uint4*>(saved_tail), reinterpret_cast<int4*>(context),
+      reinterpret_cast<const int4*>(saved_context), position, restored_position);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 void csa2_stage_contiguous_rows(int64_t* positions, int32_t* requests, int req, int64_t pos0,
                                 int rows, cudaStream_t stream, int64_t* next_position) {

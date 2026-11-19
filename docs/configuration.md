@@ -497,6 +497,11 @@ host can prepare verification while the GPU updates the rings. Mode `2`
 also replays the ring updates at previously seen widths when resident draft
 graphs are enabled. The default is `0`.
 
+For partially accepted eager verification blocks, `DGPP_DSV41_FUSED_ROLLBACK=1`
+restores the accepted row's compressor tails, Engram history and device
+position together on the model stream. The next draft can be submitted while
+that copy runs. The default is `0`.
+
 The DSpark Markov projection uses resident BF16 weights.
 `DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
 chain positions in the coalesced reader. Mode `2` prepares a rank-local copy
