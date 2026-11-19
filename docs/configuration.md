@@ -515,6 +515,11 @@ hidden layer is available. The draft consumes only the accepted prefix of
 the result. This uses the existing projection buffer and the resident FP8
 projection with BF16 outputs. The default is `0`.
 
+`DGPP_DSV41_DRAFT_CANDIDATES=1` sends exact vocabulary tile winners to the
+CPU for single-request eager neural proposals. The reduction runs after
+Markov bias and any configured rescoring. If the grammar forbids the local
+winner, the engine downloads that row for masking. The default is `0`.
+
 The DSpark Markov projection uses resident BF16 weights.
 `DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
 chain positions in the coalesced reader. Mode `2` prepares a rank-local copy

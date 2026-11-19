@@ -83,7 +83,7 @@ struct Dsv41Model::PagedGraphs {
   };
   std::map<std::array<uint64_t, 7>, Graph> graphs;
   static constexpr size_t max_target_graphs = 8;
-  std::map<std::array<int, 5>, Graph> draft_graphs, append_graphs;
+  std::map<std::array<int, 6>, Graph> draft_graphs, append_graphs;
   cudaStream_t service = nullptr;
   cudaStream_t draft_input = nullptr;
   cudaEvent_t draft_start = nullptr, draft_done = nullptr;
@@ -534,6 +534,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     if (mtp && residency == Dsv41Residency::Resident && !cfg_.weights_exl3 && dense_mma_)
       early_draft_input_ = mode.front() - '0';
   }
+  if (const char* value = std::getenv("DGPP_DSV41_DRAFT_CANDIDATES"))
+    draft_candidates_enabled_ = std::string_view(value) == "1";
   if (const char* value = std::getenv("DGPP_DSV41_FUSED_ROLLBACK"))
     fused_rollback_ = std::string_view(value) == "1";
   if (const char* value = std::getenv("DGPP_DSV41_ASYNC_DRAFT_APPEND")) {
@@ -1468,15 +1470,14 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   draft_row_ = 1;
   prefetch_.join(stream_);
   if (decode_row && (!capture || decode_tail_mirrors_) && head_rows <= max_decode_rows_)
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, static_cast<size_t>(head_rows) * lm_vocab_count_ * sizeof(float),
-                                 cudaMemcpyDeviceToHost, stream_));
+    publish_draft_logits(head_rows);
 }
 
 bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only, bool prepared) {
   auto& p = *paged_graphs_;
   auto& graphs = append_only ? p.append_graphs : p.draft_graphs;
-  const std::array<int, 5> key{req, accepted_rows, append_only ? 0 : eager_draft_head_rows_,
-                               int(!append_only && eager_draft_confidence_), int(prepared)};
+  const std::array<int, 6> key{req, accepted_rows, append_only ? 0 : eager_draft_head_rows_,
+                               int(!append_only && eager_draft_confidence_), int(prepared), int(!append_only && compact_draft_)};
   auto it = graphs.find(key);
   if (it == graphs.end()) {
     if (graphs.size() >= PagedGraphs::max_target_graphs) return false;
@@ -1558,8 +1559,7 @@ void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, i
                             tokens, 1, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block + row,
                             block, stream_);
   if (!capture || decode_tail_mirrors_)
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, static_cast<size_t>(head_rows) * lm_vocab_count_ * sizeof(float),
-                                 cudaMemcpyDeviceToHost, stream_));
+    publish_draft_logits(head_rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,6 +2505,48 @@ void Dsv41Model::prefetch_draft_input_weights() {
   launch_l2_prefetch(w.payload, bytes, prefetch_.boundary_rate(), stream_);
 }
 
+void Dsv41Model::ensure_candidate_tiles() {
+  if (verify_maxima_) return;
+  if (!h_verify_maxima_)
+    h_verify_maxima_ = pinned_alloc<sample::Candidate>(size_t(max_decode_rows_) * dsv41_verify_tiles(lm_vocab_count_));
+  DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&verify_maxima_), h_verify_maxima_, 0));
+}
+
+void Dsv41Model::collect_candidate_tiles(Outputs& out, int rows) {
+  out.lm_vocab_begin = lm_vocab_begin_;
+  out.lm_vocab_count = lm_vocab_count_;
+  const int tiles = dsv41_verify_tiles(lm_vocab_count_);
+  for (int r = 0; r < rows; ++r) {
+    const auto* row = h_verify_maxima_ + size_t(r) * tiles;
+    auto best = row[0];
+    for (int i = 1; i < tiles; ++i)
+      if (row[i].logit > best.logit) best = row[i];
+    out.local_candidates.push_back(best);
+  }
+  compact_verify_rows_ = rows;
+}
+
+Dsv41Model::DraftCandidateScope Dsv41Model::draft_candidate_scope() {
+  if (draft_candidates_enabled_) ensure_candidate_tiles();
+  compact_draft_ = draft_candidates_enabled_;
+  return {compact_draft_};
+}
+
+bool Dsv41Model::collect_draft_candidate(Outputs& out) {
+  if (!compact_draft_) return false;
+  collect_candidate_tiles(out, 1);
+  return true;
+}
+
+void Dsv41Model::publish_draft_logits(int rows) {
+  if (compact_draft_) {
+    dsv41_verify_tile_max(logits_, rows, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
+  } else {
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, size_t(rows) * lm_vocab_count_ * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream_));
+  }
+}
+
 Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::vector<int64_t>& tokens) {
   const char* flag = std::getenv("DGPP_DSV41_GPU_CANDIDATES");
   // Only the eager greedy verifier requests compact output. All diagnostic,
@@ -2512,11 +2554,7 @@ Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::ve
   compact_verify_ = flag && flag[0] == '1';
   compact_verify_rows_ = 0;
   try {
-    if (compact_verify_ && !verify_maxima_) {
-      if (!h_verify_maxima_)
-        h_verify_maxima_ = pinned_alloc<sample::Candidate>(size_t(max_decode_rows_) * dsv41_verify_tiles(lm_vocab_count_));
-      DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&verify_maxima_), h_verify_maxima_, 0));
-    }
+    if (compact_verify_) ensure_candidate_tiles();
     auto out = Base::session_verify(req, tokens);
     if (!compact_verify_) prefetch_draft_input_weights();
     compact_verify_ = false;
@@ -3022,17 +3060,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       start_draft_input(req, run.pos0, run.T, false);
     }
-    out.lm_vocab_begin = lm_vocab_begin_;
-    out.lm_vocab_count = lm_vocab_count_;
-    const int tiles = dsv41_verify_tiles(lm_vocab_count_);
-    for (int r = 0; r < run.T; ++r) {
-      const auto* row = h_verify_maxima_ + size_t(r) * tiles;
-      auto best = row[0];
-      for (int i = 1; i < tiles; ++i)
-        if (row[i].logit > best.logit) best = row[i];
-      out.local_candidates.push_back(best);
-    }
-    compact_verify_rows_ = run.T;
+    collect_candidate_tiles(out, run.T);
   } else {
     out = finish_run(run, std::move(out), packed_logits, -1,
                      output_hidden_rows.empty() ? nullptr : &output_hidden_rows, tail_ready);

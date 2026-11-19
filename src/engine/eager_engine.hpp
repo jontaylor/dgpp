@@ -1099,6 +1099,12 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         if (grammar) grammar->advance(token);
         return token;
       };
+      // A compact row is consumed by pick_draft before the next chain row
+      // overwrites logits. A rejected local winner still needs the grammar mask.
+      [[maybe_unused]] auto draft_output = [&] {
+        if constexpr (requires { model_->draft_candidate_scope(); }) return model_->draft_candidate_scope();
+        else return false;
+      }();
       const auto first = model_->session_draft(req, rows);
       if (!mtp_schedule_) {
         drafts.assign(static_cast<size_t>(mtp_depth_), -1);

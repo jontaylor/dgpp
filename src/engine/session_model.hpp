@@ -512,6 +512,7 @@ class SessionModel : public PrefillReporting {
   void check_draft_rows(int req, const std::vector<int64_t>& tokens) const;
   void mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload);
   void execute_draft_rows(int req, const std::vector<int64_t>& tokens, int head_rows);
+  Outputs single_draft_output();
   // The draft block's input window per slot ([R][max_decode_rows_][draft_width]).
   uint16_t* mtp_window(int req) const {
     return mtp_window_ +
@@ -2003,7 +2004,14 @@ void SessionModel<D>::execute_draft_rows(int req, const std::vector<int64_t>& to
 template <class D>
 typename SessionModel<D>::Outputs SessionModel<D>::session_draft(int req, const std::vector<int64_t>& tokens) {
   execute_draft_rows(req, tokens, 1);
+  return single_draft_output();
+}
+
+template <class D>
+typename SessionModel<D>::Outputs SessionModel<D>::single_draft_output() {
   Outputs out;
+  if constexpr (requires { derived().collect_draft_candidate(out); })
+    if (derived().collect_draft_candidate(out)) return out;
   out.lm_vocab_begin = lm_vocab_begin_;
   out.lm_vocab_count = lm_vocab_count_;
   out.logits.assign(h_tail_logits_, h_tail_logits_ + static_cast<size_t>(lm_vocab_count_));
@@ -2111,11 +2119,7 @@ typename SessionModel<D>::Outputs SessionModel<D>::session_draft_chain(int req, 
   if (last) derived().restore_chain_state(req);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   draft_last_row_ = 0;
-  Outputs out;
-  out.lm_vocab_begin = lm_vocab_begin_;
-  out.lm_vocab_count = lm_vocab_count_;
-  out.logits.assign(h_tail_logits_, h_tail_logits_ + static_cast<size_t>(lm_vocab_count_));
-  return out;
+  return single_draft_output();
 }
 
 template <class D>

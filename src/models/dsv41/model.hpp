@@ -252,6 +252,12 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // written by the step's draft (row 0 by the block, row c by chain row c).
   static constexpr bool kVerifyConfidence = true;
   void set_eager_draft_outputs(int depth, bool schedule);
+  struct DraftCandidateScope {
+    bool& active;
+    ~DraftCandidateScope() { active = false; }
+  };
+  [[nodiscard]] DraftCandidateScope draft_candidate_scope();
+  bool collect_draft_candidate(Outputs& out);
   bool draft_chain_reads_hidden(int req, int64_t pos) const {
     return !eager_token_only_chain_ || draft_row_ == 0 || pos < session_pos_[req];
   }
@@ -356,6 +362,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool resident_draft_graphs_ = false;
   int async_draft_append_ = 0;
   int early_draft_input_ = 0;
+  bool draft_candidates_enabled_ = false, compact_draft_ = false;
+  void ensure_candidate_tiles();
+  void collect_candidate_tiles(Outputs& out, int rows);
+  void publish_draft_logits(int rows);
   int prepared_draft_req_ = -1, prepared_draft_rows_ = 0;
   int64_t prepared_draft_pos_ = -1;
   void project_draft_input(const uint16_t* src, int rows, bool prefill_tile, cudaStream_t stream);
