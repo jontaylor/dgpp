@@ -1312,16 +1312,28 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
   const int K = cfg_.top_k, H = cfg_.hidden, I = cfg_.inter;
   const auto& g = w_.shared[0]; const auto& u = w_.shared[1]; const auto& d = w_.shared[2];
   const auto shift = [](int block) { int n = 0; while ((1 << n) < block) ++n; return n; };
+  static const int shared_limit = [] {
+    const char* flag = std::getenv("DGPP_EXPERT_SHARED_BLOCKS");
+    if (!flag) return 0;
+    char* end = nullptr;
+    const long value = std::strtol(flag, &end, 10);
+    if (end == flag || *end != '\0' || value < 0 || value > 128)
+      throw std::invalid_argument("DGPP_EXPERT_SHARED_BLOCKS must be 0..128");
+    return static_cast<int>(value);
+  }();
+  // The persistent routed grid shares the GPU with this branch. Bound only
+  // the shared expert of the paged target graph; its row arithmetic is fixed.
+  const int blocks = shared_limit ? std::min(shared_limit, sh_lane_blocks_) : sh_lane_blocks_;
   const int run = moe_shared_run_rows(tokens, H);
   DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
   DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
   auto* act = d_slot_act_ + K*I;
   launch_moe_shared_run_gate_up_swiglu(hidden, H, g.payload, g.scales, u.payload, u.scales,
       act, static_cast<size_t>(K+1)*I, tokens, static_cast<int>(g.rows), H, cfg_.swiglu_limit,
-      run, sh_lane_blocks_, sh_lane_, shift(g.scale_block_rows), shift(g.scale_block_cols));
+      run, blocks, sh_lane_, shift(g.scale_block_rows), shift(g.scale_block_cols));
   launch_moe_shared_run_down(act, static_cast<size_t>(K+1)*I, d.payload, d.scales,
       d_slot_down_ + K*H, static_cast<size_t>(K+1)*H, tokens, H, static_cast<int>(g.rows),
-      run, sh_lane_blocks_, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
+      run, blocks, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
   DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
   // The shared slots are disjoint from routed slots on both execution paths.
   route(hidden, tokens, stream, d_router_counters_);
