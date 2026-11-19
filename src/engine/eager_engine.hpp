@@ -431,6 +431,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     sched::SchedulerEngine::PrefixInfo info;
     info.arena_slots = arena_.slots();
     info.align = model_->session_snapshot_align();
+    if constexpr (kEagerMtp)
+      if (mtp_depth_) info.max_hop_distance = max_tokens_per_step() - 1;
     info.block_tokens = model_->kv_block_tokens();
     info.chunk_tokens = Model::prefill_chunk_tokens();
     if constexpr (requires { model_->mtp_enabled(); })
@@ -513,6 +515,12 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       }
     }
     return true;
+  }
+  void prefix_arm_hop(int req, int slot, int64_t position) override {
+    state_.at(req).hop = {PrefixHopStatus::kNone, slot, position};
+  }
+  PrefixHopResult take_prefix_hop_result(int req) override {
+    return std::exchange(state_.at(req).hop, PrefixHopResult{});
   }
   void prefix_snapshot(int req, int slot, int64_t position) override {
     arena_.snapshot(req, slot, position);
@@ -775,6 +783,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
   }
   void close(int req) override {
+    state_.at(req).hop = {};
     mtp_drafts_.at(static_cast<size_t>(req)).clear();
     mtp_slot_attempts_.at(static_cast<size_t>(req)) = {};
     mtp_slot_accepts_.at(static_cast<size_t>(req)) = {};
@@ -954,6 +963,24 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       }
       const auto redraft_begin = stamp();
       mtp_redraft_batch(draft_reqs, draft_rows);
+      // The target's per-row rollback state survives the DSpark draft walk.
+      // The accepted draft rows have now populated its attention rings too.
+      for (size_t i = 0; i < reqs.size(); ++i) {
+        const int req = reqs[i];
+        auto& hop = state_[req].hop;
+        if (hop.slot < 0) continue;
+        hop.status = PrefixHopStatus::kNotTaken;
+        const int64_t pos = model_->session_position(req);
+        const int64_t after = pos - hop.position;
+        const int accepted = verdicts[i].accepted;
+        if (after <= 0 || after >= accepted || model_->session_draft_position(req) != pos) continue;
+        // A chain that stages future hidden rows must not wrap around and
+        // overwrite the target hidden row at hop.position - 1.
+        if (after + mtp_depth_ - 1 >= model_->max_decode_rows()) continue;
+        const int row = offsets[i] + accepted - 1 - static_cast<int>(after);
+        const bool saved = arena_.snapshot_post_row0(req, hop.slot, hop.position, row, static_cast<int>(after));
+        hop.status = saved ? PrefixHopStatus::kStored : PrefixHopStatus::kNoBlock;
+      }
       const auto end = stamp();
       if (timing) {
         const auto ms = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
@@ -1108,6 +1135,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
   struct SlotState {
     LookupHistoryIndex lookup;
+    PrefixHopResult hop;
     int mtp_eligibility_reasons = -1;  // Log once per request and on eligibility changes.
     sample::Params params = sample::greedy_params();
     sample::Rng rng;

@@ -1507,7 +1507,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   sched::SchedulerEngine::PrefixInfo prefix_info() const override {
     sched::SchedulerEngine::PrefixInfo info;
     info.arena_slots = arena_.slots();
-    info.step_tokens_max = rows_per_request_;
+    info.max_hop_distance = rows_per_request_ > 1 ? 1 : 0;
     info.align = model_->session_snapshot_align();
     info.block_tokens = model_->kv_block_tokens();
     info.chunk_tokens = Model::prefill_chunk_tokens();

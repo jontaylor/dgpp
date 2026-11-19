@@ -169,7 +169,7 @@ class FakeEngine : public SchedulerEngine {
     info.align = arena_align_;
     info.block_tokens = block_tokens_;
     info.chunk_tokens = arena_chunk_;
-    info.step_tokens_max = step_tokens_max_;
+    info.max_hop_distance = step_tokens_max_ - 1;
     info.prefill_lookahead = prefill_lookahead_;
     info.attach_within = attach_within_;
     return info;
@@ -482,11 +482,9 @@ class FakeEngine : public SchedulerEngine {
       const auto [slot, position] = hop_armed_[req];
       hop_armed_.erase(req);
       hop_results_[req].status = PrefixHopStatus::kNotTaken;
-      if (out.size() >= 2) {
-        require(position == live.prompt_tokens + static_cast<int64_t>(live.returned),
-                "fake: hop position " + std::to_string(position) +
-                    " is not the committed count + 1 (" +
-                    std::to_string(live.prompt_tokens + static_cast<int64_t>(live.returned)) + ")");
+      const auto start = live.prompt_tokens + static_cast<int64_t>(live.returned) - 1;
+      require(position > start && position - start < step_tokens_max_, "fake: hop outside the step");
+      if (start + static_cast<int64_t>(out.size()) > position) {
         if (pinned_.count(slot) != 0) pinned_.erase(slot);
         pin(slot, position);
         hop_results_[req].status = PrefixHopStatus::kStored;
@@ -3314,6 +3312,18 @@ DGPP_TEST(scheduler_prefixCache_aStepCutShortByTheCapTakesNoRetireSnapshot) {
     require(ops.find("RS:0:24@") == std::string::npos, "align 4: no retire-time snapshot at 24: " + ops);
     require(ops.size() >= 3 && ops.compare(ops.size() - 3, 3, "C:0") == 0, "align 4: the slot closed: " + ops);
   }
+}
+
+DGPP_TEST(scheduler_prefixCache_interiorHopAfterEarlyEosIsNeverPublished) {
+  FakeEngine engine(1, 100, 4);
+  engine.set_prefix_arena(4, 8);
+  engine.set_step_tokens_max(6);
+  engine.arm_batches(0, 31, {{kEos, 33, 34, 35, 36, 37}}, 7);
+  Scheduler sched(&engine, {kEos});
+  sched.submit(make_cached_request("short", counted_prompt(21), {8}, 7));
+  sched.run_to_completion();
+  require(sched.meters().prefix_hops == 1 && sched.meters().prefix_close_entries == 0,
+          "the engine crossed 24 but the public response stopped at 22");
 }
 
 DGPP_TEST(scheduler_prefixCache_twoTokenStepsHopOverAnAlignedPositionAndSnapshotIt) {

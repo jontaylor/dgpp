@@ -269,7 +269,7 @@ class SchedulerEngine {
     int64_t align = 1;         // every snapshot position is a multiple (kpool)
     int64_t block_tokens = 0;  // the DSA block; 0 = no pool (nothing pinned)
     int64_t chunk_tokens = 2048;  // the prefill's chunk (the cold cuts)
-    int step_tokens_max = 1;   // tokens one step may commit (2: the MTP step)
+    int max_hop_distance = 0;  // furthest row boundary recoverable inside one accepted step
     bool prefill_lookahead = false;  // MTP prefill snapshots also depend on prompt[position]
     bool body_snapshots = true;      // extra snapshots must preserve the prefill's computation
     // A request may open on the first tokens of a deeper entry: the engine
@@ -277,13 +277,9 @@ class SchedulerEngine {
     bool attach_within = false;
   };
   virtual PrefixInfo prefix_info() const { return {}; }
-  // The hop (M7 under a multi-token step): the request's next step may
-  // commit past `position` (= its committed count + 1, pool-aligned) without
-  // stopping there; if it commits two tokens, the engine attempts to save the state
-  // after the step's first row — the state at `position` — into arena slot
-  // `slot` before returning from that step. Capture is decided before sampled
-  // fallback: the final token count does NOT say whether it happened.
-  // The arm holds until the slot's next step (or its close).
+  // Save the aligned state if the next step commits past the requested
+  // position. The arm holds until the slot steps or closes. A graph engine
+  // may capture before sampled fallback, so it reports the actual outcome.
   enum class PrefixHopStatus { kNone, kNotTaken, kStored, kNoBlock };
   struct PrefixHopResult {
     PrefixHopStatus status = PrefixHopStatus::kNone;

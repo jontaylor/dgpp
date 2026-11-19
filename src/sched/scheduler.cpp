@@ -1220,10 +1220,12 @@ void Scheduler::apply_step_batch(const std::vector<int>& arrivals,
     r.hop_armed = -1;
     const auto outcome = engine_->take_prefix_hop_result(r.slot);
     const int64_t position = engine_->prefix_position(r.rolling_slot);
+    const int64_t before = static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1;
+    const bool crossed = before < hop && before + static_cast<int64_t>(batches[i].size()) > hop;
     const bool matches_arm = outcome.slot == r.rolling_slot && outcome.position == hop;
     using Hop = SchedulerEngine::PrefixHopStatus;
     if (matches_arm && outcome.status == Hop::kNotTaken && position == r.rolling_position) {
-      if (batches[i].size() >= 2) {
+      if (crossed) {
         ++cache_.stats().skipped_hop_fallback;
         cache_.note(7, static_cast<uint64_t>(hop), static_cast<uint64_t>(r.rolling_slot));
         // A position of -1 means this was the first hop: there is no old
@@ -1240,7 +1242,7 @@ void Scheduler::apply_step_batch(const std::vector<int>& arrivals,
       ++cache_.stats().skipped_no_block;
       continue;
     }
-    if (!matches_arm || outcome.status != Hop::kStored || position != hop || batches[i].size() < 2) {
+    if (!matches_arm || outcome.status != Hop::kStored || position != hop || !crossed) {
       // Unexpected cache metadata must not be published under a guessed
       // prefix. Drop this request's optional snapshot, preserving the
       // model's own position checks and all non-cache engine failures.
@@ -1407,11 +1409,12 @@ void Scheduler::retire(int arrival, Result::Status status,
     r.rolling_slot = -1;
     r.rolling_position = -1;
     bool kept = false;
-    const bool cancelled_snapshot_is_committed =
-        reason == Result::Reason::kCancelled && position > 0 &&
-        position <= static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1;
-    if (reason == Result::Reason::kEos || reason == Result::Reason::kSteps ||
-        cancelled_snapshot_is_committed) {
+    // A public stop can cut an accepted verification batch before an
+    // interior snapshot. Only published, committed tokens may key an entry.
+    const bool reusable = reason == Result::Reason::kCancelled ||
+                          reason == Result::Reason::kEos || reason == Result::Reason::kSteps;
+    if (reusable && position > 0 &&
+        position <= static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1) {
       std::vector<int64_t> ids(r.spec.prompt.begin(), r.spec.prompt.end());
       const int64_t gen = position - static_cast<int64_t>(r.spec.prompt.size());
       if (gen > 0)
@@ -2102,11 +2105,9 @@ void Scheduler::rolling_snapshots() {
         static_cast<int64_t>(r.spec.prompt.size()) + r.steps_done - 1;
     if (committed <= 0) continue;
     if (committed % align != 0) {
-      // The hop (M7 under the two-token step): the next aligned position is
-      // committed + 1 and a step that commits two tokens passes it without
-      // stopping — arm the engine to take the state after its first row.
-      const int64_t hop = committed + 1;
-      if (prefix_info_.step_tokens_max < 2 || hop % align != 0) continue;
+      const int64_t distance = align - committed % align;
+      if (distance > prefix_info_.max_hop_distance) continue;
+      const int64_t hop = committed + distance;
       if (hop <= r.attach_position || hop == r.rolling_position) continue;
       if (hop < policy_.prefix_min_tokens) continue;  // below the entry floor
       if (r.rolling_slot < 0) {

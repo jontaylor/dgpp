@@ -1007,6 +1007,73 @@ DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
   }
 }
 
+DGPP_TEST(dsv41_eager_dspark_restores_interior_prefix_for_each_request) {
+  using Engine = dgpp::sched::SchedulerEngine;
+  const Fixture fx = make_fixture(false);
+  const auto pick = dgpp::make_w1_pick(fx.cfg.vocab_size);
+  std::vector<std::vector<int64_t>> prompts{
+      tokens_of(43, 125, fx.cfg.vocab_size), tokens_of(47, 126, fx.cfg.vocab_size)};
+  std::vector<std::vector<int32_t>> expected(2);
+  {
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 1024, dgpp::Dsv41Residency::Resident,
+                           nullptr, 0, 1, 2, false, 16);
+    for (int req : {0, 1}) {
+      auto& ids = expected[req];
+      ids.push_back(pick(model.session_prefill(req, prompts[req])));
+      for (int t = 0; t < 16; ++t) ids.push_back(pick(model.session_step(req, ids.back())));
+      model.session_close(req);
+    }
+  }
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 1024, dgpp::Dsv41Residency::Resident,
+                         nullptr, 0, 1, 2, true, 16, false, &paging);
+  dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 2, pick, nullptr, nullptr, 2);
+  int draft = 0;
+  engine.configure_eager_mtp(5, [&](const std::vector<dgpp::sample::Candidate>& rows) {
+    if (draft < 5 && rows.size() == 2) {
+      ++draft;
+      return std::vector<int32_t>{expected[0][draft], expected[1][draft]};
+    }
+    std::vector<int32_t> ids;
+    for (const auto& row : rows) ids.push_back(row.id);
+    return ids;
+  });
+  for (int req : {0, 1}) {
+    require(engine.prefill(req, prompts[req]) == expected[req][0], "prefill agrees");
+    engine.reserve(req, 160);
+    engine.prefix_arm_hop(req, req, 128);
+  }
+  const auto batches = engine.step_batch({0, 1});
+  for (int req : {0, 1}) {
+    require(batches[req].size() == 6 && std::equal(batches[req].begin(), batches[req].end(),
+            expected[req].begin() + 1), "full verification crosses the cut without shortening the pass");
+    const auto saved = engine.take_prefix_hop_result(req);
+    require(saved.status == Engine::PrefixHopStatus::kStored && saved.position == 128 &&
+            saved.slot == req && engine.prefix_position(req) == 128, "saved the interior row of this slot");
+    engine.close(req);
+  }
+  for (int req : {0, 1}) {
+    // Resume with a suffix that differs from the verified rows past the cut.
+    // A fresh full prefill supplies the reference picks and draft state.
+    auto next = prompts[req];
+    next.insert(next.end(), expected[req].begin(), expected[req].begin() + (128 - next.size()));
+    next.insert(next.end(), {7, 11, 13, 17});
+    const auto fresh = engine.prefill(req, next);
+    engine.reserve(req, 160);
+    const auto following = engine.step(req);
+    engine.close(req);
+    const std::vector<int64_t> boundaries{128};
+    Engine::PrefixPrefill plan;
+    plan.boundaries = &boundaries;
+    plan.attach_slot = req;
+    plan.attach_position = 128;
+    require(engine.prefill_cached(req, next, &plan) == fresh, "reattached suffix agrees with a fresh prefill");
+    engine.reserve(req, 160);
+    require(engine.step(req) == following, "next verified and drafted tokens agree after the attach");
+    engine.close(req);
+  }
+}
+
 DGPP_TEST(dsv41_paged_eager_stale_draft_skips_optional_snapshot) {
   const Fixture fx = make_fixture(true);
   const auto prompt = tokens_of(0x5A9, 253, fx.cfg.vocab_size);
