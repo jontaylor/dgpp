@@ -4,6 +4,7 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include "loaders/minijson.hpp"
@@ -866,26 +867,27 @@ void GrammarState::enter(State s) {
   }
 }
 
+// Tokens may span any literal bytes through the next DSML tag. Only the
+// checkpoint's marker id can consume the tag itself.
+static std::string_view next_literal(std::string_view target, std::string_view emitted) {
+  if (!target.starts_with(emitted)) return {};
+  target.remove_prefix(emitted.size());
+  const auto tag = target.find(kDsmlSentinel);
+  return target.substr(0, tag == 0 ? 1 : tag);
+}
+
 std::vector<int64_t> GrammarState::match_ids(const TextMatch& m,
                                              int64_t closer) const {
   std::vector<int64_t> out;
   for (const std::string& target : m.targets) {
-    if (target.size() <= m.emitted.size()) continue;
-    if (target.compare(0, m.emitted.size(), m.emitted) != 0) continue;
-    // A DSML target's tag: the marker id alone continues there, and no
-    // token's text may run across it.
-    size_t remaining = target.size() - m.emitted.size();
-    const size_t sentinel = target.find(kDsmlSentinel, m.emitted.size());
-    if (sentinel == m.emitted.size()) {
+    const auto piece = next_literal(target, m.emitted);
+    if (piece.empty()) continue;
+    if (piece.front() == kDsmlSentinel) {
       out.push_back(vocab_->markers().dsml.id);
       continue;
     }
-    if (sentinel != std::string::npos) remaining = sentinel - m.emitted.size();
-    const unsigned char b = static_cast<unsigned char>(target[m.emitted.size()]);
-    for (const int32_t id : vocab_->ids_starting_with(b)) {
-      const std::string& text = vocab_->text(id);
-      if (text.size() <= remaining &&
-          target.compare(m.emitted.size(), text.size(), text) == 0)
+    for (const int32_t id : vocab_->ids_starting_with(static_cast<unsigned char>(piece.front()))) {
+      if (piece.starts_with(vocab_->text(id)))
         out.push_back(id);
     }
   }
@@ -1259,6 +1261,34 @@ bool GrammarState::allows(int64_t id) const {
     if (minimax_->allows(id)) return true;
     return spec().mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
            json_allows(json_, -1, id);
+  }
+  if (dsml() && spec().mode != GrammarSpec::Mode::kJsonOrTools && state_ == State::kTop) {
+    if (id < 0 || id >= vocab_->vocab_size()) return false;
+    if (top_lt_ && calls_remaining() && id == vocab_->markers().dsml.id) return true;
+    const auto& markers = vocab_->marker_ids();
+    return std::find(markers.begin(), markers.end(), id) == markers.end() &&
+           !(obligation_open() && vocab_->is_eos(id));
+  }
+  switch (state_) {
+    case State::kDCalls:
+    case State::kDInvoke:
+    case State::kDParamOrClose:
+    case State::kDFlag:
+    case State::kDInvokeOrClose: {
+      if (id < 0 || id >= vocab_->vocab_size()) return false;
+      const auto& text = vocab_->text(id);
+      for (const auto& target : match_.targets) {
+        const auto piece = next_literal(target, match_.emitted);
+        if (piece.empty()) continue;
+        if (piece.front() == kDsmlSentinel) {
+          if (id == vocab_->markers().dsml.id) return true;
+        } else if (!text.empty() && piece.starts_with(text)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    default: break;
   }
   if (state_ == State::kJsonBody) return json_allows(json_, -1, id);
   if (state_ == State::kValue) {

@@ -525,6 +525,24 @@ GrammarVocab dsml_vocab(dgpp::text::DsmlDialect dialect = dgpp::text::DsmlDialec
   return GrammarVocab(std::move(texts), m, {kEosText}, kVocab, kEosText);
 }
 
+DGPP_TEST(tool_grammar_dsml_point_queries_agree_with_the_full_mask_through_a_call) {
+  const GrammarVocab vocab = dsml_vocab();
+  GrammarState grammar(&vocab, spec_of(GrammarSpec::Mode::kRequired), false);
+  const std::string call = "Taking a look.\n<| calls>\n<| invoke name=\"get_weather\">\n"
+                           "<| parameter name=\"city\" string=\"true\">Paris</| parameter>\n"
+                           "</| invoke>\n</| calls>";
+  for (const char byte : call) {
+    TokenMask mask;
+    grammar.mask(&mask);
+    for (int id = -1; id <= kVocab; ++id)
+      require(grammar.allows(id) == mask.allows(id), grammar.state_name());
+    const int token = byte == '|' ? kDsmlTag : static_cast<unsigned char>(byte);
+    require(grammar.allows(token), "fixture token accepted");
+    grammar.advance(token);
+  }
+  require(grammar.allows(kEosText), "call complete");
+}
+
 DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   const GrammarVocab vocab = dsml_vocab();
   require(vocab.usable() && vocab.markers().tool_format() == dgpp::text::ToolFormat::kDsml,
