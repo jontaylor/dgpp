@@ -39,7 +39,8 @@ struct EdgeStats {
 // Rewrites every kernel -> kernel dependency whose dependent carries the
 // wait into a programmatic edge (the dependent launches as the primary's
 // blocks exit). Non-kernel nodes and unlisted kernels keep plain edges.
-inline EdgeStats programmatic_edges(cudaGraph_t graph) {
+using EdgeFilter = bool (*)(const char* producer, const char* consumer);
+inline EdgeStats programmatic_edges(cudaGraph_t graph, EdgeFilter filter = nullptr) {
   EdgeStats st;
   size_t n = 0;
   DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &n));
@@ -73,7 +74,7 @@ inline EdgeStats programmatic_edges(cudaGraph_t graph) {
     for (size_t i = 0; i < nd; ++i) {
       const char* from_name = nullptr;
       if (!kernel_name(deps[i], &from_name)) continue;  // only kernel -> kernel edges
-      if (data[i].type != cudaGraphDependencyTypeDefault) continue;
+      if (data[i].type != cudaGraphDependencyTypeDefault || (filter && !filter(from_name, name))) continue;
       cudaGraphEdgeData e{};
       e.from_port = cudaGraphKernelNodePortProgrammatic;
       e.to_port = 0;

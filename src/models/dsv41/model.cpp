@@ -454,7 +454,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_PDL")) {
     const std::string_view mode(value);
     paged_pdl_ = s_default_paged_pdl && (mode == "1" || mode == "2");
-    paged_woa_lead_ = paged_pdl_ && mode == "2";
+    paged_woa_lead_ = s_default_paged_pdl && (mode == "2" || mode == "3");
   }
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
@@ -2040,8 +2040,11 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
-      if (paged_pdl_) {
-        const auto stats = pdl::programmatic_edges(graph);
+      if (paged_pdl_ || paged_woa_lead_) {
+        const pdl::EdgeFilter attention_output_edge = [](const char* from, const char* to) {
+          return from && to && std::strstr(from, "attn_finish_kernel") && std::strstr(to, "woa_decode_kernel");
+        };
+        const auto stats = pdl::programmatic_edges(graph, paged_pdl_ ? nullptr : attention_output_edge);
         DGPP_LOG_INFO("dsv41 target graph {}: {} programmatic edges", g.variant, stats.converted);
       }
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
