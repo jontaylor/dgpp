@@ -9,6 +9,10 @@ Keep generated benchmark results, profiles and run logs untracked. Do not
 force-add ignored benchmark artifacts. Summarize validation in the PR and
 keep reusable documentation in `docs/`, without links to local run artifacts.
 
+For performance changes, follow [Developing an optimization](docs/optimizing_performance.md#developing-an-optimization).
+Record the predicted critical-path saving and the matched serving result. When
+they diverge, trace the handoff to the next consumer before judging the design.
+
 Benchmarks follow the method of record in `docs/benchmarks.md` ("Workload and
 timing"): one deployment template, measured as shipped, yields every row the
 doc keeps for it, and `scripts/serve_campaign.py run --config <template>`

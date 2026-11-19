@@ -199,6 +199,95 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
   DGPP_CUDA_OK(cudaEventDestroy(end));
 }
 
+// Isolate the effect of running the real wo_a producer immediately before
+// wo_b. In every graph wo_b reads the same per-layer BF16 values at the
+// same addresses. Its weights rotate through the same 40 layers.
+void wob_handoff(cudaStream_t stream) {
+  constexpr int layers = 40, rows = 4, groups = 4, k = 4096, n = 5120;
+  constexpr int a_bytes = groups * 1024 * k, b_bytes = n * k;
+  constexpr int x_size = rows * groups * k, middle_size = rows * k, y_size = rows * n;
+  Device<uint8_t> wa(layers * a_bytes), wb(layers * b_bytes), packed(x_size + x_size / 32);
+  Device<float> sa(layers * a_bytes / 1024), sb(layers * b_bytes / 1024);
+  Device<uint16_t> x(x_size), middle(layers * middle_size), other(layers * middle_size), y(layers * y_size);
+  Device<uint8_t> scratch(workspace_bytes);
+  fill<<<layers * a_bytes / 256, 256, 0, stream>>>(wa.p, layers * a_bytes, sa.p,
+                                                    layers * a_bytes / 1024, x.p, x_size);
+  fill<<<layers * b_bytes / 256, 256, 0, stream>>>(wb.p, layers * b_bytes, sb.p,
+                                                    layers * b_bytes / 1024, x.p, 0);
+  DGPP_CUDA_OK(cudaGetLastError());
+  launch_mxfp8_quantize_rows(x.p, k, rows * groups, k, packed.p, packed.p + x_size, stream);
+  auto produce = [&](int layer, uint16_t* dest) {
+    launch_mxfp8_woa_decode(packed.p, wa.p + layer * a_bytes, sa.p + layer * (a_bytes / 1024),
+                            dest + layer * middle_size, rows, groups, 1024, k, stream);
+  };
+  auto project = [&](int layer, bool fused) {
+    auto* in = middle.p + layer * middle_size;
+    auto* w = wb.p + layer * b_bytes;
+    auto* scale = sb.p + layer * (b_bytes / 1024);
+    auto* out = y.p + layer * y_size;
+    if (fused) {
+      if (!try_launch_wo_b_split_bf16(in, w, scale, out, rows, n, k, scratch.p, workspace_bytes, stream))
+        throw std::runtime_error("wo_b handoff requires the two-split TP2 shape");
+    } else {
+      launch_scale_gemm_grid_bf16(in, k, w, scale, out, rows, n, k, stream, n, 5, 5,
+                                  true, scratch.p, workspace_bytes, false);
+    }
+  };
+  for (int layer = 0; layer < layers; ++layer) produce(layer, middle.p);
+  project(0, false);
+  project(0, true);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+
+  struct Case {
+    const char* name;
+    uint16_t* producer_output;
+    bool fused;
+    cudaGraphExec_t graph{};
+  };
+  Case cases[] = {{"ordinary", nullptr, false}, {"exact", nullptr, true},
+                  {"wo_a+ordinary", middle.p, false}, {"wo_a+exact", middle.p, true},
+                  {"independent_wo_a+ordinary", other.p, false}, {"independent_wo_a+exact", other.p, true}};
+  std::vector<uint16_t> reference, output(layers * y_size);
+  for (auto& c : cases) {
+    cudaGraph_t graph;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    for (int layer = 0; layer < layers; ++layer) {
+      if (c.producer_output) produce(layer, c.producer_output);
+      project(layer, c.fused);
+    }
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&c.graph, graph, 0));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    DGPP_CUDA_OK(cudaMemsetAsync(y.p, 0xfe, output.size() * sizeof(uint16_t), stream));
+    DGPP_CUDA_OK(cudaGraphLaunch(c.graph, stream));
+    DGPP_CUDA_OK(cudaMemcpyAsync(output.data(), y.p, output.size() * sizeof(uint16_t),
+                                 cudaMemcpyDeviceToHost, stream));
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    if (reference.empty()) reference = output;
+    else if (output != reference) throw std::runtime_error("wo_b handoff changed output bits");
+  }
+  cudaEvent_t start, end;
+  DGPP_CUDA_OK(cudaEventCreate(&start));
+  DGPP_CUDA_OK(cudaEventCreate(&end));
+  std::puts("round,variant,microseconds_per_layer");
+  for (int round = 0; round < 12; ++round) {
+    constexpr int case_count = sizeof(cases) / sizeof(cases[0]);
+    for (int j = 0; j < case_count; ++j) {
+      const auto& c = cases[(round + j) % case_count];
+      DGPP_CUDA_OK(cudaEventRecord(start, stream));
+      for (int repeat = 0; repeat < 4; ++repeat) DGPP_CUDA_OK(cudaGraphLaunch(c.graph, stream));
+      DGPP_CUDA_OK(cudaEventRecord(end, stream));
+      DGPP_CUDA_OK(cudaEventSynchronize(end));
+      float ms;
+      DGPP_CUDA_OK(cudaEventElapsedTime(&ms, start, end));
+      std::printf("%d,%s,%.3f\n", round, c.name, 1000 * ms / (4 * layers));
+    }
+  }
+  DGPP_CUDA_OK(cudaEventDestroy(start));
+  DGPP_CUDA_OK(cudaEventDestroy(end));
+  for (auto& c : cases) DGPP_CUDA_OK(cudaGraphExecDestroy(c.graph));
+}
+
 __global__ void fill_partials(float* c, float* m, float* l, float* sink, float* freq, int64_t* pos,
                               int entries, int heads, int splits) {
   const int i = int(blockIdx.x * blockDim.x + threadIdx.x);
@@ -427,6 +516,12 @@ int main(int argc, char** argv) {
       if (vocab < 32 || vocab > 262144 || rank < 8 || rank > 512 || rank % 8)
         throw std::invalid_argument("--markov-chain local_vocab markov_rank");
       markov_chain(vocab, rank, prop.l2CacheSize, stream);
+      DGPP_CUDA_OK(cudaStreamDestroy(stream));
+      return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--wo-b-handoff") {
+      if (argc != 2) throw std::invalid_argument("--wo-b-handoff takes no arguments");
+      wob_handoff(stream);
       DGPP_CUDA_OK(cudaStreamDestroy(stream));
       return 0;
     }

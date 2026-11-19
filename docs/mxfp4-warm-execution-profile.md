@@ -781,3 +781,76 @@ accepted 21 draft tokens in ten passes. Across 400 projections per rank,
 mean `wo_b` time including the reduction went from 106.26 to 108.32 µs on
 Spark 1 and from 106.84 to 108.33 µs on Spark 2. This locates the loss
 inside the projection even after removing its second kernel launch.
+
+#### Following the result through the TP2 fold
+
+The fusion hypothesis was that removing the global partials and reduction
+would let both ranks reach the attention fold sooner. At four rows it
+eliminates 160 KiB of partial writes and the corresponding reads per layer.
+The ordinary kernel already completed its reduction, including the gap
+before launch, in about 2.0 µs. Recovering all of that time with an equally
+fast main projection would save about 0.08 ms over 40 layers, before peer
+waits, in a roughly 62 ms profiled round.
+
+In the same 400 layer visits per rank and mode, the time from the end of
+`wo_a` to the first `wo_b` kernel was 0.47–0.49 µs. From the projection's
+last write kernel ending to the TP fold starting it was 0.56–0.59 µs.
+Every projection ran as a graph node with zero recorded overlap with
+another kernel, CUDA copy or memset on its rank. The FFN weight prefetch
+still overlapped the fold in both modes. From `wo_a` completion to the
+first downstream residual update, the mean went from 156.88 to 153.53 µs
+on Spark 1 and from 138.55 to 141.98 µs on Spark 2. Those are local
+elapsed intervals with an intervening collective. Adding them would
+double-count shared progress. The extra projection time was on the GPU,
+with graph replay active and zero expert reads.
+
+#### Replaying the producer
+
+`dsv41_verify_dense_bench --wo-b-handoff` varies one part of the serving
+sequence on a single GB10. Four rows pass through the same 40 synthetic
+`wo_b` matrices in the same order, with identical BF16 inputs and outputs
+checked across every layer. The real MXFP8 `wo_a` kernel either supplies
+the input immediately beforehand, writes the same values to an independent
+buffer while `wo_b` consumes precomputed values, or is omitted from the
+timed graph. A per-layer activation buffer keeps the consumer's addresses
+identical across cases. Serving reuses layer scratch. The dependent and
+independent cases stream identical producer weights. CUDA event timing
+covers each complete sequence.
+
+| Producer before `wo_b` | Fused minus ordinary time per layer on Spark 2 |
+|---|---:|
+| Omitted, inputs precomputed | −3.65 to +1.50 µs |
+| Writes the input consumed by `wo_b` | +6.78 to +10.06 µs |
+| Writes an independent buffer | +16.18 to +19.69 µs |
+
+Each range spans the medians of paired differences from four process
+starts, with 12 rotating rounds per start. A positive value favors the
+ordinary path. Adding the producer reproduced the reversal on one GPU.
+Writing directly to the consumer's buffer reduced the fused penalty in
+all four runs. In an initial two-start screen without the independent
+buffer case, the isolated fused path was 0.21–3.79 µs slower and the
+dependent pair was 10.12–12.99 µs slower. The isolated ranking varied.
+The penalty with the producer present reproduced across both screens.
+
+One behavior fusion lost is activation sharing. In the captured grid,
+eight warps share a staged activation window across 64 output columns in
+the ordinary block. The fused block covers eight output columns and its
+two warps read separate halves of the BF16 input directly. More blocks
+consume the same activation addresses. The trace reports 49,664 and
+35,104 shared-memory bytes per block respectively. Both fit at most two
+blocks per GB10 SM by that limit, giving ceilings of 16 and four resident
+warps. The trace supplies allocation sizes. Actual warp occupancy and
+physical DRAM traffic remain unmeasured.
+
+A targeted attempt to hide the direct input load prefetched each
+128-byte activation line into L1 before waiting for the corresponding
+weight window. With `wo_a` producing the input, it increased the median
+paired sequence time by 3.88–4.51 µs per layer against the same fused
+kernel without the hint across three process starts. The projection
+outputs matched.
+
+**Outcome.** The ordinary kernel serves the measured workload. The
+classification of fusion as a design is inconclusive. The experiment
+identifies a reproducible integration penalty and rejects the simple L1
+hint. The relative contributions of cross-warp reuse, weight streaming
+and memory-latency hiding remain open.

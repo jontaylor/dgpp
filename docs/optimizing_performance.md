@@ -41,6 +41,54 @@ Rules that keep the numbers comparable:
   prefetcher and the other kernels. A microbenchmark says whether a kernel
   is worth trying; only the served A/B decides.
 
+### Developing an optimization
+
+Use sustained serving performance on the intended workload to select an
+implementation. For a tool-using agent, measure time to a correct completed
+turn alongside cold prefill, engine decode throughput and time per pass.
+Prefix reuse, expert residency and speculative acceptance affect different
+parts of that result.
+
+1. **Predict which wait will shrink.** Name the producer, the consumer that
+   must wait, and the work that can run between them. Estimate the exposed
+   saving per layer, per pass or per request. On TP2 the peer can determine
+   when a collective finishes. Record which assumption would invalidate
+   the prediction.
+2. **Test the local mechanism.** Match the serving shapes, layouts, precision,
+   cache reuse interval and execution order. Include preparation and reduction.
+   Compare the dependent sequence too when its producer changes the input's
+   readiness or the memory traffic immediately before the operation.
+3. **Check what the deployed path already buys.** Follow the data from its
+   first available address to its next consumer. Account for early I/O,
+   conversion and copy avoidance, shared buffers, CPU decisions, graph edges,
+   side streams and rank communication. Verify dispatch on each rank. Identify
+   each benefit the candidate retains, replaces or loses.
+4. **Test the prediction in serving.** Compare the fully optimized baseline
+   and candidate on matched requests. Record completed work, latency, decode
+   steps and accepted tokens. Cover the concurrency and streaming conditions
+   relevant to the claim. A zero-expert-read decode exposes execution cost,
+   while a miss-bearing request tests whether that saving survives disk waits.
+   Use the [benchmark protocol](benchmarks.md#workload-and-timing) for published rows.
+5. **Explain a discrepancy at the first boundary where it appears.** Time the
+   producer, operation and first dependent consumer on each rank. Check where
+   copies, reads or other kernels overlap those intervals. Keep profiling
+   separate from ordinary service timing. Change one suspected cause and state
+   what observation would distinguish it from the other explanations.
+6. **Record the decision and its scope.** Keep the prediction, local and
+   serving measurements, preserved or lost behavior, interpretation and open
+   questions together. Classify the design separately from the choice of
+   which binary to serve.
+
+| Outcome | Evidence for that classification |
+|---|---|
+| Successful | A repeatable end-to-end improvement on the stated workload with the required output quality. |
+| Promising but incomplete | A local saving and a specific integration cost that could be recovered. State how to test the proposed fix. |
+| Fundamentally unsuitable | An intrinsic limit or unavoidable cost outweighs the benefit under the stated constraints. Identify the evidence for that limit. |
+| Inconclusive | The measurements cannot distinguish the proposed explanations, or the effect is within the observed variation. Record what would resolve it. |
+
+For an example using graph replay, rank-local timelines and uninstrumented
+serving, see the [TP2 attention output projection](mxfp4-warm-execution-profile.md#following-the-result-through-the-tp2-fold).
+
 ## 2. The levers, by what they move
 
 ### Memory and context
