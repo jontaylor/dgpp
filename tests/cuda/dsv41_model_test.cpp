@@ -1232,6 +1232,34 @@ DGPP_TEST(dsv41_paged_eager_stale_draft_skips_optional_snapshot) {
   engine.close(0);
 }
 
+DGPP_TEST(dsv41_eager_lookup_tail_shares_verification_rows) {
+  const Fixture fx = make_fixture(false);
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 128, 512, dgpp::Dsv41Residency::Resident,
+                         nullptr, 0, 1, 3, true, 16, false, &paging);
+  // A known continuation in the prompt and forced correct picks exercise the
+  // longest lookup on every tick. The target has room for 16 rows altogether.
+  const auto pick = [](const dgpp::DecodeOutputs&) { return int32_t{11}; };
+  dgpp::EagerEngineAdapter<dgpp::Dsv41Model> engine(&model, 3, pick);
+  engine.configure_eager_mtp(3, [](const auto& rows) { return std::vector<int32_t>(rows.size(), 11); });
+  engine.configure_eager_lookup(4, 4, 2, 4);
+  require(engine.max_tokens_per_step() == 8 && engine.decode_batch_capacity() == 3,
+          "one request can use eight rows and three requests can share sixteen");
+  const std::vector<int64_t> suffix{21, 22, 23, 24, 25, 26, 27, 28};
+  auto prompt = suffix;
+  prompt.insert(prompt.end(), 32, 11);
+  prompt.push_back(12);
+  prompt.insert(prompt.end(), suffix.begin(), suffix.end());
+  engine.prefill(0, prompt);
+  require(engine.step_batch({0})[0].size() == 8, "one slot accepts the full history tail");
+  engine.prefill(1, prompt);
+  engine.prefill(2, prompt);
+  for (const auto& emitted : engine.step_batch({2, 0, 1}))
+    require(emitted == std::vector<int32_t>(5, 11), "three slots fit their target and draft row budgets");
+  require(engine.step_batch({0})[0].size() == 8, "the full lookup width returns when the batch shrinks");
+  for (int slot = 0; slot < 3; ++slot) engine.close(slot);
+}
+
 DGPP_TEST(dsv41_paged_eager_dspark_batches_and_matches_plain_greedy) {
   using namespace dgpp::expert;
   struct PendingBoundary : dgpp::BoundaryReducer {

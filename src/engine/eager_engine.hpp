@@ -738,8 +738,14 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   // One physical pass advances every arriving spec slot; the row budget
   // (max_decode_rows verify rows, a full block per spec slot) bounds it.
   int decode_batch_capacity() const override {
-    if constexpr (kEagerMtp)
-      if (mtp_depth_) return std::min(slots_, model_->max_decode_rows() / max_tokens_per_step());
+    if constexpr (kEagerMtp) {
+      // A batch must fit both the bidirectional draft block and the target
+      // with its neural proposals. History tails can use any remaining rows.
+      if (mtp_depth_) {
+        const int rows = std::max(mtp_depth_ + 1, model_->confidence_rows());
+        return std::min(slots_, model_->max_decode_rows() / rows);
+      }
+    }
     if constexpr (requires { model_->eager_plain_decode_batch_capacity(); })
       if (model_->eager_plain_decode_batch_capacity() > 1)
         return std::min(slots_, model_->eager_plain_decode_batch_capacity());
@@ -877,6 +883,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         }
       }
       mtp_redraft_batch(draft_reqs, draft_rows);
+      const size_t max_drafts = static_cast<size_t>(model_->max_decode_rows()) / reqs.size() - 1;
       for (size_t i = 0; i < reqs.size(); ++i) {
         const int req = reqs[i];
         feeds.push_back({pending_[req]});
@@ -892,6 +899,9 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
           else if (!copy.drafts.empty())
             drafts = lookup_fuse(drafts, copy, lookup_strong_, lookup_agree_).drafts;
         }
+        // Request membership can change between ticks. A copy or grammar
+        // block prepared for a smaller batch can now exceed its row share.
+        if (drafts.size() > max_drafts) drafts.resize(max_drafts);
         feeds.back().insert(feeds.back().end(), drafts.begin(), drafts.end());
       }
       const auto verify_begin = stamp();
