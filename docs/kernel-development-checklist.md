@@ -57,6 +57,10 @@ while known baseline optimizations are missing.
 - [ ] **Tune lookahead to the consumer.** One upcoming line beat two in our
   native canonical screen. More prefetch is not automatically better. This
   is GPU cache prefetch, distinct from speculative SSD expert loading.
+- [ ] **Match the interval between uses of a weight matrix.** For TP2
+  `wo_b`, rotate through all 40 target-layer matrices before reusing the
+  first. Five matrices exceeded L2 capacity but still favored a different
+  tile and prefetch policy. Check the winning projection in a serving trace.
 - [ ] **Pipeline copies with compute.** Use asynchronous staging and a working
   shared-memory ring; issue the next useful work before the consumer needs it.
   Check dependencies and buffer lifetime rather than assuming async means overlap.

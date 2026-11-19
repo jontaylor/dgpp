@@ -729,3 +729,55 @@ The command defaults to the last completed turn in the rollout. Pass
 `--turn-id` to select an earlier turn or `-` for a log piped from the
 serving host. It reports per-request wall clocks. Under concurrency these
 clocks can overlap. Missing or ambiguous matches produce an error.
+
+### Exact TP2 attention output projection
+
+Each target layer projects four verification rows through a rank-local
+5,120 × 4,096 `wo_b` matrix. The ordinary path writes two FP32 partial
+sums to global scratch and launches a reduction. The exact kernel gives
+the two K halves to two warps of the same block. They reduce through
+shared memory and write BF16 output directly. Weights, scales, activation
+precision and accumulation order match the ordinary path. The fast path
+supports one through eight rows and needs no additional persistent memory.
+
+The first version used 512-byte copies and explicit L2 lookahead. At
+four rows its median fell from 96.94 to 79.71 µs in a graph replay
+rotating five synthetic matrices. During warm serving, each rank executed
+the new kernel 1,240 times across 31 verification passes, with zero expert
+reads. The mean time from projection start through reduction completion
+was 107.41 → 109.28 µs on Spark 1 and 104.98 → 107.50 µs on Spark 2.
+The separate, uninstrumented C1 comparisons also showed no decode gain.
+
+Changing the synthetic weight base offset by up to 12,032 bytes preserved
+the five-matrix advantage. Increasing the rotation to 40 distinct matrices
+(800 MiB of weights per rank, one matrix per target layer) removed it.
+On that rotation the 512-byte version took 95.84 µs versus 94.74 µs for
+the ordinary path. The replay demonstrates sensitivity to weight reuse.
+It does not measure cache hit rates or physical DRAM traffic.
+
+The revised kernel issues both 1,024-byte copies for each row of its K
+half before consuming the first window. It uses the low-retention bulk
+load and omits the separate L2 prefetch. The integrated four-row replay
+took 97.38 µs versus 101.84 µs for the ordinary path. Output bits matched
+for every width from one through eight, including comparison with
+separate single-row launches. Reproduce the 40-matrix geometry with
+`dsv41_verify_dense_bench --wo-b-mxfp8 4 40`.
+
+A targeted two-Spark C1 comparison ran the ordinary, exact, exact and
+ordinary modes on the same binary built at `c30b4490` (SHA-256
+`b7adc6e0a4b1687f54089b55d2a3d8cf528e802f1bce65450388c09894e93e89`).
+Across the two runs of each mode, pooled engine decode was 46.66 versus
+46.51 tok/s on zero-read warm continuations and 33.71 versus 33.59 tok/s
+on continuations requiring expert reads. Mean cold 24,292-token tool
+prefill was 36.55 versus 36.62 seconds. The tool call and reply, prose and
+code outputs, speculative acceptance and expert bytes matched. Both ranks
+had zero process swap and matching nonempty operation streams in each run.
+The ordinary projection remains the deployment choice.
+
+A separate Nsight capture of the two modes used a 32-token coding response
+and reduced the expert budget by 3 GiB per rank to leave room for profiling.
+Both modes attached 24,448 prefix tokens, read zero expert bytes and
+accepted 21 draft tokens in ten passes. Across 400 projections per rank,
+mean `wo_b` time including the reduction went from 106.26 to 108.32 µs on
+Spark 1 and from 106.84 to 108.33 µs on Spark 2. This locates the loss
+inside the projection even after removing its second kernel launch.
