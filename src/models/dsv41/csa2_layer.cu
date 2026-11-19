@@ -701,11 +701,16 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const ui
   if (before_wo_b) DGPP_CUDA_OK(cudaEventRecord(before_wo_b, stream));
   static const int native_wob = [] {
     const char* option = std::getenv("DGPP_DSV41_MX_WOB_DECODE");
+    if (option && std::strcmp(option, "exact") == 0) return 3;
     if (option && std::strcmp(option, "2") == 0) return 2;
     return int(option && std::strcmp(option, "1") == 0);
   }();
   const int input_width = lg * cfg_.o_lora;
-  if (native_wob && mx_out && input_width == 4096 && cfg_.hidden % 32 == 0) {
+  if (native_wob == 3 && mx_out && !prefill_tile_ && cfg_.dense_mma &&
+      try_launch_wo_b_split_bf16(oa_, w_.wo_b.payload, w_.wo_b.scales, static_cast<uint16_t*>(out),
+                                 tokens, cfg_.hidden, input_width, gemm_ws_, gemm_ws_bytes_, stream))
+    return;
+  if ((native_wob == 1 || native_wob == 2) && mx_out && input_width == 4096 && cfg_.hidden % 32 == 0) {
     // wo_a consumed the larger packed attention tensor on this stream.
     // Reuse its allocation for the rank-local wo_b input (one group).
     auto* packed = static_cast<uint8_t*>(gemm_ws_);

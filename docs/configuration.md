@@ -553,7 +553,10 @@ Two optional DeepSeek V4.1 settings change different computations.
   projection (`wo_b`) to MXFP8 for small decode batches using native MXFP8
   `wo_a`. Mode `2` also encodes the quantization residual. It shares each weight
   read across both terms. This setting changes target arithmetic and can change
-  the output. Both settings default to `0`.
+  the output. Mode `exact` reads BF16 activations and combines the two
+  2,048-column partial sums in one block. It applies to one through eight
+  rows on the 5,120 × 4,096 local projection when the ordinary kernel would
+  use two splits. Both settings default to `0`.
 
 NVFP4 main weights use the existing main-only paged image;
 MXFP4 draft experts stay resident and their exact allocation is deducted from

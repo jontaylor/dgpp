@@ -57,6 +57,7 @@ struct Arm {
   int warps;
   bool mxfp8_input = false;
   bool residual = false;
+  bool exact_wob = false;
 };
 
 void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = false, int rows = 4) {
@@ -86,6 +87,7 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
 
   if (native_wob) {
     arms.resize(1);
+    arms.push_back({"exact-split", false, true, false, 0, false, false, true});
     arms.push_back({"mxfp8-input", false, false, false, 0, true});
     arms.push_back({"mxfp8-residual", false, false, false, 0, true, true});
   }
@@ -94,6 +96,12 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
     const auto* input = x.p + first * xs;
     auto* w = weights.p + copy * matrix;
     auto* sc = scales.p + copy * scale_matrix;
+    if (a.exact_wob) {
+      if (!try_launch_wo_b_split_bf16(input, w, sc, y.p + first * os, m, shape.n, shape.k,
+                                      ws, workspace_bytes, stream))
+        throw std::runtime_error("exact wo_b requires the two-split TP2 shape");
+      return;
+    }
     if (a.mxfp8_input) {
       launch_mxfp8_wob_decode(input, w, sc, y.p + first * os, m, shape.n, scratch.p, a.residual, stream);
       return;
@@ -142,6 +150,7 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
     launch(arm, 0, 0, rows);
     auto output = result();
     if (!i) reference = output;
+    if (arm.exact_wob && output != reference) throw std::runtime_error("exact wo_b differs from split-K");
     double err = 0, norm = 0;
     for (size_t j = 0; j < output.size(); ++j) {
       double b = bf16_bits_to_float(reference[j]), d = bf16_bits_to_float(output[j]) - b;

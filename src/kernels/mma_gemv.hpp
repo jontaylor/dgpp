@@ -62,6 +62,12 @@ constexpr int kMmaGemvMaxRowsPerLaunch = 128;
 // count a function of the shape only and the ranges the same in every tile
 // form, so a row's chain is still the same whatever m rides in the launch,
 // 1..128). nullptr: the unsplit form, as before.
+// Grid32 FP8 weights and contiguous BF16 rows for the TP2 attention output.
+// Dispatch only when the reference projection uses the same two K halves.
+bool try_launch_wo_b_split_bf16(const uint16_t* input, const uint8_t* weights, const float* scales,
+                                uint16_t* out, int rows, int n, int k, void* ws, size_t ws_bytes,
+                                cudaStream_t stream);
+
 void launch_mma_gemv_fp8_bf16(const uint16_t* act, size_t act_stride, const uint8_t* w,
                               const float* scales, uint16_t* out, int m, int n, int k,
                               size_t out_stride, int rs, int cs, cudaStream_t stream,

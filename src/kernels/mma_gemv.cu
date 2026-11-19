@@ -649,6 +649,93 @@ __global__ void mma_gemv_split_reduce_kernel(const float* __restrict__ part, int
   fp8_gemv::store_dot(out + static_cast<size_t>(mrow) * out_stride + col, acc);
 }
 
+// TP2 wo_b uses two 2048-column partial sums. Two warps own the same
+// eight output columns, one warp per partial, so they can finish the
+// ordinary split-K reduction in shared memory in this launch.
+__global__ void wo_b_split_bf16_kernel(const uint16_t* act, const uint8_t* weights, const float* scales,
+                                      uint16_t* out, int rows) {
+  dgpp_pdl_wait();
+  constexpr int k = 4096, n = 5120, half_k = k / 2, step = 512;
+  const int half = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int row = lane / 4, quarter = lane % 4;
+  const int column = blockIdx.x * 8;
+  // Offset adjacent row starts by 64 bytes to spread fragment loads across banks.
+  __shared__ __align__(16) uint8_t tile[2][2][8][step + 64];
+  __shared__ uint64_t ready[2][2];
+  __shared__ float upper[32][2];
+  auto barrier = [&](int slot) { return unsigned(__cvta_generic_to_shared(&ready[half][slot])); };
+  if (lane < 2)
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(barrier(lane)) : "memory");
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  __syncwarp();
+
+  auto issue = [&](int window) {
+    const int slot = window & 1;
+    if (lane == 0)
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                   :: "r"(barrier(slot)), "r"(8 * step) : "memory");
+    __syncwarp();
+    if (lane < 8) {
+      const unsigned dst = unsigned(__cvta_generic_to_shared(&tile[half][slot][lane][0]));
+      const uint8_t* src = weights + (column + lane) * k + half * half_k + window * step;
+      asm volatile("{ .reg .b64 policy; createpolicy.fractional.L2::evict_first.b64 policy, 1.0; "
+                   "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+                   "[%0], [%1], %2, [%3], policy; }"
+                   :: "r"(dst), "l"(src), "r"(step), "r"(barrier(slot)) : "memory");
+    }
+    // One lane per 128-byte line. At the last window, look ahead to a
+    // later output block instead of reading beyond this warp's K half.
+    const bool next = window + 1 < half_k / step;
+    const int lead_column = next ? column : column + 96 * 8;
+    if (lead_column < n) {
+      const int lead_k = half * half_k + (next ? (window + 1) * step : 0);
+      const uint8_t* line = weights + (lead_column + lane / 4) * k + lead_k + quarter * 128;
+      asm volatile("prefetch.global.L2 [%0];" :: "l"(line));
+    }
+  };
+
+  float accum[4]{};
+  issue(0);
+  const uint16_t* input = act + (row < rows ? row : 0) * k;
+  for (int window = 0; window < half_k / step; ++window) {
+    if (window + 1 < half_k / step) issue(window + 1);
+    const int slot = window & 1, base = half * half_k + window * step;
+    unsigned done;
+    do {
+      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p,[%1],%2; selp.u32 %0,1,0,p; }"
+                   : "=r"(done) : "r"(barrier(slot)), "r"(window / 2) : "memory");
+    } while (!done);
+    __syncwarp();
+#pragma unroll 4
+    for (int offset = 0; offset < step; offset += 64) {
+      const int pos = offset + quarter * 16;
+      const auto codes = *reinterpret_cast<const uint4*>(&tile[half][slot][row][pos]);
+      const float scale = scales[(column / 32) * (k / 32) + (base + pos) / 32];
+      uint32_t weight[8];
+      chunk_to_bf16x8(codes, scale, weight);
+      const auto* activation = reinterpret_cast<const uint4*>(input + base + pos);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const uint4 a = activation[j];
+        // Rows 8..15 are discarded. Reuse the lower activation fragments.
+        mma_bf16(accum, a.x, a.x, a.y, a.y, weight[4 * j], weight[4 * j + 1]);
+        mma_bf16(accum, a.z, a.z, a.w, a.w, weight[4 * j + 2], weight[4 * j + 3]);
+      }
+    }
+    __syncwarp();
+  }
+  if (half == 1) {
+    upper[lane][0] = accum[0];
+    upper[lane][1] = accum[1];
+  }
+  __syncthreads();
+  if (half == 0 && row < rows) {
+    uint16_t* dest = out + row * n + column + quarter * 2;
+    fp8_gemv::store_dot(dest, (0.f + accum[0]) + upper[lane][0]);
+    fp8_gemv::store_dot(dest + 1, (0.f + accum[1]) + upper[lane][1]);
+  }
+}
+
 // Split-K for the decode forms (2026-09-21): a small-n site's grid is n / 16
 // blocks at two warps (the [320 x 10240] hyperconnection down projection: 20
 // blocks on a 48-SM part), and each warp then walks its k windows in
@@ -990,6 +1077,15 @@ void mma_gemv_set_decode_width(int warps) {
   if (warps != 0 && warps != 1 && warps != 2 && warps != 4 && warps != 8)
     throw std::invalid_argument("mma_gemv_set_decode_width: 0, 1, 2, 4 or 8");
   g_mma_decode_width = warps;
+}
+
+bool try_launch_wo_b_split_bf16(const uint16_t* input, const uint8_t* weights, const float* scales,
+                                uint16_t* out, int rows, int n, int k, void* ws, size_t ws_bytes,
+                                cudaStream_t stream) {
+  if (rows < 1 || rows > 8 || n != 5120 || k != 4096 || split_k_for(n, k, ws, ws_bytes) != 2) return false;
+  wo_b_split_bf16_kernel<<<n / 8, 64, 0, stream>>>(input, weights, scales, out, rows);
+  DGPP_CUDA_OK(cudaGetLastError());
+  return true;
 }
 
 bool mma_gemv_shape_ok(const void* w, const void* act, size_t act_stride, int m, int k) {

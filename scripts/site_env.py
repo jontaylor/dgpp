@@ -207,7 +207,7 @@ def deployment(path):
             "DGPP_DSV41_DRAFT_OUTPUTS": ("full", "head", "confidence", "chain", "compact"),
             "DGPP_DSV41_PAGED_PDL": ("0", "1", "2", "3"),
             "DGPP_DSV41_FFN_LOOKAHEAD": ("0", "1", "2"),
-            "DGPP_DSV41_MX_WOB_DECODE": ("0", "1", "2"),
+            "DGPP_DSV41_MX_WOB_DECODE": ("0", "1", "2", "exact"),
             "DGPP_DSV41_MARKOV_CACHE": ("0", "64", "256"),
             "DGPP_DSV41_MARKOV_LAYOUT": ("0", "1", "2", "3"),
             "DGPP_DSV41_MX_DRAFT_HEAD": ("0", "1", "2"),
