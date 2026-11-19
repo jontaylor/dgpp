@@ -699,19 +699,18 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const ui
   const bool with_workspace = prefill_tile_ ||
       (lg == 4 && cfg_.o_lora == 1024 && cfg_.hidden == 5120);
   if (before_wo_b) DGPP_CUDA_OK(cudaEventRecord(before_wo_b, stream));
-  static const bool native_wob = [] {
+  static const int native_wob = [] {
     const char* option = std::getenv("DGPP_DSV41_MX_WOB_DECODE");
-    return option && std::strcmp(option, "1") == 0;
+    if (option && std::strcmp(option, "2") == 0) return 2;
+    return int(option && std::strcmp(option, "1") == 0);
   }();
   const int input_width = lg * cfg_.o_lora;
   if (native_wob && mx_out && input_width == 4096 && cfg_.hidden % 32 == 0) {
     // wo_a consumed the larger packed attention tensor on this stream.
     // Reuse its allocation for the rank-local wo_b input (one group).
     auto* packed = static_cast<uint8_t*>(gemm_ws_);
-    launch_mxfp8_quantize_rows(oa_, input_width, tokens, input_width, packed,
-                               packed + size_t(tokens) * input_width, stream);
-    launch_mxfp8_woa_decode(packed, w_.wo_b.payload, w_.wo_b.scales, static_cast<uint16_t*>(out),
-                            tokens, 1, cfg_.hidden, input_width, stream);
+    launch_mxfp8_wob_decode(oa_, w_.wo_b.payload, w_.wo_b.scales, static_cast<uint16_t*>(out),
+                            tokens, cfg_.hidden, packed, native_wob == 2, stream);
     return;
   }
   launch_csa2_projection(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,

@@ -22,7 +22,7 @@ struct Tile {
   static constexpr int stride = bk + 16;
 };
 
-template <bool SwiGLU>
+template <bool SwiGLU, bool Residual = false>
 __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, uint8_t* codes,
                                       uint8_t* scales, const uint16_t* up = nullptr,
                                       float alpha = 0.f, float limit = 0.f, float minimum = 0.f) {
@@ -55,7 +55,14 @@ __global__ void mxfp8_quantize_kernel(const uint16_t* x, size_t stride, int k, u
     }
   }
   const size_t offset = static_cast<size_t>(row) * k + column;
-  mxfp8_quantize_four(values, minimum, codes + offset, scales + offset / 32);
+  if constexpr (Residual) {
+    float remainder[4];
+    mxfp8_quantize_four<true>(values, minimum, codes + offset, scales + offset / 32, remainder);
+    const size_t low = offset + size_t(gridDim.y) * k;
+    mxfp8_quantize_four(remainder, minimum, codes + low, scales + low / 32);
+  } else {
+    mxfp8_quantize_four(values, minimum, codes + offset, scales + offset / 32);
+  }
 }
 
 __device__ __forceinline__ void copy16(void* dst, const void* src, bool valid) {
@@ -101,7 +108,11 @@ __device__ __forceinline__ uint2 woa_token_pair(const uint8_t* token) {
   return make_uint2(*reinterpret_cast<const uint32_t*>(token), *reinterpret_cast<const uint32_t*>(token + 16));
 }
 
-template <bool AlignedScales, int FixedRows, bool StreamWeights>
+// Up to four rows can use the unused half of an eight-row MMA tile for the
+// quantization residual. Wider calls reuse each weight fragment in a second MMA.
+enum class ActivationParts { Single, PairedRows, SecondMma };
+
+template <bool AlignedScales, int FixedRows, bool StreamWeights, ActivationParts Parts>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
     const float* weight_scale, uint16_t* out, int rows, int groups, int n, bool early_weight_copy) {
@@ -168,7 +179,8 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
   };
   const bool live = row8 < rows;
   const size_t token_row = (size_t(live ? row8 : 0) * groups + group) * k;
-  float acc[4]{};
+  float acc[4]{}, correction[4]{};
+  const size_t plane = size_t(rows) * groups * k;
   issue(k0, 0);
   // The first compulsory copy reads only the resident projection. Finish must
   // publish every activation code and scale before this grid consumes them.
@@ -199,6 +211,9 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
       uint32_t token_scales = 0;
       if constexpr (FixedRows == 8) token_scales = activation.scales[chunk / 128];
       else if (live) token_scales = *reinterpret_cast<const uint32_t*>(scales + (token_base + chunk) / 32);
+      uint32_t low_scales = 0;
+      if constexpr (Parts == ActivationParts::SecondMma)
+        if (live) low_scales = *reinterpret_cast<const uint32_t*>(scales + (plane + token_base + chunk) / 32);
       const float* ws = weight_scale + size_t(column / 32) * (k / 32) + (base + chunk) / 32;
       float4 four;
       if constexpr (AlignedScales) four = *reinterpret_cast<const float4*>(ws);
@@ -216,18 +231,33 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
         if constexpr (FixedRows == 8) token = activation.codes[kk / 32];
         else if (live) token = woa_token_pair(codes + token_base + kk + part * 4);
         mma(acc, a, token.x, token.y, (__float_as_uint(weight_scales[j]) >> 23) & 255, (token_scales >> (8 * j)) & 255);
+        if constexpr (Parts == ActivationParts::SecondMma) {
+          const uint2 low = live ? woa_token_pair(codes + plane + token_base + kk + part * 4) : make_uint2(0, 0);
+          mma(correction, a, low.x, low.y, (__float_as_uint(weight_scales[j]) >> 23) & 255,
+              (low_scales >> (8 * j)) & 255);
+        }
       }
     }
     __syncwarp();
   }
 #pragma unroll
-  for (int i = 0; i < 4; ++i) partial[warp][row8 + (i / 2) * 8][part * 2 + i % 2] = acc[i];
+  for (int i = 0; i < 4; ++i) {
+    if constexpr (Parts == ActivationParts::SecondMma) acc[i] += correction[i];
+    partial[warp][row8 + (i / 2) * 8][part * 2 + i % 2] = acc[i];
+  }
   __syncthreads();
-  for (int cell = threadIdx.x; cell < rows * 16; cell += woa_warps * 32) {
+  const int output_rows = Parts == ActivationParts::PairedRows ? rows / 2 : rows;
+  for (int cell = threadIdx.x; cell < output_rows * 16; cell += woa_warps * 32) {
     const int r = cell / 16, col = cell % 16;
-    float sum = partial[0][col][r];
+    auto value = [&](int w) {
+      if constexpr (Parts == ActivationParts::PairedRows)
+        return partial[w][col][r] + partial[w][col][output_rows + r];
+      else
+        return partial[w][col][r];
+    };
+    float sum = value(0);
 #pragma unroll
-    for (int w = 1; w < woa_warps; ++w) sum += partial[w][col][r];
+    for (int w = 1; w < woa_warps; ++w) sum += value(w);
     const size_t offset = size_t(r) * groups * n + column + col;
     out[offset] = __bfloat16_as_ushort(__float2bfloat16_rn(sum));
   }
@@ -387,20 +417,19 @@ void dispatch(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8
 }
 }  // namespace
 
-void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const float* ws,
-                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream, bool early_weight_copy) {
-  if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
-    throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
+template <ActivationParts Parts>
+static void launch_decode_parts(const uint8_t* codes, const uint8_t* scales, const uint8_t* w, const float* ws,
+                                uint16_t* out, int rows, int groups, int n, cudaStream_t stream, bool early_weight_copy) {
   static const bool stream_weights = [] {
     const char* setting = std::getenv("DGPP_MX_WOA_STREAM_WEIGHTS");
     return setting && setting[0] == '1';
   }();
   auto launch = [&]<bool AlignedScales>() {
     auto emit = [&]<int FixedRows>() {
-      auto kernel = stream_weights ? woa_decode_kernel<AlignedScales, FixedRows, true>
-                                   : woa_decode_kernel<AlignedScales, FixedRows, false>;
+      auto kernel = stream_weights ? woa_decode_kernel<AlignedScales, FixedRows, true, Parts>
+                                   : woa_decode_kernel<AlignedScales, FixedRows, false, Parts>;
       kernel<<<groups * n / 16, woa_warps * 32, 0, stream>>>(
-          packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, early_weight_copy);
+          codes, scales, w, ws, out, rows, groups, n, early_weight_copy);
     };
     switch (rows) {
       case 1: return emit.template operator()<1>();
@@ -413,6 +442,34 @@ void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const floa
   if (reinterpret_cast<uintptr_t>(ws) % alignof(float4) == 0) launch.template operator()<true>();
   else launch.template operator()<false>();
   DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const float* ws,
+                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream, bool early_weight_copy) {
+  if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
+    throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
+  launch_decode_parts<ActivationParts::Single>(packed, packed + size_t(rows) * groups * k, w, ws, out,
+                                               rows, groups, n, stream, early_weight_copy);
+}
+
+void launch_mxfp8_wob_decode(const uint16_t* x, const uint8_t* w, const float* ws, uint16_t* out,
+                             int rows, int n, uint8_t* scratch, bool residual, cudaStream_t stream) {
+  constexpr int k = 4096;
+  if (rows < 1 || rows > 8 || n <= 0 || n % 32 || !scratch)
+    throw std::invalid_argument("wo_b MXFP8 decode: unsupported projection");
+  auto* scales = scratch + size_t(rows) * k * (residual ? 2 : 1);
+  if (residual) {
+    const dim3 grid(k / (4 * kThreads), rows);
+    mxfp8_quantize_kernel<false, true><<<grid, kThreads, 0, stream>>>(x, k, k, scratch, scales);
+    DGPP_CUDA_OK(cudaGetLastError());
+    if (rows <= 4)
+      launch_decode_parts<ActivationParts::PairedRows>(scratch, scales, w, ws, out, rows * 2, 1, n, stream, false);
+    else
+      launch_decode_parts<ActivationParts::SecondMma>(scratch, scales, w, ws, out, rows, 1, n, stream, false);
+  } else {
+    launch_mxfp8_quantize_rows(x, k, rows, k, scratch, scales, stream);
+    launch_decode_parts<ActivationParts::Single>(scratch, scales, w, ws, out, rows, 1, n, stream, false);
+  }
 }
 
 void launch_mxfp8_quantize_rows(const uint16_t* x, size_t stride, int rows, int k, uint8_t* codes,

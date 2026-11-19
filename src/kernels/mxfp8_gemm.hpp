@@ -13,6 +13,11 @@ void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const floa
                              uint16_t* out, int rows, int groups, int n, int k, cudaStream_t,
                              bool early_weight_copy = false);
 
+// TP2 wo_b: BF16 [rows,4096], optional second MXFP8 term for activation error.
+// Scratch holds one or two [rows,4096] code planes and their K32 scales.
+void launch_mxfp8_wob_decode(const uint16_t* x, const uint8_t* w, const float* ws, uint16_t* out,
+                             int rows, int n, uint8_t* scratch, bool residual, cudaStream_t stream);
+
 // Dynamic MXFP8: BF16 [rows,k] -> E4M3 [rows,k], E8M0 [rows,k/32].
 // Each 32-value group's scale is ceil-rounded to a power of two, matching
 // the pinned SGLang MiniMax producer. x_stride is in BF16 elements.
