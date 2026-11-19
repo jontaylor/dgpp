@@ -2317,6 +2317,10 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
       if (status != cudaErrorNotReady) DGPP_CUDA_OK(status);
       std::this_thread::yield();
     }
+    // Tile maxima are visible and every demand gate has retired. Read the
+    // draft weights during transport retirement, hit accounting and the
+    // host token pick. The cached weights are independent of the verdict.
+    if (capture_tail && compact_verify_) prefetch_draft_input_weights();
     demand_window.end();
     if (boundary_) boundary_->graph_segment_finish();
     account(p.layers);
@@ -2375,6 +2379,14 @@ bool Dsv41Model::prefill_batch_fits(const RowRun& run) const {
   return rows <= max_tokens_;
 }
 
+void Dsv41Model::prefetch_draft_input_weights() {
+  if (!draft_pick_prefetch_bytes_ || !mtp_ || !prefetching(true)) return;
+  const auto& w = draft_stage(0).main_proj;
+  if (!w.payload) return;
+  const size_t bytes = std::min(draft_pick_prefetch_bytes_, static_cast<size_t>(w.rows) * w.cols);
+  launch_l2_prefetch(w.payload, bytes, prefetch_.boundary_rate(), stream_);
+}
+
 Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::vector<int64_t>& tokens) {
   const char* flag = std::getenv("DGPP_DSV41_GPU_CANDIDATES");
   // Only the eager greedy verifier requests compact output. All diagnostic,
@@ -2388,18 +2400,8 @@ Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::ve
       DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&verify_maxima_), h_verify_maxima_, 0));
     }
     auto out = Base::session_verify(req, tokens);
+    if (!compact_verify_) prefetch_draft_input_weights();
     compact_verify_ = false;
-    // The verify has completed. While the host merges the token candidates
-    // from the ranks, bring in the start of the draft's first projection.
-    // The accepted row count changes the activations only. The projection
-    // is immutable and its normal weight reader can consume the cached lines.
-    if (draft_pick_prefetch_bytes_ && mtp_ && prefetching(true)) {
-      const auto& w = draft_stage(0).main_proj;
-      if (w.payload) {
-        const size_t bytes = std::min(draft_pick_prefetch_bytes_, static_cast<size_t>(w.rows) * w.cols);
-        launch_l2_prefetch(w.payload, bytes, prefetch_.boundary_rate(), stream_);
-      }
-    }
     return out;
   } catch (...) { compact_verify_ = false; throw; }
 }
@@ -2899,6 +2901,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
     if (!tail_ready) {
       dsv41_verify_tile_max(logits_, run.T, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+      prefetch_draft_input_weights();
     }
     out.lm_vocab_begin = lm_vocab_begin_;
     out.lm_vocab_count = lm_vocab_count_;
