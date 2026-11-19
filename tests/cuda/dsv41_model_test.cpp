@@ -1007,6 +1007,41 @@ DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
   }
 }
 
+DGPP_TEST(dsv41_compact_neural_draft_candidates_match_full_logits) {
+  const Fixture fx = make_fixture(false);
+  const auto prompt = tokens_of(912, 23, fx.cfg.vocab_size);
+  const char* option = std::getenv("DGPP_DSV41_DRAFT_CANDIDATES");
+  const std::optional<std::string> saved = option ? std::optional<std::string>(option) : std::nullopt;
+  struct Restore {
+    const std::optional<std::string>& saved;
+    ~Restore() {
+      if (saved) setenv("DGPP_DSV41_DRAFT_CANDIDATES", saved->c_str(), 1);
+      else unsetenv("DGPP_DSV41_DRAFT_CANDIDATES");
+    }
+  } restore{saved};
+  setenv("DGPP_DSV41_DRAFT_CANDIDATES", "1", 1);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                         nullptr, 0, 1, 1, true, 8);
+  model.session_prefill(0, prompt);
+  const auto first = model.session_draft(0, {23});
+  const auto chain = model.session_draft_chain(0, 15, 0, true, true);
+  model.session_close(0);
+  model.session_prefill(0, prompt);
+  {
+    auto selection = model.draft_candidate_scope();
+    const auto check = [&](const auto& compact, const auto& full) {
+      require(compact.logits.empty() && compact.local_candidates.size() == 1, "one draft winner");
+      const auto best = dgpp::sample::local_max(full.logits.data(), full.lm_vocab_count, full.lm_vocab_begin);
+      require(compact.local_candidates[0].id == best.id && compact.local_candidates[0].logit == best.logit,
+              "compact draft preserves the token and logit");
+      require(model.verification_logits_row(0) == full.logits, "an illegal draft winner can be fully masked");
+    };
+    check(model.session_draft(0, {23}), first);
+    check(model.session_draft_chain(0, 15, 0, true, true), chain);
+  }
+  model.session_close(0);
+}
+
 // The target has seen every proposed row when the draft input projection
 // starts. Only the accepted prefix may be appended to the draft rings.
 DGPP_TEST(dsv41_dspark_early_input_matches_accepted_rows) {
