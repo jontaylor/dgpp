@@ -9,6 +9,7 @@
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 
+#include <cuda.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -54,6 +55,7 @@ struct Dsv41Model::PagedGraphs {
   int ffn_lookahead = 0, attention_lookahead = 0;
   ExpertDemand* demands = nullptr;
   uint32_t* pending_layer = nullptr;
+  ExpertDemand* release_mailboxes = nullptr;
   uint64_t *tables = nullptr, *host_tables = nullptr;
   int layers;
   Graph* capturing = nullptr;
@@ -88,6 +90,22 @@ struct Dsv41Model::PagedGraphs {
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     DGPP_CUDA_OK(cudaHostAlloc(&demands, n * sizeof(ExpertDemand), cudaHostAllocMapped));
+    if (const char* flag = std::getenv("DGPP_EXPERT_STREAM_RELEASE"); flag && flag[0] == '1') {
+      DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&release_mailboxes), demands, 0));
+      // Exercise the actual mapped address before the first graph can block.
+      // Some device/driver combinations do not support these stream writes.
+      const auto status = cuStreamWriteValue32(service, reinterpret_cast<CUdeviceptr>(&release_mailboxes->request),
+                                               0, CU_STREAM_WRITE_VALUE_DEFAULT);
+      if (status == CUDA_SUCCESS) {
+        DGPP_CUDA_OK(cudaStreamSynchronize(service));
+        DGPP_LOG_INFO("dsv41 GPU paging: service stream releases completed expert reads");
+      } else if (status == CUDA_ERROR_NOT_SUPPORTED || status == CUDA_ERROR_INVALID_VALUE) {
+        release_mailboxes = nullptr;
+        DGPP_LOG_WARN("dsv41 GPU paging: using host release for unsupported stream writes");
+      } else {
+        throw std::runtime_error("GPU paging: could not initialize service stream writes");
+      }
+    }
     if (const char* flag = std::getenv("DGPP_EXPERT_DEMAND_SIGNAL"); flag && flag[0] == '1') {
       DGPP_CUDA_OK(cudaHostAlloc(&pending_layer, sizeof(*pending_layer), cudaHostAllocMapped));
       *pending_layer = 0;
@@ -136,7 +154,7 @@ struct Dsv41Model::PagedGraphs {
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
                int hidden, int inter, int scale_group, bool pending_experts = false) {
     if (published_revision == cache.prepared_revision()) {
-      if (pending_experts) DGPP_CUDA_OK(cudaStreamSynchronize(service));
+      if (pending_experts && !release_mailboxes) DGPP_CUDA_OK(cudaStreamSynchronize(service));
       return;
     }
     const auto started = profile_publish ? std::chrono::steady_clock::now()
@@ -175,7 +193,7 @@ struct Dsv41Model::PagedGraphs {
     }
     // Revision changes may also enqueue payload mutations. Preserve their
     // visibility to consumers even when the final pointer values are unchanged.
-    DGPP_CUDA_OK(cudaStreamSynchronize(service));
+    if (!pending_experts || !release_mailboxes) DGPP_CUDA_OK(cudaStreamSynchronize(service));
     if (profile_publish) {
       ++publish_calls;
       publish_build_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(built-started).count();
@@ -2144,8 +2162,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
         moe_->enqueue_paged(g.inputs[l], g.outputs[l], T, *expert_cache_, expert_cache_map_[l],
                             p.service, MoeExpertKernel::kGemv, nullptr, &ready);
         if (ready.projections) { ++p.projection_waves; p.projection_pending += split.down_pending_at_gate; }
-        // Submit dirty bindings behind the expert kernels. One service-stream
-        // fence covers both before the host releases the graph.
+        // Submit dirty bindings behind the expert kernels. The release must
+        // become visible after both the bindings and the expert outputs.
         p.publish(*expert_cache_, expert_cache_map_, cfg_.hidden_size, cfg_.moe_intermediate_size / world_,
                   cfg_.experts_nvfp4 ? 16 : 32, /*pending_experts=*/true);
         if (p.layer_stamps) {
@@ -2155,7 +2173,15 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
         ++p.misses; accounted = l + 1;
         // The next layer cannot publish until this layer sees its release.
         if (p.pending_layer) __atomic_store_n(p.pending_layer, 0u, __ATOMIC_RELAXED);
-        __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
+        if (p.release_mailboxes) {
+          // The next layer cannot request another transfer until this write
+          // has executed, so the pinned binding source stays valid throughout.
+          const auto addr = reinterpret_cast<CUdeviceptr>(&p.release_mailboxes[l].request);
+          if (cuStreamWriteValue32(p.service, addr, 2u, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS)
+            throw std::runtime_error("GPU paging: failed to release a serviced layer");
+        } else {
+          __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
+        }
       }
       const auto status = cudaEventQuery(p.done);
       if (status == cudaSuccess) break;
@@ -2199,6 +2225,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
     if (sm12x_projection_mode() && p.passes % 100 == 0)
       DGPP_LOG_INFO("projection waves: {}, down reads outstanding at gate launch: {}", p.projection_waves, p.projection_pending);
   } catch (...) {
+    if (p.release_mailboxes) (void)cudaStreamSynchronize(p.service);
     for (int l = 0; l < p.layers; ++l) __atomic_store_n(&p.demands[l].request, 3u, __ATOMIC_RELEASE);
     if (launched) (void)cudaStreamSynchronize(stream_);
     try { expert_cache_->set_execution_context(stream_); } catch (...) {}
