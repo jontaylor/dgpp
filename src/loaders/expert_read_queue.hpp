@@ -60,6 +60,7 @@ struct ReadQueueConfig {
   bool scan_nvfp4_scales = false;  // opt-in; file workers scan completed immutable reads
   bool require_mx_nibbles = false;  // reject any E8M0 byte outside 112..127 before publication
   size_t adjacent_records = 1;  // maximum reserved demand records per vectored read
+  size_t prefill_adjacent_records = 0;  // zero inherits adjacent_records
 };
 struct ReadQueueStats {
   uint64_t accepted = 0, coalesced = 0, promoted = 0, refused = 0;
@@ -81,7 +82,7 @@ class ExpertReadQueue {
   // All-or-none nonblocking reservation: every returned ticket owns a buffer
   // or an already-running/completed read. Empty on capacity backpressure.
   // Unique records only. Reservations are released on cancellation/failure.
-  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records);
+  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records, bool prefill = false);
   // Two disjoint reads per record, all gate/up tickets followed by all down
   // tickets. Reserve the entire wave from the existing bounded worker pool.
   std::vector<std::shared_ptr<ReadTicket>> reserve_projections(std::span<const size_t> records);

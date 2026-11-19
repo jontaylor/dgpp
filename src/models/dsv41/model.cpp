@@ -185,6 +185,8 @@ expert::CacheConfig paging_cache_config(const Dsv41TextConfig& cfg, int rank, in
   cache.reads.require_mx_nibbles = packed && std::atoi(packed) != 0;
   if (const char* batch = std::getenv("DGPP_EXPERT_ADJACENT_READS"))
     cache.reads.adjacent_records = std::stoi(batch);
+  if (const char* batch = std::getenv("DGPP_EXPERT_PREFILL_ADJACENT_READS"))
+    cache.reads.prefill_adjacent_records = std::stoi(batch);
   if (mtp) {
     auto resident = cfg, descriptors = cfg;
     resident.runtime_page_experts = false;

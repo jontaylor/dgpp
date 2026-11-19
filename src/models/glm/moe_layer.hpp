@@ -424,7 +424,7 @@ class GlmMoeLayer {
   std::unique_ptr<Sm12xMoe> sm12x_moe_;
   void enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
       cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-      std::span<const int> active_experts, const ReadyRoutes* ready);
+      std::span<const int> active_experts, const ReadyRoutes* ready, bool prefill);
 
   // host staging
   std::vector<int32_t> h_ids_;

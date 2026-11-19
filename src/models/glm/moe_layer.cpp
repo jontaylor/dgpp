@@ -743,7 +743,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     // Exact IDs are available now. Start I/O before host copies, counts,
     // history, segment construction, binding preparation or shared kernels.
     if (cache && expert::early_demand_enabled())
-      (void)cache->prime_demand({h_ids_pinned_, tk}, cache_experts);
+      (void)cache->prime_demand({h_ids_pinned_, tk}, cache_experts, kernel == MoeExpertKernel::kMma);
     demand_window.end();
     h_ids_.assign(h_ids_pinned_, h_ids_pinned_ + tk);
     h_weights_.assign(h_weights_pinned_, h_weights_pinned_ + tk);
@@ -828,7 +828,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
     cache->observe(selected, kernel == MoeExpertKernel::kMma);
     if (cache->packed_fp4() && sm12x_moe_ && tokens <= Sm12xMoe::kCapacity &&
         (tokens <= decode_slots_ || !down_bf16_) && out_bf16) {
-      enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts, ready);
+      enqueue_paged_sm12x(hidden, out_bf16, tokens, stream, *cache, cache_experts, active_experts, ready,
+                        kernel == MoeExpertKernel::kMma);
       return;
     }
     // Metadata-only tables are rebound to a live reconstruction before a
@@ -1081,7 +1082,7 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
       selected.reserve(end-first);
       for (size_t j = first; j < end; ++j)
         selected.push_back(cache_experts[static_cast<size_t>(active_experts[j])]);
-      (void)cache->prime_group(selected);
+      (void)cache->prime_group(selected, kernel == MoeExpertKernel::kMma);
     };
     const bool resident_first = direct_prefill && resident_first_enabled;
     static const bool ready_groups_enabled = [] {
@@ -1334,7 +1335,7 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
 
 void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int tokens,
     cudaStream_t stream, expert::ExpertCache& cache, std::span<const size_t> cache_experts,
-    std::span<const int> active_experts, const ReadyRoutes* ready) {
+    std::span<const int> active_experts, const ReadyRoutes* ready, bool prefill) {
   const bool graph_finishes = ready != nullptr;
   auto* projections = ready ? ready->projections : nullptr;
   if (!sm12x_moe_ || !stream || stream == cudaStreamLegacy || !shared_lane_takes(true, tokens) ||
@@ -1444,7 +1445,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
       std::vector<size_t> next;
       const size_t count = std::min(missing.size(), cache.memory().execution_slots);
       for (size_t j = 0; j < count; ++j) next.push_back(routed[missing[j]]);
-      (void)cache.prime_group(next);
+      (void)cache.prime_group(next, prefill);
     } else (void)cache.prefetch(routed[missing.front()]);
   }
   shared();
@@ -1495,7 +1496,7 @@ void GlmMoeLayer::enqueue_paged_sm12x(const uint16_t* hidden, uint16_t* out, int
         sm12x_moe_->prepare(h_ids_, addresses, tokens, stream, ids);
       }
       sm12x_moe_->run(hidden, d_ids_, d_weights_, slots, tokens, stream, nullptr, part);
-    });
+    }, prefill);
     finish();
     return;
   }

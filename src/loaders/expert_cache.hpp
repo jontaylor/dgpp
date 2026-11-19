@@ -241,7 +241,7 @@ class ExpertCache {
   // Admission follows execution submission and uses the reconstructed payload.
   void execute_ready(std::span<const size_t> selected,
       const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute,
-      ProjectionReads* projections = nullptr, const ExecuteProjection& execute_projection = {});
+      ProjectionReads* projections = nullptr, const ExecuteProjection& execute_projection = {}, bool prefill = false);
   ProjectionReads prime_projections(std::span<const int32_t> ids, std::span<const size_t> mapping);
   bool packed_fp4() const;
   // Borrowed metadata, not a lease. Only usable by a quiescent engine-owned
@@ -272,10 +272,10 @@ class ExpertCache {
   // Submit the first complete missing-expert group before route bookkeeping.
   // Legacy control submits two experts; no observations/admissions.
   // Small layer populations only; larger populations keep the normal path.
-  size_t prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping);
+  size_t prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping, bool prefill = false);
   // Reserve every missing record of the next execution group before queuing
   // it. Zero means no fresh records (already queued/resident or backpressure).
-  size_t prime_group(std::span<const size_t> experts);
+  size_t prime_group(std::span<const size_t> experts, bool prefill = false);
   // Bounded complete group, fitting half of staging and half of scratch.
   size_t demand_group_capacity() const;
   // Engine-owned scheduling hint only; no memory/cache ownership changes.

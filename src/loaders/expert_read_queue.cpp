@@ -123,6 +123,7 @@ struct ReadQueueImpl {
     bool started = false;
     std::shared_ptr<ReadTicket> ticket;
     size_t reserved_slot = SIZE_MAX;  // protected by pool mutex
+    size_t adjacent_limit = 1;   // fixed when this job reserves its staging slot
     bool acquired = false;          // protected by pool mutex
   };
   std::shared_ptr<const ExpertStore> store;
@@ -150,6 +151,7 @@ struct ReadQueueImpl {
       : store(std::move(source)), config(cfg) {
     if (!store || !cfg.buffers || !cfg.workers || !cfg.max_pending ||
         !cfg.adjacent_records || cfg.adjacent_records > ExpertStore::max_read_batch ||
+        cfg.prefill_adjacent_records > ExpertStore::max_read_batch ||
         cfg.workers > cfg.max_pending || cfg.workers > cfg.buffers)
       throw std::invalid_argument("expert read queue: invalid worker/buffer capacity");
     for (const auto& r : store->records()) {
@@ -162,7 +164,7 @@ struct ReadQueueImpl {
     counters.staging_reserved = cfg.buffers * pool->slot_bytes;
     pool->buffers.reserve(cfg.buffers);
     pool->free.reserve(cfg.buffers);
-    const size_t alignment = cfg.adjacent_records > 1 ? store->vector_alignment() : 4096;
+    const size_t alignment = std::max(cfg.adjacent_records, cfg.prefill_adjacent_records) > 1 ? store->vector_alignment() : 4096;
     for (size_t b = 0; b < cfg.buffers; ++b) {
       void* data = nullptr;
       if (::posix_memalign(&data, alignment, pool->slot_bytes) != 0)
@@ -282,7 +284,7 @@ struct ReadQueueImpl {
     --reserved_queued;
     pool->available.notify_all();
   }
-  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records, bool split = false) {
+  std::vector<std::shared_ptr<ReadTicket>> reserve_demand(std::span<const size_t> records, bool split = false, bool prefill = false) {
     std::vector<std::shared_ptr<ReadTicket>> result;
     result.reserve(records.size());
     std::vector<size_t> checked(records.begin(), records.end());
@@ -309,6 +311,7 @@ struct ReadQueueImpl {
       if (!ticket) throw std::logic_error("expert read queue: lost reserved queue capacity");
       result.push_back(std::move(ticket));
       if (auto job = jobs[r].lock(); job && !job->acquired && job->reserved_slot == SIZE_MAX) {
+        job->adjacent_limit = prefill && config.prefill_adjacent_records ? config.prefill_adjacent_records : config.adjacent_records;
         job->reserved_slot = pool->free.back();
         pool->free.pop_back();
         pool->used += pool->slot_bytes;
@@ -378,10 +381,11 @@ struct ReadQueueImpl {
   // demand records; a worker must never hold a partial batch waiting for room.
   void take_adjacent(std::deque<std::shared_ptr<Job>>::iterator first,
                      std::vector<std::shared_ptr<Job>>& batch) {
-    if (config.adjacent_records == 1 || !store->accepts_read_batch()) return;
+    const size_t limit = (*first)->adjacent_limit;
+    if (limit == 1 || !store->accepts_read_batch()) return;
     auto next = first;
     const auto start = (*first)->record;
-    while (next != demand.end() && batch.size() < config.adjacent_records &&
+    while (next != demand.end() && batch.size() < limit && (*next)->adjacent_limit == limit &&
            (*next)->record == start + batch.size() && (*next)->record < store->records().size() &&
            (*next)->reserved_slot != SIZE_MAX && (*next)->ticket.use_count() > 1) {
       batch.push_back(*next++);
@@ -422,7 +426,7 @@ struct ReadQueueImpl {
   }
   void run(size_t index) {
     std::vector<std::shared_ptr<Job>> batch;
-    batch.reserve(config.adjacent_records);
+    batch.reserve(std::max(config.adjacent_records, config.prefill_adjacent_records));
     for (;;) {
       if (index == 0) {
         while (demand_window_active.load() && !stopping.load() && queued.load() == 0) {
@@ -534,8 +538,8 @@ struct ReadQueueImpl {
 ExpertReadQueue::ExpertReadQueue(std::shared_ptr<const ExpertStore> store, ReadQueueConfig cfg)
     : impl_(std::make_unique<ReadQueueImpl>(std::move(store), cfg)) {}
 ExpertReadQueue::~ExpertReadQueue() = default;
-std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_demand(std::span<const size_t> records) {
-  return impl_->reserve_demand(records);
+std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_demand(std::span<const size_t> records, bool prefill) {
+  return impl_->reserve_demand(records, false, prefill);
 }
 std::vector<std::shared_ptr<ReadTicket>> ExpertReadQueue::reserve_projections(std::span<const size_t> records) {
   const size_t count = impl_->store->records().size();

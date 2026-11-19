@@ -82,6 +82,21 @@ DGPP_TEST(expert_read_queue_refuses_unrepresentable_mx_scale_before_publication)
   refuses([&] { ready(queue.request(1)); });
   require(ready(queue.request(2)) != nullptr, "later valid record still readable");
 }
+DGPP_TEST(expert_read_queue_prefill_and_decode_keep_their_own_adjacent_limits) {
+  Fixture f;
+  auto store = std::make_shared<ExpertStore>(f.path, f.store->identity(), 8, IoMode::kBuffered, false);
+  auto cfg = f.config();
+  cfg.buffers = cfg.adjacent_records = 4;
+  cfg.prefill_adjacent_records = 2;
+  cfg.staging_budget_bytes *= cfg.buffers;
+  ExpertReadQueue queue(store, cfg);
+  const std::array<size_t,4> prefill{0, 1, 2, 3}, decode{4, 5, 6, 7};
+  for (const auto& ticket : queue.reserve_demand(prefill, true)) (void)ready(ticket);
+  require(store->stats().calls == 2, "prefill reads consecutive pairs");
+  for (const auto& ticket : queue.reserve_demand(decode)) (void)ready(ticket);
+  require(store->stats().calls == 3, "decode reads four consecutive records");
+}
+
 DGPP_TEST(expert_read_queue_vectors_reserved_records_and_checks_each_lease) {
   Fixture f(true);
   auto store = std::make_shared<ExpertStore>(f.path, f.store->identity(), 8, IoMode::kBuffered, false);

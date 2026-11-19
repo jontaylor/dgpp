@@ -890,7 +890,7 @@ ExpertExecutionLease ExpertCache::acquire(size_t expert, bool canonical, bool ch
 }
 void ExpertCache::execute_ready(std::span<const size_t> selected,
     const std::function<void(std::span<const size_t>, std::span<const ExpertExecutionLease>)>& execute,
-    ProjectionReads* projections, const ExecuteProjection& execute_projection) {
+    ProjectionReads* projections, const ExecuteProjection& execute_projection, bool prefill) {
   auto& s = *state_;
   s.check();
   if (s.counters.active_execution_slots || s.counters.active_native_leases)
@@ -922,7 +922,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       std::vector<ExpertExecutionLease> leases;
       std::vector<std::pair<size_t, size_t>> missing;
       jobs.reserve(count); leases.reserve(count);
-      if (!projections && group_reads_enabled()) (void)prime_group(selected.subspan(base, count));
+      if (!projections && group_reads_enabled()) (void)prime_group(selected.subspan(base, count), prefill);
       // Snapshot every resident source before any admission can evict it.
       for (size_t j = 0; j < count; ++j) {
         const size_t e = selected[base+j];
@@ -1066,7 +1066,7 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           const size_t promised = pending.size() + s.pending_copies.size() +
               s.direct_staging_count() + s.prefetched.size();
           if (promised <= s.config.reads.buffers && fresh <= s.config.reads.buffers-promised)
-            (void)prime_group(following);
+            (void)prime_group(following, prefill);
         }
         launch_ready();  // lease publication orders consumers after assembly
         if (launched == jobs.size()) break;
@@ -1263,7 +1263,7 @@ ProjectionReads ExpertCache::prime_projections(std::span<const int32_t> ids,
   if (result.tickets.empty()) return {};
   return result;
 }
-size_t ExpertCache::prime_group(std::span<const size_t> selected) {
+size_t ExpertCache::prime_group(std::span<const size_t> selected, bool prefill) {
   auto& s = *state_;
   s.check();
   s.reap_copies();
@@ -1276,7 +1276,7 @@ size_t ExpertCache::prime_group(std::span<const size_t> selected) {
       if (s.slots[r] == absent) records.push_back(r);
   }
   if (records.empty()) return 0;
-  auto tickets = s.reads->reserve_demand(records);
+  auto tickets = s.reads->reserve_demand(records, prefill);
   if (tickets.empty()) return 0;
   const auto started = std::chrono::steady_clock::now();
   size_t fresh = 0;
@@ -1289,7 +1289,7 @@ size_t ExpertCache::prime_group(std::span<const size_t> selected) {
   }
   return fresh;
 }
-size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping) {
+size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const size_t> mapping, bool prefill) {
   auto& s = *state_;
   s.check();
   std::array<bool,384> selected{};
@@ -1309,7 +1309,7 @@ size_t ExpertCache::prime_demand(std::span<const int32_t> ids, std::span<const s
       s.expert_index(e);
       if (s.planner->current().chunks[e] != s.experts[e].records.size()) group[count++] = e;
     }
-    return prime_group(std::span<const size_t>(group).first(count));
+    return prime_group(std::span<const size_t>(group).first(count), prefill);
   }
   size_t accepted = 0, issued_experts = 0;
   for (size_t id = 0; id < mapping.size() && issued_experts < 2; ++id) {
