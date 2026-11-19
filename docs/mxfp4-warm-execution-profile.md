@@ -319,3 +319,35 @@ drafting took 6.67 ms in both configurations. The two ranks generated matching
 operation streams, accepted the same proposals, and agreed with the control
 on outputs and expert bytes. Both ranks had zero process swap. These timings
 measure latency and throughput; physical DRAM bandwidth was unavailable.
+
+### Grouping adjacent expert records on local SSD
+
+Each rank reads its own MXFP4 shard from local NVMe. When consecutive
+expert records have reserved staging buffers, the reader can fill several
+buffers with one `preadv` call. Direct I/O on these GB10 hosts required
+64 KiB alignment for the component buffers. Each NVMe block queue also
+reported a 256 KiB hardware request limit. The file-call count measures
+submissions by DGPP. The kernel and device can split those submissions.
+
+At revision `d7d7f258`, both ranks used binary SHA-256
+`e13f6814ba1b37623717d266ed6aac9795d9fbd50944bf56dd03bbf387bc28a3`.
+Every width used 20 MiB boundary prefetch and resident DSpark graph replay.
+On the cold 24,292-token tool call each rank read 101.40 GiB. One record
+per submission took 207,666 file calls per rank. Four took 55,093–55,719.
+The generated responses, accepted drafts, rank operation streams and
+per-rank expert bytes matched at every width. Both ranks had zero process
+swap. These are single-client diagnostics.
+
+| Maximum records per submission | Fresh process starts | Cold prefill (s) | Decode with expert reads (tok/s) | Warm zero-read decode (tok/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2 | 36.90–36.97 | 32.65–32.82 | 45.04–45.06 |
+| 2 | 1 | 36.50 | 32.75 | 45.11 |
+| 4 | 2 | 37.45–37.60 | 32.89–33.03 | 45.12–45.15 |
+| 8 | 1 | 37.37 | 32.90 | 45.06 |
+| 16 | 1 | 38.51 | 32.58 | 45.15 |
+
+Four records improved decode with expert reads on both starts while
+extending cold prefill. The phase-specific controls select the maximum
+prefill group with `DGPP_EXPERT_PREFILL_ADJACENT_READS` and decode group
+with `DGPP_EXPERT_ADJACENT_READS`. Omitting the prefill override uses the
+decode setting for both phases.
