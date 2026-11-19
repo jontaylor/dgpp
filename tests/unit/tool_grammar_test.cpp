@@ -630,12 +630,18 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
               std::find(v.begin(), v.end(), kThinkOpen) == v.end() &&
               std::find(v.begin(), v.end(), 'P') != v.end(),
           "free value: text only");
-  feed(g, bytes_of("Paris </b> <"));
+  feed(g, bytes_of("Paris </b> "));
+  g.advance(kQuotedLt);  // multi-byte token ending in '<'
   require(!g.allows(kDsmlTag), "a lone '<' in the value is text");
   g.advance('/');
   require(g.allows(kDsmlTag) && g.allows('x'), "after \"</\" the tag opens the closer (or the text goes on)");
+  require(g.literal_proposal() < 0, "the text value can still continue");
+  auto text_branch = g;
+  text_branch.advance(kCity);
+  require(!text_branch.allows(kDsmlTag), "another word withdraws the closer on the speculative branch");
   g.advance(kDsmlTag);
   require(same(allowed_ids(g), {' '}), "after the closer's tag: its literal only: " + show(allowed_ids(g)));
+  require(g.literal_proposal() == ' ', "the committed free-value closer can be proposed");
   feed(g, bytes_of(" parameter>\n"));
   require(std::string(g.state_name()) == "d-param-or-close", "the closer ends the value");
   // days is JSON-typed: the flag is forced false; the value a JSON integer.
@@ -646,6 +652,7 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   feed(g, bytes_of(" parameter name=\""));
   require(g.allows('d') && !g.allows('c'), "a closed key is offered once");
   feed(g, bytes_of("days\" string=\"false\">3</"));
+  require(g.literal_proposal() == kDsmlTag, "the committed JSON-value closer can propose the tag");
   g.advance(kDsmlTag);
   feed(g, bytes_of(" parameter>\n"));
   // Every key used: only the invoke's close remains.

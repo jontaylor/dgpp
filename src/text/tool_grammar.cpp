@@ -902,6 +902,7 @@ std::string_view GrammarState::next_literal(std::string_view target, std::string
 int32_t GrammarState::literal_proposal() const {
   if (!active() || think_openable_) return -1;
   switch (state_) {
+    case State::kDValue:
     case State::kDCalls:
     case State::kDInvoke:
     case State::kDParamOrClose:
@@ -913,16 +914,20 @@ int32_t GrammarState::literal_proposal() const {
   }
   std::string_view common;
   bool first = true;
-  for (const auto& target : match_.targets) {
-    if (!target.starts_with(match_.emitted)) continue;
-    auto piece = next_literal(target, match_.emitted);
-    if (first) {
-      common = piece;
-      first = false;
-    } else {
-      common = common.substr(0, std::mismatch(common.begin(), common.end(), piece.begin(), piece.end()).first - common.begin());
+  if (state_ == State::kDValue && !term_.empty()) {
+    common = next_literal(dsml_literals(vocab_).param_close, term_);
+  } else {
+    for (const auto& target : match_.targets) {
+      if (!target.starts_with(match_.emitted)) continue;
+      auto piece = next_literal(target, match_.emitted);
+      if (first) {
+        common = piece;
+        first = false;
+      } else {
+        common = common.substr(0, std::mismatch(common.begin(), common.end(), piece.begin(), piece.end()).first - common.begin());
+      }
+      if (common.empty()) return -1;
     }
-    if (common.empty()) return -1;
   }
   if (common.empty()) return -1;
   if (common.front() == kDsmlSentinel) return static_cast<int32_t>(vocab_->markers().dsml.id);
@@ -1359,6 +1364,14 @@ bool GrammarState::allows(int64_t id) const {
   }
   if (state_ == State::kQValue || state_ == State::kDValue) {
     const GrammarArg* a = current_arg();
+    if (state_ == State::kDValue && term_.empty() && (!a || a->kind == GrammarArg::Kind::kFree)) {
+      if (id < 0 || id >= vocab_->vocab_size()) return false;
+      const auto& m = vocab_->markers();
+      if (id == m.dsml.id) return match_.emitted == "</";
+      const auto& markers = vocab_->marker_ids();
+      return !vocab_->is_eos(id) && id != m.think_open.id && id != m.think_close.id &&
+             std::find(markers.begin(), markers.end(), id) == markers.end();
+    }
     if (a != nullptr && a->kind == GrammarArg::Kind::kJson) {
       const std::string& closer =
           state_ == State::kQValue ? std::string(xml_parameter_end()) : dsml_literals(vocab_).param_close;
@@ -1573,11 +1586,14 @@ void GrammarState::advance(int64_t id) {
       }
       // A free value: its text, until the tag after a "</" starts the closer.
       if (id == m.dsml.id) {
-        match_.emitted.resize(match_.emitted.size() - 2);  // the "</" belongs to the closer
         term_ = "</" + kDTag;
         return;
       }
-      match_.emitted += vocab_->text(id);
+      // A speculative cursor copies this state for each proposal block. Only
+      // the last two bytes can affect a future tag, even for a long patch.
+      const std::string_view text = vocab_->text(id);
+      match_.emitted += text.substr(text.size() - std::min<size_t>(text.size(), 2));
+      if (match_.emitted.size() > 2) match_.emitted.erase(0, match_.emitted.size() - 2);
       return;
     }
     case State::kQName:
