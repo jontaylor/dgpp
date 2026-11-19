@@ -401,3 +401,37 @@ passed the row-invariance and projection tests and preserved serving output
 and acceptance. Compact staging had mixed projection timings and did not
 improve warm serving throughput across the four starts. The deployment
 continues to use the standard staging.
+
+### Packed expert reads inside a warm verification pass
+
+The TP2 replay used four target rows with six routes per row. Across 34
+recorded layer calls, the mean was 17.59 distinct expert shards per rank.
+Each shard contains 9,123,840 packed weight and scale bytes. The replay
+rotated eight copies of the prepared weights and checked routed FP32 outputs
+against the original reader. Synthetic activations and real routing IDs
+were identical across variants.
+
+With five copy stages and low L2 retention for the weight codes, mean
+expert time was 679.18 µs. That represents **236 GB/s of distinct expert
+payload per Spark**. The numerator counts each selected shard once. It
+excludes activations, scratch traffic and physical rereads. The advertised
+273 GB/s would take about 588 µs to read the same payload from DRAM once.
+The difference is a comparison of byte volumes and elapsed time. The
+hardware trace does not measure how many of those bytes hit L2.
+
+Moving the routed activation address lookup outside the K loop and issuing
+the packed weight and scale copies first reduced mean replay time to
+678.77 µs. It won 19 of the 34 route groups. In two fresh C1 starts per
+configuration, the three read-free serving continuations ran at 45.53–45.58
+tok/s for the original schedule and 45.48–45.52 for the changed schedule.
+The first two continuations, which needed expert reads, ran at 33.12–33.18
+and 33.22–33.28 tok/s respectively. All seven responses and accepted
+proposals matched. These are engine decode rates in a targeted comparison.
+
+The source for the export options is `92d3684a`. The compared server hashes
+were `2b15ef35ff7a9f7743bd75529584f3f6d984a19e1a79a9a1e4f3470b53f0f074`
+and `ba0f1f1de65d7315797fa8bdf259df03d9a9a6537996648c7164a28c46d111bf`.
+To reproduce the candidate export, add `--reuse-route-offset` and
+`--stage-weights-first` to `--format mxfp4-nibble --pipeline-stages 5
+--stream-weight-codes`. The down projection's copy depth can be set
+independently with `--down-pipeline-stages`.
