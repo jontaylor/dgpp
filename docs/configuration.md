@@ -502,6 +502,14 @@ restores the accepted row's compressor tails, Engram history and device
 position together on the model stream. The next draft can be submitted while
 that copy runs. The default is `0`.
 
+`DGPP_DSV41_EARLY_DRAFT_INPUT=1` projects the target hidden rows for
+DSpark as soon as compact verification maxima are ready. Token selection
+and rollback can overlap that weight read. Mode `2` launches the projection
+on a side stream inside the paged target graph when the last required
+hidden layer is available. The draft consumes only the accepted prefix of
+the result. This uses the existing projection buffer and the resident FP8
+projection with BF16 outputs. The default is `0`.
+
 The DSpark Markov projection uses resident BF16 weights.
 `DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
 chain positions in the coalesced reader. Mode `2` prepares a rank-local copy

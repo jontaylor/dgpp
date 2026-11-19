@@ -1007,6 +1007,34 @@ DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
   }
 }
 
+// The target has seen every proposed row when the draft input projection
+// starts. Only the accepted prefix may be appended to the draft rings.
+DGPP_TEST(dsv41_dspark_early_input_matches_accepted_rows) {
+  const Fixture fx = make_fixture(false);
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
+                         nullptr, 0, 1, 1, true, 8, false, &paging);
+  const auto prompt = tokens_of(730, 23, fx.cfg.vocab_size);
+  const std::vector<int64_t> feed{10, 20, 30, 40};
+  const auto run = [&](bool candidates) {
+    model.session_prefill(0, prompt);
+    model.session_advance_draft(0, {feed[0]});
+    std::vector<std::vector<float>> logits;
+    for (int accepted : {1, 3, 4, 2}) {
+      if (candidates) (void)model.session_verify_candidates(0, feed);
+      else (void)model.session_verify(0, feed);
+      model.session_rollback(0, accepted, 4);
+      std::vector<int64_t> picks(feed.begin(), feed.begin() + accepted);
+      logits.push_back(model.session_draft(0, picks).logits);
+      logits.push_back(model.session_draft_chain(0, 11, 0, true, true).logits);
+    }
+    model.session_close(0);
+    return logits;
+  };
+  const auto reference = run(false);
+  require(run(true) == reference, "prepared draft and chain logits match for every accepted width");
+}
+
 DGPP_TEST(dsv41_eager_dspark_interior_snapshot_logits_match_live_cut) {
   const Fixture fx = make_fixture(false);
   const auto prompt = tokens_of(751, 125, fx.cfg.vocab_size);

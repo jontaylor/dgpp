@@ -73,6 +73,7 @@ struct Dsv41Model::PagedGraphs {
   struct Graph {
     cudaGraphExec_t exec = nullptr;
     int variant = 0;
+    bool projects_draft = false;
     uint16_t *cur = nullptr, *next = nullptr;
     float *pre = nullptr, *pre_next = nullptr;
     std::vector<const uint16_t*> inputs;
@@ -82,8 +83,10 @@ struct Dsv41Model::PagedGraphs {
   };
   std::map<std::array<uint64_t, 7>, Graph> graphs;
   static constexpr size_t max_target_graphs = 8;
-  std::map<std::array<int, 4>, Graph> draft_graphs, append_graphs;
+  std::map<std::array<int, 5>, Graph> draft_graphs, append_graphs;
   cudaStream_t service = nullptr;
+  cudaStream_t draft_input = nullptr;
+  cudaEvent_t draft_start = nullptr, draft_done = nullptr;
   cudaEvent_t done = nullptr;
   cudaEvent_t ffn_window = nullptr, next_attention_window = nullptr;
   int ffn_lookahead = 0, attention_lookahead = 0;
@@ -173,6 +176,9 @@ struct Dsv41Model::PagedGraphs {
     if (ffn_window) (void)cudaEventDestroy(ffn_window);
     if (next_attention_window) (void)cudaEventDestroy(next_attention_window);
     if (done) (void)cudaEventDestroy(done);
+    if (draft_start) (void)cudaEventDestroy(draft_start);
+    if (draft_done) (void)cudaEventDestroy(draft_done);
+    if (draft_input) (void)cudaStreamDestroy(draft_input);
     if (service) (void)cudaStreamDestroy(service);
   }
   int next_demand(int first) const {
@@ -521,6 +527,13 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_DRAFT_GRAPH"))
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
+  if (const char* value = std::getenv("DGPP_DSV41_EARLY_DRAFT_INPUT")) {
+    const std::string_view mode(value);
+    if (mode != "0" && mode != "1" && mode != "2")
+      throw std::invalid_argument("DGPP_DSV41_EARLY_DRAFT_INPUT requires 0, 1 or 2");
+    if (mtp && residency == Dsv41Residency::Resident && !cfg_.weights_exl3 && dense_mma_)
+      early_draft_input_ = mode.front() - '0';
+  }
   if (const char* value = std::getenv("DGPP_DSV41_FUSED_ROLLBACK"))
     fused_rollback_ = std::string_view(value) == "1";
   if (const char* value = std::getenv("DGPP_DSV41_ASYNC_DRAFT_APPEND")) {
@@ -1088,6 +1101,7 @@ const Dsv41DraftResident& Dsv41Model::draft_stage(int stage) {
 // The session core's state hooks.
 // ---------------------------------------------------------------------------
 void Dsv41Model::reset_slot_state(int req) {
+  prepared_draft_rows_ = 0;
   pool_.reset_request(req, stream_);
   if (engram_) {
     std::vector<int32_t> pad(4, sidecar_.pad_class);
@@ -1141,6 +1155,7 @@ void Dsv41Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
 }
 
 void Dsv41Model::read_state_snapshot(int req, const uint8_t* s) {
+  prepared_draft_rows_ = 0;
   const size_t rb = pool_.ring_bytes_per_request();
   for (int l = 0; l < pool_.shape().layers; ++l) {
     DGPP_CUDA_OK(cudaMemcpyAsync(pool_.ring(l) + static_cast<size_t>(req) * rb, s, rb, cudaMemcpyDeviceToDevice, stream_));
@@ -1182,9 +1197,10 @@ void Dsv41Model::session_advance_draft(int req, const std::vector<int64_t>& toke
     const int rows = static_cast<int>(tokens.size());
     const int64_t pos = mtp_pos_[req];
     csa2_stage_contiguous_rows(d_step_pos_, d_req_ids_, req, pos, rows, stream_, d_mtp_pos_ + req);
+    const bool prepared = take_draft_input(req, pos, rows);
     const bool replay = async_draft_append_ == 2 && resident_draft_graphs_ && paged_graphs_ &&
-                        enqueue_resident_draft_graph(req, rows, true);
-    if (!replay) draft_first(req, nullptr, d_step_pos_, d_req_ids_, rows, true, false, 0, 0);
+                        enqueue_resident_draft_graph(req, rows, true, prepared);
+    if (!replay) draft_first(req, nullptr, d_step_pos_, d_req_ids_, rows, true, false, 0, 0, 0, false, prepared);
     mtp_pos_[req] = pos + rows;
     draft_rows_ = rows;
     draft_last_row_ = rows - 1;
@@ -1292,12 +1308,14 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
     draft_chain_row(req, tokens, capture, head_rows, batch_requests);
     return;
   }
+  const bool prepared = decode_row && !capture && batch_requests == 0 && take_draft_input(req, first_pos, T);
+  prepared_draft_rows_ = 0;
   // The accepted positions and token IDs already live in the session's
   // device input buffers. Reuse the resident first-block walk at this width.
   if (resident_draft_graphs_ && paged_graphs_ && decode_row && !capture &&
       batch_requests == 0 && head_rows == 1 && tokens == d_tokens_ &&
       !std::getenv("DGPP_DSV41_CAPTURE_DRAFT") && !debug_teacher_ && !debug_capture_ &&
-      enqueue_resident_draft_graph(req, T)) return;
+      enqueue_resident_draft_graph(req, T, false, prepared)) return;
   const int64_t* d_pos = d_step_pos_;
   const int32_t* d_req = d_req_ids_;
   if (!decode_row) {
@@ -1311,15 +1329,47 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
     d_req = d_draft_req_;
   }
   draft_first(req, tokens, d_pos, d_req, T, decode_row, capture, head_rows, batch_requests,
-               decode_row ? 0 : segment_of(req).row0);
+               decode_row ? 0 : segment_of(req).row0, false, prepared);
   // Eager token picks use the host bus after this draft walk. A CUDA
   // stream drain alone does not retire the transport's outstanding folds.
   if (!capture && boundary_) boundary_->settle();
 }
 
+// The neural draft and history-only updates consume the same row-wise projection.
+void Dsv41Model::project_draft_input(const uint16_t* src, int T, bool prefill_tile, cudaStream_t stream) {
+  const int H = cfg_.hidden_size, W = targets_ * H;
+  const Dsv41DraftResident& d0 = draft_stage(0);
+  if ((!d0.main_proj.payload && !d0.main_proj_x.tiles) || !d0.main_norm)
+    throw std::runtime_error("mtp_run_rows: the DSpark main projection is unbound");
+  if (d0.main_proj_x.tiles)
+    launch_exl3_gemm_bf16(src, static_cast<size_t>(W), d0.main_proj_x, main_x_, T, H, W, 0, stream, exl3_ws_,
+                          exl3_ws_bytes_);
+  else
+    launch_scale_gemm_grid_bf16(src, static_cast<size_t>(W), d0.main_proj.payload, d0.main_proj.scales, main_x_, T, H, W,
+                                stream, 0, 5, 5, dense_mma_, nullptr, 0, /*prefill_tile=*/prefill_tile);
+  csa2_rmsnorm_bf16(main_x_, H, d0.main_norm, main_x_, H, T, H, cfg_.rms_norm_eps, stream);
+}
+
+bool Dsv41Model::take_draft_input(int req, int64_t pos, int rows) {
+  const bool ready = rows <= prepared_draft_rows_ && req == prepared_draft_req_ && pos == prepared_draft_pos_;
+  prepared_draft_rows_ = 0;
+  return ready;
+}
+
+void Dsv41Model::start_draft_input(int req, int64_t pos, int rows, bool projected_in_graph) {
+  if (!early_draft_input_) {
+    prefetch_draft_input_weights();
+    return;
+  }
+  if (!projected_in_graph) project_draft_input(main_hidden_, rows, false, stream_);
+  prepared_draft_req_ = req;
+  prepared_draft_pos_ = pos;
+  prepared_draft_rows_ = rows;
+}
+
 void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T,
                              bool decode_row, bool capture, int head_rows, int batch_requests, int source_row,
-                             bool use_draft_tables) {
+                             bool use_draft_tables, bool prepared) {
   const int H = cfg_.hidden_size;
   const int W = targets_ * H;
   const int block = cfg_.dspark_block_size;
@@ -1337,18 +1387,7 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
     gather_draft_hidden(d_req, d_pos, main_gather_, T);
     src = main_gather_;
   }
-  {
-    const Dsv41DraftResident& d0 = draft_stage(0);
-    if ((!d0.main_proj.payload && !d0.main_proj_x.tiles) || !d0.main_norm)
-      throw std::runtime_error("mtp_run_rows: the DSpark main projection is unbound");
-    if (d0.main_proj_x.tiles)
-      launch_exl3_gemm_bf16(src, static_cast<size_t>(W), d0.main_proj_x, main_x_, T, H, W, 0, stream_, exl3_ws_,
-                            exl3_ws_bytes_);
-    else
-      launch_scale_gemm_grid_bf16(src, static_cast<size_t>(W), d0.main_proj.payload, d0.main_proj.scales, main_x_, T, H, W,
-                                  stream_, 0, 5, 5, dense_mma_, nullptr, 0, /*prefill_tile=*/!decode_row && prefill_dense_tile_);
-    csa2_rmsnorm_bf16(main_x_, H, d0.main_norm, main_x_, H, T, H, eps, stream_);
-  }
+  if (!prepared) project_draft_input(src, T, !decode_row && prefill_dense_tile_, stream_);
   // ---- the draft rings: each stage's window latent of the real rows ------------
   // A prefill chunk appends its last min(T, ring) rows (one ring slot per
   // row; the older rows are past every window).
@@ -1433,11 +1472,11 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
                                  cudaMemcpyDeviceToHost, stream_));
 }
 
-bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only) {
+bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only, bool prepared) {
   auto& p = *paged_graphs_;
   auto& graphs = append_only ? p.append_graphs : p.draft_graphs;
-  const std::array<int, 4> key{req, accepted_rows, append_only ? 0 : eager_draft_head_rows_,
-                               int(!append_only && eager_draft_confidence_)};
+  const std::array<int, 5> key{req, accepted_rows, append_only ? 0 : eager_draft_head_rows_,
+                               int(!append_only && eager_draft_confidence_), int(prepared)};
   auto it = graphs.find(key);
   if (it == graphs.end()) {
     if (graphs.size() >= PagedGraphs::max_target_graphs) return false;
@@ -1458,7 +1497,7 @@ bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows, bool a
       capturing = true;
       // The segment reducer operates in place on model buffers. The ordinary
       // outer capture requires staged buffers from a different reducer.
-      draft_first(req, d_tokens_, d_step_pos_, d_req_ids_, accepted_rows, true, false, append_only ? 0 : 1, 0, 0, true);
+      draft_first(req, d_tokens_, d_step_pos_, d_req_ids_, accepted_rows, true, false, append_only ? 0 : 1, 0, 0, true, prepared);
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (recording) { boundary_->graph_segment_end(); recording = false; }
       if (paged_pdl_) {
@@ -1468,8 +1507,8 @@ bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows, bool a
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
-      DGPP_LOG_INFO("dsv41 GPU paging: captured resident draft graph {}, slot={}, accepted rows={}, append only={}",
-                    g.variant, req, accepted_rows, append_only);
+      DGPP_LOG_INFO("dsv41 GPU paging: captured resident draft graph {}, slot={}, accepted rows={}, append only={}, projected input={}",
+                    g.variant, req, accepted_rows, append_only, prepared);
     } catch (...) {
       if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
       if (recording) { try { boundary_->graph_segment_end(); } catch (...) {} }
@@ -2077,6 +2116,14 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
       dsv41_stream_mean_bf16(cur_, 4, H, T, main_hidden_ + static_cast<size_t>(ord) * H,
                              static_cast<int64_t>(targets_) * H, stream_);
   }
+  if (paged_graph_capture_ && paged_graphs_->capturing->projects_draft &&
+      layer == cfg_.dspark_target_layer_ids.back()) {
+    auto& p = *paged_graphs_;
+    DGPP_CUDA_OK(cudaEventRecord(p.draft_start, stream_));
+    DGPP_CUDA_OK(cudaStreamWaitEvent(p.draft_input, p.draft_start));
+    project_draft_input(main_hidden_, T, false, p.draft_input);
+    DGPP_CUDA_OK(cudaEventRecord(p.draft_done, p.draft_input));
+  }
   const bool draft = cfg_.is_draft(layer);
   // ---- the attention site ----------------------------------------------------
   GlmMhcWeights aw;
@@ -2230,6 +2277,12 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
         !gemm_.ensure_plan(T, lm_vocab_count_, cfg_.hidden_size, DType::BF16, GemmOut::F32, cfg_.hidden_size))
       return false;
     auto& g = p.graphs[key];
+    g.projects_draft = capture_tail && compact_verify_ && early_draft_input_ == 2;
+    if (g.projects_draft && !p.draft_input) {
+      DGPP_CUDA_OK(cudaStreamCreateWithFlags(&p.draft_input, cudaStreamNonBlocking));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&p.draft_start, cudaEventDisableTiming));
+      DGPP_CUDA_OK(cudaEventCreateWithFlags(&p.draft_done, cudaEventDisableTiming));
+    }
     g.variant = static_cast<int>(p.graphs.size()) - 1;
     g.inputs.resize(p.layers); g.outputs.resize(p.layers);
     cudaGraph_t graph = nullptr;
@@ -2257,6 +2310,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
           dsv41_verify_tile_max(logits_, T, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
         else copy_decode_mirrors(T);
       }
+      if (g.projects_draft) DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, p.draft_done));
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
       if (boundary_) { boundary_->graph_segment_end(); recording = false; }
@@ -2384,7 +2438,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
     // Tile maxima are visible and every demand gate has retired. Read the
     // draft weights during transport retirement, hit accounting and the
     // host token pick. The cached weights are independent of the verdict.
-    if (capture_tail && compact_verify_) prefetch_draft_input_weights();
+    if (capture_tail && compact_verify_) start_draft_input(rows.req, rows.pos0, T, g.projects_draft);
     demand_window.end();
     if (boundary_) boundary_->graph_segment_finish();
     account(p.layers);
@@ -2481,6 +2535,7 @@ std::vector<float> Dsv41Model::verification_logits_row(int row) const {
 }
 
 Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
+  prepared_draft_rows_ = 0;
   if (run.capture && expert_cache_)
     throw std::logic_error("run_rows: expert paging requires eager execution");
   const int T = run.T, req = run.req;
@@ -2965,7 +3020,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
     if (!tail_ready) {
       dsv41_verify_tile_max(logits_, run.T, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
-      prefetch_draft_input_weights();
+      start_draft_input(req, run.pos0, run.T, false);
     }
     out.lm_vocab_begin = lm_vocab_begin_;
     out.lm_vocab_count = lm_vocab_count_;

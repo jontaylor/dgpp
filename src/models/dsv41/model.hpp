@@ -355,12 +355,18 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
   int async_draft_append_ = 0;
+  int early_draft_input_ = 0;
+  int prepared_draft_req_ = -1, prepared_draft_rows_ = 0;
+  int64_t prepared_draft_pos_ = -1;
+  void project_draft_input(const uint16_t* src, int rows, bool prefill_tile, cudaStream_t stream);
+  void start_draft_input(int req, int64_t pos, int rows, bool projected_in_graph);
+  bool take_draft_input(int req, int64_t pos, int rows);
   bool fused_rollback_ = false;
   size_t draft_pick_prefetch_bytes_ = 0;
   void prefetch_draft_input_weights();
   int eager_draft_head_rows_ = 0, draft_rows_scored_ = 0;
   bool eager_draft_confidence_ = true, eager_token_only_chain_ = false;
-  bool enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only = false);
+  bool enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only, bool prepared);
   bool paged_graph_tail_ = false;
   bool paged_async_prologue_ = false;
   inline static bool s_default_paged_pdl = true;
@@ -429,7 +435,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // The DSpark pieces (mtp): the first draft call of a step (the rings, the
   // block, base_logits_, row 0) and a chain row (block row draft_row_).
   void draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T, bool decode_row,
-                   bool capture, int head_rows, int batch_requests, int source_row = 0, bool use_draft_tables = false);
+                   bool capture, int head_rows, int batch_requests, int source_row = 0, bool use_draft_tables = false, bool prepared = false);
   void draft_chain_row(int req, const int64_t* tokens, bool capture, int head_rows, int batch_requests);
   const Dsv41DraftResident& draft_stage(int stage);
   // The decode walk's boundary prefetch windows (kernels/l2_prefetch.hpp;
