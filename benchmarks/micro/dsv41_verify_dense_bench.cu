@@ -55,6 +55,7 @@ struct Arm {
   const char* name;
   bool pair, workspace, gemv;
   int warps;
+  bool mxfp8_input = false;
 };
 
 void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = false) {
@@ -84,14 +85,14 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
 
   if (native_wob) {
     arms.resize(1);
-    arms.push_back({"mxfp8-input", false, false, false, 0});
+    arms.push_back({"mxfp8-input", false, false, false, 0, true});
   }
   auto launch = [&](const Arm& a, int copy, int first, int m) {
     void* ws = a.workspace ? scratch.p : nullptr;
     const auto* input = x.p + first * xs;
     auto* w = weights.p + copy * matrix;
     auto* sc = scales.p + copy * scale_matrix;
-    if (native_wob && !a.workspace) {
+    if (a.mxfp8_input) {
       launch_mxfp8_quantize_rows(input, xs, m, shape.k, scratch.p, scratch.p + size_t(m) * shape.k, stream);
       launch_mxfp8_woa_decode(scratch.p, w, sc, y.p + first * os, m, 1, shape.n, shape.k, stream);
       return;
@@ -147,7 +148,7 @@ void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = 
       norm += b * b;
     }
     errors[i] = std::sqrt(err / norm);
-    if (!(errors[i] < (native_wob && i == 1 ? 0.05 : 0.01))) throw std::runtime_error("projection outside reference tolerance");
+    if (!(errors[i] < (arm.mxfp8_input ? 0.05 : 0.01))) throw std::runtime_error("projection outside reference tolerance");
     DGPP_CUDA_OK(cudaMemsetAsync(y.p, 0xfe, rows * os * 2, stream));
     for (int r = 0; r < rows; ++r) launch(arm, 0, r, 1);
     if (output != result()) throw std::runtime_error("batched and standalone rows diverged");
