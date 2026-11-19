@@ -16,6 +16,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--format', choices=('nvfp4', 'mxfp4', 'mxfp4-nibble'), default='nvfp4')
 parser.add_argument('--split-projections', action='store_true', help='Also export MX nibble gate/up and down entry points')
+parser.add_argument('--pipeline-stages', type=int, choices=(2, 3, 4, 5),
+                    help='Override the b12x asynchronous weight-copy pipeline depth for both projections')
 args = parser.parse_args()
 if args.split_projections and args.format != 'mxfp4-nibble':
  raise ValueError('split projection export requires mxfp4-nibble')
@@ -148,7 +150,8 @@ def export(name):
  compiled=kernel.compile_w4a16_fused_moe(size_m=64,hidden_size=5120,intermediate_size=1152,num_experts=384,top_k=6,
  activation='silu',apply_router_weight_on_input=False,zero_fc2_output=False,moe_block_size=8,max_m_blocks=384,
  element_dtype='bf16',sms=48,max_shared_mem=props.shared_memory_per_block_optin,swiglu_limit=10.,
- weight_layout='packed',scale_format='e8m0_k32' if is_mx else 'e4m3_k16',w13_layout='packed',force_tile_config=(128,128,64,256))
+ weight_layout='packed',scale_format='e8m0_k32' if is_mx else 'e4m3_k16',w13_layout='packed',force_tile_config=(128,128,64,256),
+ **({'pipeline_stages': args.pipeline_stages} if args.pipeline_stages is not None else {}))
  compiled.compiled.export_to_c(str(args.output), name)
 export(symbol)
 with (args.output / (symbol + '.h')).open('a') as header:
