@@ -227,9 +227,17 @@ void Sm12xMoe::prepare(std::span<const int32_t> ids,
     groups[ids[j]].push_back(j);
   }
   int blocks = 0;
+  static const bool skip_masked_tiles = [] {
+    const char* flag = std::getenv("DGPP_EXPERT_SKIP_MASKED_TILES");
+    return flag && flag[0] == '1';
+  }();
+  // b12x skips a negative expert before reading its weights. Keep its tile
+  // in the schedule so the split-K slices of every active tile stay identical.
+  // The optional singleton partition uses original expert IDs even on masked tiles.
+  const bool skip = skip_masked_tiles && !(c.reused && rows == 4);
   for (int e = 0; e < E; ++e)
     for (size_t begin = 0; begin < groups[e].size(); begin += B) {
-      experts[blocks] = e;
+      experts[blocks] = skip && !execute[e] ? -1 : e;
       if (execute[e])
         for (int j = 0; j < B && begin+j < groups[e].size(); ++j)
           routes[blocks*B+j] = groups[e][begin+j];
