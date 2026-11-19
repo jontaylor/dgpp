@@ -1,6 +1,8 @@
 #include "kernels/dsv41_dspark.hpp"
 #include "kernels/pdl.cuh"
 
+#include <cub/block/block_reduce.cuh>
+#include <climits>
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
@@ -8,6 +10,31 @@
 
 namespace dgpp {
 namespace {
+
+struct MaxCandidate {
+  __device__ sample::Candidate operator()(sample::Candidate a, sample::Candidate b) const {
+    return b.logit > a.logit || (b.logit == a.logit && b.id < a.id) ? b : a;
+  }
+};
+
+__global__ void verify_tile_max_kernel(const float* logits, int count, int begin, sample::Candidate* maxima) {
+  dgpp_pdl_wait();
+  constexpr int threads = 128;
+  using Reduce = cub::BlockReduce<sample::Candidate, threads>;
+  __shared__ typename Reduce::TempStorage temp;
+  const int offset = blockIdx.x * kVerifyLogitTile;
+  const float* row = logits + size_t(blockIdx.y) * count;
+  sample::Candidate best{INT_MAX, -INFINITY};
+  const int live = min(count - offset, kVerifyLogitTile);
+  for (int i = threadIdx.x; i < live; i += threads)
+    best = MaxCandidate{}(best, {begin + offset + i, row[offset + i]});
+  best = Reduce(temp).Reduce(best, MaxCandidate{});
+  if (threadIdx.x == 0) {
+    // local_max initializes the host scan with the row's first logit.
+    if (offset == 0 && isnan(row[0])) best = {begin, row[0]};
+    maxima[size_t(blockIdx.y) * gridDim.x + blockIdx.x] = best;
+  }
+}
 
 __global__ void stream_mean_kernel(const uint16_t* __restrict__ streams, int hc_mult, int hidden, int rows,
                                    uint16_t* __restrict__ out, int64_t out_stride) {
@@ -409,6 +436,15 @@ __global__ void confidence_kernel(const uint16_t* __restrict__ x, int64_t x_grou
 }
 
 }  // namespace
+
+void dsv41_verify_tile_max(const float* logits, int rows, int vocab_count, int vocab_begin,
+                           sample::Candidate* maxima, cudaStream_t stream) {
+  if (!logits || !maxima || rows <= 0 || vocab_count <= 0 || vocab_begin < 0 || vocab_begin > INT_MAX - vocab_count)
+    throw std::invalid_argument("dsv41_verify_tile_max: invalid logit slice");
+  verify_tile_max_kernel<<<dim3(dsv41_verify_tiles(vocab_count), rows), 128, 0, stream>>>(
+      logits, vocab_count, vocab_begin, maxima);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
 
 void dsv41_stream_mean_bf16(const uint16_t* streams, int hc_mult, int hidden, int rows, uint16_t* out,
                             int64_t out_stride, cudaStream_t stream) {

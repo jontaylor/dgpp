@@ -493,11 +493,6 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     exl3_ws_ = dev_alloc<char>(exl3_ws_bytes_);
     DGPP_CUDA_OK(cudaMemset(exl3_ws_, 0, exl3_ws_bytes_));
   }
-  verify_locals_ = dev_alloc<PickLocal>(max_decode_rows_);
-  h_verify_locals_ = pinned_alloc<PickLocal>(max_decode_rows_);
-  verify_table_ = dev_alloc<uint16_t>(device_pick_table_elems(max_decode_rows_, 1));
-  verify_digest_ = dev_alloc<uint64_t>(1);
-  DGPP_CUDA_OK(cudaMemset(verify_digest_, 0, sizeof(uint64_t)));
   gemm_.set_decode_rows(max_decode_rows_);
   const Dsv41LocalGeometry& geo = loader_.geometry();
   moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/false);
@@ -762,10 +757,7 @@ Dsv41Model::~Dsv41Model() {
   csa2_.reset();
   moe_.reset();
   engram_.reset();
-  cudaFree(verify_locals_);
-  cudaFreeHost(h_verify_locals_);
-  cudaFree(verify_table_);
-  cudaFree(verify_digest_);
+  cudaFreeHost(h_verify_maxima_);
   cudaFree(gemm_ws_);
   cudaFree(exl3_ws_);
   cudaFree(csa2_scratch_);
@@ -901,8 +893,7 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg
     // The bounded prefill's tail streams and the tail/segment coefficients.
     act += (R + 1) * static_cast<size_t>(cfg.sliding_window) * 4 * H * 2 +
            (R + 1) * static_cast<size_t>(cfg.sliding_window) * 4 * 4;
-    act += static_cast<size_t>(rows) * sizeof(PickLocal) + device_pick_table_elems(rows, 1) * 2 + 8;
-    core_pin += static_cast<size_t>(rows) * sizeof(PickLocal);
+    core_pin += static_cast<size_t>(rows) * dsv41_verify_tiles(static_cast<int>(V)) * sizeof(sample::Candidate);
     plan.add("activations (session core, the four residual streams, block io, mHC coefficients, route staging)", act,
              core_pin + static_cast<size_t>(cfg.num_hidden_layers) * M * K * 8);
   }
@@ -2152,7 +2143,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
   auto& p = *paged_graphs_;
   const std::array<uint64_t,7> key{static_cast<uint64_t>(T), static_cast<uint64_t>(rows.num_requests),
       static_cast<uint64_t>(rows.snapshots), reinterpret_cast<uintptr_t>(rows.req_ids),
-      reinterpret_cast<uintptr_t>(rows.pos), reinterpret_cast<uintptr_t>(rows.spans), static_cast<uint64_t>(capture_tail)};
+      reinterpret_cast<uintptr_t>(rows.pos), reinterpret_cast<uintptr_t>(rows.spans),
+      capture_tail ? (compact_verify_ ? 2u : 1u) : 0u};
   auto it = p.graphs.find(key);
   // Bound graph executable memory. Uncached uncommon shapes retain the
   // ordinary eager path; live request IDs/positions remain device inputs.
@@ -2197,7 +2189,9 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
         normalize_head(0, T);
         head_logits(h_, T, logits_, stream_);
         if (mtp_) store_draft_hidden(main_hidden_, rows.req_ids, rows.pos, T);
-        copy_decode_mirrors(T);
+        if (compact_verify_)
+          dsv41_verify_tile_max(logits_, T, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
+        else copy_decode_mirrors(T);
       }
       paged_graph_capture_ = false; p.capturing = nullptr;
       DGPP_CUDA_OK(cudaStreamEndCapture(stream_, &graph)); capturing = false;
@@ -2212,8 +2206,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
       DGPP_CUDA_OK(cudaGraphInstantiate(&g.exec, graph, nullptr, nullptr, 0));
       DGPP_CUDA_OK(cudaGraphDestroy(graph)); graph = nullptr;
       g.cur = cur_; g.next = nxt_; g.pre = pre_cur_; g.pre_next = pre_nxt_;
-      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}, L2 prefetch launches={}, output tail={}",
-                    g.variant, T, rows.num_requests, prefetch_.launches() - prefetch_start, capture_tail);
+      DGPP_LOG_INFO("dsv41 GPU paging: captured target graph {}, rows={}, requests={}, L2 prefetch launches={}, output tail={}, tile maxima={}",
+                    g.variant, T, rows.num_requests, prefetch_.launches() - prefetch_start, capture_tail, capture_tail && compact_verify_);
     } catch (...) {
       paged_graph_capture_ = false; p.capturing = nullptr;
       if (capturing) (void)cudaStreamEndCapture(stream_, &graph);
@@ -2388,6 +2382,11 @@ Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::ve
   compact_verify_ = flag && flag[0] == '1';
   compact_verify_rows_ = 0;
   try {
+    if (compact_verify_ && !verify_maxima_) {
+      if (!h_verify_maxima_)
+        h_verify_maxima_ = pinned_alloc<sample::Candidate>(size_t(max_decode_rows_) * dsv41_verify_tiles(lm_vocab_count_));
+      DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&verify_maxima_), h_verify_maxima_, 0));
+    }
     auto out = Base::session_verify(req, tokens);
     compact_verify_ = false;
     // The verify has completed. While the host merges the token candidates
@@ -2588,7 +2587,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       !debug_teacher_ && !debug_capture_ && !traces && rows.num_requests == 1 &&
       last_layer == cfg_.num_hidden_layers && T <= 16 &&
       (!boundary_ || boundary_->supports_graph_segments());
-  const bool capture_tail = paged_graph_tail_ && !compact_verify_ && !packed_prefill_logits(run) &&
+  const bool capture_tail = paged_graph_tail_ && !packed_prefill_logits(run) &&
                             !group && T <= max_decode_rows_ && T <= logits_capacity_rows_;
   const bool paged_graph = paged_candidate && enqueue_paged_graph(T, rows, capture_tail);
   const bool tail_ready = paged_graph && capture_tail;
@@ -2897,15 +2896,20 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // collective is an error here, not a wrong number read later).
   if (!run.capture && boundary_) boundary_->settle();
   if (compact_verify_ && run.decode && run.all_rows && !run.capture) {
-    device_pick_local(logits_, run.T, lm_vocab_count_, lm_vocab_begin_, 0, 1,
-        verify_digest_, verify_table_, verify_locals_, stream_);
-    DGPP_CUDA_OK(cudaMemcpyAsync(h_verify_locals_, verify_locals_, run.T * sizeof(PickLocal),
-        cudaMemcpyDeviceToHost, stream_));
-    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    if (!tail_ready) {
+      dsv41_verify_tile_max(logits_, run.T, lm_vocab_count_, lm_vocab_begin_, verify_maxima_, stream_);
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    }
     out.lm_vocab_begin = lm_vocab_begin_;
     out.lm_vocab_count = lm_vocab_count_;
-    for (int r = 0; r < run.T; ++r)
-      out.local_candidates.push_back({h_verify_locals_[r].best_id, h_verify_locals_[r].best_logit});
+    const int tiles = dsv41_verify_tiles(lm_vocab_count_);
+    for (int r = 0; r < run.T; ++r) {
+      const auto* row = h_verify_maxima_ + size_t(r) * tiles;
+      auto best = row[0];
+      for (int i = 1; i < tiles; ++i)
+        if (row[i].logit > best.logit) best = row[i];
+      out.local_candidates.push_back(best);
+    }
     compact_verify_rows_ = run.T;
   } else {
     out = finish_run(run, std::move(out), packed_logits, -1,

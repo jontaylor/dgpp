@@ -93,6 +93,36 @@ DGPP_TEST(markov_bias_alternate_traversal_and_packing_preserve_logits_and_maxima
 }
 DGPP_TEST(markov_bias_rank_252_per_thread_form) { check(252, 600, 100, 800, 2, 1); }
 
+DGPP_TEST(verify_tile_max_preserves_ties_offsets_and_partial_tiles) {
+  constexpr int count = 2 * dgpp::kVerifyLogitTile + 3, begin = 64640;
+  constexpr int rows = 4, tiles = dgpp::dsv41_verify_tiles(count);
+  std::vector<float> logits(rows * count, -INFINITY);
+  logits[17] = logits[731] = logits[count - 1] = 9.f;
+  logits[count + 1402] = -2.f;
+  logits[2 * count - 2] = -1.f;
+  logits[3 * count] = NAN;
+  float* device_logits = nullptr;
+  dgpp::sample::Candidate *host = nullptr, *mapped = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&device_logits, logits.size() * sizeof(float)));
+  DGPP_CUDA_OK(cudaMemcpy(device_logits, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice));
+  DGPP_CUDA_OK(cudaHostAlloc(&host, rows * tiles * sizeof(*host), cudaHostAllocMapped));
+  DGPP_CUDA_OK(cudaHostGetDevicePointer(&mapped, host, 0));
+  dgpp::dsv41_verify_tile_max(device_logits, rows, count, begin, mapped, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  for (int r = 0; r < rows; ++r) {
+    for (int t = 0; t < tiles; ++t) {
+      const int start = t * dgpp::kVerifyLogitTile;
+      int best = start;
+      for (int i = start + 1; i < std::min(count, start + dgpp::kVerifyLogitTile); ++i)
+        if (logits[r * count + i] > logits[r * count + best]) best = i;
+      require(host[r * tiles + t].id == begin + best, "tile winner and lowest id");
+      require(!std::memcmp(&host[r * tiles + t].logit, &logits[r * count + best], sizeof(float)), "exact tile score");
+    }
+  }
+  cudaFree(device_logits);
+  cudaFreeHost(host);
+}
+
 }  // namespace
 
 int main() {

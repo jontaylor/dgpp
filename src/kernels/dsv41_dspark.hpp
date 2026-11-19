@@ -7,8 +7,17 @@
 #include <cstdint>
 
 #include <cuda_runtime.h>
+#include "sample/candidate.hpp"
 
 namespace dgpp {
+
+constexpr int kVerifyLogitTile = 1024;
+constexpr int dsv41_verify_tiles(int vocab_count) { return 1 + (vocab_count - 1) / kVerifyLogitTile; }
+
+// One exact maximum per row and vocabulary tile, in increasing tile order.
+// The host can consume mapped output as soon as the verification stream completes.
+void dsv41_verify_tile_max(const float* logits, int rows, int vocab_count, int vocab_begin,
+                           sample::Candidate* maxima, cudaStream_t stream);
 
 // out[t, :] (row stride out_stride elements) = bf16(mean over the hc_mult
 // streams of streams[t, :, :]) — the fp32 sum in stream order, one

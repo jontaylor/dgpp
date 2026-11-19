@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "common/det_math.hpp"
+#include "sample/candidate.hpp"
 
 // ARITHMETIC CONTRACT (M6 6b): every transcendental here is the
 // deterministic host/device implementation (common/det_math.hpp), every
@@ -108,11 +109,6 @@ struct Params {
   float frequency_penalty = 0.0f;   // additive per context count
   float presence_penalty = 0.0f;    // additive once for seen ids
   int logprobs = 0;                 // report top-N (id, logprob) pairs
-};
-
-struct Candidate {
-  int32_t id = -1;
-  float logit = 0.0f;
 };
 
 struct Result {

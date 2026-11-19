@@ -59,7 +59,6 @@
 #include "kernels/bf12_companions.hpp"
 #include "engine/session_model.hpp"
 #include "kernels/gemm.hpp"
-#include "kernels/pick.hpp"
 #include "kernels/draft_head.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/glm_mhc_launch.hpp"
@@ -308,10 +307,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
 
  private:
   bool compact_verify_ = false;
-  PickLocal* verify_locals_ = nullptr;
-  PickLocal* h_verify_locals_ = nullptr;
-  uint16_t* verify_table_ = nullptr;
-  uint64_t* verify_digest_ = nullptr;
+  sample::Candidate* verify_maxima_ = nullptr;    // device alias of the pinned tile maxima
+  sample::Candidate* h_verify_maxima_ = nullptr;
   int compact_verify_rows_ = 0;
   static constexpr int kBlockTokens = 128;
   // Amortize prefill launches while bounding scratch growth on four GB10s.
