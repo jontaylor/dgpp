@@ -875,6 +875,45 @@ std::string_view GrammarState::next_literal(std::string_view target, std::string
   return target.substr(0, tag == 0 ? 1 : tag);
 }
 
+int32_t GrammarState::literal_proposal() const {
+  if (!active() || think_openable_) return -1;
+  switch (state_) {
+    case State::kDCalls:
+    case State::kDInvoke:
+    case State::kDParamOrClose:
+    case State::kDFlag:
+    case State::kDInvokeOrClose:
+      break;
+    default:
+      return -1;
+  }
+  std::string_view common;
+  bool first = true;
+  for (const auto& target : match_.targets) {
+    if (!target.starts_with(match_.emitted)) continue;
+    auto piece = next_literal(target, match_.emitted);
+    if (first) {
+      common = piece;
+      first = false;
+    } else {
+      common = common.substr(0, std::mismatch(common.begin(), common.end(), piece.begin(), piece.end()).first - common.begin());
+    }
+    if (common.empty()) return -1;
+  }
+  if (common.empty()) return -1;
+  if (common.front() == kDsmlSentinel) return static_cast<int32_t>(vocab_->markers().dsml.id);
+  int32_t best = -1;
+  size_t length = 0;
+  for (int32_t token : vocab_->ids_starting_with(static_cast<unsigned char>(common.front()))) {
+    const auto& text = vocab_->text(token);
+    if (text.size() > length && common.starts_with(text)) {
+      best = token;
+      length = text.size();
+    }
+  }
+  return best;
+}
+
 std::vector<int64_t> GrammarState::match_ids(const TextMatch& m,
                                              int64_t closer) const {
   std::vector<int64_t> out;

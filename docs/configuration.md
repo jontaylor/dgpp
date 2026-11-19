@@ -482,6 +482,14 @@ history and context capacity for all proposals. DGPP updates the draft
 attention rings, skips the neural proposal block for that round, and
 verifies the copied tokens with the usual target and tool grammar.
 
+With a positive lookup tail and fixed depth, `DGPP_DSV41_GRAMMAR_PROPOSALS=1`
+also lets the eager engine propose the common literal text of DeepSeek tool
+tags. For example, several permitted tool names can share the same opening
+tag. When the literal covers the full neural depth, the engine advances the
+draft rings directly. A shorter literal can extend the end of a neural
+proposal. The verifier still selects the token at each position because
+several vocabulary tokens can encode the same text.
+
 Two optional DeepSeek V4.1 settings change different computations.
 
 - `DGPP_DSV41_MX_DRAFT_HEAD=1` builds an MXFP8 copy of each rank's vocabulary head

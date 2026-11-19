@@ -263,6 +263,10 @@ class GrammarState {
   void mask(TokenMask* out) const;
   // Pointwise: would `id` be allowed next? (The same rule as mask().)
   bool allows(int64_t id) const;
+  // A proposed token from the common literal bytes of a DeepSeek tool tag.
+  // Returns -1 when the grammar does not predict the spelling. The target
+  // can prefer another legal tokenization of the same bytes.
+  int32_t literal_proposal() const;
   // The id was committed. A disallowed id (which the sampler never
   // produces; the MTP draft may propose one, to be rejected) kills the
   // grammar: every later position is free, so a row the step will discard

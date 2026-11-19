@@ -1040,6 +1040,33 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       }
       std::unique_ptr<text::GrammarState> grammar;
       if (state_[req].grammar) grammar = std::make_unique<text::GrammarState>(*state_[req].grammar);
+      static const bool grammar_proposals = [] {
+        const char* option = std::getenv("DGPP_DSV41_GRAMMAR_PROPOSALS");
+        return option && option[0] == '1';
+      }();
+      const int proposal_limit = static_cast<int>(std::min<int64_t>(mtp_depth_ + lookup_tail_,
+          model_->max_context() - model_->session_position(req) - 1));
+      const bool extend_literal = grammar_proposals && grammar && !mtp_schedule_ && lookup_tail_ > 0;
+      const auto append_literal = [&](text::GrammarState& cursor, std::vector<int32_t>& block) {
+        while (int(block.size()) < proposal_limit) {
+          const int32_t token = cursor.literal_proposal();
+          if (token < 0) break;
+          block.push_back(token);
+          cursor.advance(token);
+        }
+      };
+      if constexpr (requires { model_->session_advance_draft(req, rows); }) {
+        if (extend_literal && grammar->literal_proposal() >= 0) {
+          auto cursor = *grammar;
+          std::vector<int32_t> literal;
+          append_literal(cursor, literal);
+          if (int(literal.size()) >= mtp_depth_) {
+            model_->session_advance_draft(req, rows);
+            drafts = std::move(literal);
+            return;
+          }
+        }
+      }
       const auto pick_draft = [&](const DecodeOutputs& out) {
         const auto token = mtp_pick_rows_({mtp_row_max(out, 0, grammar.get())}).at(0);
         if (grammar) grammar->advance(token);
@@ -1052,6 +1079,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         chain_drafts(*model_, req, mtp_depth_, &drafts, [&](const DecodeOutputs& out) {
           return pick_draft(out);
         });
+        if (extend_literal) append_literal(*grammar, drafts);
         return;
       }
       // DSpark writes confidence row c only when chain row c executes.

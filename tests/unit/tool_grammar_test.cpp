@@ -543,6 +543,27 @@ DGPP_TEST(tool_grammar_dsml_point_queries_agree_with_the_full_mask_through_a_cal
   require(grammar.allows(kEosText), "call complete");
 }
 
+DGPP_TEST(tool_grammar_literal_proposals_follow_only_shared_dsml_structure) {
+  for (auto dialect : {dgpp::text::DsmlDialect::kV4, dgpp::text::DsmlDialect::kV41}) {
+    const GrammarVocab vocab = dsml_vocab(dialect);
+    GrammarState state(&vocab, spec_of(GrammarSpec::Mode::kRequired), false);
+    require(state.literal_proposal() < 0, "free text has no literal proposal");
+    state.advance('<');
+    state.advance(kDsmlTag);
+    int count = 0;
+    while (count < 80) {
+      const int32_t token = state.literal_proposal();
+      if (token < 0) break;
+      TokenMask allowed;
+      state.mask(&allowed);
+      require(allowed.allows(token), "proposed token belongs to the current mask");
+      state.advance(token);
+      ++count;
+    }
+    require(count > 3 && count < 80, "literal sequence stops at the choice of tool");
+  }
+}
+
 DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   const GrammarVocab vocab = dsml_vocab();
   require(vocab.usable() && vocab.markers().tool_format() == dgpp::text::ToolFormat::kDsml,
