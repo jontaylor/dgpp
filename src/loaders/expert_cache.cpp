@@ -460,6 +460,14 @@ struct ExpertCacheState {
     const auto nested = counters.native_layout_wall_ns - nested_before;
     counters.native_layout_wall_ns += wall > nested ? wall - nested : 0;
   }
+  size_t free_native_extent(size_t chunks) const {
+    for (const size_t first : free_slots) {
+      if (first % chunks || chunks > slot_records.size() - first) continue;
+      const auto slots = std::span(free_positions).subspan(first, chunks);
+      if (std::find(slots.begin(), slots.end(), absent) == slots.end()) return first;
+    }
+    return absent;
+  }
   void evict(const ResidencyPlan& plan, size_t scratch = 0) {
     ++prepared_revision;
     const auto& previous = planner->current().chunks;
@@ -910,6 +918,10 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
     }
     return;
   }
+  static const int direct_native_admission = [] {
+    const char* value = std::getenv("DGPP_EXPERT_DIRECT_NATIVE_ADMISSION");
+    return value ? std::atoi(value) : 0;
+  }();
   struct Job { size_t input, expert, slot, remaining = 0; bool launched = false; };
   struct Read { size_t job, record; std::shared_ptr<ReadTicket> ticket;
     std::chrono::steady_clock::time_point started; };
@@ -971,6 +983,11 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
       std::vector<ExpertCacheStorage::Assembly> ready_assemblies;
       ready_assemblies.reserve(s.config.reads.buffers);
       size_t next = 0, launched = 0;
+      std::optional<ResidencyPlan> early_plan;
+      size_t early_extent = absent;
+      const bool plan_during_read = direct_native_admission == 2 && !prefill && !projections &&
+          !fractional && !s.config.planner.learn_load_cost && s.config.packed_fp4 &&
+          selected.size() == 1 && jobs.front().remaining == s.experts[jobs.front().expert].records.size();
       const auto drain = [&] { s.reap_copies(true); };
       const auto launch_ready = [&] {
         // Contiguous completed runs need no additional lease ownership.
@@ -981,7 +998,15 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           while (j < jobs.size() && !jobs[j].remaining && !jobs[j].launched) {
             inputs.push_back(jobs[j].input); jobs[j++].launched = true; ++launched;
           }
+          if (early_extent != absent) {
+            s.storage->execution_to_native(first, early_extent);
+            leases[first].packed_override_ = s.storage->cache_data(early_extent);
+            if (!leases[first].packed_override_)
+              throw std::logic_error("expert cache: missing packed admission destination");
+          }
           execute(inputs, std::span<const ExpertExecutionLease>(leases).subspan(first, j-first));
+          if (early_extent != absent)
+            s.storage->retire_native_extent(early_extent, s.experts[jobs[first].expert].records.size());
         }
       };
       if (projections) {
@@ -1039,6 +1064,17 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
           if (!ticket) break;
           pending.push_back({j, r, std::move(ticket), queued}); ++next;
         }
+        // Once every read is submitted, fixed-cost whole-expert admission has
+        // all its inputs. Prior resident readers have already been retired.
+        // The extent is private to this one job until packing and publication.
+        if (plan_during_read && !early_plan && next == missing.size()) {
+          const auto e = jobs.front().expert;
+          early_plan = s.planner->propose_admission(e);
+          if (early_plan->chunks[e]) {
+            s.evict(*early_plan);
+            early_extent = s.free_native_extent(s.experts[e].records.size());
+          }
+        }
         bool consumed = false;
         ready_assemblies.clear();
         for (size_t i = 0; i < pending.size();) {
@@ -1081,40 +1117,30 @@ void ExpertCache::execute_ready(std::span<const size_t> selected,
             std::chrono::steady_clock::now() - wait).count();
       }
       s.reap_copies();
-      // Execution has already been submitted. Admission reads its complete
-      // canonical scratch, not a second file read or retained staging window.
+      // Publish the reserved extent or retain from the complete scratch after
+      // execution has been submitted. Both paths reuse the demand reads.
       for (const auto& job : jobs) {
-        auto plan = s.planner->propose_admission(job.expert);
+        auto plan = early_plan ? std::move(*early_plan) : s.planner->propose_admission(job.expert);
         const auto previous = s.planner->current().chunks;
         if (plan.chunks[job.expert] <= previous[job.expert]) continue;
-        s.evict(plan, fractional ? capacity : job.slot);
+        if (!early_plan) s.evict(plan, fractional ? capacity : job.slot);
         // A wholly missing expert can be retained directly in the prepared
         // layout when eviction freed an aligned whole-expert extent. Its
         // canonical reconstruction is still live in this execution slot.
         // Fall back to independent chunk retention for fragmented space and
         // for all partial-residency admissions.
-        static const bool direct_native_admission = [] {
-          const char* value = std::getenv("DGPP_EXPERT_DIRECT_NATIVE_ADMISSION");
-          return value && std::atoi(value) != 0;
-        }();
         const auto& records = s.experts[job.expert].records;
-        size_t native_first = absent;
-        if (direct_native_admission && s.config.packed_fp4 && !fractional &&
-            previous[job.expert] == 0 && plan.chunks[job.expert] == records.size()) {
-          for (const size_t first : s.free_slots) {
-            if (first % records.size() || first + records.size() > s.slot_records.size()) continue;
-            bool free = true;
-            for (size_t c = 0; c < records.size(); ++c)
-              free &= s.free_positions[first + c] != absent;
-            if (free) { native_first = first; break; }
-          }
-        }
+        size_t native_first = early_extent;
+        if (!early_plan && direct_native_admission && s.config.packed_fp4 && !fractional &&
+            previous[job.expert] == 0 && plan.chunks[job.expert] == records.size())
+          native_first = s.free_native_extent(records.size());
         if (native_first != absent) {
-          if (!s.execution_packed[job.slot] ||
-              !s.storage->packed_execution_to_native(job.slot, native_first)) {
-            s.storage->execution_to_native(job.slot, native_first);
-          } else {
-            ++s.counters.direct_native_packed_copies;
+          if (early_extent == absent) {
+            if (s.execution_packed[job.slot] &&
+                s.storage->packed_execution_to_native(job.slot, native_first))
+              ++s.counters.direct_native_packed_copies;
+            else
+              s.storage->execution_to_native(job.slot, native_first);
           }
           s.storage->order_mutations();
           for (size_t c = 0; c < records.size(); ++c) {
@@ -1411,9 +1437,17 @@ ExpertExecutionLease::ExpertExecutionLease(std::shared_ptr<ExpertCacheState> sta
     : state_(std::move(state)), slot_(expert), native_data_(data) {}
 ExpertExecutionLease::~ExpertExecutionLease() { release_noexcept(); }
 ExpertExecutionLease::ExpertExecutionLease(ExpertExecutionLease&& other) noexcept
-    : state_(std::move(other.state_)), slot_(other.slot_), native_data_(other.native_data_), chunked_(other.chunked_) {}
+    : state_(std::move(other.state_)), slot_(other.slot_), native_data_(other.native_data_),
+      packed_override_(other.packed_override_), chunked_(other.chunked_) {}
 ExpertExecutionLease& ExpertExecutionLease::operator=(ExpertExecutionLease&& other) noexcept {
-  if (this != &other) { release_noexcept(); state_ = std::move(other.state_); slot_ = other.slot_; native_data_ = other.native_data_; chunked_ = other.chunked_; }
+  if (this != &other) {
+    release_noexcept();
+    state_ = std::move(other.state_);
+    slot_ = other.slot_;
+    native_data_ = other.native_data_;
+    packed_override_ = other.packed_override_;
+    chunked_ = other.chunked_;
+  }
   return *this;
 }
 const uint8_t* const* ExpertExecutionLease::chunk_sources() const {
@@ -1433,6 +1467,7 @@ const uint8_t* ExpertExecutionLease::packed_data() const {
   state_->check();
   if (!state_->config.packed_fp4) throw std::logic_error("expert cache: packed layout is disabled");
   if (native_data_) return native_data_;
+  if (packed_override_) return packed_override_;
   try {
     const auto* data = state_->storage->packed_execution_data(slot_);
     state_->execution_packed[slot_] = true;

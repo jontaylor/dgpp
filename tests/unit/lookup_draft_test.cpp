@@ -92,6 +92,21 @@ DGPP_TEST(lookup_extends_only_a_fully_matching_strong_prefix) {
   require(drafts == std::vector<int32_t>({1, 2, 3, 4, 5}), "extend an agreed copy");
 }
 
+DGPP_TEST(lookup_alternate_requires_agreement_and_obeys_the_row_budget) {
+  const std::vector<int32_t> history = {1, 2, 3, 4, 5, 6, 7, 8, 9,
+      0, 1, 2, 3, 4, 15, 16, 17, 18, 0, 1, 2, 3, 4};
+  const std::vector<int32_t> prefix = {5, 6, 7};
+  dgpp::LookupHistoryIndex index;
+  const auto primary = index.propose(history, 5, 4, 4);
+  require(primary.strong && primary.drafts[0] == 15, "most recent suffix disagrees");
+  const auto tail = index.alternate_tail(history, prefix, 4, 4);
+  require(tail.size() == 1 && tail.front() == 8, "older agreeing occurrence extends one row");
+  require(index.alternate_tail(history, prefix, 3, 4).empty(), "full row budget");
+  require(index.alternate_tail(history, prefix, 5, 5).empty(), "older occurrence too short");
+  require(index.alternate_tail(history, std::vector<int32_t>{5, 6, 9}, 5, 4).empty(),
+          "every neural token must agree");
+}
+
 DGPP_TEST(lookup_fuse_strong_takes_lookup) {
   const std::vector<int32_t> mtp = {1, 2, 3};
   dgpp::LookupDraft lu;

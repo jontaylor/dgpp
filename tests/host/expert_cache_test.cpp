@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <functional>
 #include <exception>
@@ -11,6 +12,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -107,6 +109,8 @@ class HostStorage final : public ExpertCacheStorage {
  public:
   HostStorage(CacheMemory memory, StoreIdentity identity, std::shared_ptr<Control> control)
       : memory_(memory), id_(identity), control_(std::move(control)),
+        canonical_bytes_(partition(id_.hidden, id_.intermediate, id_.world, id_.rank,
+            id_.intermediate / id_.world, id_.format).front().allocation_bytes),
         cache_(memory.cache_slots * memory.cache_slot_bytes),
         execution_(memory.execution_slots * memory.execution_slot_bytes) {}
   const CacheMemory& memory() const override { return memory_; }
@@ -149,13 +153,13 @@ class HostStorage final : public ExpertCacheStorage {
                 cache_.data() + source * memory_.cache_slot_bytes, memory_.cache_slot_bytes);
   }
   void native_to_execution(size_t slot, size_t first) override {
-    require(first * memory_.cache_slot_bytes + memory_.execution_slot_bytes <= cache_.size(), "native read extent");
-    std::memcpy(execution(slot).data(), cache_.data() + first * memory_.cache_slot_bytes, memory_.execution_slot_bytes);
+    require(first * memory_.cache_slot_bytes + canonical_bytes_ <= cache_.size(), "native read extent");
+    std::memcpy(execution(slot).data(), cache_.data() + first * memory_.cache_slot_bytes, canonical_bytes_);
   }
   void execution_to_native(size_t slot, size_t first) override {
-    require(first * memory_.cache_slot_bytes + memory_.execution_slot_bytes <= cache_.size(), "native write extent");
+    require(first * memory_.cache_slot_bytes + canonical_bytes_ <= cache_.size(), "native write extent");
     if (control_->fail_copy) throw std::runtime_error("injected native pack failure");
-    std::memcpy(cache_.data() + first * memory_.cache_slot_bytes, execution(slot).data(), memory_.execution_slot_bytes);
+    std::memcpy(cache_.data() + first * memory_.cache_slot_bytes, execution(slot).data(), canonical_bytes_);
   }
   void unpack_native_chunk(size_t slot, const StoreRecord& r, size_t cache_slot) override {
     require(cache_slot < memory_.cache_slots, "native unpack bound");
@@ -176,11 +180,12 @@ class HostStorage final : public ExpertCacheStorage {
  private:
   std::span<uint8_t> execution(size_t slot) {
     require(slot < memory_.execution_slots, "execution slab bound");
-    return std::span<uint8_t>(execution_).subspan(slot * memory_.execution_slot_bytes, memory_.execution_slot_bytes);
+    return std::span<uint8_t>(execution_).subspan(slot * memory_.execution_slot_bytes, canonical_bytes_);
   }
   CacheMemory memory_;
   StoreIdentity id_;
   std::shared_ptr<Control> control_;
+  size_t canonical_bytes_;
   std::vector<uint8_t> cache_, execution_;
 };
 CacheStorageFactory host(const Fixture& f, std::shared_ptr<Control> control = std::make_shared<Control>()) {
@@ -1069,5 +1074,33 @@ DGPP_TEST(expert_cache_next_group_is_reserved_before_current_execution) {
     });
     require(done==4 && cache.telemetry().file.calls==16,"both groups execute with one read per missing chunk");
     require(cache.read_stats().staging_peak<=cfg.reads.staging_budget_bytes,"two groups stay inside original reservation");
+  }
+}
+
+DGPP_TEST(expert_cache_single_miss_executes_at_retained_address) {
+  const char* mode = std::getenv("DGPP_EXPERT_DIRECT_NATIVE_ADMISSION");
+  if (!mode || std::string_view(mode) != "2") dgpp::test::skip("requires direct admission mode 2");
+  Fixture f(Format::kMxfp4, true);
+  auto cfg = f.config(Policy::kWholeExpert);
+  cfg.packed_fp4 = true;
+  cfg.planner.learn_load_cost = false;
+  cfg.planner.budget_bytes += cfg.execution_slots * f.expected().size();
+  auto control = std::make_shared<Control>();
+  control->native = true;
+  ExpertCache cache(f.store, cfg, host(f, control));
+  cache.initialize();
+  for (size_t expert : {0u, 1u, 2u, 3u}) {
+    const std::array demand{expert};
+    cache.observe(demand);
+    const uint8_t* packed = nullptr;
+    cache.execute_ready(demand, [&](auto, auto leases) {
+      check_bytes(leases.front(), f, expert);
+      packed = leases.front().packed_data();
+      require(packed != leases.front().data(), "consumer uses retained storage");
+    });
+    require(packed && packed == cache.prepared_address(expert), "published address is the executed extent");
+    auto native = cache.acquire(expert);
+    require(native.packed_data() == packed, "next reader sees the same extent");
+    check_bytes(native, f, expert);
   }
 }

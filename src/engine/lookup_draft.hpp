@@ -137,6 +137,32 @@ class LookupHistoryIndex {
     return result;
   }
 
+  // Called after propose() on this same history. Only consider older strong
+  // occurrences that agree with every neural token and have at least one
+  // further known token. Bound the retry cost even for repetitive prompts.
+  std::span<const int32_t> alternate_tail(std::span<const int32_t> history,
+      std::span<const int32_t> prefix, int width, int strong) const {
+    if (history.empty() || previous_.size() != history.size() || prefix.empty() ||
+        width <= static_cast<int>(prefix.size()) || strong <= 0) return {};
+    const int last = static_cast<int>(history.size()) - 1;
+    const int cap = std::min(64, last);
+    int best = strong - 1;
+    std::span<const int32_t> tail;
+    int remaining = 32;
+    for (int end = previous_.back(); end >= best && remaining > 0; end = previous_[end], --remaining) {
+      const auto continuation = history.subspan(end + 1);
+      if (continuation.size() <= prefix.size() ||
+          !std::equal(prefix.begin(), prefix.end(), continuation.begin())) continue;
+      int length = 0;
+      while (length <= end && length < cap && history[end - length] == history[last - length]) ++length;
+      if (length <= best) continue;
+      best = length;
+      tail = continuation.first(std::min<size_t>(width, continuation.size())).subspan(prefix.size());
+      if (best == cap) break;
+    }
+    return tail;
+  }
+
  private:
   int key_tokens_ = 0;
   std::vector<int32_t> heads_, previous_;

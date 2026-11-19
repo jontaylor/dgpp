@@ -156,7 +156,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     SlotState& s = state_.at(static_cast<size_t>(req));
     s.params = sampling;
     s.rng = sample::Rng{seed, 0};
-    s.lookup = {};
+    s.reset_lookup();
     s.context.clear();
     s.logprobs.clear();
   }
@@ -789,6 +789,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     }
   }
   void close(int req) override {
+    state_.at(req).report_lookup_trials();
     state_.at(req).hop = {};
     mtp_drafts_.at(static_cast<size_t>(req)).clear();
     mtp_slot_attempts_.at(static_cast<size_t>(req)) = {};
@@ -894,9 +895,12 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
           const int width = static_cast<int>(std::min<int64_t>(
               drafts.size() + lookup_tail_, model_->max_context() - model_->session_position(req) - 1));
           auto copy = slot.lookup.propose(slot.context, width, lookup_min_, lookup_strong_);
-          if (lookup_tail_)
+          if (lookup_tail_) {
+            const size_t prefix = drafts.size();
             lookup_extend(drafts, copy);
-          else if (!copy.drafts.empty())
+            if (drafts.size() == prefix)
+              slot.try_alternate_tail(drafts, std::min(width, static_cast<int>(max_drafts)), lookup_strong_);
+          } else if (!copy.drafts.empty())
             drafts = lookup_fuse(drafts, copy, lookup_strong_, lookup_agree_).drafts;
         }
         // Request membership can change between ticks. A copy or grammar
@@ -1155,6 +1159,61 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
   struct SlotState {
     LookupHistoryIndex lookup;
+    struct LookupTrial {
+      size_t position, prefix;
+      std::vector<int32_t> tokens;
+    };
+    std::vector<LookupTrial> lookup_trials;
+    uint64_t alternate_searches = 0, alternate_search_ns = 0;
+    void reset_lookup() {
+      lookup = {};
+      lookup_trials.clear();
+      alternate_searches = alternate_search_ns = 0;
+    }
+    void try_alternate_tail(std::vector<int32_t>& drafts, int width, int strong) {
+      enum class Mode { Off, Shadow, Apply };
+      static const Mode mode = [] {
+        const char* value = std::getenv("DGPP_DSV41_LOOKUP_ALTERNATE");
+        if (!value || std::string_view(value) == "0") return Mode::Off;
+        if (std::string_view(value) == "shadow") return Mode::Shadow;
+        if (std::string_view(value) == "1") return Mode::Apply;
+        throw std::invalid_argument("invalid DGPP_DSV41_LOOKUP_ALTERNATE");
+      }();
+      if (mode == Mode::Off || drafts.empty() || width <= static_cast<int>(drafts.size())) return;
+      // The neural prefix also corroborates the earlier continuation. Require
+      // four committed history tokens even when the neural prefix is long.
+      const int required = std::max(4, strong - static_cast<int>(drafts.size()));
+      using Clock = std::chrono::steady_clock;
+      const auto start = mode == Mode::Shadow ? Clock::now() : Clock::time_point{};
+      const auto tail = lookup.alternate_tail(context, drafts, width, required);
+      if (mode == Mode::Apply) {
+        if (!tail.empty()) drafts.insert(drafts.end(), tail.begin(), tail.end());
+        return;
+      }
+      ++alternate_searches;
+      alternate_search_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+      if (!tail.empty()) {
+        auto& trial = lookup_trials.emplace_back(context.size(), drafts.size(), drafts);
+        trial.tokens.insert(trial.tokens.end(), tail.begin(), tail.end());
+      }
+    }
+    void report_lookup_trials() const {
+      if (alternate_searches) {
+        size_t proposed = 0, matched = 0, unresolved = 0;
+        for (const auto& trial : lookup_trials) {
+          const auto actual = std::span<const int32_t>(context).subspan(trial.position);
+          const size_t checked = std::min(actual.size(), trial.tokens.size());
+          const size_t same = std::mismatch(trial.tokens.begin(), trial.tokens.begin() + checked,
+                                            actual.begin()).first - trial.tokens.begin();
+          proposed += trial.tokens.size() - trial.prefix;
+          if (same > trial.prefix) matched += same - trial.prefix;
+          if (same == checked)
+            unresolved += trial.tokens.size() - std::max(checked, trial.prefix);
+        }
+        DGPP_LOG_INFO("lookup alternate: searches={} ns={} extensions={} extra_rows={} matched_extra={} unresolved_extra={}",
+            alternate_searches, alternate_search_ns, lookup_trials.size(), proposed, matched, unresolved);
+      }
+    }
     PrefixHopResult hop;
     int mtp_eligibility_reasons = -1;  // Log once per request and on eligibility changes.
     sample::Params params = sample::greedy_params();
@@ -1183,7 +1242,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   }
   int32_t open_slot_finish(int req, const std::vector<int64_t>& prompt, const typename Model::Outputs& out) {
     SlotState& s = state_.at(static_cast<size_t>(req));
-    s.lookup = {};
+    s.reset_lookup();
     s.context.clear();
     s.context.reserve(prompt.size() + 64);
     for (int64_t id : prompt) s.context.push_back(static_cast<int32_t>(id));

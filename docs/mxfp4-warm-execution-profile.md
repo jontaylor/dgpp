@@ -854,3 +854,269 @@ classification of fusion as a design is inconclusive. The experiment
 identifies a reproducible integration penalty and rejects the simple L1
 hint. The relative contributions of cross-warp reuse, weight streaming
 and memory-latency hiding remain open.
+
+### Decode priorities for a long tool-using review
+
+The November 19 review used 834.9 seconds of request decode across 10,623
+target passes. Every millisecond removed from every pass would have saved
+10.6 seconds. The four longest decode calls accounted for 408.9 seconds
+(49%). Grouping all 34 calls by their prompt length gives the following
+pass-weighted results. Each band's decode seconds, tokens and passes sum
+back to the recorded turn.
+
+| Prompt tokens at call entry | Calls | Passes | Request decode (s) | ms/pass | Decode tokens/pass |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Below 32,768 | 4 | 291 | 26.4 | 90.7 | 4.04 |
+| 32,768–65,535 | 8 | 2,420 | 186.7 | 77.1 | 3.21 |
+| 65,536–98,303 | 16 | 4,186 | 331.6 | 79.2 | 3.32 |
+| 98,304 and above | 6 | 3,726 | 290.2 | 77.9 | 3.06 |
+
+Pass cost has no monotonic trend across these calls. The final call alone
+took 154.5 seconds, with 2.97 tokens/pass over 2,042 passes. The review log
+lacks per-pass expert reads, proposal sources and verification widths.
+Context, acceptance, SSD service and width can all change together.
+
+#### What holds up the next layer on resident hits
+
+The separate, zero-expert-read Rust capture on the selected binary
+(`f0a3a1f7` above) used four verification rows at a roughly 24K context.
+For each of 31 passes and 40 layers, follow the GPU route packet through
+b12x, the shared expert's down projection, the ordered slot sum, the FFN
+TP fold and the first dependent residual update. The routed expert lane
+finished last on **all 1,240 visits on each rank**.
+
+| Mean elapsed time per layer (µs, local GPU clock) | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| Routed kernel | 715.9 | 689.6 |
+| Shared down completion to routed completion | 612.1 | 589.2 |
+| Routed completion to slot sum start | 0.82 | 0.78 |
+| FFN TP fold | 26.9 | 55.4 |
+| Routed start to dependent residual start | 746.7 | 748.9 |
+
+The faster routed lane often paid the difference in the fold. Across
+matched layer visits the difference in routed durations and the difference
+in time from routed completion to residual start had correlation −0.946.
+The smaller 400-visit ordinary-projection capture described above reversed
+which Spark averaged the longer routed duration and showed the same
+relationship (−0.934). This compares durations at the same logical layer.
+No subtraction of timestamps between machines is required.
+
+Inside the 53 ms target span, intervals with neither kernels nor CUDA
+copies active totaled 0.24–0.25 ms per pass. In the 30 complete intervals
+from the last routed completion to the next first-layer packet, an interval
+union including kernels, copies and memsets found 0.90/1.60 ms idle on
+Spark 1/2 out of 9.91/9.96 ms. Only 0.023 ms per rank had a copy or memset
+as its sole activity. The rest includes the target head, rollback and picks,
+proposal work and the next first layer. A gap on one GPU can coincide with
+useful work on its peer. Device loads issued inside kernels are outside
+the CUDA copy count.
+
+#### Where expert misses add time
+
+On the two ordinary-projection starts of the `c30b4490` comparison above,
+the first prose continuation took **86.6–86.8 ms/engine pass** versus
+**59.0–59.1** on its zero-read repeat. Code took **77.6–78.3** versus
+**58.5–58.6**. Each comparison held the generated output and pass count
+fixed (82 prose, 117 code). Decode-step timers exclude the uncached
+prompt tail. The file-byte counters include it.
+
+An earlier four-row MXFP4 capture with per-layer timestamps allows a
+closer comparison. Pair the first prose and code with their respective
+last warm repeats by request, pass ordinal, layer and rank. The repeats
+had zero expert reads. The table gives Spark 1's mean **difference**
+in layer duration, grouped by whole shards demanded in the first run.
+Spark 2's means were within 0.002 ms of Spark 1's in every group.
+
+| Shards read in first visit | Prose visits | Extra ms/visit | Extra ms/prose pass | Code visits | Extra ms/visit | Extra ms/code pass |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 2,636 | 0.082 | 2.62 | 3,998 | 0.066 | 2.25 |
+| 1 | 507 | 2.635 | 16.29 | 611 | 2.665 | 13.92 |
+| 2 or more | 137 | 5.454 | 9.11 | 71 | 5.201 | 3.16 |
+
+The differences include computation, cache handling, local reads and TP
+waits through the end of each layer. The five layers contributing the most
+extra time among read-bearing visits accounted for 26% of that time in
+prose and 20% in code. The two top-five sets were disjoint.
+
+#### Engineering order
+
+1. **Earn more tokens from the passes the review already pays for.**
+   The history index chooses the longest prior suffix, breaking ties by
+   recency. For neural-tail extension the engine then checks whether that
+   one continuation agrees with the neural prefix. Another prior occurrence
+   can agree even when the first one diverges. Shadow a bounded search for
+   an agreeing continuation wherever the existing rule declines to extend.
+   Use only history available at proposal time. Score its extra candidates
+   against subsequently committed tokens, recording proposal source, width,
+   and the cost of both target rows and host search. Preserve the existing
+   whole-block copy and grammar paths, neural prefix, row budget, rollback
+   and target verification. The break-even is concrete. At 3.40 tokens/pass
+   for the same answer, the review could afford 4.27 additional ms/pass
+   before losing the gain. With unchanged pass cost it would save 43 s.
+   Sparse matches in long reasoning stretches or more expensive wide
+   passes can erase the benefit. Shadow matches establish coverage. A timed
+   completed tool turn establishes the gain.
+2. **Shorten the path from one exact miss to an executable shard.**
+   Single-shard misses outnumber multi-shard misses 1,118 to 208 in the
+   paired capture. Measure demand publication, first submission, last
+   required read, native weights ready, routed completion, gate release
+   and dependent residual on each rank. If assembly or admission lies after
+   I/O on that path, try writing the packed result directly into an eligible
+   retained extent and executing there. The existing packed admission can
+   copy the prepared shard from execution scratch into the cache. Preserve
+   early read submission, independent miss readiness, existing eviction
+   choices and readers of the old extent. Fall back to scratch if reserving
+   space would delay demand or displace an active reader. Recovering
+   0.25 ms per single miss would save 1.55 ms/prose pass and 1.31 ms/code
+   pass at the observed frequencies. If the residual instead follows the
+   last SSD completion with little intervening work, prioritize avoidance
+   of those demanded reads. Read volume alone cannot establish that choice.
+3. **Time routed-kernel changes through the FFN residual on both ranks.**
+   The long routed tail offers room for an improvement to reach the join.
+   The prior packed W4A8 replay is a concrete candidate. Compare it with
+   today's five-stage packed W4A16 reader on identical inputs, routes and
+   width, including activation quantization, slot handling, the overlapping
+   shared expert and the TP fold. A 3.5% saving on a 700 µs routed lane
+   would be about 1 ms across 40 layers if both peers deliver it through
+   the residual. The historical single-layer result used different activation
+   inputs and a different timing boundary. Check ordinary serving for route
+   changes, expert reads, acceptance and correct tool completion before
+   selecting a backend. A faster rank-local kernel with an unchanged
+   downstream residual calls for investigating rank skew or displaced work.
+
+The review's read-bearing fraction remains unknown. The 24K capture also
+leaves long-context attention open. At that shape the index-score and
+selection kernels occupied about 1.05 and 0.37 ms per pass respectively
+on each rank. A short resident four-row continuation at a review-sized
+context can distinguish growth in selection and attention through the
+output projection from changes in pass width or paging. All comparisons
+in this section are engineering diagnostics.
+
+#### Following a single missing shard through the residual
+
+A two-rank Nsight capture followed 31 target verification walks during a
+96-token coding continuation. Each rank had 283 single-shard visits among
+1,240 layer visits. Five successful grouped file calls requested the 9 MiB
+rank-local shard. The other 872 visits issued zero expert reads and 85
+issued reads for two or more shards. The profiling configuration reserved
+3 GiB of additional headroom. The following intervals are medians across
+the same single-shard visits on each rank. The baseline trace used binary
+`26d7c7a71215` and the direct-admission trace used `fcbe9ef89310`, both
+built from the experiment changes on base `e5cdf17a`.
+
+| Interval, µs | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| GPU route-packet kernel start to first read entry | 150 | 161 |
+| First read entry to last required read return | 2,067 | 2,114 |
+| Last read return to native scale pack complete | 240 | 223 |
+| Missing-expert GPU execution | 259 | 259 |
+| Missing-expert execution complete to route gate release | 402 | 262 |
+| Gate release through slot reduction, TP fold and FFN residual | 46 | 180 |
+
+The GPU start and end of the packet kernel bracket route publication and
+release. On 278 of 283 single-shard visits on each rank, admission copied
+the prepared payload into a retained extent. That 9,123,840-byte copy
+took a median 66 µs on each rank. The ready lease already marks the packed
+scratch valid. The baseline packs once and then copies those bytes. Whole
+cache planning, submission and binding publication can also delay release
+after the missing expert finishes. Overlap with the other rank matters at
+the residual. Summing these per-rank or per-interval medians would lose it.
+
+Mode 2 of `DGPP_EXPERT_DIRECT_NATIVE_ADMISSION` lets a single fully
+missing decode expert use its final cache extent. Once all demanded reads
+are queued, the engine asks the existing whole-expert planner for the
+admission. Fixed load costs make that decision independent of outstanding
+read timings. If an aligned extent is available after eviction, packing
+writes it directly and the expert kernel reads it there. Extent fences
+protect the previous and new GPU readers. The canonical scratch stays
+valid for consumers of that representation. Multi-expert jobs, prefill,
+learned load costs, projection reads and fragmented extents use their
+ordinary execution and retention paths.
+
+The mode-2 capture had the same miss histogram, 31 passes and 65 accepted
+predictions. The admission copy disappeared from all 283 single-shard
+intervals per rank. Median time from the end of missing-expert computation
+to gate release fell from 402 to 14 µs on Spark 1 and from 262 to 15 µs on
+Spark 2. From packet start through the dependent FFN residual, the medians
+fell from 3.345 to 2.962 ms and from 3.335 to 2.968 ms. The five-read
+window still took 2.07 and 2.12 ms respectively in mode 2.
+
+Four uninstrumented service starts ran the same tool call, prose, code,
+resident repeats and completed tool exchange in A/B/B/A order. Both ranks
+used binary `fcbe9ef89310` and zero swap. Output, acceptance, prefix
+attach, expert bytes and rank operation streams were checked. Engine
+decode rates below pool generated tokens and scheduler step time within
+each cache condition. These are focused concurrency-one diagnostics.
+
+| Two-Spark MXFP4 decode, tok/s | Baseline A1 | Direct B1 | Direct B2 | Baseline A2 |
+| --- | ---: | ---: | ---: | ---: |
+| Prose and code with required reads | 33.51 | 34.15 | 34.27 | 33.62 |
+| Fully resident repeats | 46.63 | 46.64 | 46.49 | 46.57 |
+
+Direct admission improved the read-bearing trials by 1.9% on average.
+Cold 24K prefill took 36.4–37.0 seconds across all four starts. The cache
+budget and local SSD traffic were the same across configurations.
+
+#### Alternate lookup occurrences
+
+The optional `DGPP_DSV41_LOOKUP_ALTERNATE=shadow|1` examines up to 32
+history occurrences when the usual lookup fails to extend the neural
+draft. Candidates must agree with the entire neural prefix, fit the
+available target rows and have a continuation in the committed history.
+The shadow mode compares offered extra positions against subsequent tokens.
+
+An eight-token committed suffix supplied no extra candidates across two
+1,536-token review continuations. Counting the three agreeing DSpark
+tokens toward that threshold yielded five extensions in each review
+shadow, with eight matching positions out of 20 offered. On a completed
+82,756-token-context edit, all four offered positions matched. Applying
+them still took 50 passes to produce the same checked edit. The capped
+review took 576 passes with the extension and 575 without, and the text
+diverged. The coding continuation also differed and took 123 versus
+117 passes. The directory call took seven in both arms. Lookup extensions
+remain opt-in. These workload-specific probe rates do not establish a
+same-answer throughput improvement.
+
+#### Packed W4A8 through the two-rank FFN residual
+
+The layer-10 replay used both ranks' local checkpoint shards, four BF16
+activation rows and 33 observed top-six route masks. The W4A8 path included
+GPU dispatch, input quantization, gate/up, SwiGLU and requantization, down
+and ordered weighted combination. The W4A16 path included GPU route
+preparation, the selected five-stage b12x reader and DGPP slot reduction.
+Both ran the shared expert on a side stream.
+
+An initial rank-1-only graph with uniform routing weights favored b12x on
+all 33 masks. W4A8 took a paired median 5.1% longer. The TP2 replay used
+the same PyTorch container on both nodes, nonuniform weights, the serving
+shared-expert activation stride and block-32 scales. Each graph used a
+synchronizing untimed fold before its measurement, the DGPP write-transport
+all-reduce, a 20 MiB light range prefetch over a synthetic dense buffer,
+and the four-stream FFN residual. Router weights, input activations and
+shared-expert weights were synthetic and matched between implementations.
+The measured shared branch used 48 blocks. Routing-score computation and
+the next layer's consumption of prefetched weights were outside the timer.
+
+| TP2 replay boundary | Route sets favoring W4A8 | Paired median W4A8 time change |
+| --- | ---: | ---: |
+| One FFN through residual | 30/33 | −1.12% |
+| Four successive FFNs, expert preparation through local combination | 32/33 | −1.29% |
+| Four successive FFNs, expert preparation through residual | 31/33 | −1.21% |
+
+The four-FFN replay cycled through four successive recorded route masks,
+with independent shared weights and prefetch buffers. Each table entry
+takes the slower peer per replay, the median across six repetitions for
+each backend and the paired change across route sets. The last row saved
+9.6 µs per FFN. The advantage existed before communication in that same
+replay. The local and TP2 setups differed in several respects, so these
+runs do not identify a single cause for the earlier reversal.
+
+The median relative L2 difference at the synthetic residual was 3.2%.
+At 40 similar target layers, 9.6 µs per layer would save about 0.38 ms
+per verification pass before any routing or acceptance changes. The
+W4A8 reader addresses 128-column tile-major weights and tiled scale codes.
+DGPP's cache publishes b12x-swizzled payloads and scale words. Serving
+W4A8 within the existing budget needs a common expert layout across
+prefill, verification and paging, or a reader that consumes the existing
+cache addresses. Whole-model throughput, acceptance and tool quality with
+that arithmetic remain open. The serving configuration keeps b12x.

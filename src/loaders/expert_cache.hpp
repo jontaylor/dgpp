@@ -161,6 +161,7 @@ class ExpertExecutionLease {
   std::shared_ptr<ExpertCacheState> state_;
   size_t slot_ = 0;
   const uint8_t* native_data_ = nullptr;
+  const uint8_t* packed_override_ = nullptr;  // admitted extent, fenced after the ready callback
   bool chunked_ = false;
 };
 struct CacheStats {
