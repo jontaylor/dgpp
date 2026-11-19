@@ -921,11 +921,12 @@ bool launch_mma_gemv_bf12_bf16(const uint16_t* act, size_t act_stride, const Bf1
 }
 
 bool mma_gemv_pair_ok(const void* w0, const void* w1, const uint16_t* a0, const uint16_t* a1, size_t act_stride, int m,
-                      int n0, int n1, int k, void* ws, size_t ws_bytes) {
-  if (!ws || m < 1 || m > 32) return false;  // the one- and two-tile decode forms
+                      int n0, int n1, int k, void* ws, size_t ws_bytes, bool allow_unsplit) {
+  if ((!ws && !allow_unsplit) || m < 1 || m > 32) return false;  // the one- and two-tile decode forms
   if (!mma_gemv_shape_ok(w0, a0, act_stride, m, k) || !mma_gemv_shape_ok(w1, a1, act_stride, m, k)) return false;
   const int per_block = decode_width(n0) * kRowsPerWarp;
   if (n0 % per_block != 0 || n1 % per_block != 0) return false;
+  if (!ws) return true;  // Both callers explicitly use the unsplit reduction.
   // Both segments' chains must be their single launches': the same split count
   // (the rule at each segment's own width) at the same k.
   const int s0 = split_k_for(n0, k, ws, ws_bytes), s1 = split_k_for(n1, k, ws, ws_bytes);

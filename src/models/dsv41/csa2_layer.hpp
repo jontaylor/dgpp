@@ -250,12 +250,13 @@ class Csa2Layer {
 
   // The projections and the window row of `tokens` rows at `pos` (device).
   // rope_q false: the q rope is left to the decode tail kernel (enqueue_decode).
-  void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q = true);
+  bool project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q = true,
+                    bool pair_index = false);
   void project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
   // The compressor's projections (bf16 matmul or the EXL3 launchers).
   void compress_project(const void* hidden_in, int tokens, float* kv, float* score, cudaStream_t stream);
   void compress_latent(const void* hidden_in, int tokens, cudaStream_t stream);
-  void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
+  void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool projected = false);
   // The index keys and the main rows of `n` entries (entries_ / ent_pos_
   // set; latent_ holds the normed, unrotated latents).
   void publish_entries(Csa2StatePool& pool, const int32_t* req_ids, int n, cudaStream_t stream);

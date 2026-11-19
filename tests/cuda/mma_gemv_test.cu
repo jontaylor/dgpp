@@ -702,8 +702,9 @@ DGPP_TEST(mma_gemv_fp8_pair_is_bitwise_the_two_launches) {
   const size_t ws_bytes = 64u << 20;
   void* ws = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
-  struct Pair { int n0, n1, k; bool same_act; };
-  for (const Pair pr : {Pair{1280, 512, 5120, true}, Pair{1024, 1024, 4096, false}}) {
+  struct Pair { int n0, n1, k; bool same_act; bool unsplit = false; };
+  for (const Pair pr : {Pair{1280, 512, 5120, true}, Pair{1024, 1024, 4096, false},
+                        Pair{16384, 4096, 1280, true, true}}) {
     for (const int m : {1, 4, 8, 16}) {
       const int n = pr.n0 + pr.n1, k = pr.k;
       std::vector<uint8_t> hw(size_t(n) * k);
@@ -721,12 +722,14 @@ DGPP_TEST(mma_gemv_fp8_pair_is_bitwise_the_two_launches) {
       DGPP_CUDA_OK(cudaMemcpy(da, ha.data(), ha.size() * 2, cudaMemcpyHostToDevice));
       const uint16_t* a0 = da; const uint16_t* a1 = pr.same_act ? da : da + size_t(m) * k;
       const uint8_t* w1 = dw + size_t(pr.n0) * k; const float* s1 = ds + (size_t(pr.n0) / 32) * sc;
-      // the two single launches (the split form: the workspace passed), outputs side by side at stride n
-      dgpp::launch_mma_gemv_fp8_bf16(a0, k, dw, ds, o_single, m, pr.n0, k, n, 5, 5, nullptr, ws, ws_bytes);
-      dgpp::launch_mma_gemv_fp8_bf16(a1, k, w1, s1, o_single + pr.n0, m, pr.n1, k, n, 5, 5, nullptr, ws, ws_bytes);
-      require(dgpp::mma_gemv_pair_ok(dw, w1, a0, a1, k, m, pr.n0, pr.n1, k, ws, ws_bytes), "the pair form holds for the shape");
+      void* workspace = pr.unsplit ? nullptr : ws;
+      const size_t capacity = pr.unsplit ? 0 : ws_bytes;
+      // Both single launches and their pair use the same reduction geometry.
+      dgpp::launch_mma_gemv_fp8_bf16(a0, k, dw, ds, o_single, m, pr.n0, k, n, 5, 5, nullptr, workspace, capacity);
+      dgpp::launch_mma_gemv_fp8_bf16(a1, k, w1, s1, o_single + pr.n0, m, pr.n1, k, n, 5, 5, nullptr, workspace, capacity);
+      require(dgpp::mma_gemv_pair_ok(dw, w1, a0, a1, k, m, pr.n0, pr.n1, k, workspace, capacity, pr.unsplit), "the pair form holds for the shape");
       dgpp::launch_mma_gemv_fp8_bf16_pair(a0, dw, ds, o_pair, pr.n0, n, a1, w1, s1, o_pair + pr.n0, pr.n1, n, k, m, k, 5, 5,
-                                          nullptr, ws, ws_bytes);
+                                          nullptr, workspace, capacity);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       std::vector<uint16_t> hs1(size_t(m) * n), hp(size_t(m) * n);
       DGPP_CUDA_OK(cudaMemcpy(hs1.data(), o_single, hs1.size() * 2, cudaMemcpyDeviceToHost));

@@ -389,7 +389,7 @@ void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos
                   tokens, stream);
 }
 
-void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q) {
+bool Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool rope_q, bool pair_index) {
   const uint16_t* h = static_cast<const uint16_t*>(hidden_in);
   const int lh = cfg_.local_heads();
   // wq_a and wkv read the same hidden: one decode launch for both when the
@@ -419,7 +419,24 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
     csa2_rmsnorm_bf16(qr_, cfg_.q_lora, w_.q_norm, qr_, cfg_.q_lora, tokens, cfg_.q_lora, cfg_.eps, stream);
     project_kv(hidden_in, tokens, pos, stream);
   }
-  if (w_.exl3())
+  // Attention and index queries consume the same normalized LoRA rows.
+  // The index output has dedicated scratch through KV publication and can
+  // be produced now with the original, unsplit accumulation on both sides.
+  const int q_width = lh * kCsa2Latent;
+  const int index_width = cfg_.index_heads * kCsa2IndexDim;
+  const bool combined = pair_index && !w_.exl3() && cfg_.dense_mma && !prefill_tile_ &&
+      mma_gemv_pair_ok(w_.wq_b.payload, w_.idx_wq_b.payload, qr_, qr_, cfg_.q_lora, tokens,
+                       q_width, index_width, cfg_.q_lora, nullptr, 0, true);
+  if (combined) {
+    launch_mma_gemv_fp8_bf16_pair(qr_, w_.wq_b.payload, w_.wq_b.scales, q_, q_width, q_width,
+        qr_, w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, index_width, index_width,
+        cfg_.q_lora, tokens, cfg_.q_lora, 5, 5, stream, nullptr, 0);
+    static const bool announced = [] {
+      DGPP_LOG_INFO("dsv41 decode: paired attention and index query projections");
+      return true;
+    }();
+    (void)announced;
+  } else if (w_.exl3())
     launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b_x, q_, tokens, lh * kCsa2Latent, cfg_.q_lora, 0, stream,
                           exl3_ws_, exl3_ws_bytes_);
   else
@@ -430,18 +447,21 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
   if (rope_q)
     csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                     w_.inv_freq, false, tokens, stream);
+  return combined;
 }
 
-void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
+void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream, bool projected) {
   const int heads = cfg_.index_heads;
-  if (w_.exl3())
-    launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b_x, idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, 0,
-                          stream, exl3_ws_, exl3_ws_bytes_);
-  else
-    launch_csa2_projection(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales,
-                           idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 5, 5,
-                           cfg_.dense_mma, prefill_tile_ ? gemm_ws_ : nullptr,
-                           prefill_tile_ ? gemm_ws_bytes_ : 0, prefill_tile_);
+  if (!projected) {
+    if (w_.exl3())
+      launch_exl3_gemm_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b_x, idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, 0,
+                            stream, exl3_ws_, exl3_ws_bytes_);
+    else
+      launch_csa2_projection(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales,
+                             idx_q_, tokens, heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 5, 5,
+                             cfg_.dense_mma, prefill_tile_ ? gemm_ws_ : nullptr,
+                             prefill_tile_ ? gemm_ws_bytes_ : 0, prefill_tile_);
+  }
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
   csa2_index_q_quant(idx_q_, tokens, heads, q_fp8_, q_scale_, violations_, stream);
@@ -736,7 +756,12 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
   } window_scope{prefetch_windows_};
 
   const int lh = cfg_.local_heads();
-  project_q_kv(hidden_in, tokens, pos, stream, /*rope_q=*/false);  // the q rope rides the decode tail below
+  static const bool pair_queries = [] {
+    const char* value = std::getenv("DGPP_DSV41_PAIR_INDEX_QUERY");
+    return value && value[0] == '1';
+  }();
+  const bool index_projected = project_q_kv(hidden_in, tokens, pos, stream, /*rope_q=*/false,
+      pair_queries && w_.ratio > 0 && w_.index_source);
   // The output window of a layer without an index source (2026-10-20):
   // wo_b alone, opened behind the q/kv projections at the layer rate — it
   // streams under the appends, the selection, the attention and the first
@@ -790,7 +815,7 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
     }
     // (the entry positions came with the decode tail above)
     if (w_.index_source) {
-      indexer_query(hidden_in, tokens, pos, stream);
+      indexer_query(hidden_in, tokens, pos, stream, index_projected);
       open_output_window(stream);  // behind the indexer's projection, under the selection and the attention
       const int epb = pool.entries_per_block(ord);
       if (w_.candidate_source) {

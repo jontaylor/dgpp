@@ -123,7 +123,7 @@ bool launch_mma_gemv_bf12_bf16(const uint16_t* act, size_t act_stride, const Bf1
 // ramp and drain. act_stride is both activations'; ws holds both segments'
 // split partials.
 bool mma_gemv_pair_ok(const void* w0, const void* w1, const uint16_t* a0, const uint16_t* a1, size_t act_stride, int m,
-                      int n0, int n1, int k, void* ws, size_t ws_bytes);
+                      int n0, int n1, int k, void* ws, size_t ws_bytes, bool allow_unsplit = false);
 void launch_mma_gemv_fp8_bf16_pair(const uint16_t* a0, const uint8_t* w0, const float* s0, uint16_t* o0, int n0,
                                    size_t stride0, const uint16_t* a1, const uint8_t* w1, const float* s1, uint16_t* o1,
                                    int n1, size_t stride1, size_t act_stride, int m, int k, int rs, int cs,
