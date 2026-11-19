@@ -19,6 +19,14 @@ constexpr int dsv41_verify_tiles(int vocab_count) { return 1 + (vocab_count - 1)
 void dsv41_verify_tile_max(const float* logits, int rows, int vocab_count, int vocab_begin,
                            sample::Candidate* maxima, cudaStream_t stream);
 
+struct Dsv41SparseLogits {
+  static constexpr int capacity = 32;
+  int count = 0;
+  int offsets[capacity]{};
+};
+void dsv41_gather_sparse_logits(const float* row, Dsv41SparseLogits selection, float* host_mapped,
+                                cudaStream_t stream);
+
 // out[t, :] (row stride out_stride elements) = bf16(mean over the hc_mult
 // streams of streams[t, :, :]) — the fp32 sum in stream order, one
 // rounding (torch's bf16 mean: `h.mean(dim=2)` of the attention input at

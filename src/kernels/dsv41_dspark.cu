@@ -17,6 +17,10 @@ struct MaxCandidate {
   }
 };
 
+__global__ void gather_sparse_logits_kernel(const float* row, Dsv41SparseLogits selection, float* out) {
+  if (threadIdx.x < selection.count) out[threadIdx.x] = row[selection.offsets[threadIdx.x]];
+}
+
 __global__ void verify_tile_max_kernel(const float* logits, int count, int begin, sample::Candidate* maxima) {
   dgpp_pdl_wait();
   constexpr int threads = 128;
@@ -457,6 +461,12 @@ __global__ void confidence_kernel(const uint16_t* __restrict__ x, int64_t x_grou
 }
 
 }  // namespace
+
+void dsv41_gather_sparse_logits(const float* row, Dsv41SparseLogits selection, float* host_mapped,
+                                cudaStream_t stream) {
+  gather_sparse_logits_kernel<<<1, Dsv41SparseLogits::capacity, 0, stream>>>(row, selection, host_mapped);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
 
 void dsv41_verify_tile_max(const float* logits, int rows, int vocab_count, int vocab_begin,
                            sample::Candidate* maxima, cudaStream_t stream) {

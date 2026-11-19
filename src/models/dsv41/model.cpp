@@ -14,6 +14,7 @@
 #include <cuda.h>
 #include <algorithm>
 #include <charconv>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -2510,6 +2511,9 @@ void Dsv41Model::ensure_candidate_tiles() {
   if (!h_verify_maxima_)
     h_verify_maxima_ = pinned_alloc<sample::Candidate>(size_t(max_decode_rows_) * dsv41_verify_tiles(lm_vocab_count_));
   DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&verify_maxima_), h_verify_maxima_, 0));
+  const char* sparse = std::getenv("DGPP_DSV41_SPARSE_GRAMMAR");
+  if (sparse && std::string_view(sparse) == "1")
+    DGPP_CUDA_OK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped_sparse_logits_), h_tail_logits_, 0));
 }
 
 void Dsv41Model::collect_candidate_tiles(Outputs& out, int rows) {
@@ -2560,6 +2564,43 @@ Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::ve
     compact_verify_ = false;
     return out;
   } catch (...) { compact_verify_ = false; throw; }
+}
+
+std::optional<sample::Candidate> Dsv41Model::verification_sparse_max(
+    int row, const uint32_t* mask, int vocab, int allowed) const {
+  if (!mapped_sparse_logits_ || !mask || allowed <= 0 || allowed > Dsv41SparseLogits::capacity)
+    return std::nullopt;
+  if (row < 0 || row >= compact_verify_rows_) throw std::out_of_range("compact verification row");
+  Dsv41SparseLogits selected;
+  const int end = std::min(vocab, lm_vocab_begin_ + lm_vocab_count_);
+  for (int word = lm_vocab_begin_ / 32; word * 32 < end; ++word) {
+    uint32_t bits = mask[word];
+    while (bits) {
+      const int id = word * 32 + std::countr_zero(bits);
+      if (id >= lm_vocab_begin_ && id < end) {
+        if (selected.count == selected.capacity) return std::nullopt;
+        selected.offsets[selected.count++] = id - lm_vocab_begin_;
+      }
+      bits &= bits - 1;
+    }
+  }
+  sample::Candidate best{lm_vocab_begin_, -INFINITY};
+  if (selected.count == 0) return best;
+  const float* logits = logits_ + static_cast<size_t>(row) * lm_vocab_count_;
+  if (selected.offsets[selected.count - 1] - selected.offsets[0] + 1 == selected.count) {
+    DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits + selected.offsets[0], selected.count * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream_));
+  } else {
+    dsv41_gather_sparse_logits(logits, selected, mapped_sparse_logits_, stream_);
+  }
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  // Visit allowed IDs in vocabulary order, matching local_masked_max even
+  // for ties, a NaN at the start of the rank, and an empty rank.
+  for (int i = 0; i < selected.count; ++i) {
+    if (selected.offsets[i] == 0 || h_tail_logits_[i] > best.logit)
+      best = {lm_vocab_begin_ + selected.offsets[i], h_tail_logits_[i]};
+  }
+  return best;
 }
 
 std::vector<float> Dsv41Model::verification_logits_row(int row) const {

@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 // DeepSeek-V4.1-Flash (DeepseekV41ForCausalLM) on the shared session core
 // (2026-09-13, docs/deepseek_v41_flash_plan.md G5). The layer walk follows
 // the reference `Block` with the single-pass mHC (§1.2):
@@ -85,6 +86,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool prefill_batch_fits(const RowRun& run) const;
   Base::Outputs session_verify_candidates(int req, const std::vector<int64_t>& tokens);
   std::vector<float> verification_logits_row(int row) const;
+  std::optional<sample::Candidate> verification_sparse_max(int row, const uint32_t* mask, int vocab,
+                                                            int allowed) const;
   int max_mixed_prefill_readers(int decode_rows) const {
     return prefill_bounded_ ? std::max(0, (max_tokens_ - decode_rows) / cfg_.sliding_window) : max_requests_;
   }
@@ -315,6 +318,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   bool compact_verify_ = false;
   sample::Candidate* verify_maxima_ = nullptr;    // device alias of the pinned tile maxima
   sample::Candidate* h_verify_maxima_ = nullptr;
+  float* mapped_sparse_logits_ = nullptr;  // device alias of the existing pinned logits mirror
   int compact_verify_rows_ = 0;
   static constexpr int kBlockTokens = 128;
   // Amortize prefill launches while bounding scratch growth on four GB10s.

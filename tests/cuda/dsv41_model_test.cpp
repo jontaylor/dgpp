@@ -1010,16 +1010,18 @@ DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
 DGPP_TEST(dsv41_compact_neural_draft_candidates_match_full_logits) {
   const Fixture fx = make_fixture(false);
   const auto prompt = tokens_of(912, 23, fx.cfg.vocab_size);
-  const char* option = std::getenv("DGPP_DSV41_DRAFT_CANDIDATES");
-  const std::optional<std::string> saved = option ? std::optional<std::string>(option) : std::nullopt;
-  struct Restore {
-    const std::optional<std::string>& saved;
-    ~Restore() {
-      if (saved) setenv("DGPP_DSV41_DRAFT_CANDIDATES", saved->c_str(), 1);
-      else unsetenv("DGPP_DSV41_DRAFT_CANDIDATES");
+  struct Enable {
+    const char* key;
+    std::optional<std::string> saved;
+    explicit Enable(const char* name) : key(name) {
+      if (const char* old = std::getenv(key)) saved = old;
+      setenv(key, "1", 1);
     }
-  } restore{saved};
-  setenv("DGPP_DSV41_DRAFT_CANDIDATES", "1", 1);
+    ~Enable() {
+      if (saved) setenv(key, saved->c_str(), 1);
+      else unsetenv(key);
+    }
+  } candidates("DGPP_DSV41_DRAFT_CANDIDATES"), sparse("DGPP_DSV41_SPARSE_GRAMMAR");
   dgpp::Dsv41Model model(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Resident,
                          nullptr, 0, 1, 1, true, 8);
   model.session_prefill(0, prompt);
@@ -1035,6 +1037,14 @@ DGPP_TEST(dsv41_compact_neural_draft_candidates_match_full_logits) {
       require(compact.local_candidates[0].id == best.id && compact.local_candidates[0].logit == best.logit,
               "compact draft preserves the token and logit");
       require(model.verification_logits_row(0) == full.logits, "an illegal draft winner can be fully masked");
+      const int vocab = full.lm_vocab_count + 1;
+      for (const auto& ids : std::vector<std::vector<int>>{{1}, {3, 4, 5}, {0, 9, 17}, {vocab - 1}}) {
+        std::vector<uint32_t> words((vocab + 31) / 32);
+        for (int token : ids) words[token / 32] |= uint32_t{1} << (token % 32);
+        const auto got = model.verification_sparse_max(0, words.data(), vocab, ids.size());
+        const auto want = dgpp::sample::local_masked_max(full.logits.data(), full.lm_vocab_count, 0, words.data(), vocab);
+        require(got && got->id == want.id && got->logit == want.logit, "sparse grammar agrees with full-row masking");
+      }
     };
     check(model.session_draft(0, {23}), first);
     check(model.session_draft_chain(0, 15, 0, true, true), chain);

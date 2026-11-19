@@ -813,15 +813,19 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     const auto best = compact ? out.local_candidates.at(row)
         : sample::local_max(logits, out.lm_vocab_count, out.lm_vocab_begin);
     if (!grammar || grammar->allows(best.id)) return best;
+    text::TokenMask mask;
+    grammar->mask(&mask);
     std::vector<float> downloaded;
     if (compact) {
+      if constexpr (requires { model_->verification_sparse_max(row, mask.words.data(), mask.vocab, mask.allowed); }) {
+        if (auto winner = model_->verification_sparse_max(row, mask.words.data(), mask.vocab, mask.allowed))
+          return *winner;
+      }
       if constexpr (requires { model_->verification_logits_row(row); }) {
         downloaded = model_->verification_logits_row(row);
         logits = downloaded.data();
       } else throw std::logic_error("compact verification requires grammar row fallback");
     }
-    text::TokenMask mask;
-    grammar->mask(&mask);
     return sample::local_masked_max(logits, out.lm_vocab_count, out.lm_vocab_begin,
                                     mask.constrained() ? mask.words.data() : nullptr, mask.vocab);
   }
