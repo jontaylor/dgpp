@@ -659,3 +659,73 @@ passing implementation and ran its own 3,000-case check. The client reached
 its 85 s time limit before it received a final answer. That attempt gives
 no completed-turn latency. Warm cache reuse alone cannot predict how many
 tool calls or output tokens the agent will choose.
+
+### Resident verification on the deployed MXFP8 draft head
+
+On 19 November both Sparks ran the selected MXFP4 binary from `f0a3a1f7`,
+SHA-256 `aecb709392c95b404d4f33bdf43578e3154f664f55b1c22cea74907fd9156297`.
+The profiled Rust continuation reproduced the earlier 96 output tokens, 31
+target passes and 65 accepted predictions. It processed 26 uncached prompt
+tokens, read zero expert bytes on both ranks and produced identical rank
+operation streams. The ordinary service was restored after capture.
+
+| Mean GPU time per target span (ms) | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| First route packet to last routed kernel | 53.07 | 53.02 |
+| Routed experts running alone | 24.49 | 23.57 |
+| Attention output `wo_a` running alone | 3.02 | 2.94 |
+| Attention output `wo_b` running alone | 4.11 | 4.01 |
+| Query expansion `wq_b` running alone | 1.23 | 1.57 |
+| CSA index scores running alone | 1.05 | 1.05 |
+| Neither a kernel nor a CUDA copy running | 0.24 | 0.25 |
+
+The table covers 31 spans. The two output projections had no overlapping
+kernel or CUDA copy in these spans. The `wo_b` time counts the main
+projection with two K splits. The subsequent reduction has its own kernel.
+
+| Mean GPU time in the 30 complete intervals between spans (ms) | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| Whole interval | 9.91 | 9.96 |
+| Target vocabulary projection, lossless 12-bit weights | 2.14 | 1.97 |
+| Draft vocabulary projection, MXFP8 | 1.47 | 1.39 |
+| Draft Markov bias across three positions | 0.301 | 0.295 |
+| BF16 rescoring across three positions | 0.015 | 0.016 |
+| Draft projection start through final pick collective end | 2.16 | 2.16 |
+
+The last row includes the draft projection, bias, rescoring, confidence,
+pick collectives and gaps between them. Each MXFP8 head reads a logical
+341,299,200-byte weight and scale payload per rank. Dividing by projection
+time gives 232–245 GB/s of logical payload. Physical memory-controller
+throughput was unavailable. The measured rescoring leaves at most 0.016 ms
+per neural round to recover. A 10% reduction in `wo_b` projection time at
+this shape would save about 0.4 ms per pass before downstream effects.
+
+### Where a 16-minute branch review spent its time
+
+The real Codex review went through OpenCodex to this two-Spark deployment.
+It completed in 963.823 s across 34 sequential model calls. All 34 matched
+rank-zero retirement records by timestamp and exact input, cached-input
+and output counts. The service spent 118.788 s in request prefill and
+834.9 s in request decode, or 86.6% of the client wall time in decode.
+About 10.1 s fell outside those request clocks, including client and tool
+work. The scheduler rounds each logged request's decode time to 0.1 s.
+
+Across the calls, 2,372,480 of 2,460,316 input tokens came from prefix
+cache. The service computed 87,836 input tokens and generated 34,290
+output tokens. The client counted 26,175 of those as reasoning tokens.
+Excluding each call's first token, decode delivered 34,256 tokens in
+10,623 passes, or 3.225 tokens/pass and 41.03 tokens/s of request decode.
+The input total counts reused conversation prefixes on each call. The
+longest individual prompt was 113,732 tokens.
+
+For the next review, use its completed Codex rollout and the UTC
+rank-zero serving log covering that turn:
+
+```sh
+python scripts/serve_agent_turn.py "$rollout" "$rank_zero_log"
+```
+
+The command defaults to the last completed turn in the rollout. Pass
+`--turn-id` to select an earlier turn or `-` for a log piped from the
+serving host. It reports per-request wall clocks. Under concurrency these
+clocks can overlap. Missing or ambiguous matches produce an error.
