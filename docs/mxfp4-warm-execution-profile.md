@@ -579,3 +579,29 @@ Depth four took 74 and 113. Depth three took 82 and 117. Six of the seven
 standard responses changed at depths two and four, so their respective
 42.29 and 43.76 warm tok/s also reflect different generated text. The
 completed LRU and directory tasks passed at both widths.
+
+The final comparison also tested limiting the neural vocabulary head to
+the required proposal rows, omitting unused confidence, and returning
+only the picked chain token (`DGPP_DSV41_DRAFT_OUTPUTS=compact`). On two
+starts, warm decode was 46.43–46.54 tok/s and decode with reads was
+33.43–33.55 tok/s. With the ordinary draft outputs these ranges were
+46.51–46.55 and 33.51–33.65. The completed warm edit took 4.65 versus
+4.64 s, respectively. The selected template uses ordinary draft outputs.
+
+Against the preceding production binary (`fafa9116`, SHA-256
+`e9b2eaff13e4e0e7e5ab0eb830ee0ba784ce6d797cc62694e69f45b268bc904c`),
+the selected two-Spark configuration produced the following focused
+single-client results. Each range spans two fresh starts. The older
+configuration also completed the checked LRU task.
+
+| Measurement | Preceding deployment | Selected deployment |
+| --- | ---: | ---: |
+| Warm prose and code, zero expert reads (engine tok/s) | 44.81–44.83 | 46.51–46.55 |
+| Prose and code with expert reads (engine tok/s) | 32.55–32.71 | 33.51–33.65 |
+| Cold 24,292-token tool prefill (s) | 37.39 | 36.51–36.61 |
+| Completed warm LRU implementation (engine tok/s) | 57.49–57.58 | 59.91–60.27 |
+
+The separate service and kernel measurements support this recipe for
+single-client tool traffic. Physical DRAM bandwidth, throughput under a
+sustained concurrent workload and performance on long generations from
+new user conversations remain open.
