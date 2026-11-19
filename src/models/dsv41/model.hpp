@@ -351,6 +351,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   std::unique_ptr<PagedGraphs> paged_graphs_;
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
+  size_t draft_pick_prefetch_bytes_ = 0;
   int eager_draft_head_rows_ = 0, draft_rows_scored_ = 0;
   bool eager_draft_confidence_ = true, eager_token_only_chain_ = false;
   bool enqueue_resident_draft_graph(int req, int accepted_rows);

@@ -11,6 +11,7 @@
 
 #include <cuda.h>
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -491,6 +492,14 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_DRAFT_GRAPH"))
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
+  if (const char* value = std::getenv("DGPP_DSV41_PICK_PREFETCH_MIB")) {
+    unsigned mib = 0;
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, mib);
+    if (result.ec != std::errc{} || result.ptr != end || mib > 64)
+      throw std::invalid_argument("DGPP_DSV41_PICK_PREFETCH_MIB requires 0..64");
+    draft_pick_prefetch_bytes_ = size_t{mib} << 20;
+  }
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_GRAPH_TAIL")) paged_graph_tail_ = value[0] == '1';
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_ASYNC_PROLOGUE")) paged_async_prologue_ = value[0] == '1';
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_PDL")) {
@@ -2289,14 +2298,24 @@ bool Dsv41Model::prefill_batch_fits(const RowRun& run) const {
 
 Dsv41Model::Outputs Dsv41Model::session_verify_candidates(int req, const std::vector<int64_t>& tokens) {
   const char* flag = std::getenv("DGPP_DSV41_GPU_CANDIDATES");
-  if (!flag || flag[0] != '1') return Base::session_verify(req, tokens);
   // Only the eager greedy verifier requests compact output. All diagnostic,
   // sampling, logprob and multi-request entry points retain full host outputs.
-  compact_verify_ = true;
+  compact_verify_ = flag && flag[0] == '1';
   compact_verify_rows_ = 0;
   try {
     auto out = Base::session_verify(req, tokens);
     compact_verify_ = false;
+    // The verify has completed. While the host merges the token candidates
+    // from the ranks, bring in the start of the draft's first projection.
+    // The accepted row count changes the activations only. The projection
+    // is immutable and its normal weight reader can consume the cached lines.
+    if (draft_pick_prefetch_bytes_ && mtp_ && prefetching(true)) {
+      const auto& w = draft_stage(0).main_proj;
+      if (w.payload) {
+        const size_t bytes = std::min(draft_pick_prefetch_bytes_, static_cast<size_t>(w.rows) * w.cols);
+        launch_l2_prefetch(w.payload, bytes, prefetch_.boundary_rate(), stream_);
+      }
+    }
     return out;
   } catch (...) { compact_verify_ = false; throw; }
 }
