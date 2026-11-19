@@ -1007,6 +1007,43 @@ DGPP_TEST(dsv41_paged_eager_dspark_preserves_tool_and_json_constraints) {
   }
 }
 
+DGPP_TEST(dsv41_eager_dspark_interior_snapshot_logits_match_live_cut) {
+  const Fixture fx = make_fixture(false);
+  const auto prompt = tokens_of(751, 125, fx.cfg.vocab_size);
+  auto paging = fixture_paging(fx, dgpp::expert::Policy::kWholeExpert, true);
+  // Both executions verify the same six rows. One rolls back to 128 and
+  // saves a live snapshot. The other commits past 128 and recovers row 2.
+  const auto resume = [&](bool interior) {
+    dgpp::Dsv41Model model(fx.cfg, fx.dir, 256, 1024, dgpp::Dsv41Residency::Resident,
+                           nullptr, 0, 1, 2, true, 16, false, &paging);
+    const std::vector<int64_t> fed{10, 20, 30, 40, 50, 60};
+    model.session_prefill(0, prompt);
+    model.session_advance_draft(0, {fed.front()});
+    model.session_verify(0, fed);
+    const int accepted = interior ? 5 : 3;
+    model.session_rollback(0, accepted, 6);
+    model.session_advance_draft(0, {fed.begin() + 1, fed.begin() + 1 + accepted});
+    void* snapshot = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&snapshot, model.session_snapshot_bytes()));
+    struct Free { void* p; ~Free() { (void)cudaFree(p); } } cleanup{snapshot};
+    const auto meta = interior ? model.session_snapshot_post_row0(0, snapshot, 2, 2)
+                               : model.session_snapshot(0, snapshot);
+    model.session_close(0);
+    model.session_attach(1, snapshot, meta);
+    std::vector<std::vector<float>> logits;
+    logits.push_back(model.session_prefill_resume(1, {41, 64, 74, 84}, {}).logits);
+    logits.push_back(model.session_draft(1, {94}).logits);
+    logits.push_back(model.session_verify(1, {94, 104}).logits);
+    model.session_release_snapshot(meta);
+    model.session_close(1);
+    return logits;
+  };
+  const auto live = resume(false), interior = resume(true);
+  require(interior[0] == live[0], "all resumed prefill logits match the live aligned snapshot");
+  require(interior[1] == live[1], "all draft logits match after attaching the changed suffix");
+  require(interior[2] == live[2], "all following target verification logits match");
+}
+
 DGPP_TEST(dsv41_eager_dspark_restores_interior_prefix_for_each_request) {
   using Engine = dgpp::sched::SchedulerEngine;
   const Fixture fx = make_fixture(false);
