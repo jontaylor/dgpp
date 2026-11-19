@@ -272,7 +272,7 @@ class Csa2Layer {
                    const int32_t* win_table, const int32_t* req_ids_main, const int64_t* pos, int row0, int rows,
                    int n_split_main, cudaStream_t stream, const int32_t* list, int list_stride,
                    const int32_t* counts, bool split_window = false, int sel_base = 0, bool flash_window = false,
-                   uint8_t* mx_out = nullptr, bool keep_attn_out = true);
+                   uint8_t* mx_out = nullptr, bool keep_attn_out = true, cudaEvent_t window_ready = nullptr);
   void project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out = nullptr, cudaEvent_t before_wo_b = nullptr);
   void validate_pool(const Csa2StatePool& pool) const;
 

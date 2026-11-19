@@ -526,7 +526,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
                             int win_block_tokens, const int32_t* win_table, const int32_t* req_ids_main,
                             const int64_t* pos, int row0, int rows, int n_split_main, cudaStream_t stream,
                             const int32_t* list, int list_stride, const int32_t* counts, bool split_window,
-                            int sel_base, bool flash_window, uint8_t* mx_out, bool keep_attn_out) {
+                            int sel_base, bool flash_window, uint8_t* mx_out, bool keep_attn_out, cudaEvent_t window_ready) {
   const int lh = cfg_.local_heads();
   if (rows > ws_win_rows_ || rows * n_split_main > ws_slots_) throw std::logic_error("csa2 layer: attention tile too wide");
   const uint16_t* q = q_ + size_t(row0) * lh * kCsa2Latent;
@@ -561,8 +561,11 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   const bool beside = split_window && side_stream_ != nullptr && w_.ratio > 0;
   cudaStream_t wstream = stream;
   if (beside) {
-    DGPP_CUDA_OK(cudaEventRecord(side_fork_, stream));
-    DGPP_CUDA_OK(cudaStreamWaitEvent(side_stream_, side_fork_, 0));
+    if (!window_ready) {
+      DGPP_CUDA_OK(cudaEventRecord(side_fork_, stream));
+      window_ready = side_fork_;
+    }
+    DGPP_CUDA_OK(cudaStreamWaitEvent(side_stream_, window_ready, 0));
     wstream = side_stream_;
   }
   // Decode's window is split like the scalar form's (eight splits of a
@@ -797,6 +800,18 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
                            w_.ratio > 0 ? pos_sel_ : nullptr, w_.ratio, kv_, req_ids, pool.ring_table(), pool.ring(layer_),
                            kCsa2Latent, tokens, stream);
 
+  // The local ring, rotated queries and window lists are now complete.
+  // Compression and selection only affect the other source. In a captured
+  // walk the side stream can read the ring as soon as this node completes.
+  static const bool early_window = [] {
+    const char* value = std::getenv("DGPP_CSA2_EARLY_DECODE_WINDOW");
+    return value && value[0] == '1';
+  }();
+  cudaEvent_t window_ready = nullptr;
+  if (early_window && side_stream_ && w_.ratio > 0 && (w_.kv_source || w_.index_source)) {
+    window_ready = side_fork_;
+    DGPP_CUDA_OK(cudaEventRecord(window_ready, stream));
+  }
   if (w_.ratio > 0) {
     const int ord = w_.cache_ord;
     if (w_.kv_source) {
@@ -855,7 +870,7 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
       cfg_.o_lora == 1024 && cfg_.heads_per_group() == 8 && gemm_ws_bytes_ >= values + values / 32)
     mx_out = static_cast<uint8_t*>(gemm_ws_);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table(), req_ids, pos, 0, tokens,
-              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out, keep_attn_out);
+              decode_n_split_, stream, wlist_, cfg_.window, wcounts_, /*split_window=*/true, 0, false, mx_out, keep_attn_out, window_ready);
   if (before_wo_a) DGPP_CUDA_OK(cudaEventRecord(before_wo_a, stream));
   project_out(tokens, out, stream, mx_out, before_wo_b);
 }
