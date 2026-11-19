@@ -644,15 +644,13 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   require(g.literal_proposal() == ' ', "the committed free-value closer can be proposed");
   feed(g, bytes_of(" parameter>\n"));
   require(std::string(g.state_name()) == "d-param-or-close", "the closer ends the value");
-  // days is JSON-typed: the flag is forced false; the value a JSON integer.
-  GrammarSpec typed = spec_of(GrammarSpec::Mode::kRequired);
-  (void)typed;
+  // This fixture has free arguments. The model may spell days as a number.
   feed(g, bytes_of("<"));
   g.advance(kDsmlTag);
   feed(g, bytes_of(" parameter name=\""));
   require(g.allows('d') && !g.allows('c'), "a closed key is offered once");
   feed(g, bytes_of("days\" string=\"false\">3</"));
-  require(g.literal_proposal() == kDsmlTag, "the committed JSON-value closer can propose the tag");
+  require(g.literal_proposal() < 0, "an untyped numeric spelling can continue after </");
   g.advance(kDsmlTag);
   feed(g, bytes_of(" parameter>\n"));
   // Every key used: only the invoke's close remains.
@@ -710,6 +708,7 @@ DGPP_TEST(tool_grammar_dsml_typed_values_named_single_and_open_keys) {
   require(same(allowed_ids(t), {'/'}), "inside the closer only its bytes");
   t.advance('/');
   require(same(allowed_ids(t), {kDsmlTag}), "then the tag");
+  require(t.literal_proposal() == kDsmlTag, "the committed JSON-value closer can propose the tag");
   t.advance(kDsmlTag);
   feed(t, bytes_of(" parameter>\n<"));
   t.advance(kDsmlTag);
