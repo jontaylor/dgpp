@@ -1325,6 +1325,13 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
   // the shared expert of the paged target graph; its row arithmetic is fixed.
   const int blocks = shared_limit ? std::min(shared_limit, sh_lane_blocks_) : sh_lane_blocks_;
   const int run = moe_shared_run_rows(tokens, H);
+  static const bool route_first = [] {
+    const char* v = std::getenv("DGPP_EXPERT_ROUTE_BEFORE_SHARED");
+    return v && std::string_view(v) == "1";
+  }();
+  // The shared result is only consumed after the routed down projection.
+  // Give the router an exclusive read window before arming the shared lane.
+  if (route_first) route(hidden, tokens, stream, d_router_counters_);
   DGPP_CUDA_OK(cudaEventRecord(sh_lane_fork_, stream));
   DGPP_CUDA_OK(cudaStreamWaitEvent(sh_lane_, sh_lane_fork_));
   auto* act = d_slot_act_ + K*I;
@@ -1336,7 +1343,7 @@ void GlmMoeLayer::enqueue_paged_device(const uint16_t* hidden, uint16_t* out, in
       run, blocks, sh_lane_, shift(d.scale_block_rows), shift(d.scale_block_cols));
   DGPP_CUDA_OK(cudaEventRecord(sh_lane_join_, sh_lane_));
   // The shared slots are disjoint from routed slots on both execution paths.
-  route(hidden, tokens, stream, d_router_counters_);
+  if (!route_first) route(hidden, tokens, stream, d_router_counters_);
   if (before_demand) DGPP_CUDA_OK(cudaEventRecord(before_demand, stream));
   sm12x_moe_->prepare_device(table, d_ids_, demand, tokens, stream, resident_wave);
   sm12x_moe_->run(hidden, d_ids_, d_weights_, d_slot_down_, tokens, stream, table);

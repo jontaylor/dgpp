@@ -497,6 +497,11 @@ host can prepare verification while the GPU updates the rings. Mode `2`
 also replays the ring updates at previously seen widths when resident draft
 graphs are enabled. The default is `0`.
 
+`DGPP_EXPERT_ROUTE_BEFORE_SHARED=1` gives the paged target router first
+access to the GPU before starting the shared expert. The shared FP8
+projections still run on their side stream alongside the routed expert
+reads and execution. The default starts the two branches together.
+
 For partially accepted eager verification blocks, `DGPP_DSV41_FUSED_ROLLBACK=1`
 restores the accepted row's compressor tails, Engram history and device
 position together on the model stream. The next draft can be submitted while
