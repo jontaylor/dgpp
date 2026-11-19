@@ -278,6 +278,13 @@ add_library(dgpp_kernels STATIC
   src/kernels/dory_head.cu)
 target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
+option(DGPP_DIRECT_FP8_BF16 "Use the SM121a packed FP8 to BF16 instruction in dense projections" OFF)
+if(DGPP_DIRECT_FP8_BF16)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.2)
+    message(FATAL_ERROR "DGPP_DIRECT_FP8_BF16 requires CUDA 13.2 or newer")
+  endif()
+  set_property(SOURCE src/kernels/mma_gemv.cu APPEND PROPERTY COMPILE_DEFINITIONS DGPP_DIRECT_FP8_BF16=1)
+endif()
 # The device sampler mirrors the host oracle bit for bit: no contraction of
 # its multiplies and adds (the host builds with -ffp-contract=off).
 set_source_files_properties(src/kernels/sample_pick.cu PROPERTIES

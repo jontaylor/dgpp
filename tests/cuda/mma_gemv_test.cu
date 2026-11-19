@@ -120,6 +120,30 @@ DGPP_TEST(mma_gemv_oracle_rejects_nonfinite_outputs) {
   }
 }
 
+DGPP_TEST(mma_gemv_fp8_weight_rounding) {
+  // One nonzero weight per output column isolates conversion from accumulation.
+  // Place every E4M3 code in each of the 16 positions of a vector load.
+  constexpr int k = 256, n = 4096;
+  Problem p = make(4, n, k, 0, 5, 17);
+  std::fill(p.act.begin(), p.act.end(), dgpp::float_to_bf16_bits(1.f));
+  std::fill(p.w8.begin(), p.w8.end(), 0);
+  for (int col = 0; col < n; ++col)
+    p.w8[size_t(col) * k + col % 16] = static_cast<uint8_t>(col / 16);
+  Dev d(p);
+  for (float scale : {0.f, -0.5f, 0.0625f, 1.003f, 1.005f}) {
+    std::fill(p.scales.begin(), p.scales.end(), scale);
+    DGPP_CUDA_OK(cudaMemcpy(d.scales, p.scales.data(), p.scales.size() * sizeof(float), cudaMemcpyHostToDevice));
+    dgpp::launch_mma_gemv_fp8_f32(d.act, k, d.w8, d.scales, d.outf, p.m, n, k, n, p.rs, p.cs, nullptr);
+    const auto out = fetch_f(d.outf, size_t(p.m) * n);
+    for (size_t j = 0; j < out.size(); ++j) {
+      const auto col = static_cast<int>(j % n);
+      const float expected = wval8(p, col, col % 16);
+      require(out[j] == expected || (std::isnan(out[j]) && std::isnan(expected)),
+              "E4M3 weight times block scale must round once to BF16");
+    }
+  }
+}
+
 DGPP_TEST(mma_gemv_fp8_matches_oracle_and_is_m_invariant) {
   const Problem p = make(30, 1024, 512, 5, 5, 0x9E3779B97F4A7C15ull);
   Dev d(p);

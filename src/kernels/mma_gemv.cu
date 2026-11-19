@@ -249,6 +249,26 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 // for the e8m0 (power-of-two) scales the fp8 matrices carry.
 __device__ __forceinline__ void chunk_to_bf16x8(const uint4& c, float s, uint32_t (&w)[8]) {
   const uint32_t words[4] = {c.x, c.y, c.z, c.w};
+#if defined(DGPP_DIRECT_FP8_BF16) && defined(__CUDA_ARCH_FEAT_SM121_ALL)
+  // E4M3 widens exactly. When the FP32 scale also fits BF16, the packed
+  // multiply gives both weights their single rounding directly. Other grids
+  // retain the FP32 product below to avoid double-rounding the scale.
+  const uint32_t scale_bits = __float_as_uint(s);
+  if ((scale_bits & 0xffffu) == 0) {
+    const uint32_t scale2 = scale_bits | (scale_bits >> 16);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const uint32_t word = words[q];
+      uint32_t lo, hi;
+      asm("{ .reg .b16 a, b; mov.b32 {a, b}, %2; "
+          "cvt.rn.bf16x2.e4m3x2 %0, a; cvt.rn.bf16x2.e4m3x2 %1, b; }"
+          : "=r"(lo), "=r"(hi) : "r"(word));
+      asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(w[2 * q]) : "r"(lo), "r"(scale2));
+      asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(w[2 * q + 1]) : "r"(hi), "r"(scale2));
+    }
+    return;
+  }
+#endif
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
     const float2 w01 = fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(words[q] & 0xFFFFu));
