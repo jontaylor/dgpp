@@ -420,8 +420,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "l2_prefetch_form") {
           e.l2_prefetch_form = text(x, ek, what);
           if (e.l2_prefetch_form != "load" && e.l2_prefetch_form != "lines" &&
-              e.l2_prefetch_form != "touch" && e.l2_prefetch_form != "ranges")
-            fail(what, "'" + ek + "' must be load, lines, touch or ranges");
+              e.l2_prefetch_form != "touch" && e.l2_prefetch_form != "ranges" && e.l2_prefetch_form != "bulk")
+            fail(what, "'" + ek + "' must be load, lines, touch, ranges or bulk");
         }
         else if (p.key == "l2_prefetch_full_form") {
           e.l2_prefetch_full_form = text(x, ek, what);

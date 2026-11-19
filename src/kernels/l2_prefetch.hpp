@@ -71,7 +71,7 @@ void launch_l2_release(const void* ptr, size_t bytes, cudaStream_t stream);
 // windows inside the attention layers (layer_rate(); light — the Full rate
 // slowed the small kernels it ran beside by as much as it saved on the
 // projection) and whether adjacent ranges merge into one launch.
-enum class L2PrefetchForm { Load, Lines, Touch, Ranges };
+enum class L2PrefetchForm { Load, Lines, Touch, Ranges, Bulk };
 // The full-rate window's shape (engine.l2_prefetch_full_form): 16 blocks x 8
 // loads (512 KB in flight, the DRAM rate at the light form's SM footprint;
 // DeepSeek-V4.1's gap kernels run unstretched beside it) or 48 x 4 (768 KB
@@ -93,7 +93,7 @@ void l2_prefetch_configure(const L2PrefetchSettings& s);
 const L2PrefetchSettings& l2_prefetch_settings();
 // "off" | "light" | "full" (throws on anything else).
 PrefetchRate l2_prefetch_rate(const std::string& name);
-// "load" | "lines" | "touch" (throws on anything else).
+// "load" | "lines" | "touch" | "ranges" | "bulk".
 L2PrefetchForm l2_prefetch_form(const std::string& name);
 // "16x8" | "48x4" (throws on anything else).
 L2FullForm l2_prefetch_full_form(const std::string& name);

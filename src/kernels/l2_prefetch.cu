@@ -98,6 +98,20 @@ __global__ __launch_bounds__(kThreads) void l2_prefetch_lines_kernel(
 }
 
 L2PrefetchSettings g_l2_settings;  // l2_prefetch_configure, before any model is built
+
+// A warp submits contiguous 4 KiB ranges. Every request stays within the
+// caller's clamped vector span. Consumers retain their own compulsory loads.
+constexpr unsigned kBulkVectors = 4096 / sizeof(uint4);
+__global__ void l2_prefetch_bulk_kernel(const uint4* p, size_t vectors) {
+  dgpp_pdl_wait();
+  const size_t lane = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x * kBulkVectors;
+  for (size_t i = lane * kBulkVectors; i < vectors; i += stride) {
+    const unsigned count = static_cast<unsigned>(min(static_cast<size_t>(kBulkVectors), vectors - i));
+    const unsigned bytes = count * sizeof(uint4);
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p + i), "r"(bytes) : "memory");
+  }
+}
 bool full_form_wide() { return g_l2_settings.full_form == L2FullForm::Wide48x4; }
 int full_blocks() { return full_form_wide() ? kWideBlocks : kNarrowBlocks; }
 bool env_prefetch_form_lines() { return g_l2_settings.form == L2PrefetchForm::Lines; }
@@ -156,7 +170,8 @@ L2PrefetchForm l2_prefetch_form(const std::string& name) {
   if (name == "lines") return L2PrefetchForm::Lines;
   if (name == "touch") return L2PrefetchForm::Touch;
   if (name == "ranges") return L2PrefetchForm::Ranges;
-  throw std::invalid_argument("l2 prefetch form: load, lines, touch or ranges (got '" + name + "')");
+  if (name == "bulk") return L2PrefetchForm::Bulk;
+  throw std::invalid_argument("l2 prefetch form: load, lines, touch, ranges or bulk (got '" + name + "')");
 }
 L2FullForm l2_prefetch_full_form(const std::string& name) {
   if (name == "16x8") return L2FullForm::Narrow16x8;
@@ -253,6 +268,10 @@ void launch_l2_prefetch(const void* ptr, size_t bytes, PrefetchRate rate,
       l2_prefetch_kernel<kWideUnroll><<<kWideBlocks, kThreads, 0, stream>>>(p, vecs);
     else
       l2_prefetch_kernel<kNarrowUnroll><<<kNarrowBlocks, kThreads, 0, stream>>>(p, vecs);
+  } else if (g_l2_settings.form == L2PrefetchForm::Bulk) {
+    constexpr unsigned warp_vectors = 32 * kBulkVectors;
+    const unsigned blocks = static_cast<unsigned>(std::min<size_t>(light_blocks(), (vecs + warp_vectors - 1) / warp_vectors));
+    l2_prefetch_bulk_kernel<<<blocks, 32, 0, stream>>>(p, vecs);
   } else if (env_prefetch_form_touch()) {
     const size_t sb = env_touch_stride_bytes();
     const size_t touches = (vecs * 16 + sb - 1) / sb;
