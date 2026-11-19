@@ -1466,6 +1466,53 @@ DGPP_TEST(glm_spec_accept_matches_reference_loopback) {
   require(accepts > 0 && accepts < kSteps, "the run must accept and reject");
 }
 
+// The eager host pick can validate the sender's candidate table in the
+// gather itself. A stale pick from either peer must fail on both ranks.
+DGPP_TEST(glm_tp_checked_greedy_pick_loopback) {
+  constexpr int world = 2;
+  auto buses = start_world(world, 29862);
+  require(buses.size() == world, "pick loopback world failed to start");
+  std::array<uint16_t*, world> scratch{};
+  for (auto& table : scratch)
+    DGPP_CUDA_OK(cudaHostAlloc(&table, sizeof(*table) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
+  std::vector<std::thread> workers;
+  std::array<std::string, world> errors;
+  for (int rank = 0; rank < world; ++rank) {
+    workers.emplace_back([&, rank] {
+      try {
+        uint64_t seq = 0;
+        auto pick = [&](int rows, cudaStream_t stream) {
+          std::vector<dgpp::sample::Candidate> local;
+          for (int row = 0; row < rows; ++row)
+            local.push_back({100000 + 1000 * rank + row, row % 2 ? static_cast<float>(rank) : -0.25f});
+          return dgpp::bus_greedy_pick_rows(*buses[rank], rank, world, local, scratch[rank],
+                                            test_wait_timeout_ms(), stream, &seq);
+        };
+        for (cudaStream_t stream : std::array<cudaStream_t, 2>{nullptr, cudaStreamPerThread}) {
+          for (int rows : {1, 4, 6, dgpp::kPickMaxRows}) {
+            const auto tokens = pick(rows, stream);
+            for (int r = 0; r < rows; ++r)
+              require(tokens.at(r) == 100000 + (r % 2) * 1000 + r, "pick lost a winner or tie break");
+          }
+        }
+        seq += rank;
+        try {
+          pick(4, cudaStreamPerThread);
+          errors[rank] = "accepted a candidate table from a different pick";
+        } catch (const std::runtime_error& e) {
+          if (std::string_view(e.what()).find("invalid candidate table") == std::string_view::npos) throw;
+        }
+      } catch (const std::exception& e) {
+        errors[rank] = e.what();
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  for (auto& bus : buses) bus->quiesce();
+  for (auto* table : scratch) DGPP_CUDA_OK(cudaFreeHost(table));
+  for (const auto& err : errors) require(err.empty(), err);
+}
+
 // The eager sampled speculator on the MTP fixture over the real bus: every
 // rank produces the same transcript (the accept test, the residual, the
 // row-1 sample and the greedy draft are collectives or rank-identical

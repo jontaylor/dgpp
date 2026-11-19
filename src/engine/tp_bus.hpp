@@ -26,6 +26,7 @@
 #include <format>
 #include <vector>
 
+#include "common/crc32c.hpp"
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include <stdexcept>
@@ -601,7 +602,7 @@ inline uint64_t pick_decode_digits(const uint16_t* slots, int digits) {
 inline std::vector<int32_t> bus_greedy_pick_rows(
     net::CollectiveBus& bus, int rank, int world,
     const std::vector<sample::Candidate>& locals, uint16_t* scratch,
-    int timeout_ms) {
+    int timeout_ms, cudaStream_t pick_stream = nullptr, uint64_t* pick_sequence = nullptr) {
   step_timing::Scope tick(step_timing::kPick);
   const int rows = static_cast<int>(locals.size());
   if (rows < 1 || rows > kPickMaxRows)
@@ -615,9 +616,21 @@ inline std::vector<int32_t> bus_greedy_pick_rows(
   // Before the generation-gated claim this raced a peer's in-flight
   // collective kernel (corruption or stall, whichever way the claim
   // fell); the gate pins the claim to this collective's doorbells.
-  const size_t gather_elems =
-      static_cast<size_t>(rows) * world * kPickSlotsPerRank;
+  // On small picks a final row can carry each sender's CRC of its candidate
+  // digits, rank, shape and call sequence. All ranks validate the identical
+  // inputs to the canonical merge before using any token, in one collective.
+  const size_t row_elems = static_cast<size_t>(world) * kPickSlotsPerRank;
+  const size_t checked_elems = (static_cast<size_t>(rows + 1) * row_elems + 1) & ~size_t{1};
+  const bool checked = pick_sequence && checked_elems <= kPickScratchElems(world) &&
+                       checked_elems <= bus_latency_slot_elems(bus);
+  const size_t gather_elems = checked ? checked_elems : rows * row_elems;
   const auto allreduce_wait = [&](std::string* err) -> uint64_t {
+    if (pick_stream) {
+      const uint64_t gen = bus.allreduce_stream(pick_stream, scratch, scratch, gather_elems, err);
+      if (!gen || !bus.allreduce_settle(timeout_ms, err)) return 0;
+      DGPP_CUDA_OK(cudaStreamSynchronize(pick_stream));
+      return gen;
+    }
     const uint64_t id = bus.allreduce(scratch, scratch, gather_elems, err);
     if (id == 0) return 0;
     const net::BusAllReduceResult r = bus.wait_allreduce(id, timeout_ms);
@@ -641,9 +654,26 @@ inline std::vector<int32_t> bus_greedy_pick_rows(
     pick_encode_digits(mine + kPickLogitDigits,
                        static_cast<uint64_t>(locals[row].id), kPickIdDigits);
   }
+  const auto sender_crc = [&](int sender) {
+    const uint64_t header[] = {*pick_sequence, static_cast<uint64_t>(sender), static_cast<uint64_t>(rows)};
+    uint32_t sum = crc32c(header, sizeof(header));
+    for (int row = 0; row < rows; ++row)
+      sum = crc32c(slot(row, sender), kPickSlotsPerRank * sizeof(*scratch), sum);
+    return sum;
+  };
+  if (checked) {
+    ++*pick_sequence;
+    pick_encode_digits(slot(rows, rank), sender_crc(rank), kPickLogitDigits);
+  }
   std::string err;
   if (allreduce_wait(&err) == 0)
     throw std::runtime_error("bus_greedy_pick gather: " + err);
+  if (checked) {
+    for (int sender = 0; sender < world; ++sender)
+      if (pick_decode_digits(slot(rows, sender), kPickLogitDigits) != sender_crc(sender))
+        throw std::runtime_error(std::format("bus_greedy_pick: invalid candidate table from rank {} at pick {} on rank {}",
+                                             sender, *pick_sequence, rank));
+  }
   std::vector<int32_t> winners(static_cast<size_t>(rows));
   for (int row = 0; row < rows; ++row) {
     std::vector<sample::Candidate> cands;
@@ -660,6 +690,8 @@ inline std::vector<int32_t> bus_greedy_pick_rows(
     }
     winners[static_cast<size_t>(row)] = sample::merge_greedy(cands);
   }
+
+  if (checked) return winners;
 
   // ---- broadcast: rank 0's winner digits reach every rank -----------
   std::memset(scratch, 0, gather_elems * 2);

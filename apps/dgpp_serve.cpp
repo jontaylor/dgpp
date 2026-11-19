@@ -4282,11 +4282,21 @@ int main(int argc, char** argv) {
                                        family->vocab_size()),
               &grammar_vocab, prefix_slots);
           engine->set_prefill_group(expert_streaming.has_value() && prefill_group);
-          if (mtp) engine->configure_eager_mtp(mtp_depth,
-              [&, rank, world](const std::vector<dgpp::sample::Candidate>& rows) {
-                return dgpp::bus_greedy_pick_rows(*bus, rank, world, rows, pick_scratch, 60000);
-              }, mtp_schedule, static_cast<float>(mtp_schedule_row_ms), static_cast<float>(mtp_schedule_base_ms),
-              static_cast<float>(mtp_schedule_lambda), mtp_schedule_min_depth, mtp_schedule_adapt);
+          if (mtp) {
+            const char* setting = std::getenv("DGPP_EAGER_PICK_TRANSPORT");
+            const std::string_view mode = setting ? setting : "host";
+            if (mode != "host" && mode != "stream" && mode != "gather" && mode != "stream-gather")
+              throw std::invalid_argument("invalid DGPP_EAGER_PICK_TRANSPORT");
+            auto pick_stream = mode == "stream" || mode == "stream-gather" ? cudaStreamPerThread : nullptr;
+            bool checked = mode == "gather" || mode == "stream-gather";
+            engine->configure_eager_mtp(mtp_depth,
+                [&, rank, world, pick_stream, checked, sequence = uint64_t{0}](
+                    const std::vector<dgpp::sample::Candidate>& rows) mutable {
+                  return dgpp::bus_greedy_pick_rows(*bus, rank, world, rows, pick_scratch, 60000,
+                                                   pick_stream, checked ? &sequence : nullptr);
+                }, mtp_schedule, static_cast<float>(mtp_schedule_row_ms), static_cast<float>(mtp_schedule_base_ms),
+                static_cast<float>(mtp_schedule_lambda), mtp_schedule_min_depth, mtp_schedule_adapt);
+          }
           if (mtp && lookup_draft) engine->configure_eager_lookup(lookup_nmin, lookup_nstrong, lookup_agree, lookup_tail);
           knobs.admission = dgpp::serve::resolve_prefill_policy(
               knobs.admission, *engine, prefill_early_admission_override);
