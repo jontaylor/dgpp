@@ -4,7 +4,6 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include "loaders/minijson.hpp"
@@ -869,7 +868,7 @@ void GrammarState::enter(State s) {
 
 // Tokens may span any literal bytes through the next DSML tag. Only the
 // checkpoint's marker id can consume the tag itself.
-static std::string_view next_literal(std::string_view target, std::string_view emitted) {
+std::string_view GrammarState::next_literal(std::string_view target, std::string_view emitted) {
   if (!target.starts_with(emitted)) return {};
   target.remove_prefix(emitted.size());
   const auto tag = target.find(kDsmlSentinel);

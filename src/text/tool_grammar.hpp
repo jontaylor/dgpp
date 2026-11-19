@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "text/json_grammar.hpp"
@@ -365,6 +366,7 @@ class GrammarState {
   const GrammarArg* current_arg() const;
   // The ids that continue the match (and the closer when a target is
   // complete).
+  static std::string_view next_literal(std::string_view target, std::string_view emitted);
   std::vector<int64_t> match_ids(const TextMatch& m, int64_t closer) const;
 
   const GrammarVocab* vocab_ = nullptr;
