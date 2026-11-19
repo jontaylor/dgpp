@@ -21,6 +21,7 @@
 #include <thread>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
@@ -448,7 +449,11 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     resident_draft_graphs_ = value[0] == '1' && cfg_.runtime_resident_draft_experts;
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_GRAPH_TAIL")) paged_graph_tail_ = value[0] == '1';
   if (const char* value = std::getenv("DGPP_DSV41_PAGED_ASYNC_PROLOGUE")) paged_async_prologue_ = value[0] == '1';
-  if (const char* value = std::getenv("DGPP_DSV41_PAGED_PDL")) paged_pdl_ = s_default_paged_pdl && value[0] == '1';
+  if (const char* value = std::getenv("DGPP_DSV41_PAGED_PDL")) {
+    const std::string_view mode(value);
+    paged_pdl_ = s_default_paged_pdl && (mode == "1" || mode == "2");
+    paged_woa_lead_ = paged_pdl_ && mode == "2";
+  }
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
   gemm_.set_decode_mma(dense_mma_);
@@ -900,6 +905,7 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   csa2_->set_prefill_dense_tile(prefill_dense_tile_);
   csa2_->set_prefill_window_flash(prefill_window_flash_);
   csa2_->set_decode_window_flash(decode_window_flash_);
+  csa2_->set_woa_weight_lead(paged_graph_capture_ && paged_woa_lead_ && loader_.residency() == Dsv41Residency::Resident);
   if (decode_window_beside_) csa2_->set_decode_side(attn_side_, attn_fork_, attn_join_);
   else csa2_->set_decode_side(nullptr, nullptr, nullptr);
   if (cfg_.is_draft(r.layer)) {

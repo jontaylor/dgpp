@@ -289,6 +289,6 @@ void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_m
                       int n_main, const float* m_win, const float* l_win, const float* c_win,
                       int n_win, const float* sink, int rows, int local_heads,
                       const int64_t* pos, const float* inv_freq, void* out,
-                      cudaStream_t stream, uint8_t* mx_codes = nullptr);
+                      cudaStream_t stream, uint8_t* mx_codes = nullptr, bool release_woa = false);
 
 }  // namespace dgpp

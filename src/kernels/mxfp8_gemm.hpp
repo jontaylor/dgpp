@@ -8,8 +8,10 @@ namespace dgpp {
 // Fused attention-finish layout: contiguous [rows,groups,k] codes then their K32 scales.
 // Weight [groups,n,k] has one expanded E8M0 scale per 32x32 block.
 // Supports 1..8 decode rows, k=4096 and n divisible by 32.
+// An early weight copy requires immutable weights throughout graph replay.
 void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const float* ws,
-                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t);
+                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t,
+                             bool early_weight_copy = false);
 
 // Dynamic MXFP8: BF16 [rows,k] -> E4M3 [rows,k], E8M0 [rows,k/32].
 // Each 32-value group's scale is ceil-rounded to a power of two, matching

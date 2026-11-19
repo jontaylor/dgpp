@@ -104,8 +104,9 @@ __device__ __forceinline__ uint2 woa_token_pair(const uint8_t* token) {
 template <bool AlignedScales, int FixedRows>
 __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
     const uint8_t* codes, const uint8_t* scales, const uint8_t* weight,
-    const float* weight_scale, uint16_t* out, int rows, int groups, int n) {
-  dgpp_pdl_wait();
+    const float* weight_scale, uint16_t* out, int rows, int groups, int n, bool early_weight_copy) {
+  dgpp_pdl_preamble();
+  if (!early_weight_copy) dgpp_pdl_wait();
   constexpr int k = 4096;
   if constexpr (FixedRows != 0) rows = FixedRows;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -160,6 +161,9 @@ __global__ __launch_bounds__(woa_warps * 32) void woa_decode_kernel(
   const size_t token_row = (size_t(live ? row8 : 0) * groups + group) * k;
   float acc[4]{};
   issue(k0, 0);
+  // The first compulsory copy reads only the resident projection. Finish must
+  // publish every activation code and scale before this grid consumes them.
+  if (early_weight_copy) dgpp_pdl_wait();
   for (int step = 0; step < span / woa_step; ++step) {
     const int base = k0 + step * woa_step, slot = step & 1;
     if (step + 1 < span / woa_step) issue(base + woa_step, slot ^ 1);
@@ -375,13 +379,13 @@ void dispatch(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8
 }  // namespace
 
 void launch_mxfp8_woa_decode(const uint8_t* packed, const uint8_t* w, const float* ws,
-                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream) {
+                             uint16_t* out, int rows, int groups, int n, int k, cudaStream_t stream, bool early_weight_copy) {
   if (rows < 1 || rows > 8 || groups < 1 || n <= 0 || n % 32 || k != 4096)
     throw std::invalid_argument("wo_a MXFP8 decode: unsupported projection");
   auto launch = [&]<bool AlignedScales>() {
     auto emit = [&]<int FixedRows>() {
       woa_decode_kernel<AlignedScales, FixedRows><<<groups * n / 16, woa_warps * 32, 0, stream>>>(
-          packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n);
+          packed, packed + size_t(rows) * groups * k, w, ws, out, rows, groups, n, early_weight_copy);
     };
     switch (rows) {
       case 1: return emit.template operator()<1>();

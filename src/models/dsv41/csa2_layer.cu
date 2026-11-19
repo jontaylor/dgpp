@@ -620,7 +620,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   uint16_t* bf16_out = (!mx_out || keep_attn_out) ? o_ + size_t(row0) * lh * kCsa2Latent : nullptr;
   csa2_attn_finish(n_main_pub ? m_main_pub : nullptr, n_main_pub ? l_main_pub : nullptr,
                    n_main_pub ? c_main_pub : nullptr, n_main_pub, m_win_pub, l_win_pub, c_win_pub, n_win_pub,
-                   w_.attn_sink, rows, lh, pos, w_.inv_freq, bf16_out, stream, mx_out);
+                   w_.attn_sink, rows, lh, pos, w_.inv_freq, bf16_out, stream, mx_out, woa_weight_lead_);
 }
 
 void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const uint8_t* mx_out, cudaEvent_t before_wo_b) {
@@ -650,7 +650,7 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream, const ui
       return true;
     }();
     (void)announced;
-    launch_mxfp8_woa_decode(mx_out, w_.wo_a.payload, w_.wo_a.scales, oa_, tokens, lg, cfg_.o_lora, K, stream);
+    launch_mxfp8_woa_decode(mx_out, w_.wo_a.payload, w_.wo_a.scales, oa_, tokens, lg, cfg_.o_lora, K, stream, woa_weight_lead_);
   } else if (paired) {
     for (int g = 0; g < lg; g += 2) {
       const uint16_t* input = o_ + size_t(g) * K;

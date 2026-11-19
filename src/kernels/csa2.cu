@@ -988,8 +988,9 @@ template <bool Quantize, bool StoreBf16>
 __global__ void attn_finish_kernel(const float* m_main, const float* l_main, const float* c_main,
                                    int n_main, const float* m_win, const float* l_win, const float* c_win,
                                    int n_win, const float* sink, int local_heads, const int64_t* pos,
-                                   const float* inv_freq, uint16_t* out, uint8_t* codes) {
+                                   const float* inv_freq, uint16_t* out, uint8_t* codes, bool release_woa) {
   dgpp_pdl_wait();
+  if constexpr (Quantize) { if (release_woa) dgpp_pdl_release(); }
   __shared__ float o[kCsa2Latent];
   __shared__ float s_w[kFinishMaxSplits];          // exp(m - mhat) of the live splits, in order
   __shared__ const float* s_c[kFinishMaxSplits];   // their c rows [kCsa2Latent]
@@ -1445,7 +1446,7 @@ void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride, 
 void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_main, int n_main,
                       const float* m_win, const float* l_win, const float* c_win, int n_win,
                       const float* sink, int rows, int local_heads, const int64_t* pos,
-                      const float* inv_freq, void* out, cudaStream_t stream, uint8_t* mx_codes) {
+                      const float* inv_freq, void* out, cudaStream_t stream, uint8_t* mx_codes, bool release_woa) {
   if (rows <= 0) return;
   if (local_heads <= 0 || n_main < 0 || n_win < 0 || (n_main > 0 && (m_main == nullptr || c_main == nullptr)) ||
       (n_win > 0 && (m_win == nullptr || c_win == nullptr)))
@@ -1457,7 +1458,7 @@ void csa2_attn_finish(const float* m_main, const float* l_main, const float* c_m
   auto launch = [&]<bool Quantize, bool StoreBf16>() {
     attn_finish_kernel<Quantize, StoreBf16><<<dim3(unsigned(rows), unsigned(local_heads)), 128, 0, stream>>>(
         m_main, l_main, c_main, n_main, m_win, l_win, c_win, n_win, sink, local_heads, pos, inv_freq,
-        static_cast<uint16_t*>(out), mx_codes);
+        static_cast<uint16_t*>(out), mx_codes, release_woa);
   };
   if (!mx_codes) launch.template operator()<false, true>();
   else if (out) launch.template operator()<true, true>();

@@ -193,6 +193,7 @@ def deployment(path):
             "CUDA_MODULE_LOADING": ("EAGER", "LAZY"),
             "CUDA_DEVICE_MAX_CONNECTIONS": tuple(str(n) for n in range(1, 33)),
             "DGPP_EXPERT_ADJACENT_READS": tuple(str(n) for n in range(1, 17)),
+            "DGPP_DSV41_PAGED_PDL": ("0", "1", "2"),
             "DGPP_DSV41_FFN_LOOKAHEAD": ("0", "1", "2"),
             "DGPP_DSV41_ATTENTION_LOOKAHEAD": ("0", "1", "2"),
             "DGPP_EXPERT_READY_WORKER": ("0", "1", "2"),

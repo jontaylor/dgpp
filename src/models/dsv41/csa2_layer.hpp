@@ -112,6 +112,7 @@ class Csa2Layer {
   // bit-identical on or off): the output projections wo_a / wo_b under the
   // selection and the attention. Null (the default) or a disabled
   // prefetcher: none.
+  void set_woa_weight_lead(bool on) { woa_weight_lead_ = on; }
   void set_prefetcher(WeightPrefetcher* p) { prefetch_ = p; }
   // The prefill walk's dense form (engine.prefill_dense; scale_gemm.hpp
   // prefill_tile): the fp8-weight tile GEMM (true) or the streaming decode
@@ -289,6 +290,7 @@ class Csa2Layer {
   bool prefill_tile_ = false;
   bool prefill_dense_tile_ = true;  // the configured form (set_prefill_dense_tile)
   bool prefill_window_flash_ = true;  // set_prefill_window_flash
+  bool woa_weight_lead_ = false;
   bool decode_window_flash_ = true;   // set_decode_window_flash
   cudaStream_t side_stream_ = nullptr;  // set_decode_side
   cudaEvent_t side_fork_ = nullptr;
