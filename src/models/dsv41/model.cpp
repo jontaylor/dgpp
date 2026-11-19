@@ -6,6 +6,8 @@
 #include "kernels/moe_fp4_pack.hpp"
 
 #include "kernels/dsv41_dspark.hpp"
+#include "kernels/mma_gemv.hpp"
+#include "kernels/mxfp8_gemm.hpp"
 #include "kernels/exl3_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 
@@ -34,6 +36,16 @@
 namespace dgpp {
 using session_detail::dev_alloc;
 using session_detail::pinned_alloc;
+
+namespace {
+int mx_draft_head_mode() {
+  const char* value = std::getenv("DGPP_DSV41_MX_DRAFT_HEAD");
+  if (!value || std::strcmp(value, "0") == 0) return 0;
+  if (std::strcmp(value, "1") == 0) return 1;
+  if (std::strcmp(value, "2") == 0) return 2;
+  throw std::invalid_argument("DGPP_DSV41_MX_DRAFT_HEAD must be 0, 1 or 2");
+}
+}  // namespace
 
 struct Dsv41Model::PagedGraphs {
   static constexpr int experts = 384, words = experts * 6;
@@ -647,6 +659,25 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     bf12_.log_summary(loader_.rank(),
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   }
+  if (mtp_ && mx_draft_head_mode()) {
+    if (!globals_.lm_head || loader_.residency() != Dsv41Residency::Resident ||
+        bf12_.released() || draft_head_settings().blocks || cfg_.hidden_size % 64)
+      throw std::invalid_argument("the MXFP8 draft head needs resident BF16 head rows and the draft screen off");
+    const int H = cfg_.hidden_size;
+    const size_t values = size_t(lm_vocab_count_) * H;
+    mx_draft_head_ = dev_alloc<uint8_t>(values + values / 32);
+    if (mx_draft_head_mode() == 2)
+      draft_block_max_ = dev_alloc<float>(size_t(max_requests_) * ((lm_vocab_count_ + 255) / 256));
+    // Each row has its own K32 scales. Bound grid.y for a full-vocabulary rank.
+    for (int row = 0; row < lm_vocab_count_; row += 16384) {
+      const size_t offset = size_t(row) * H;
+      launch_mxfp8_quantize_rows(globals_.lm_head + offset, H, std::min(16384, lm_vocab_count_ - row), H,
+                                 mx_draft_head_ + offset, mx_draft_head_ + values + offset / 32, stream_);
+    }
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    DGPP_LOG_INFO("rank {} MXFP8 draft head: {} bytes, near-maximum rescoring {}", rank_,
+                  values + values / 32, draft_block_max_ != nullptr);
+  }
   log_memory_ledger("dsv41: model ready");
   // The draft head's screen (engine.draft_head): from the served head, for
   // the decode drafts only; off (with a logged reason) when the setting or
@@ -756,6 +787,8 @@ Dsv41Model::~Dsv41Model() {
   cudaFree(blk_tok_);
   cudaFree(blk_req_);
   cudaFree(blk_spans_);
+  cudaFree(mx_draft_head_);
+  cudaFree(draft_block_max_);
   cudaFree(base_logits_);
   cudaFree(conf_);
   cudaFree(d_draft_pos_);
@@ -859,6 +892,10 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg
       size_t draft_pinned = 0;
       const size_t draft_dev = GlmMoeLayer::scratch_bytes(draft_cfg, max_tokens, rows, draft_slots, &draft_pinned);
       plan.add("dspark moe scratch (the draft stages' routed chain)", draft_dev, draft_pinned);
+      if (mx_draft_head_mode()) {
+        const size_t maxima = mx_draft_head_mode() == 2 ? R * ((V + 255) / 256) * sizeof(float) : 0;
+        plan.add("MXFP8 draft vocabulary head and rescore scratch", V * H + V * H / 32 + maxima);
+      }
       plan.add("draft head screen (2-bit rotated head copy, scratch)", DraftHead::plan_bytes(static_cast<int>(V), cfg.hidden_size, rows));
     }
   }
@@ -1293,14 +1330,18 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   const int score_rows = groups * draft_rows_scored_;
   launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, score_rows, stream_);
   csa2_rmsnorm_bf16(collapsed_, H, dl.norm, h_, H, score_rows, H, eps, stream_);
-  if (!(decode_row && draft_head_.logits(draft_head_matrix(), h_, static_cast<size_t>(H), score_rows, base_logits_,
+  if (mx_draft_head_) {
+    launch_mma_gemv_fp8e8m0_f32(h_, H, mx_draft_head_, mx_draft_head_ + size_t(lm_vocab_count_) * H,
+                                base_logits_, score_rows, lm_vocab_count_, H, lm_vocab_count_, 0, 5, stream_);
+  } else if (!(decode_row && draft_head_.logits(draft_head_matrix(), h_, static_cast<size_t>(H), score_rows, base_logits_,
                                          static_cast<size_t>(lm_vocab_count_), stream_)))
     head_logits(h_, score_rows, base_logits_, stream_);
   // ---- block row 0, biased by the Markov head of `next`, into the head rows ----
   const int rows_out = head_rows / groups;
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed, dl.markov_head,
                            cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, blk_tok_, block, groups, logits_,
-                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_);
+                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_, draft_block_max_);
+  if (draft_block_max_) rescore_draft_head(0, groups, rows_out);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, 0, H, dl.markov_embed, cfg_.dspark_markov_rank,
                             blk_tok_, block, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block,
@@ -1367,6 +1408,15 @@ bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows) {
   return true;
 }
 
+// Recompute close proposal logits from the source BF16 rows after the Markov bias.
+// The two-logit window is the V4 DSpark heuristic. The target retains its own head.
+void Dsv41Model::rescore_draft_head(int row, int groups, int rows_out) {
+  const int H = cfg_.hidden_size, block = cfg_.dspark_block_size;
+  dsv41_dspark_rescore(logits_, int64_t(rows_out) * lm_vocab_count_, rows_out, base_logits_,
+                       int64_t(block) * lm_vocab_count_, row, lm_vocab_count_, h_, int64_t(block) * H,
+                       H, globals_.lm_head, draft_block_max_, 2.0f, groups, stream_);
+}
+
 void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, int head_rows, int batch_requests) {
   const int H = cfg_.hidden_size;
   const int block = cfg_.dspark_block_size;
@@ -1377,7 +1427,8 @@ void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, i
   const int row = draft_row_++;
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, row, dl.markov_embed, dl.markov_head,
                            cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, tokens, 1, groups, logits_,
-                           lm_vocab_count_, 1, stream_);
+                           lm_vocab_count_, 1, stream_, draft_block_max_);
+  if (draft_block_max_) rescore_draft_head(row, groups, 1);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, row, H, dl.markov_embed, cfg_.dspark_markov_rank,
                             tokens, 1, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block + row,
@@ -1476,6 +1527,10 @@ void Dsv41Model::prefetch_head(const uint16_t* norm, bool draft, int rows, cudaE
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, 0, prefetch_.boundary_rate(), false, ready);  // the budget: engine.l2_prefetch_window_mib
   prefetch_bf16(norm, H * 2, rows);
+  if (draft && mx_draft_head_) {
+    prefetch_.add_isolated(mx_draft_head_, size_t(lm_vocab_count_) * H);
+    return;
+  }
   if (draft && draft_head_.enabled()) return;
   if (globals_.lm_head_x.tiles) {
     prefetch_exl3(globals_.lm_head_x);

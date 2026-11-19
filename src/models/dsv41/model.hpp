@@ -470,6 +470,9 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // head at construction under engine.draft_head; answers a decode draft's
   // head call with the masked row or declines (the exact head runs).
   DraftHead draft_head_;
+  uint8_t* mx_draft_head_ = nullptr;  // E4M3 codes followed by their E8M0 scales
+  float* draft_block_max_ = nullptr;
+  void rescore_draft_head(int row, int groups, int rows_out);
   HeadMatrix draft_head_matrix() const;
   bool dense_mma_ = true;  // the dense projections' and head's decode form (DGPP_DSV41_DENSE_GEMV=1: the GEMV chunks)
   void* gemm_ws_ = nullptr;

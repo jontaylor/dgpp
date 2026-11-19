@@ -481,6 +481,21 @@ match of at least `max(16, lookup_nstrong)` tokens, and enough following
 history and context capacity for all proposals. DGPP updates the draft
 attention rings, skips the neural proposal block for that round, and
 verifies the copied tokens with the usual target and tool grammar.
+
+Two optional DeepSeek V4.1 settings change different computations.
+
+- `DGPP_DSV41_MX_DRAFT_HEAD=1` builds an MXFP8 copy of each rank's vocabulary head
+  for DSpark proposals. Mode `2` also recomputes close candidates from resident BF16
+  weights after applying the Markov bias. Both modes can change proposal IDs and
+  acceptance. Target verification continues to use its configured vocabulary head.
+  Use with resident BF16 head rows and `draft_head: exact`. The copy takes one byte
+  per weight plus one scale byte per 32 weights.
+- `DGPP_DSV41_MX_WOB_DECODE=1` quantizes the input to the TP2 attention output
+  projection (`wo_b`) to MXFP8 for small decode batches using native MXFP8
+  `wo_a`. Mode `2` also encodes the quantization residual. It shares each weight
+  read across both terms. This setting changes target arithmetic and can change
+  the output. Both settings default to `0`.
+
 NVFP4 main weights use the existing main-only paged image;
 MXFP4 draft experts stay resident and their exact allocation is deducted from
 the same expert budget. Main-cache telemetry reports the remaining cache budget.
