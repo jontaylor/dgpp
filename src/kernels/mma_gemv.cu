@@ -287,7 +287,7 @@ __device__ __forceinline__ float scale_at(const uint8_t* __restrict__ row, int i
   return b ? __uint_as_float(b << 23) : __uint_as_float(0x00400000u);
 }
 
-template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT, bool kBf12 = false>
+template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT, bool kBf12 = false, bool kCompactA = false>
 __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __restrict__ act_in,
                                                             size_t act_stride,
                                                             const void* __restrict__ wv_in,
@@ -357,9 +357,13 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   using L = WarpLoads<kTiles, kFp8, kW, kBf12>;
   constexpr int kGroups = W::kK / F::kQuadSpan;  // lane runs per window
   extern __shared__ __align__(16) uint16_t sA_raw[];
-  uint16_t* sA[2] = {sA_raw, sA_raw + W::kBufBytes / 2};
+  // Only live epilogue rows need distinct A operands. For up to eight
+  // rows the second half of the MMA tile can reuse the first half's values.
+  static_assert(!kCompactA || kTiles == 1);
+  const size_t pane = kCompactA ? static_cast<size_t>(m) * W::kStride : W::kBufBytes / sizeof(uint16_t);
+  uint16_t* sA[2] = {sA_raw, sA_raw + pane};
   // The warp's weight ring (past the A windows): stage s at s * kWarpBytes, row b's slice at b * kRowBytes.
-  uint8_t* wring = reinterpret_cast<uint8_t*>(sA_raw) + W::kSmemBytes +
+  uint8_t* wring = reinterpret_cast<uint8_t*>(sA_raw + 2 * pane) +
                    static_cast<size_t>(warp) * L::kStages * L::kWarpBytes;
   const int nwin = (k + W::kK - 1) / W::kK;
   // Split-K (the decode forms at a small n, grid.y > 1): this block folds
@@ -419,8 +423,10 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   // loads, stage the NEXT window's activations, consume, one barrier.
   // Rows past m never change: zeroed once in both buffers, so a window's
   // staging touches only the live rows (a sixteenth of the stores at one row).
-  zero_rows<kTiles, kFp8, F::kLaneUnits, kW>(m, sA[0]);
-  zero_rows<kTiles, kFp8, F::kLaneUnits, kW>(m, sA[1]);
+  if constexpr (!kCompactA) {
+    zero_rows<kTiles, kFp8, F::kLaneUnits, kW>(m, sA[0]);
+    zero_rows<kTiles, kFp8, F::kLaneUnits, kW>(m, sA[1]);
+  }
   stage_a<kTiles, kFp8, F::kLaneUnits, kW>(act, act_stride, m, k, win0 * W::kK, sA[0], act2, limit);
   using P = Pre<kTiles, kFp8, kW>;
   const bool pipelined = L::kOn && P::kOn && act2 == nullptr;
@@ -526,8 +532,9 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
         constexpr int kUnitsPerVec = F::kPerVec / 8;  // 2 or 1
 #pragma unroll
         for (int tt = 0; tt < kTiles; ++tt) {
-          const uint16_t* row0 = sAc + static_cast<size_t>(tt * 16 + r) * W::kStride;
-          const uint16_t* row8 = row0 + static_cast<size_t>(8) * W::kStride;
+          const int arow = kCompactA ? min(r, m - 1) : tt * 16 + r;
+          const uint16_t* row0 = sAc + static_cast<size_t>(arow) * W::kStride;
+          const uint16_t* row8 = kCompactA ? row0 : row0 + static_cast<size_t>(8) * W::kStride;
 #pragma unroll
           for (int j = 0; j < kUnitsPerVec; ++j) {
             const int u = swz<F::kLaneUnits>(u0 + v * kUnitsPerVec + j) * 8;
@@ -664,6 +671,34 @@ int split_k_for(int n, int k, const void* ws, size_t ws_bytes) {
   return s;
 }
 
+// Pick one kernel and its dynamic shared footprint before graph capture.
+template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT>
+auto decode_entry(int rows, size_t& smem) {
+  using L = WarpLoads<kTiles, kFp8, kW>;
+  using W = Win<kTiles, kFp8>;
+  auto kernel = mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT>;
+  smem = L::kSmemBytes;
+  if constexpr (kTiles == 1 && kFp8 && std::is_same_v<OutT, uint16_t> && std::is_same_v<ScaleT, float>) {
+    static const bool compact = [] {
+      const char* option = std::getenv("DGPP_MMA_COMPACT_ACTIVATIONS");
+      return option && option[0] == '1';
+    }();
+    if (compact && rows <= 8) {
+      // At most 32 KiB of weights and two eight-row, 256-column panes.
+      // This fits the standard 48 KiB dynamic shared-memory allowance.
+      static_assert(L::kBlockBytes + 2 * 8 * W::kStride * sizeof(uint16_t) <= 48 * 1024);
+      smem = L::kBlockBytes + 2 * rows * W::kStride * sizeof(uint16_t);
+      return mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, true>;
+    }
+  }
+  static bool opted_in = false;
+  if (!opted_in) {
+    DGPP_CUDA_OK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, L::kSmemBytes));
+    opted_in = true;
+  }
+  return kernel;
+}
+
 // One decode form at one width: the shared-memory opt-in once per
 // instantiation (the A windows + the warp weight buffers exceed the default
 // budget at the wide widths).
@@ -671,26 +706,20 @@ template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT>
 void launch_decode_form(const uint16_t* a, size_t act_stride, const void* w, const ScaleT* scales, OutT* o,
                         int rows, int n, int k, size_t out_stride, int rs, int cs, cudaStream_t stream,
                         void* ws, size_t ws_bytes, const uint16_t* act2 = nullptr, float limit = 0.f) {
-  using L = WarpLoads<kTiles, kFp8, kW>;
-  static bool opted_in = false;
-  if (!opted_in) {
-    DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      static_cast<int>(L::kSmemBytes)));
-    opted_in = true;
-  }
+  size_t smem;
+  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, smem);
   const int blocks = (n + kW * kRowsPerWarp - 1) / (kW * kRowsPerWarp);
   const int splits = split_k_for(n, k, ws, ws_bytes);
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
-    mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks, splits), kW * 32, L::kSmemBytes, stream>>>(
+    kernel<<<dim3(blocks, splits), kW * 32, smem, stream>>>(
         a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, part, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
     const int total = rows * n;
     mma_gemv_split_reduce_kernel<OutT><<<(total + 255) / 256, 256, 0, stream>>>(part, splits, rows, n, o,
                                                                                  out_stride);
     return;
   }
-  mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks), kW * 32, L::kSmemBytes, stream>>>(
+  kernel<<<dim3(blocks), kW * 32, smem, stream>>>(
       a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr, act2, limit, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr);
 }
 // The bf12 form's launch (two warps a block; the unsplit chain — the
@@ -763,27 +792,21 @@ void launch_decode_form_pair(const uint16_t* a0, const void* w0, const ScaleT* s
                              const uint16_t* a1, const void* w1, const ScaleT* s1, OutT* o1, int n1, size_t stride1,
                              size_t act_stride, int rows, int k, int rs, int cs, cudaStream_t stream, void* ws,
                              size_t ws_bytes) {
-  using L = WarpLoads<kTiles, kFp8, kW>;
-  static bool opted_in = false;
-  if (!opted_in) {
-    DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      static_cast<int>(L::kSmemBytes)));
-    opted_in = true;
-  }
+  size_t smem;
+  auto kernel = decode_entry<kTiles, kFp8, kW, OutT, ScaleT>(rows, smem);
   const int per_block = kW * kRowsPerWarp;
   const int blocks0 = (n0 + per_block - 1) / per_block, blocks1 = (n1 + per_block - 1) / per_block;
   const int splits = split_k_for(n0, k, ws, ws_bytes);
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
-    mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks0 + blocks1, splits), kW * 32, L::kSmemBytes, stream>>>(
+    kernel<<<dim3(blocks0 + blocks1, splits), kW * 32, smem, stream>>>(
         a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, part, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr);
     const int total = rows * (n0 + n1);
     mma_gemv_split_reduce_pair_kernel<OutT><<<(total + 255) / 256, 256, 0, stream>>>(part, splits, rows, n0, o0, stride0,
                                                                                       n1, o1, stride1);
     return;
   }
-  mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT><<<dim3(blocks0 + blocks1), kW * 32, L::kSmemBytes, stream>>>(
+  kernel<<<dim3(blocks0 + blocks1), kW * 32, smem, stream>>>(
       a0, act_stride, w0, s0, o0, rows, n0, k, stride0, rs, cs, nullptr, nullptr, 0.f, a1, w1, s1, o1, n1, stride1, blocks0, nullptr, nullptr, nullptr);
 }
 

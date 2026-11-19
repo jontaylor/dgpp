@@ -383,3 +383,21 @@ The comparison linked the low-retention b12x export from `37de8533`, SHA-256
 `fb50bffe2dc673c30f13670265749050a78d29303db3bb0c31a63047731a0e3c`.
 These are single-request diagnostic traces. Uninstrumented serving runs
 determine the deployment choice.
+
+### Compact staging for the four-row dense projections
+
+The grid-scaled FP8 projections load only the live BF16 activation rows
+from global memory. The standard kernel reserves two shared-memory panes
+of 16 rows each and initializes the unused entries once per block. With
+`DGPP_MMA_COMPACT_ACTIVATIONS=1`, launches with one through eight rows
+reserve only the live rows in each pane. The tensor-core instruction still
+computes a 16-row tile. Its discarded outputs reuse valid activation
+fragments. Weight traffic, split-K boundaries and the stored rows' MMA
+accumulation order stay the same.
+
+In the four-row verification case this frees 12,672 bytes of shared memory
+per block. The two-Spark control/candidate/candidate/control comparison
+passed the row-invariance and projection tests and preserved serving output
+and acceptance. Compact staging had mixed projection timings and did not
+improve warm serving throughput across the four starts. The deployment
+continues to use the standard staging.
