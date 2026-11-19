@@ -609,6 +609,17 @@ DGPP_TEST(dsv41_model_dspark_draft_rows_and_chain_at_world_1) {
   const auto dc1 = model.session_draft_chain(0, argmax(d1.logits.data(), size_t(V)), 0, true, false);
   for (const float v : dc1.logits) require(std::isfinite(v), "second chain finite");
   model.session_close(0);
+
+  // After verifying the same proposed tokens and accepting the same prefix,
+  // the next neural draft must see exactly the same DSpark rings.
+  (void)model.session_prefill(0, prompt);
+  model.session_advance_draft(0, {next});
+  const auto copied = model.session_verify(0, fed);
+  require(copied.logits == ver.logits, "history proposals preserve target logits");
+  if (accepted < B + 1) model.session_rollback(0, accepted);
+  const auto resumed = model.session_draft(0, draft_tokens);
+  require(resumed.logits == d1.logits, "resumed neural draft sees the same accepted history");
+  model.session_close(0);
 }
 
 int main() { return dgpp::test::run_all(); }

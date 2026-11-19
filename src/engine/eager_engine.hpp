@@ -869,7 +869,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
         feeds.push_back({pending_[req]});
         if (!eligible[i]) continue;
         auto& drafts = mtp_drafts_[req];
-        if (lookup_min_) {
+        if (lookup_min_ && drafts.size() <= static_cast<size_t>(mtp_depth_)) {
           auto& slot = state_[req];
           const int width = static_cast<int>(std::min<int64_t>(
               drafts.size() + lookup_tail_, model_->max_context() - model_->session_position(req) - 1));
@@ -1021,6 +1021,23 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   void mtp_redraft(int req, const std::vector<int64_t>& rows) {
     if constexpr (kEagerMtp) {
       auto& drafts = mtp_drafts_[req];
+      if constexpr (requires { model_->session_advance_draft(req, rows); }) {
+        static const bool copy_block = [] {
+          const char* value = std::getenv("DGPP_DSV41_LOOKUP_PROPOSALS");
+          return value && value[0] == '1';
+        }();
+        const int width = mtp_depth_ + lookup_tail_;
+        if (copy_block && lookup_tail_ && model_->max_context() - model_->session_position(req) > width) {
+          auto& slot = state_[req];
+          const int threshold = std::max(16, lookup_strong_);
+          auto copy = slot.lookup.propose(slot.context, width, threshold, threshold);
+          if (copy.drafts.size() == static_cast<size_t>(width)) {
+            model_->session_advance_draft(req, rows);
+            drafts = std::move(copy.drafts);
+            return;
+          }
+        }
+      }
       std::unique_ptr<text::GrammarState> grammar;
       if (state_[req].grammar) grammar = std::make_unique<text::GrammarState>(*state_[req].grammar);
       const auto pick_draft = [&](const DecodeOutputs& out) {

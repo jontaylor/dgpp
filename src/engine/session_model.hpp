@@ -510,6 +510,7 @@ class SessionModel : public PrefillReporting {
   // The draft block's rows.
   void mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens, int hidden_row = 0);
   void mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload);
+  void execute_draft_rows(int req, const std::vector<int64_t>& tokens, int head_rows);
   // The draft block's input window per slot ([R][max_decode_rows_][draft_width]).
   uint16_t* mtp_window(int req) const {
     return mtp_window_ +
@@ -1971,17 +1972,22 @@ void SessionModel<D>::mtp_decode_host_prep(int req, const std::vector<int64_t>& 
 }
 
 template <class D>
-typename SessionModel<D>::Outputs SessionModel<D>::session_draft(int req, const std::vector<int64_t>& tokens) {
+void SessionModel<D>::execute_draft_rows(int req, const std::vector<int64_t>& tokens, int head_rows) {
   step_tokens_ = d_tokens_;
   mtp_decode_host_prep(req, tokens, /*upload=*/true);
   const int64_t q = mtp_pos_[static_cast<size_t>(req)];
   if constexpr (requires { derived().mtp_select_block(0); }) derived().mtp_select_block(0);
   derived().mtp_run_rows(req, d_tokens_, q, static_cast<int>(tokens.size()), /*decode_row=*/true, /*capture=*/false,
-                         /*head_rows=*/1, 0);
+                         head_rows, 0);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   mtp_pos_[static_cast<size_t>(req)] = q + static_cast<int64_t>(tokens.size());
   push_mtp_position(req);
   draft_last_row_ = static_cast<int>(tokens.size()) - 1;  // the chain's first hidden row
+}
+
+template <class D>
+typename SessionModel<D>::Outputs SessionModel<D>::session_draft(int req, const std::vector<int64_t>& tokens) {
+  execute_draft_rows(req, tokens, 1);
   Outputs out;
   out.lm_vocab_begin = lm_vocab_begin_;
   out.lm_vocab_count = lm_vocab_count_;

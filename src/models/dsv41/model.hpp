@@ -256,6 +256,12 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   int confidence_rows() const { return cfg_.dspark_block_size; }
   const float* device_confidence() const { return conf_; }
   // Eager batch: confidence rows are indexed by compact batch position.
+  // Append verified rows to the DSpark attention rings when history supplies
+  // the next proposals. The following neural draft starts at the usual cursor.
+  void session_advance_draft(int req, const std::vector<int64_t>& tokens) {
+    execute_draft_rows(req, tokens, 0);
+    draft_row_ = 0;
+  }
   Outputs session_draft_batch(const std::vector<int>& reqs,
                               const std::vector<std::vector<int64_t>>& tokens);
   Outputs session_draft_chain_batch(const std::vector<int64_t>& tokens);
