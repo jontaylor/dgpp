@@ -308,7 +308,7 @@ __device__ __forceinline__ float scale_at(const uint8_t* __restrict__ row, int i
 }
 
 template <int kTiles, bool kFp8, int kW, typename OutT, typename ScaleT, bool kBf12 = false,
-          bool kCompactA = false, bool kWarpScales = false>
+          bool kCompactA = false, bool kWarpScales = false, bool kWeightLookahead = false>
 __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __restrict__ act_in,
                                                             size_t act_stride,
                                                             const void* __restrict__ wv_in,
@@ -486,6 +486,18 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
       // previous window's barrier), then wait for this window's group.
       const int win = base / W::kK;
       issue(win + L::kStages - 1);
+      if constexpr (kWeightLookahead) {
+        // One warp covers all sixteen 128-byte lines of its next eight-row
+        // slice. Request those lines one window before cp.async consumes them.
+        static_assert(kFp8 && W::kK == 256 && kRowsPerWarp == 8);
+        const int future = win + L::kStages;
+        const int wrow = n0 + lane / 2;
+        const int col = future * W::kK + (lane % 2) * 128;
+        if (lane < 16 && future < win1 && wrow < n && col < k) {
+          const auto* line = w8 + static_cast<size_t>(wrow) * k + col;
+          asm volatile("prefetch.global.L2 [%0];" :: "l"(line));
+        }
+      }
       cp_async_wait<L::kStages - 1>();
       __syncwarp();  // every lane's copies of this window visible to the warp
       if (pipelined) {
@@ -729,6 +741,21 @@ auto decode_entry(int rows, int rs, int cs, size_t& smem) {
       const char* value = std::getenv("DGPP_MMA_WARP_SCALES");
       return value && value[0] == '1';
     }();
+    static const bool lookahead = [] {
+      const char* value = std::getenv("DGPP_MMA_WEIGHT_LOOKAHEAD");
+      return value && value[0] == '1';
+    }();
+    if (lookahead && rows <= 8 && rs == 5 && cs == 5) {
+      static const auto selected = warp_scales
+          ? mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, false, true, true>
+          : mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, false, false, true>;
+      static const bool opted_in = [] {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(selected, cudaFuncAttributeMaxDynamicSharedMemorySize, L::kSmemBytes));
+        return true;
+      }();
+      (void)opted_in;
+      return selected;
+    }
     if (warp_scales && rs == 5 && cs == 5 && rows <= 8) {
       auto selected = mma_gemv_kernel<kTiles, kFp8, kW, OutT, ScaleT, false, false, true>;
       static const bool opted_in = [selected] {
