@@ -472,6 +472,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   DraftHead draft_head_;
   uint8_t* mx_draft_head_ = nullptr;  // E4M3 codes followed by their E8M0 scales
   float* draft_block_max_ = nullptr;
+  uint16_t* packed_markov_head_ = nullptr;
   void rescore_draft_head(int row, int groups, int rows_out);
   HeadMatrix draft_head_matrix() const;
   bool dense_mma_ = true;  // the dense projections' and head's decode form (DGPP_DSV41_DENSE_GEMV=1: the GEMV chunks)

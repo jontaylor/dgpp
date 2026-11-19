@@ -145,11 +145,12 @@ template <int kUnitsPerLane>  // 16-byte units a lane loads per row: 1 (rank <= 
 __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kernel(
     const float* __restrict__ base, int64_t base_group_stride, int block_row, const uint16_t* __restrict__ markov_embed,
     const uint16_t* __restrict__ markov_head, int rank, int vocab_begin, int count, const int64_t* __restrict__ tok,
-    int tok_stride, float* __restrict__ out, int64_t out_group_stride, int rows_out, float* __restrict__ block_max) {
+    int tok_stride, float* __restrict__ out, int64_t out_group_stride, int rows_out, float* __restrict__ block_max, bool reverse) {
   dgpp_pdl_wait();
   constexpr int kBatchRows = 32 / kUnitsPerLane;
   constexpr int kBatches = kMarkovRowsPerWarp / kBatchRows;
   const int g = blockIdx.y;
+  const int tile = reverse ? gridDim.x - 1 - blockIdx.x : blockIdx.x;
   __shared__ float e[kMaxRank];
   __shared__ __align__(16) uint8_t stage[kMarkovWarps][kMarkovStageBytes];
   __shared__ float s_max[kMarkovWarps];
@@ -159,7 +160,7 @@ __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kerne
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int units = rank / 8;                 // 16-byte units per row
   const int row_stride = rank * 2 + 16;       // the staged row's pitch
-  const int vbase = blockIdx.x * 256 + warp * kMarkovRowsPerWarp;
+  const int vbase = tile * 256 + warp * kMarkovRowsPerWarp;
   const uint8_t* hb = reinterpret_cast<const uint8_t*>(markov_head + static_cast<size_t>(vocab_begin) * rank);
   uint4 w[kBatchRows][kUnitsPerLane];
   auto load = [&](int b) {
@@ -223,7 +224,72 @@ __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kerne
       float bm = s_max[0];
 #pragma unroll
       for (int ww = 1; ww < kMarkovWarps; ++ww) bm = fmaxf(bm, s_max[ww]);
-      block_max[static_cast<size_t>(g) * gridDim.x + blockIdx.x] = bm;
+      block_max[static_cast<size_t>(g) * gridDim.x + tile] = bm;
+    }
+  }
+}
+
+__global__ void pack_markov_kernel(const uint4* input, uint4* packed, int count, int units) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int tile = index / (32 * units);
+  if (tile >= (count + 31) / 32) return;
+  const int row = tile * 32 + index % 32;
+  const int unit = (index / 32) % units;
+  packed[index] = row < count ? input[size_t(row) * units + unit] : make_uint4(0, 0, 0, 0);
+}
+
+template <int FixedUnits>
+__global__ void __launch_bounds__(256) markov_bias_packed_kernel(
+    const float* base, int64_t base_stride, int block_row, const uint16_t* embed, const uint4* packed,
+    int rank, int count, const int64_t* tokens, int token_stride, float* out, int64_t out_stride,
+    int rows_out, float* block_max, bool reverse) {
+  dgpp_pdl_wait();
+  __shared__ float e[kMaxRank];
+  __shared__ float maxima[8];
+  const int units = FixedUnits ? FixedUnits : rank / 8;
+  const int group = blockIdx.y;
+  const int tile = reverse ? gridDim.x - 1 - blockIdx.x : blockIdx.x;
+  const int tid = threadIdx.x, v = tile * 256 + tid;
+  const int64_t token = tokens[size_t(group) * token_stride];
+  for (int r = tid; r < rank; r += 256)
+    e[r] = token < 0 ? 0.f : bf16_bits_to_float(embed[size_t(token) * rank + r]);
+  __syncthreads();
+  float val = -INFINITY;
+  if (v < count) {
+    float acc = 0.f;
+    if (token >= 0) {
+      const uint4* row = packed + size_t(v / 32) * 32 * units + v % 32;
+      for (int first = 0; first < units; first += 4) {
+        uint4 w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          if (first + i < units) w[i] = row[(first + i) * 32];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          if (first + i >= units) break;
+          const uint32_t pair[] = {w[i].x, w[i].y, w[i].z, w[i].w};
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int r = (first + i) * 8 + j * 2;
+            acc = fmaf(e[r], bf16_bits_to_float(static_cast<uint16_t>(pair[j])), acc);
+            acc = fmaf(e[r + 1], bf16_bits_to_float(static_cast<uint16_t>(pair[j] >> 16)), acc);
+          }
+        }
+      }
+    }
+    val = base[size_t(group) * base_stride + size_t(block_row) * count + v] + acc;
+    for (int r = 0; r < rows_out; ++r) out[size_t(group) * out_stride + size_t(r) * count + v] = val;
+  }
+  if (block_max) {
+    for (int offset = 16; offset; offset >>= 1)
+      val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, offset));
+    if (!(tid % 32)) maxima[tid / 32] = val;
+    __syncthreads();
+    if (!tid) {
+      float m = maxima[0];
+#pragma unroll
+      for (int w = 1; w < 8; ++w) m = fmaxf(m, maxima[w]);
+      block_max[size_t(group) * gridDim.x + tile] = m;
     }
   }
 }
@@ -366,10 +432,25 @@ void dsv41_dspark_block_rows(const int64_t* step_pos, const int64_t* tokens, con
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+size_t dsv41_markov_packed_bytes(int count, int rank) {
+  if (count < 1 || rank < 8 || rank > kMaxRank || rank % 8)
+    throw std::invalid_argument("packed Markov head requires a positive slice and a multiple of eight coefficients");
+  return ((size_t(count) + 31) / 32) * 32 * rank * sizeof(uint16_t);
+}
+
+void dsv41_pack_markov_head(const uint16_t* local_head, uint16_t* packed, int count, int rank, cudaStream_t stream) {
+  const size_t vectors = dsv41_markov_packed_bytes(count, rank) / sizeof(uint4);
+  if (!local_head || !packed || (reinterpret_cast<uintptr_t>(local_head) | reinterpret_cast<uintptr_t>(packed)) % 16)
+    throw std::invalid_argument("packed Markov head requires aligned weights");
+  pack_markov_kernel<<<(vectors + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const uint4*>(local_head), reinterpret_cast<uint4*>(packed), count, rank / 8);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int block_row, const uint16_t* markov_embed,
                               const uint16_t* markov_head, int rank, int vocab_begin, int count, const int64_t* tok,
                               int tok_stride, int groups, float* out, int64_t out_group_stride, int rows_out,
-                              cudaStream_t stream, float* block_max) {
+                              cudaStream_t stream, float* block_max, DsparkMarkovOrder order) {
   if (!base || !markov_embed || !markov_head || !tok || !out) throw std::invalid_argument("dsv41_dspark_markov_bias: null buffer");
   if (rank <= 0 || rank > kMaxRank || count <= 0 || groups <= 0 || rows_out <= 0 || block_row < 0 || tok_stride <= 0)
     throw std::invalid_argument("dsv41_dspark_markov_bias: shape");
@@ -378,14 +459,26 @@ void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int 
   // slice 16-byte aligned); the per-thread kernel otherwise.
   const bool aligned = (rank % 8) == 0 && (reinterpret_cast<uintptr_t>(markov_head) & 15u) == 0 &&
                        ((static_cast<size_t>(vocab_begin) * rank * 2) % 16) == 0;
-  if (aligned && rank <= 256) {
+  const bool reverse = (order == DsparkMarkovOrder::ReverseOdd || order == DsparkMarkovOrder::PackedReverseOdd) && block_row % 2;
+  if (order == DsparkMarkovOrder::Packed || order == DsparkMarkovOrder::PackedReverseOdd) {
+    if (rank % 8 || (reinterpret_cast<uintptr_t>(markov_head) & 15))
+      throw std::invalid_argument("misaligned packed Markov head");
+    auto launch = [&]<int Units>() {
+      markov_bias_packed_kernel<Units><<<grid, 256, 0, stream>>>(base, base_group_stride, block_row, markov_embed,
+          reinterpret_cast<const uint4*>(markov_head), rank, count, tok, tok_stride, out, out_group_stride,
+          rows_out, block_max, reverse);
+    };
+    if (rank == 256) launch.template operator()<32>();
+    else if (rank == 128) launch.template operator()<16>();
+    else launch.template operator()<0>();
+  } else if (aligned && rank <= 256) {
     markov_bias_coalesced_kernel<1><<<grid, kMarkovWarps * 32, 0, stream>>>(
         base, base_group_stride, block_row, markov_embed, markov_head, rank, vocab_begin, count, tok, tok_stride, out,
-        out_group_stride, rows_out, block_max);
+        out_group_stride, rows_out, block_max, reverse);
   } else if (aligned && rank <= 512) {
     markov_bias_coalesced_kernel<2><<<grid, kMarkovWarps * 32, 0, stream>>>(
         base, base_group_stride, block_row, markov_embed, markov_head, rank, vocab_begin, count, tok, tok_stride, out,
-        out_group_stride, rows_out, block_max);
+        out_group_stride, rows_out, block_max, reverse);
   } else {
     markov_bias_kernel<<<grid, 256, 0, stream>>>(base, base_group_stride, block_row, markov_embed, markov_head, rank,
                                                  vocab_begin, count, tok, tok_stride, out, out_group_stride, rows_out,

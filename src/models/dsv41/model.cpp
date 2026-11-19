@@ -45,6 +45,20 @@ int mx_draft_head_mode() {
   if (std::strcmp(value, "2") == 0) return 2;
   throw std::invalid_argument("DGPP_DSV41_MX_DRAFT_HEAD must be 0, 1 or 2");
 }
+DsparkMarkovOrder markov_order() {
+  static const auto order = [] {
+    const char* value = std::getenv("DGPP_DSV41_MARKOV_LAYOUT");
+    if (!value || std::strcmp(value, "0") == 0) return DsparkMarkovOrder::RowMajor;
+    if (std::strcmp(value, "1") == 0) return DsparkMarkovOrder::ReverseOdd;
+    if (std::strcmp(value, "2") == 0) return DsparkMarkovOrder::Packed;
+    if (std::strcmp(value, "3") == 0) return DsparkMarkovOrder::PackedReverseOdd;
+    throw std::invalid_argument("DGPP_DSV41_MARKOV_LAYOUT must be 0, 1, 2 or 3");
+  }();
+  return order;
+}
+bool pack_markov() {
+  return markov_order() == DsparkMarkovOrder::Packed || markov_order() == DsparkMarkovOrder::PackedReverseOdd;
+}
 }  // namespace
 
 struct Dsv41Model::PagedGraphs {
@@ -659,6 +673,17 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     bf12_.log_summary(loader_.rank(),
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   }
+  if (mtp_ && pack_markov()) {
+    const int rank = cfg_.dspark_markov_rank;
+    const auto& last = draft_stage(cfg_.num_nextn_predict_layers - 1);
+    if (!last.markov_head) throw std::runtime_error("DSpark Markov head is unbound");
+    const size_t bytes = dsv41_markov_packed_bytes(lm_vocab_count_, rank);
+    packed_markov_head_ = dev_alloc<uint16_t>(bytes / sizeof(uint16_t));
+    dsv41_pack_markov_head(last.markov_head + size_t(lm_vocab_begin_) * rank, packed_markov_head_,
+                          lm_vocab_count_, rank, stream_);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    DGPP_LOG_INFO("rank {} packed DSpark Markov head: {} bytes, {} rows, {} coefficients", rank_, bytes, lm_vocab_count_, rank);
+  }
   if (mtp_ && mx_draft_head_mode()) {
     if (!globals_.lm_head || loader_.residency() != Dsv41Residency::Resident ||
         bf12_.released() || draft_head_settings().blocks || cfg_.hidden_size % 64)
@@ -789,6 +814,7 @@ Dsv41Model::~Dsv41Model() {
   cudaFree(blk_spans_);
   cudaFree(mx_draft_head_);
   cudaFree(draft_block_max_);
+  cudaFree(packed_markov_head_);
   cudaFree(base_logits_);
   cudaFree(conf_);
   cudaFree(d_draft_pos_);
@@ -892,6 +918,8 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg
       size_t draft_pinned = 0;
       const size_t draft_dev = GlmMoeLayer::scratch_bytes(draft_cfg, max_tokens, rows, draft_slots, &draft_pinned);
       plan.add("dspark moe scratch (the draft stages' routed chain)", draft_dev, draft_pinned);
+      if (pack_markov())
+        plan.add("packed DSpark Markov head", dsv41_markov_packed_bytes(static_cast<int>(V), cfg.dspark_markov_rank));
       if (mx_draft_head_mode()) {
         const size_t maxima = mx_draft_head_mode() == 2 ? R * ((V + 255) / 256) * sizeof(float) : 0;
         plan.add("MXFP8 draft vocabulary head and rescore scratch", V * H + V * H / 32 + maxima);
@@ -1338,9 +1366,10 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
     head_logits(h_, score_rows, base_logits_, stream_);
   // ---- block row 0, biased by the Markov head of `next`, into the head rows ----
   const int rows_out = head_rows / groups;
-  dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed, dl.markov_head,
-                           cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, blk_tok_, block, groups, logits_,
-                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_, draft_block_max_);
+  dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed,
+                           packed_markov_head_ ? packed_markov_head_ : dl.markov_head, cfg_.dspark_markov_rank,
+                           lm_vocab_begin_, lm_vocab_count_, blk_tok_, block, groups, logits_,
+                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_, draft_block_max_, markov_order());
   if (draft_block_max_) rescore_draft_head(0, groups, rows_out);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, 0, H, dl.markov_embed, cfg_.dspark_markov_rank,
@@ -1425,9 +1454,10 @@ void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, i
   if (head_rows != groups) throw std::invalid_argument("mtp_run_rows: a chain call heads one row per request");
   const Dsv41DraftResident& dl = draft_stage(cfg_.num_nextn_predict_layers - 1);
   const int row = draft_row_++;
-  dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, row, dl.markov_embed, dl.markov_head,
-                           cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, tokens, 1, groups, logits_,
-                           lm_vocab_count_, 1, stream_, draft_block_max_);
+  dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, row, dl.markov_embed,
+                           packed_markov_head_ ? packed_markov_head_ : dl.markov_head, cfg_.dspark_markov_rank,
+                           lm_vocab_begin_, lm_vocab_count_, tokens, 1, groups, logits_,
+                           lm_vocab_count_, 1, stream_, draft_block_max_, markov_order());
   if (draft_block_max_) rescore_draft_head(row, groups, 1);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, row, H, dl.markov_embed, cfg_.dspark_markov_rank,

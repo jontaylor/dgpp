@@ -24,7 +24,7 @@ namespace {
 
 void require(bool c, const std::string& w) { if (!c) throw std::runtime_error(w); }
 
-void check(int rank, int count, int vocab_begin, int vocab, int groups, int rows_out) {
+void check(int rank, int count, int vocab_begin, int vocab, int groups, int rows_out, dgpp::DsparkMarkovOrder order = dgpp::DsparkMarkovOrder::RowMajor) {
   std::mt19937 rng(static_cast<unsigned>(rank * 7 + count));
   std::normal_distribution<float> nd(0.f, 0.05f);
   std::vector<uint16_t> embed(static_cast<size_t>(vocab) * rank), head(static_cast<size_t>(vocab) * rank);
@@ -35,7 +35,7 @@ void check(int rank, int count, int vocab_begin, int vocab, int groups, int rows
   for (auto& x : base) x = nd(rng) * 100.f;
   std::vector<int64_t> tok(static_cast<size_t>(groups));
   for (int g = 0; g < groups; ++g)
-    tok[static_cast<size_t>(g)] = g == groups - 1 ? -1 : static_cast<int64_t>(rng() % static_cast<unsigned>(vocab));
+    tok[static_cast<size_t>(g)] = groups > 1 && g == groups - 1 ? -1 : static_cast<int64_t>(rng() % static_cast<unsigned>(vocab));
   uint16_t* de; uint16_t* dh; float* dbase; int64_t* dtok; float* dout; float* dmax;
   DGPP_CUDA_OK(cudaMalloc(&de, embed.size() * 2)); DGPP_CUDA_OK(cudaMemcpy(de, embed.data(), embed.size() * 2, cudaMemcpyHostToDevice));
   DGPP_CUDA_OK(cudaMalloc(&dh, head.size() * 2)); DGPP_CUDA_OK(cudaMemcpy(dh, head.data(), head.size() * 2, cudaMemcpyHostToDevice));
@@ -45,8 +45,13 @@ void check(int rank, int count, int vocab_begin, int vocab, int groups, int rows
   DGPP_CUDA_OK(cudaMalloc(&dout, out_n * 4)); DGPP_CUDA_OK(cudaMemset(dout, 0x7F, out_n * 4));
   const int blocks = (count + 255) / 256;
   DGPP_CUDA_OK(cudaMalloc(&dmax, static_cast<size_t>(groups) * blocks * 4));
-  dgpp::dsv41_dspark_markov_bias(dbase, static_cast<int64_t>(block) * count, block_row, de, dh, rank, vocab_begin, count, dtok, 1,
-                                 groups, dout, static_cast<int64_t>(rows_out) * count, rows_out, nullptr, dmax);
+  uint16_t* packed = nullptr;
+  if (order == dgpp::DsparkMarkovOrder::Packed || order == dgpp::DsparkMarkovOrder::PackedReverseOdd) {
+    DGPP_CUDA_OK(cudaMalloc(&packed, dgpp::dsv41_markov_packed_bytes(count, rank)));
+    dgpp::dsv41_pack_markov_head(dh + size_t(vocab_begin) * rank, packed, count, rank, nullptr);
+  }
+  dgpp::dsv41_dspark_markov_bias(dbase, static_cast<int64_t>(block) * count, block_row, de, packed ? packed : dh, rank, vocab_begin, count, dtok, 1,
+                                 groups, dout, static_cast<int64_t>(rows_out) * count, rows_out, nullptr, dmax, order);
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   std::vector<float> got(out_n), gmax(static_cast<size_t>(groups) * blocks);
   DGPP_CUDA_OK(cudaMemcpy(got.data(), dout, out_n * 4, cudaMemcpyDeviceToHost));
@@ -71,12 +76,21 @@ void check(int rank, int count, int vocab_begin, int vocab, int groups, int rows
     for (int x = 0; x < blocks; ++x)
       require(gmax[static_cast<size_t>(g) * blocks + x] == bmax[static_cast<size_t>(x)], "block maximum differs at block " + std::to_string(x));
   }
+  cudaFree(packed);
   cudaFree(de); cudaFree(dh); cudaFree(dbase); cudaFree(dtok); cudaFree(dout); cudaFree(dmax);
 }
 
 DGPP_TEST(markov_bias_rank_256_coalesced_is_the_host_chain) { check(256, 32320, 32320, 64640, 2, 3); }
 DGPP_TEST(markov_bias_rank_64_short_slice) { check(64, 1000, 8, 2000, 3, 1); }
 DGPP_TEST(markov_bias_rank_512_two_units_a_lane) { check(512, 700, 0, 700, 1, 2); }
+DGPP_TEST(markov_bias_alternate_traversal_and_packing_preserve_logits_and_maxima) {
+  for (auto order : {dgpp::DsparkMarkovOrder::ReverseOdd, dgpp::DsparkMarkovOrder::Packed,
+                     dgpp::DsparkMarkovOrder::PackedReverseOdd}) {
+    check(256, 997, 5, 1100, 2, 3, order);
+    check(128, 513, 0, 521, 1, 1, order);
+    check(72, 71, 7, 80, 3, 2, order);
+  }
+}
 DGPP_TEST(markov_bias_rank_252_per_thread_form) { check(252, 600, 100, 800, 2, 1); }
 
 }  // namespace

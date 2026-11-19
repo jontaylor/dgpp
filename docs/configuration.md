@@ -490,6 +490,13 @@ draft rings directly. A shorter literal can extend the end of a neural
 proposal. The verifier still selects the token at each position because
 several vocabulary tokens can encode the same text.
 
+The DSpark Markov projection uses resident BF16 weights.
+`DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
+chain positions in the coalesced reader. Mode `2` prepares a rank-local copy
+with eight coefficients from each of 32 vocabulary entries adjacent in memory.
+Mode `3` adds alternating traversal to that layout. These modes keep the
+coefficient order of every FP32 dot product. The default is `0`.
+
 Two optional DeepSeek V4.1 settings change different computations.
 
 - `DGPP_DSV41_MX_DRAFT_HEAD=1` builds an MXFP8 copy of each rank's vocabulary head

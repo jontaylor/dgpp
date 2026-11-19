@@ -30,6 +30,13 @@ void dsv41_dspark_block_rows(const int64_t* step_pos, const int64_t* tokens, con
                              int rows_per_group, int block, int64_t noise_id, int64_t* pos_out, int64_t* tok_out,
                              int32_t* req_out, int32_t* spans_out, cudaStream_t stream);
 
+enum class DsparkMarkovOrder { RowMajor, ReverseOdd, Packed, PackedReverseOdd };
+
+// Rank-local BF16 slice as [ceil(count/32), rank/8, 32, 8]. Each lane can
+// read eight consecutive coefficients and its warp reads adjacent vectors.
+size_t dsv41_markov_packed_bytes(int count, int rank);
+void dsv41_pack_markov_head(const uint16_t* local_head, uint16_t* packed, int count, int rank, cudaStream_t stream);
+
 // The Markov-biased head row: for each group g and each j in [0, rows_out),
 //   out[g * out_group_stride + j * count + v] = base[g * base_group_stride + block_row * count + v]
 //                                             + sum_r embed[tok_g][r] * head[vocab_begin + v][r]
@@ -43,7 +50,8 @@ void dsv41_dspark_block_rows(const int64_t* step_pos, const int64_t* tokens, con
 void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int block_row, const uint16_t* markov_embed,
                               const uint16_t* markov_head, int rank, int vocab_begin, int count, const int64_t* tok,
                               int tok_stride, int groups, float* out, int64_t out_group_stride, int rows_out,
-                              cudaStream_t stream, float* block_max = nullptr);
+                              cudaStream_t stream, float* block_max = nullptr,
+                              DsparkMarkovOrder order = DsparkMarkovOrder::RowMajor);
 
 // The screened draft head's exact pass (2026-10-02, DeepSeek-V4-Flash). The
 // draft rows' base logits come from a block-FP8 copy of the lm head (half

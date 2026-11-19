@@ -11,6 +11,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/csa2.hpp"
+#include "kernels/dsv41_dspark.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/mxfp8_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -351,6 +352,58 @@ void woa_handoff(int l2, cudaStream_t stream, int rows, int main_splits, int win
   DGPP_CUDA_OK(cudaEventDestroy(start));
   DGPP_CUDA_OK(cudaEventDestroy(end));
 }
+// Read one rank-local head three times, as in fixed-depth-three DSpark.
+// Rotate whole heads between chains so the first row starts beyond L2.
+void markov_chain(int vocab, int rank, size_t l2, cudaStream_t stream) {
+  const size_t weights = size_t(vocab) * rank;
+  const size_t packed_size = dsv41_markov_packed_bytes(vocab, rank) / sizeof(uint16_t);
+  const int copies = std::max(3, int((4 * l2 + 2 * weights - 1) / (2 * weights)));
+  Device<uint16_t> head(weights * copies), packed(packed_size * copies), embedding(3 * rank);
+  Device<int64_t> tokens(3);
+  Device<float> base(3 * vocab), result(3 * vocab);
+  const int64_t ids[] = {2, 1, 0};
+  DGPP_CUDA_OK(cudaMemcpyAsync(tokens.p, ids, sizeof(ids), cudaMemcpyHostToDevice, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(head.p, 0x3d, 2 * weights * copies, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(embedding.p, 0x3c, 3 * rank * 2, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(base.p, 0, size_t(3) * vocab * 4, stream));
+  for (int i = 0; i < copies; ++i)
+    dsv41_pack_markov_head(head.p + i * weights, packed.p + i * packed_size, vocab, rank, stream);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  cudaGraphExec_t graphs[4]{};
+  for (int v = 0; v < 4; ++v) {
+    cudaGraph_t graph;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    for (int i = 0; i < copies; ++i) {
+      auto* w = v < 2 ? head.p + i * weights : packed.p + i * packed_size;
+      for (int r = 0; r < 3; ++r)
+        dsv41_dspark_markov_bias(base.p, 3 * vocab, r, embedding.p, w, rank, 0, vocab, tokens.p + r,
+            1, 1, result.p + r * vocab, vocab, 1, stream, nullptr, static_cast<DsparkMarkovOrder>(v));
+    }
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    DGPP_CUDA_OK(cudaGraphInstantiate(&graphs[v], graph, 0));
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    DGPP_CUDA_OK(cudaGraphLaunch(graphs[v], stream));
+  }
+  cudaEvent_t a, b;
+  DGPP_CUDA_OK(cudaEventCreate(&a));
+  DGPP_CUDA_OK(cudaEventCreate(&b));
+  std::puts("layout,round,microseconds_per_three_biases");
+  for (int round = 0; round < 12; ++round) {
+    for (int k = 0; k < 4; ++k) {
+      int v = (k + round) % 4;
+      DGPP_CUDA_OK(cudaEventRecord(a, stream));
+      for (int i = 0; i < 8; ++i) DGPP_CUDA_OK(cudaGraphLaunch(graphs[v], stream));
+      DGPP_CUDA_OK(cudaEventRecord(b, stream));
+      DGPP_CUDA_OK(cudaEventSynchronize(b));
+      float ms;
+      DGPP_CUDA_OK(cudaEventElapsedTime(&ms, a, b));
+      std::printf("%d,%d,%.2f\n", v, round, ms * 1000 / (copies * 8));
+    }
+  }
+  for (auto g : graphs) DGPP_CUDA_OK(cudaGraphExecDestroy(g));
+  DGPP_CUDA_OK(cudaEventDestroy(a));
+  DGPP_CUDA_OK(cudaEventDestroy(b));
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -359,6 +412,14 @@ int main(int argc, char** argv) {
     DGPP_CUDA_OK(cudaGetDeviceProperties(&prop, 0));
     cudaStream_t stream;
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    if (argc == 4 && std::string(argv[1]) == "--markov-chain") {
+      const int vocab = std::stoi(argv[2]), rank = std::stoi(argv[3]);
+      if (vocab < 32 || vocab > 262144 || rank < 8 || rank > 512 || rank % 8)
+        throw std::invalid_argument("--markov-chain local_vocab markov_rank");
+      markov_chain(vocab, rank, prop.l2CacheSize, stream);
+      DGPP_CUDA_OK(cudaStreamDestroy(stream));
+      return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--wo-b-mxfp8") {
       int count = argc == 3 ? std::stoi(argv[2]) : 4;
       if (argc > 3 || count < 1 || count > 8) throw std::invalid_argument("--wo-b-mxfp8 [rows 1..8]");
