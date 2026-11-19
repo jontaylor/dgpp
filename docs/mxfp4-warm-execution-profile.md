@@ -463,6 +463,32 @@ alone. Only about 0.05 ms of that 10.52 ms interval had a CUDA copy active
 with no kernel running. Device loads in kernels, including weight reads on
 the unified memory bus, are invisible to the CUDA copy count.
 
+Inside the target span, the two attention output projections were the
+largest sites running alone after the routed experts. The split-K
+`wo_b` launch (80 × 2 blocks of 256 threads) accounted for 4.03–4.11 ms
+per pass. The preceding `wo_a` projection accounted for 2.95–2.97 ms.
+The corresponding intervals exclude every other kernel and CUDA copy on
+that rank. This identifies about 7 ms of exposed attention output work
+in the captured four-row shape.
+
+The vocabulary head accounted for most of the projection time between those
+spans. Each of the 30 complete intervals contained two full reads of the
+rank-local head, one to verify the target and one to propose the next block.
+
+| Mean per interval (ms) | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| Target vocabulary projection | 2.05 | 1.98 |
+| Draft vocabulary projection | 2.05 | 2.00 |
+| Time across both projections with no overlapping kernel or CUDA copy | 3.99 | 3.87 |
+
+Each projection reads a 64,640 × 5,120 shard. Its lossless 12-bit weight
+payload is 496 MB per rank, excluding row metadata and escapes. The two
+observed projection rates correspond to roughly 242–251 GB/s of packed
+payload per Spark. For comparison, one pass through those bytes at the
+advertised 273 GB/s takes 1.82 ms. The draft and target consume different
+hidden states. A history match that supplies a complete proposal can skip
+the neural draft projection while preserving target verification.
+
 ### Reusing the aligned prefix in a tool reply
 
 When DSpark commits several tokens in one verification pass, the committed
@@ -605,3 +631,31 @@ The separate service and kernel measurements support this recipe for
 single-client tool traffic. Physical DRAM bandwidth, throughput under a
 sustained concurrent workload and performance on long generations from
 new user conversations remain open.
+
+### Completed turns through the coding client
+
+On the selected binary, Codex used the configured `spark-primary` route
+through OpenCodex. A request to run `pwd` executed the shell command once
+and returned the correct directory on both attempts. Client wall time fell
+from 20.97 to 3.97 s as cached input rose from 17,408 to 35,072 tokens
+across the model calls in the turn. Both attempts used 16 decode steps.
+
+A separate turn fixed an out-of-order update in a Python function, edited
+the file and ran the existing tests. Both implementations preserved the
+tests and passed an independent check with one-pass inputs, timestamp ties
+and falsy values. The initial run took 38.96 s. Repeating from the original
+source in the same directory took 22.11 s. The repeat computed 1,061 prompt
+tokens and spent 4.13 s in prefill and 15.08 s in 201 decode steps. The
+client reported 802 and 742 output tokens across the two turns. Differences
+in cache reuse and generated work both affect these wall times.
+
+A third task required creating an interval-coverage implementation from
+scratch. The agent ran the visible tests, and its code passed 200 independent
+randomized cases plus a case spanning a quadrillion positions. The turn
+took 64.85 s, including 18.26 s in prefill and 43.65 s in decode. The
+service accepted 1,363 draft tokens in 549 passes, or 2.48 per pass.
+On a second attempt with the source removed, the agent again wrote a
+passing implementation and ran its own 3,000-case check. The client reached
+its 85 s time limit before it received a final answer. That attempt gives
+no completed-turn latency. Warm cache reuse alone cannot predict how many
+tool calls or output tokens the agent will choose.
