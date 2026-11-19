@@ -474,6 +474,13 @@ With `lookup_tail: 0`, matching text can replace DSpark predictions at the confi
 With a positive tail and fixed depth, eager DSpark keeps its predictions and
 adds up to `lookup_tail` tokens when a strong history match agrees with the
 entire draft. Verification includes the extra rows only on those steps.
+For single-request eager DeepSeek V4.1 decode, setting the deployment
+environment variable `DGPP_DSV41_LOOKUP_PROPOSALS=1` also lets history
+supply the entire block. This requires a positive lookup tail, a suffix
+match of at least `max(16, lookup_nstrong)` tokens, and enough following
+history and context capacity for all proposals. DGPP updates the draft
+attention rings, skips the neural proposal block for that round, and
+verifies the copied tokens with the usual target and tool grammar.
 NVFP4 main weights use the existing main-only paged image;
 MXFP4 draft experts stay resident and their exact allocation is deducted from
 the same expert budget. Main-cache telemetry reports the remaining cache budget.
