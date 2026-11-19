@@ -259,10 +259,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // Eager batch: confidence rows are indexed by compact batch position.
   // Append verified rows to the DSpark attention rings when history supplies
   // the next proposals. The following neural draft starts at the usual cursor.
-  void session_advance_draft(int req, const std::vector<int64_t>& tokens) {
-    execute_draft_rows(req, tokens, 0);
-    draft_row_ = 0;
-  }
+  void session_advance_draft(int req, const std::vector<int64_t>& tokens);
   Outputs session_draft_batch(const std::vector<int>& reqs,
                               const std::vector<std::vector<int64_t>>& tokens);
   Outputs session_draft_chain_batch(const std::vector<int64_t>& tokens);
@@ -356,11 +353,12 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   std::unique_ptr<PagedGraphs> paged_graphs_;
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
+  int async_draft_append_ = 0;
   size_t draft_pick_prefetch_bytes_ = 0;
   void prefetch_draft_input_weights();
   int eager_draft_head_rows_ = 0, draft_rows_scored_ = 0;
   bool eager_draft_confidence_ = true, eager_token_only_chain_ = false;
-  bool enqueue_resident_draft_graph(int req, int accepted_rows);
+  bool enqueue_resident_draft_graph(int req, int accepted_rows, bool append_only = false);
   bool paged_graph_tail_ = false;
   bool paged_async_prologue_ = false;
   inline static bool s_default_paged_pdl = true;

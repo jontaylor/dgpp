@@ -39,6 +39,11 @@
 #include "models/quant_matrix.hpp"
 
 namespace dgpp {
+// Stage a contiguous span on its consumer stream. The optional per-slot
+// cursor advances in the same launch, without reading host staging memory.
+void csa2_stage_contiguous_rows(int64_t* positions, int32_t* requests, int req, int64_t pos0,
+                                int rows, cudaStream_t stream, int64_t* next_position = nullptr);
+
 
 struct Csa2Config {
   // The dense fp8 projections' decode form: the streaming tensor-core GEMM

@@ -490,6 +490,13 @@ draft rings directly. A shorter literal can extend the end of a neural
 proposal. The verifier still selects the token at each position because
 several vocabulary tokens can encode the same text.
 
+When history or tool syntax supplies a full block, `DGPP_DSV41_ASYNC_DRAFT_APPEND=1`
+submits the accepted hidden rows to the resident draft's attention rings on
+the model stream. Position metadata comes from the launch arguments, so the
+host can prepare verification while the GPU updates the rings. Mode `2`
+also replays the ring updates at previously seen widths when resident draft
+graphs are enabled. The default is `0`.
+
 The DSpark Markov projection uses resident BF16 weights.
 `DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
 chain positions in the coalesced reader. Mode `2` prepares a rank-local copy

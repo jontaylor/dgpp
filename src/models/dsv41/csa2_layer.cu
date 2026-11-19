@@ -935,17 +935,20 @@ void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, 
 
 namespace {
 __global__ void prefill_metadata_kernel(int64_t* positions, int32_t* requests,
-                                       int tokens, int req, int64_t pos0) {
+                                       int tokens, int req, int64_t pos0, int64_t* next_position) {
   dgpp_pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < tokens) { positions[i] = pos0 + i; requests[i] = req; }
+  if (i == 0 && next_position) *next_position = pos0 + tokens;
 }
+}
+void csa2_stage_contiguous_rows(int64_t* positions, int32_t* requests, int req, int64_t pos0,
+                                int rows, cudaStream_t stream, int64_t* next_position) {
+  prefill_metadata_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(positions, requests, rows, req, pos0, next_position);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 void Csa2Layer::stage_prefill_rows(int req, int64_t pos0, int tokens, cudaStream_t stream) {
-  // Produce deterministic metadata on the consumer stream; no host buffer
-  // lifetime or host/device fence is needed between prefill chunks.
-  prefill_metadata_kernel<<<(tokens + 255) / 256, 256, 0, stream>>>(pos_, req_ids_, tokens, req, pos0);
-  DGPP_CUDA_OK(cudaGetLastError());
+  csa2_stage_contiguous_rows(pos_, req_ids_, req, pos0, tokens, stream);
 }
 
 void Csa2Layer::publish_rows(const void* hidden_in, Csa2StatePool& pool, int req, int64_t pos0, int tokens,

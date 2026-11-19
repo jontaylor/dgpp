@@ -509,6 +509,7 @@ class SessionModel : public PrefillReporting {
   SessionSnapshotMeta pin_blocks_at(int req, int64_t pos, const char* what);
   // The draft block's rows.
   void mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens, int hidden_row = 0);
+  void check_draft_rows(int req, const std::vector<int64_t>& tokens) const;
   void mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload);
   void execute_draft_rows(int req, const std::vector<int64_t>& tokens, int head_rows);
   // The draft block's input window per slot ([R][max_decode_rows_][draft_width]).
@@ -1940,7 +1941,7 @@ void SessionModel<D>::mtp_prefill_rows(int req, int64_t row0, int64_t row1, cons
 }
 
 template <class D>
-void SessionModel<D>::mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload) {
+void SessionModel<D>::check_draft_rows(int req, const std::vector<int64_t>& tokens) const {
   if (!mtp_) refuse_mtp("session_draft");
   check_req(req, "session_draft");
   const int T = static_cast<int>(tokens.size());
@@ -1955,6 +1956,13 @@ void SessionModel<D>::mtp_decode_host_prep(int req, const std::vector<int64_t>& 
                                 " (draft exactly the accepted rows)");
   for (int64_t id : tokens)
     if (id < 0 || id >= vocab_size_) throw std::invalid_argument("session_draft: token id out of range");
+}
+
+template <class D>
+void SessionModel<D>::mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload) {
+  check_draft_rows(req, tokens);
+  const int T = static_cast<int>(tokens.size());
+  const auto q = mtp_pos_[static_cast<size_t>(req)];
   for (int r = 0; r < T; ++r) {
     h_req_ids_[r] = req;
     h_step_pos_[r] = q + r;
