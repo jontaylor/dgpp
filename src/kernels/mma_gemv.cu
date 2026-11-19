@@ -655,7 +655,8 @@ __global__ void mma_gemv_split_reduce_kernel(const float* __restrict__ part, int
 __global__ void wo_b_split_bf16_kernel(const uint16_t* act, const uint8_t* weights, const float* scales,
                                       uint16_t* out, int rows) {
   dgpp_pdl_wait();
-  constexpr int k = 4096, n = 5120, half_k = k / 2, step = 512;
+  constexpr int k = 4096, n = 5120, half_k = k / 2, step = 1024;
+  static_assert(half_k == 2 * step);
   const int half = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int row = lane / 4, quarter = lane % 4;
   const int column = blockIdx.x * 8;
@@ -670,46 +671,36 @@ __global__ void wo_b_split_bf16_kernel(const uint16_t* act, const uint8_t* weigh
   __syncwarp();
 
   auto issue = [&](int window) {
-    const int slot = window & 1;
     if (lane == 0)
       asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
-                   :: "r"(barrier(slot)), "r"(8 * step) : "memory");
+                   :: "r"(barrier(window)), "r"(8 * step) : "memory");
     __syncwarp();
     if (lane < 8) {
-      const unsigned dst = unsigned(__cvta_generic_to_shared(&tile[half][slot][lane][0]));
+      const unsigned dst = unsigned(__cvta_generic_to_shared(&tile[half][window][lane][0]));
       const uint8_t* src = weights + (column + lane) * k + half * half_k + window * step;
       asm volatile("{ .reg .b64 policy; createpolicy.fractional.L2::evict_first.b64 policy, 1.0; "
                    "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
                    "[%0], [%1], %2, [%3], policy; }"
-                   :: "r"(dst), "l"(src), "r"(step), "r"(barrier(slot)) : "memory");
-    }
-    // One lane per 128-byte line. At the last window, look ahead to a
-    // later output block instead of reading beyond this warp's K half.
-    const bool next = window + 1 < half_k / step;
-    const int lead_column = next ? column : column + 96 * 8;
-    if (lead_column < n) {
-      const int lead_k = half * half_k + (next ? (window + 1) * step : 0);
-      const uint8_t* line = weights + (lead_column + lane / 4) * k + lead_k + quarter * 128;
-      asm volatile("prefetch.global.L2 [%0];" :: "l"(line));
+                   :: "r"(dst), "l"(src), "r"(step), "r"(barrier(window)) : "memory");
     }
   };
 
   float accum[4]{};
   issue(0);
+  issue(1);
   const uint16_t* input = act + (row < rows ? row : 0) * k;
   for (int window = 0; window < half_k / step; ++window) {
-    if (window + 1 < half_k / step) issue(window + 1);
-    const int slot = window & 1, base = half * half_k + window * step;
+    const int base = half * half_k + window * step;
     unsigned done;
     do {
-      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p,[%1],%2; selp.u32 %0,1,0,p; }"
-                   : "=r"(done) : "r"(barrier(slot)), "r"(window / 2) : "memory");
+      asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p,[%1],0; selp.u32 %0,1,0,p; }"
+                   : "=r"(done) : "r"(barrier(window)) : "memory");
     } while (!done);
     __syncwarp();
 #pragma unroll 4
     for (int offset = 0; offset < step; offset += 64) {
       const int pos = offset + quarter * 16;
-      const auto codes = *reinterpret_cast<const uint4*>(&tile[half][slot][row][pos]);
+      const auto codes = *reinterpret_cast<const uint4*>(&tile[half][window][row][pos]);
       const float scale = scales[(column / 32) * (k / 32) + (base + pos) / 32];
       uint32_t weight[8];
       chunk_to_bf16x8(codes, scale, weight);

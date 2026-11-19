@@ -60,13 +60,14 @@ struct Arm {
   bool exact_wob = false;
 };
 
-void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = false, int rows = 4) {
+void measure(const Shape& shape, int l2, cudaStream_t stream, bool native_wob = false, int rows = 4,
+             int weight_copies = 0) {
   int total_n = shape.second_n ? shape.n + shape.second_n : shape.groups * shape.n;
   int xs = shape.joined_input ? shape.k : shape.groups * shape.k;
   int os = total_n;
   size_t matrix = size_t(total_n) * shape.k;
   size_t scale_matrix = matrix / 1024;
-  int copies = std::max(3, int((size_t(l2) * 4 + matrix - 1) / matrix));
+  const int copies = weight_copies ? weight_copies : std::max(3, int((size_t(l2) * 4 + matrix - 1) / matrix));
   size_t elements = matrix * copies;
   Device<uint8_t> weights(elements), scratch(workspace_bytes);
   Device<float> scales(scale_matrix * copies);
@@ -430,10 +431,13 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "--wo-b-mxfp8") {
-      int count = argc == 3 ? std::stoi(argv[2]) : 4;
-      if (argc > 3 || count < 1 || count > 8) throw std::invalid_argument("--wo-b-mxfp8 [rows 1..8]");
+      const int count = argc >= 3 ? std::stoi(argv[2]) : 4;
+      // One distinct output projection for each of the 40 target layers.
+      const int copies = argc >= 4 ? std::stoi(argv[3]) : 40;
+      if (argc > 4 || count < 1 || count > 8 || copies < 1 || copies > 64)
+        throw std::invalid_argument("--wo-b-mxfp8 [rows 1..8] [weight copies 1..64]");
       std::puts("projection,variant,weight_copies,p25_us,median_us,p75_us,rel_l2");
-      measure({"wo_b", 1, 5120, 4096, true, false, true}, prop.l2CacheSize, stream, true, count);
+      measure({"wo_b", 1, 5120, 4096, true, false, true}, prop.l2CacheSize, stream, true, count, copies);
       DGPP_CUDA_OK(cudaStreamDestroy(stream));
       return 0;
     }
