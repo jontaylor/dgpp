@@ -95,6 +95,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       mtp_pick_rows_ = std::move(pick_rows);
       if (!(row_ms > 0) || !(base_ms >= 0) || !(lambda >= 0) || min_depth < 1 || min_depth > depth)
         throw std::invalid_argument("eager MTP: invalid depth scheduler");
+      if constexpr (requires { model_->set_eager_draft_outputs(depth, schedule); })
+        model_->set_eager_draft_outputs(depth, schedule);
       mtp_schedule_ = schedule;
       mtp_row_ms_ = row_ms; mtp_base_ms_ = base_ms; mtp_min_depth_ = min_depth;
       mtp_lambda_floor_ = lambda > 0 ? lambda : verify_reservation_lambda(base_ms, row_ms);

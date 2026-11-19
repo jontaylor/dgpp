@@ -249,6 +249,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // per-position acceptance logits, [max_requests][block] on the device,
   // written by the step's draft (row 0 by the block, row c by chain row c).
   static constexpr bool kVerifyConfidence = true;
+  void set_eager_draft_outputs(int depth, bool schedule);
+  bool draft_chain_reads_hidden(int req, int64_t pos) const {
+    return !eager_token_only_chain_ || draft_row_ == 0 || pos < session_pos_[req];
+  }
   int confidence_rows() const { return cfg_.dspark_block_size; }
   const float* device_confidence() const { return conf_; }
   // Eager batch: confidence rows are indexed by compact batch position.
@@ -347,6 +351,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   std::unique_ptr<PagedGraphs> paged_graphs_;
   bool paged_graph_capture_ = false;
   bool resident_draft_graphs_ = false;
+  int eager_draft_head_rows_ = 0, draft_rows_scored_ = 0;
+  bool eager_draft_confidence_ = true, eager_token_only_chain_ = false;
   bool enqueue_resident_draft_graph(int req, int accepted_rows);
   bool paged_graph_tail_ = false;
   bool paged_async_prologue_ = false;

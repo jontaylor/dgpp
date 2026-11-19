@@ -2067,19 +2067,24 @@ typename SessionModel<D>::Outputs SessionModel<D>::session_draft_chain(int req, 
   if (pos >= max_context_) throw std::invalid_argument("session_draft_chain: position exceeds the context bound");
   step_tokens_ = d_tokens_;
   if (first) derived().snapshot_chain_state(req);
-  h_req_ids_[0] = req;
-  h_step_pos_[0] = pos;
+  bool stage_hidden = true;
+  if constexpr (requires { derived().draft_chain_reads_hidden(req, pos); })
+    stage_hidden = derived().draft_chain_reads_hidden(req, pos);
+  if (stage_hidden) {
+    h_req_ids_[0] = req;
+    h_step_pos_[0] = pos;
+    h_req_spans_[0] = 0;
+    h_req_spans_[1] = 1;
+    glm_upload_i32(h_req_ids_, d_req_ids_, 1, stream_);
+    glm_upload_i64(h_step_pos_, d_step_pos_, 1, stream_);
+    glm_upload_i32(h_req_spans_, d_req_spans_, 2, stream_);
+    // The block's previous output row is the row's hidden, in the window at
+    // the row's position (the store reads the staged position).
+    store_draft_hidden(derived().draft_hidden_rows() + static_cast<size_t>(draft_last_row_) * draft_width_, d_req_ids_,
+                       d_step_pos_, 1);
+  }
   h_token_[0] = token;
-  h_req_spans_[0] = 0;
-  h_req_spans_[1] = 1;
-  glm_upload_i32(h_req_ids_, d_req_ids_, 1, stream_);
-  glm_upload_i64(h_step_pos_, d_step_pos_, 1, stream_);
-  glm_upload_i32(h_req_spans_, d_req_spans_, 2, stream_);
   glm_upload_i64(h_token_, d_tokens_, 1, stream_);
-  // The block's previous output row is the row's hidden, in the window at
-  // the row's position (the store reads the staged position).
-  store_draft_hidden(derived().draft_hidden_rows() + static_cast<size_t>(draft_last_row_) * draft_width_, d_req_ids_,
-                     d_step_pos_, 1);
   if constexpr (requires { derived().mtp_select_block(0); }) derived().mtp_select_block(index + 1);
   derived().mtp_run_rows(req, d_tokens_, pos, /*T=*/1, /*decode_row=*/true, /*capture=*/false, /*head_rows=*/1, 0);
   if (last) derived().restore_chain_state(req);

@@ -48,7 +48,7 @@ struct Dsv41Model::PagedGraphs {
   };
   std::map<std::array<uint64_t, 7>, Graph> graphs;
   static constexpr size_t max_target_graphs = 8;
-  std::map<std::pair<int, int>, Graph> draft_graphs;
+  std::map<std::array<int, 4>, Graph> draft_graphs;
   cudaStream_t service = nullptr;
   cudaEvent_t done = nullptr;
   cudaEvent_t ffn_window = nullptr, next_attention_window = nullptr;
@@ -645,6 +645,16 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // head alone and stays off — the draft takes the EXL3 head's logits.)
   if (mtp_ && globals_.lm_head != nullptr)
     draft_head_.init(draft_head_matrix(), max_decode_rows_, loader_.rank(), stream_, /*quiet=*/true);
+}
+
+void Dsv41Model::set_eager_draft_outputs(int depth, bool schedule) {
+  const char* setting = std::getenv("DGPP_DSV41_DRAFT_OUTPUTS");
+  const std::string_view mode = setting ? setting : "full";
+  if (mode != "full" && mode != "head" && mode != "confidence" && mode != "chain" && mode != "compact")
+    throw std::invalid_argument("invalid DGPP_DSV41_DRAFT_OUTPUTS");
+  eager_draft_head_rows_ = mode == "head" || mode == "compact" ? std::min(depth, cfg_.dspark_block_size) : 0;
+  eager_draft_confidence_ = schedule || (mode != "confidence" && mode != "compact");
+  eager_token_only_chain_ = mode == "compact" || mode == "chain";
 }
 
 void Dsv41Model::normalize_head(int first, int count) {
@@ -1265,19 +1275,26 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   const Dsv41DraftResident& dl = draft_stage(stages - 1);
   if (!dl.norm || !dl.markov_embed || !dl.markov_head || !dl.confidence)
     throw std::runtime_error("mtp_run_rows: the DSpark head tensors are unbound");
-  launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, rows, stream_);
-  csa2_rmsnorm_bf16(collapsed_, H, dl.norm, h_, H, rows, H, eps, stream_);
-  if (!(decode_row && draft_head_.logits(draft_head_matrix(), h_, static_cast<size_t>(H), rows, base_logits_,
+  // All five bidirectional positions participate in the draft layers. With
+  // one request only the leading proposal rows need vocabulary scores.
+  // Batched blocks retain their original stride and share a single head read.
+  draft_rows_scored_ = decode_row && groups == 1 && eager_draft_head_rows_ && !capture
+      ? eager_draft_head_rows_ : block;
+  const int score_rows = groups * draft_rows_scored_;
+  launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, score_rows, stream_);
+  csa2_rmsnorm_bf16(collapsed_, H, dl.norm, h_, H, score_rows, H, eps, stream_);
+  if (!(decode_row && draft_head_.logits(draft_head_matrix(), h_, static_cast<size_t>(H), score_rows, base_logits_,
                                          static_cast<size_t>(lm_vocab_count_), stream_)))
-    head_logits(h_, rows, base_logits_, stream_);
+    head_logits(h_, score_rows, base_logits_, stream_);
   // ---- block row 0, biased by the Markov head of `next`, into the head rows ----
   const int rows_out = head_rows / groups;
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed, dl.markov_head,
                            cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, blk_tok_, block, groups, logits_,
                            static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_);
-  dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, 0, H, dl.markov_embed, cfg_.dspark_markov_rank,
-                          blk_tok_, block, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block,
-                          block, stream_);
+  if (capture || eager_draft_confidence_)
+    dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, 0, H, dl.markov_embed, cfg_.dspark_markov_rank,
+                            blk_tok_, block, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block,
+                            block, stream_);
   draft_row_ = 1;
   prefetch_.join(stream_);
   if (decode_row && (!capture || decode_tail_mirrors_) && head_rows <= max_decode_rows_)
@@ -1287,7 +1304,7 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
 
 bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows) {
   auto& p = *paged_graphs_;
-  const auto key = std::pair{req, accepted_rows};
+  const std::array<int, 4> key{req, accepted_rows, eager_draft_head_rows_, int(eager_draft_confidence_)};
   auto it = p.draft_graphs.find(key);
   if (it == p.draft_graphs.end()) {
     if (p.draft_graphs.size() >= PagedGraphs::max_target_graphs) return false;
@@ -1336,6 +1353,7 @@ bool Dsv41Model::enqueue_resident_draft_graph(int req, int accepted_rows) {
   if (boundary_) boundary_->graph_segment_finish();
   cur_ = g.cur; nxt_ = g.next; pre_cur_ = g.pre; pre_nxt_ = g.pre_next;
   draft_row_ = 1;
+  draft_rows_scored_ = eager_draft_head_rows_ ? eager_draft_head_rows_ : cfg_.dspark_block_size;
   return true;
 }
 
@@ -1343,16 +1361,17 @@ void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, i
   const int H = cfg_.hidden_size;
   const int block = cfg_.dspark_block_size;
   const int groups = batch_requests > 0 ? batch_requests : 1;
-  if (draft_row_ >= block) throw std::logic_error("mtp_run_rows: more chain rows than the block holds");
+  if (draft_row_ >= draft_rows_scored_) throw std::logic_error("mtp_run_rows: requested an unscored draft position");
   if (head_rows != groups) throw std::invalid_argument("mtp_run_rows: a chain call heads one row per request");
   const Dsv41DraftResident& dl = draft_stage(cfg_.num_nextn_predict_layers - 1);
   const int row = draft_row_++;
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, row, dl.markov_embed, dl.markov_head,
                            cfg_.dspark_markov_rank, lm_vocab_begin_, lm_vocab_count_, tokens, 1, groups, logits_,
                            lm_vocab_count_, 1, stream_);
-  dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, row, H, dl.markov_embed, cfg_.dspark_markov_rank,
-                          tokens, 1, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block + row,
-                          block, stream_);
+  if (capture || eager_draft_confidence_)
+    dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, row, H, dl.markov_embed, cfg_.dspark_markov_rank,
+                            tokens, 1, dl.confidence, groups, conf_ + static_cast<size_t>(batch_requests > 0 ? 0 : req) * block + row,
+                            block, stream_);
   if (!capture || decode_tail_mirrors_)
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, static_cast<size_t>(head_rows) * lm_vocab_count_ * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream_));
