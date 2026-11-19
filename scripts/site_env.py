@@ -205,6 +205,8 @@ def deployment(path):
             "DGPP_DSV41_DRAFT_OUTPUTS": ("full", "head", "confidence", "chain", "compact"),
             "DGPP_DSV41_PAGED_PDL": ("0", "1", "2", "3"),
             "DGPP_DSV41_FFN_LOOKAHEAD": ("0", "1", "2"),
+            "DGPP_DSV41_MX_WOB_DECODE": ("0", "1", "2"),
+            "DGPP_DSV41_MX_DRAFT_HEAD": ("0", "1", "2"),
             "DGPP_DSV41_ATTENTION_LOOKAHEAD": ("0", "1", "2"),
             "DGPP_EXPERT_READY_WORKER": ("0", "1", "2"),
             "DGPP_CSA2_PREFILL_SPLITS": ("1", "2", "4"),
