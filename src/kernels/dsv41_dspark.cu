@@ -168,11 +168,19 @@ constexpr int kMarkovWarps = 2;
 constexpr int kMarkovRowsPerWarp = 128;
 constexpr int kMarkovStageBytes = 32 * (256 * 2 + 16);  // 32 rows of rank 256 (16 of 512) at a 16-byte row pad
 static_assert(16 * (kMaxRank * 2 + 16) <= kMarkovStageBytes, "the stage holds a batch of the widest rank");
-template <int kUnitsPerLane>  // 16-byte units a lane loads per row: 1 (rank <= 256), 2 (rank <= 512)
+__device__ __forceinline__ void write_markov_max(float m, float* shared, float* block_max, int group, int tile) {
+  if (!block_max) return;
+  for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  if ((threadIdx.x & 31) == 0) shared[threadIdx.x / 32] = m;
+  __syncthreads();
+  if (threadIdx.x == 0) block_max[size_t(group) * gridDim.x + tile] = fmaxf(shared[0], shared[1]);
+}
+
+template <int kUnitsPerLane, bool Cache>  // 16-byte units a lane loads per row: 1 (rank <= 256), 2 (rank <= 512)
 __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kernel(
     const float* __restrict__ base, int64_t base_group_stride, int block_row, const uint16_t* __restrict__ markov_embed,
     const uint16_t* __restrict__ markov_head, int rank, int vocab_begin, int count, const int64_t* __restrict__ tok,
-    int tok_stride, float* __restrict__ out, int64_t out_group_stride, int rows_out, float* __restrict__ block_max, bool reverse) {
+    int tok_stride, float* __restrict__ out, int64_t out_group_stride, int rows_out, float* __restrict__ block_max, bool reverse, DsparkMarkovCache cache) {
   dgpp_pdl_wait();
   constexpr int kBatchRows = 32 / kUnitsPerLane;
   constexpr int kBatches = kMarkovRowsPerWarp / kBatchRows;
@@ -182,6 +190,29 @@ __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kerne
   __shared__ __align__(16) uint8_t stage[kMarkovWarps][kMarkovStageBytes];
   __shared__ float s_max[kMarkovWarps];
   const int64_t t = tok[static_cast<size_t>(g) * tok_stride];
+  float* bias_row = nullptr;
+  if constexpr (Cache) {
+    if (t >= 0) {
+      const int slot = static_cast<uint32_t>(t) % cache.slots;
+      int32_t* key = cache.keys + size_t(slot) * gridDim.x + tile;
+      bias_row = cache.biases + size_t(slot) * count;
+      // All threads finish the tag read before the miss path replaces it.
+      if (__syncthreads_and(*key == t)) {
+        float maximum = -INFINITY;
+        for (int i = threadIdx.x; i < 256; i += kMarkovWarps * 32) {
+          const int v = tile * 256 + i;
+          if (v < count) {
+            const float value = base[size_t(block_row) * count + v] + bias_row[v];
+            for (int j = 0; j < rows_out; ++j) out[size_t(j) * count + v] = value;
+            maximum = fmaxf(maximum, value);
+          }
+        }
+        write_markov_max(maximum, s_max, block_max, 0, tile);
+        return;
+      }
+      if (threadIdx.x == 0) *key = static_cast<int32_t>(t);
+    }
+  }
   for (int r = threadIdx.x; r < rank; r += blockDim.x)
     e[r] = t < 0 ? 0.f : bf16_bits_to_float(markov_embed[static_cast<size_t>(t) * rank + r]);
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -234,6 +265,7 @@ __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kerne
           }
         }
       }
+      if constexpr (Cache) { if (bias_row) bias_row[v] = acc; }
       const float bv = base[static_cast<size_t>(g) * base_group_stride + static_cast<size_t>(block_row) * count + v];
       val = bv + acc;
       float* o = out + static_cast<size_t>(g) * out_group_stride + v;
@@ -242,18 +274,7 @@ __global__ void __launch_bounds__(kMarkovWarps * 32) markov_bias_coalesced_kerne
     running = fmaxf(running, val);
     __syncwarp();
   }
-  if (block_max != nullptr) {
-    float m = running;
-    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-    if (lane == 0) s_max[warp] = m;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      float bm = s_max[0];
-#pragma unroll
-      for (int ww = 1; ww < kMarkovWarps; ++ww) bm = fmaxf(bm, s_max[ww]);
-      block_max[static_cast<size_t>(g) * gridDim.x + tile] = bm;
-    }
-  }
+  write_markov_max(running, s_max, block_max, g, tile);
 }
 
 __global__ void pack_markov_kernel(const uint4* input, uint4* packed, int count, int units) {
@@ -486,7 +507,7 @@ void dsv41_pack_markov_head(const uint16_t* local_head, uint16_t* packed, int co
 void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int block_row, const uint16_t* markov_embed,
                               const uint16_t* markov_head, int rank, int vocab_begin, int count, const int64_t* tok,
                               int tok_stride, int groups, float* out, int64_t out_group_stride, int rows_out,
-                              cudaStream_t stream, float* block_max, DsparkMarkovOrder order) {
+                              cudaStream_t stream, float* block_max, DsparkMarkovOrder order, DsparkMarkovCache cache) {
   if (!base || !markov_embed || !markov_head || !tok || !out) throw std::invalid_argument("dsv41_dspark_markov_bias: null buffer");
   if (rank <= 0 || rank > kMaxRank || count <= 0 || groups <= 0 || rows_out <= 0 || block_row < 0 || tok_stride <= 0)
     throw std::invalid_argument("dsv41_dspark_markov_bias: shape");
@@ -507,14 +528,18 @@ void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int 
     if (rank == 256) launch.template operator()<32>();
     else if (rank == 128) launch.template operator()<16>();
     else launch.template operator()<0>();
-  } else if (aligned && rank <= 256) {
-    markov_bias_coalesced_kernel<1><<<grid, kMarkovWarps * 32, 0, stream>>>(
-        base, base_group_stride, block_row, markov_embed, markov_head, rank, vocab_begin, count, tok, tok_stride, out,
-        out_group_stride, rows_out, block_max, reverse);
-  } else if (aligned && rank <= 512) {
-    markov_bias_coalesced_kernel<2><<<grid, kMarkovWarps * 32, 0, stream>>>(
-        base, base_group_stride, block_row, markov_embed, markov_head, rank, vocab_begin, count, tok, tok_stride, out,
-        out_group_stride, rows_out, block_max, reverse);
+  } else if (aligned) {
+    auto launch = [&]<int Units, bool Cache>() {
+      markov_bias_coalesced_kernel<Units, Cache><<<grid, kMarkovWarps * 32, 0, stream>>>(
+          base, base_group_stride, block_row, markov_embed, markov_head, rank, vocab_begin, count, tok, tok_stride,
+          out, out_group_stride, rows_out, block_max, reverse, cache);
+    };
+    if (groups == 1 && cache.slots > 0) {
+      if (!cache.keys || !cache.biases) throw std::invalid_argument("DSpark Markov cache requires keys and bias rows");
+      if (rank <= 256) launch.template operator()<1, true>();
+      else launch.template operator()<2, true>();
+    } else if (rank <= 256) launch.template operator()<1, false>();
+    else launch.template operator()<2, false>();
   } else {
     markov_bias_kernel<<<grid, 256, 0, stream>>>(base, base_group_stride, block_row, markov_embed, markov_head, rank,
                                                  vocab_begin, count, tok, tok_stride, out, out_group_stride, rows_out,

@@ -56,6 +56,13 @@ DsparkMarkovOrder markov_order() {
   }();
   return order;
 }
+int markov_cache_slots() {
+  const char* value = std::getenv("DGPP_DSV41_MARKOV_CACHE");
+  if (!value || std::strcmp(value, "0") == 0) return 0;
+  if (std::strcmp(value, "64") == 0) return 64;
+  if (std::strcmp(value, "256") == 0) return 256;
+  throw std::invalid_argument("DGPP_DSV41_MARKOV_CACHE must be 0, 64 or 256");
+}
 bool pack_markov() {
   return markov_order() == DsparkMarkovOrder::Packed || markov_order() == DsparkMarkovOrder::PackedReverseOdd;
 }
@@ -668,6 +675,14 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     bf12_.log_summary(loader_.rank(),
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   }
+  if (mtp_ && !pack_markov() && cfg_.dspark_markov_rank % 8 == 0 && markov_cache_slots()) {
+    markov_cache_.slots = markov_cache_slots();
+    const size_t keys = size_t(markov_cache_.slots) * ((lm_vocab_count_ + 255) / 256);
+    markov_cache_.keys = dev_alloc<int32_t>(keys);
+    markov_cache_.biases = dev_alloc<float>(size_t(markov_cache_.slots) * lm_vocab_count_);
+    DGPP_CUDA_OK(cudaMemsetAsync(markov_cache_.keys, 0xff, keys * sizeof(int32_t), stream_));
+    DGPP_LOG_INFO("rank {} DSpark Markov bias cache: {} token rows", rank_, markov_cache_.slots);
+  }
   if (mtp_ && pack_markov()) {
     const int rank = cfg_.dspark_markov_rank;
     const auto& last = draft_stage(cfg_.num_nextn_predict_layers - 1);
@@ -807,6 +822,8 @@ Dsv41Model::~Dsv41Model() {
   cudaFree(mx_draft_head_);
   cudaFree(draft_block_max_);
   cudaFree(packed_markov_head_);
+  cudaFree(markov_cache_.keys);
+  cudaFree(markov_cache_.biases);
   cudaFree(base_logits_);
   cudaFree(conf_);
   cudaFree(d_draft_pos_);
@@ -909,6 +926,8 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& source_cfg
       size_t draft_pinned = 0;
       const size_t draft_dev = GlmMoeLayer::scratch_bytes(draft_cfg, max_tokens, rows, draft_slots, &draft_pinned);
       plan.add("dspark moe scratch (the draft stages' routed chain)", draft_dev, draft_pinned);
+      if (!pack_markov() && cfg.dspark_markov_rank % 8 == 0 && markov_cache_slots())
+        plan.add("DSpark Markov bias cache", size_t(markov_cache_slots()) * (V + (V + 255) / 256) * 4);
       if (pack_markov())
         plan.add("packed DSpark Markov head", dsv41_markov_packed_bytes(static_cast<int>(V), cfg.dspark_markov_rank));
       if (mx_draft_head_mode()) {
@@ -1360,7 +1379,8 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed,
                            packed_markov_head_ ? packed_markov_head_ : dl.markov_head, cfg_.dspark_markov_rank,
                            lm_vocab_begin_, lm_vocab_count_, blk_tok_, block, groups, logits_,
-                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_, draft_block_max_, markov_order());
+                           static_cast<int64_t>(rows_out) * lm_vocab_count_, rows_out, stream_, draft_block_max_, markov_order(),
+                           capture ? DsparkMarkovCache{} : markov_cache_);
   if (draft_block_max_) rescore_draft_head(0, groups, rows_out);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, 0, H, dl.markov_embed, cfg_.dspark_markov_rank,
@@ -1448,7 +1468,8 @@ void Dsv41Model::draft_chain_row(int req, const int64_t* tokens, bool capture, i
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, row, dl.markov_embed,
                            packed_markov_head_ ? packed_markov_head_ : dl.markov_head, cfg_.dspark_markov_rank,
                            lm_vocab_begin_, lm_vocab_count_, tokens, 1, groups, logits_,
-                           lm_vocab_count_, 1, stream_, draft_block_max_, markov_order());
+                           lm_vocab_count_, 1, stream_, draft_block_max_, markov_order(),
+                           capture ? DsparkMarkovCache{} : markov_cache_);
   if (draft_block_max_) rescore_draft_head(row, groups, 1);
   if (capture || eager_draft_confidence_)
     dsv41_dspark_confidence(collapsed_, static_cast<int64_t>(block) * H, row, H, dl.markov_embed, cfg_.dspark_markov_rank,

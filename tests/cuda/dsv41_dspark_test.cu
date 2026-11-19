@@ -91,6 +91,43 @@ DGPP_TEST(markov_bias_alternate_traversal_and_packing_preserve_logits_and_maxima
     check(72, 71, 7, 80, 3, 2, order);
   }
 }
+DGPP_TEST(markov_bias_cache_preserves_hits_replacements_and_partial_tiles) {
+  constexpr int count = 531, begin = 13, vocab = begin + count, rank = 128, tiles = (count + 255) / 256;
+  std::vector<uint16_t> weights(vocab * rank);
+  std::mt19937 rng(47);
+  for (auto& v : weights) v = dgpp::float_to_bf16_bits(float(int(rng() % 257) - 128) / 91);
+  std::vector<float> base(2 * count);
+  for (auto& v : base) v = float(int(rng() % 129) - 64) / 39;
+  uint16_t* w; float *b, *out, *max; int64_t* token;
+  DGPP_CUDA_OK(cudaMalloc(&w, weights.size() * 2));
+  DGPP_CUDA_OK(cudaMalloc(&b, base.size() * sizeof(float)));
+  DGPP_CUDA_OK(cudaMalloc(&out, count * sizeof(float)));
+  DGPP_CUDA_OK(cudaMalloc(&max, tiles * sizeof(float)));
+  DGPP_CUDA_OK(cudaMalloc(&token, sizeof(int64_t)));
+  DGPP_CUDA_OK(cudaMemcpy(w, weights.data(), weights.size() * 2, cudaMemcpyHostToDevice));
+  DGPP_CUDA_OK(cudaMemcpy(b, base.data(), base.size() * sizeof(float), cudaMemcpyHostToDevice));
+  dgpp::DsparkMarkovCache cache{2};
+  DGPP_CUDA_OK(cudaMalloc(&cache.biases, 2 * count * sizeof(float)));
+  DGPP_CUDA_OK(cudaMalloc(&cache.keys, 2 * tiles * sizeof(int32_t)));
+  DGPP_CUDA_OK(cudaMemset(cache.keys, 0xff, 2 * tiles * sizeof(int32_t)));
+  int row = 0;
+  for (const int64_t id : {3, 3, 5, 2, 3, 2, -1}) {
+    DGPP_CUDA_OK(cudaMemcpy(token, &id, sizeof(id), cudaMemcpyHostToDevice));
+    auto run = [&](dgpp::DsparkMarkovCache view) {
+      dgpp::dsv41_dspark_markov_bias(b, 2 * count, row, w, w, rank, begin, count, token, 1, 1, out,
+                                     count, 1, nullptr, max, dgpp::DsparkMarkovOrder::ReverseOdd, view);
+      std::vector<float> result(count + tiles);
+      DGPP_CUDA_OK(cudaMemcpy(result.data(), out, count * sizeof(float), cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(result.data() + count, max, tiles * sizeof(float), cudaMemcpyDeviceToHost));
+      return result;
+    };
+    require(run(cache) == run({}), "cached and direct biased logits and tile maxima agree exactly");
+    row ^= 1;
+  }
+  cudaFree(cache.keys); cudaFree(cache.biases); cudaFree(token);
+  cudaFree(max); cudaFree(out); cudaFree(b); cudaFree(w);
+}
+
 DGPP_TEST(markov_bias_rank_252_per_thread_form) { check(252, 600, 100, 800, 2, 1); }
 
 DGPP_TEST(verify_tile_max_preserves_ties_offsets_and_partial_tiles) {

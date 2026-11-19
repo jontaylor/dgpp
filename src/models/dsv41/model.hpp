@@ -53,6 +53,8 @@
 
 #include <cuda_runtime.h>
 
+#include "kernels/dsv41_dspark.hpp"
+
 #include "engine/boundary_reducer.hpp"
 #include "engine/decode_outputs.hpp"
 #include "engine/memory_plan.hpp"
@@ -471,6 +473,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   uint8_t* mx_draft_head_ = nullptr;  // E4M3 codes followed by their E8M0 scales
   float* draft_block_max_ = nullptr;
   uint16_t* packed_markov_head_ = nullptr;
+  DsparkMarkovCache markov_cache_;
   void rescore_draft_head(int row, int groups, int rows_out);
   HeadMatrix draft_head_matrix() const;
   bool dense_mma_ = true;  // the dense projections' and head's decode form (DGPP_DSV41_DENSE_GEMV=1: the GEMV chunks)

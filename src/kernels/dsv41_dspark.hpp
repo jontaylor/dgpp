@@ -39,6 +39,15 @@ void dsv41_dspark_block_rows(const int64_t* step_pos, const int64_t* tokens, con
                              int rows_per_group, int block, int64_t noise_id, int64_t* pos_out, int64_t* tok_out,
                              int32_t* req_out, int32_t* spans_out, cudaStream_t stream);
 
+// One cache per immutable Markov head and vocabulary slice, accessed on a
+// single stream. Each block owns its 256 vocabulary entries and tag. Keys
+// start at -1; cached values exclude the request-dependent base logits.
+struct DsparkMarkovCache {
+  int slots = 0;
+  int32_t* keys = nullptr;
+  float* biases = nullptr;
+};
+
 enum class DsparkMarkovOrder { RowMajor, ReverseOdd, Packed, PackedReverseOdd };
 
 // Rank-local BF16 slice as [ceil(count/32), rank/8, 32, 8]. Each lane can
@@ -60,7 +69,7 @@ void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int 
                               const uint16_t* markov_head, int rank, int vocab_begin, int count, const int64_t* tok,
                               int tok_stride, int groups, float* out, int64_t out_group_stride, int rows_out,
                               cudaStream_t stream, float* block_max = nullptr,
-                              DsparkMarkovOrder order = DsparkMarkovOrder::RowMajor);
+                              DsparkMarkovOrder order = DsparkMarkovOrder::RowMajor, DsparkMarkovCache cache = {});
 
 // The screened draft head's exact pass (2026-10-02, DeepSeek-V4-Flash). The
 // draft rows' base logits come from a block-FP8 copy of the lm head (half
