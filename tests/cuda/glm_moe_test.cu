@@ -3488,10 +3488,12 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
       // GPU route grouping and miss-only host service, using the SAME graph
       // for resident hits, an injected miss, and changed routing.
       dgpp::ExpertDemand* demand = nullptr;
+      uint32_t* signal = nullptr;
       uint64_t* table = nullptr;
       cudaStream_t service = nullptr;
       cudaEvent_t done = nullptr;
       DGPP_CUDA_OK(cudaHostAlloc(&demand,sizeof(*demand),cudaHostAllocMapped));
+      DGPP_CUDA_OK(cudaHostAlloc(&signal,sizeof(*signal),cudaHostAllocMapped));
       DGPP_CUDA_OK(cudaMalloc(&table,E*6*sizeof(uint64_t)));
       DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service,cudaStreamNonBlocking));
       DGPP_CUDA_OK(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));
@@ -3542,12 +3544,18 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
           publish();
         }
         *demand={};
+        *signal=0;
+        if (pass>=2) {
+          demand->pending_layer=signal;
+          demand->layer_plus_one=7;
+        }
         if (pass==1 || pass==3) DGPP_CUDA_OK(cudaMemsetAsync(table,0,E*6*sizeof(uint64_t),stream));
         hot.set_execution_context(service);
         DGPP_CUDA_OK(cudaGraphLaunch(exec,stream));
         DGPP_CUDA_OK(cudaEventRecord(done,stream));
         for (;;) {
-          if (__atomic_load_n(&demand->request,__ATOMIC_ACQUIRE)==1) {
+          if (pass>=2 ? __atomic_load_n(signal,__ATOMIC_ACQUIRE)==7
+                      : __atomic_load_n(&demand->request,__ATOMIC_ACQUIRE)==1) {
             auto& selected_cache = (pass==1 || pass==3) ? *cold : hot;
             const auto ids=std::span<const int32_t>(demand->ids,6*6);
             selected_cache.prime_demand(ids,mapping);
@@ -3557,6 +3565,7 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
             require(layer.last_weights().empty(),"supplied routes clear stale host weight diagnostics");
             DGPP_CUDA_OK(cudaStreamSynchronize(service));
             publish();
+            __atomic_store_n(signal,0u,__ATOMIC_RELAXED);
             __atomic_store_n(&demand->request,2u,__ATOMIC_RELEASE);
           }
           const auto status=cudaEventQuery(done);
@@ -3590,7 +3599,7 @@ void check_b12x_paging(int group, bool compare_mx_nibbles = false) {
       }
       cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);cudaEventDestroy(done);
       cold.reset();
-      cudaStreamDestroy(service);cudaFree(table);cudaFreeHost(demand);
+      cudaStreamDestroy(service);cudaFree(table);cudaFreeHost(demand);cudaFreeHost(signal);
     }
     ExpertCache pressure(store,config(2,4),cuda_cache_storage(identity,stream,true)); pressure.initialize();
     layer.enqueue_paged(c.d_hidden,c.d_out,6,pressure,mapping,stream);

@@ -25,7 +25,10 @@ __device__ void store_system(uint32_t* p, uint32_t v) {
 // owns it until the host releases the mailbox, including its live route count.
 __device__ void service_miss(ExpertDemand* demand, int32_t* count) {
   demand->serviced = 1;
-  store_system(&demand->request, 1);
+  if (demand->pending_layer)
+    store_system(demand->pending_layer, demand->layer_plus_one);
+  else
+    store_system(&demand->request, 1);
   unsigned long long started;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(started));
   for (;;) {

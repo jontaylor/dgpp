@@ -53,6 +53,7 @@ struct Dsv41Model::PagedGraphs {
   cudaEvent_t ffn_window = nullptr, next_attention_window = nullptr;
   int ffn_lookahead = 0, attention_lookahead = 0;
   ExpertDemand* demands = nullptr;
+  uint32_t* pending_layer = nullptr;
   uint64_t *tables = nullptr, *host_tables = nullptr;
   int layers;
   Graph* capturing = nullptr;
@@ -87,6 +88,15 @@ struct Dsv41Model::PagedGraphs {
     DGPP_CUDA_OK(cudaStreamCreateWithFlags(&service, cudaStreamNonBlocking));
     DGPP_CUDA_OK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     DGPP_CUDA_OK(cudaHostAlloc(&demands, n * sizeof(ExpertDemand), cudaHostAllocMapped));
+    if (const char* flag = std::getenv("DGPP_EXPERT_DEMAND_SIGNAL"); flag && flag[0] == '1') {
+      DGPP_CUDA_OK(cudaHostAlloc(&pending_layer, sizeof(*pending_layer), cudaHostAllocMapped));
+      *pending_layer = 0;
+      DGPP_LOG_INFO("dsv41 GPU paging: using one demand signal for {} layers", n);
+    }
+    for (int l = 0; l < n; ++l) {
+      demands[l].pending_layer = pending_layer;
+      demands[l].layer_plus_one = static_cast<uint32_t>(l + 1);
+    }
     DGPP_CUDA_OK(cudaHostAlloc(&host_tables, n * words * sizeof(uint64_t), cudaHostAllocDefault));
     DGPP_CUDA_OK(cudaMalloc(&tables, n * words * sizeof(uint64_t)));
     std::fill_n(host_tables, n * words, uint64_t{0});
@@ -104,11 +114,24 @@ struct Dsv41Model::PagedGraphs {
     if (tables) (void)cudaFree(tables);
     if (host_tables) (void)cudaFreeHost(host_tables);
     if (demands) (void)cudaFreeHost(demands);
+    if (pending_layer) (void)cudaFreeHost(pending_layer);
     if (layer_stamps) (void)cudaFreeHost(layer_stamps);
     if (ffn_window) (void)cudaEventDestroy(ffn_window);
     if (next_attention_window) (void)cudaEventDestroy(next_attention_window);
     if (done) (void)cudaEventDestroy(done);
     if (service) (void)cudaStreamDestroy(service);
+  }
+  int next_demand(int first) const {
+    if (pending_layer) {
+      const uint32_t signal = __atomic_load_n(pending_layer, __ATOMIC_ACQUIRE);
+      if (signal == 0) return layers;
+      if (signal <= static_cast<uint32_t>(first) || signal > static_cast<uint32_t>(layers))
+        throw std::runtime_error("GPU paging: out-of-order layer demand");
+      return static_cast<int>(signal - 1);
+    }
+    for (int l = first; l < layers; ++l)
+      if (__atomic_load_n(&demands[l].request, __ATOMIC_ACQUIRE) == 1) return l;
+    return layers;
   }
   void publish(expert::ExpertCache& cache, const std::vector<std::vector<size_t>>& mapping,
                int hidden, int inter, int scale_group, bool pending_experts = false) {
@@ -2069,6 +2092,7 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
   // Each layer writes serviced and all live IDs before the host consumes
   // them. Only the request flag carries state across replays.
   for (int l = 0; l < p.layers; ++l) p.demands[l].request = 0;
+  if (p.pending_layer) *p.pending_layer = 0;
   // Cache changes occur only in the engine thread while a demand gate
   // holds the main stream. Its independent service stream must never wait
   // on that paused stream. Before release, service kernels are completed.
@@ -2096,9 +2120,8 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
     DGPP_CUDA_OK(cudaGraphLaunch(g.exec, stream_)); launched = true;
     DGPP_CUDA_OK(cudaEventRecord(p.done, stream_));
     for (;;) {
-      for (int l = accounted; l < p.layers; ++l) {
+      if (const int l = p.next_demand(accounted); l < p.layers) {
         auto& demand = p.demands[l];
-        if (__atomic_load_n(&demand.request, __ATOMIC_ACQUIRE) != 1) continue;
         const auto bytes_before = p.layer_stamps ? expert_cache_->stats().demand_bytes : 0;
         const auto reads_before = p.layer_stamps ? expert_cache_->read_stats().completed : 0;
         const auto selected = std::span<const int32_t>(demand.ids, T * cfg_.num_experts_per_tok);
@@ -2130,8 +2153,9 @@ bool Dsv41Model::enqueue_paged_graph(int T, const WalkRows& rows, bool capture_t
           layer_reads[l] = expert_cache_->read_stats().completed - reads_before;
         }
         ++p.misses; accounted = l + 1;
+        // The next layer cannot publish until this layer sees its release.
+        if (p.pending_layer) __atomic_store_n(p.pending_layer, 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&demand.request, 2u, __ATOMIC_RELEASE);
-        break;
       }
       const auto status = cudaEventQuery(p.done);
       if (status == cudaSuccess) break;
