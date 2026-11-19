@@ -50,28 +50,26 @@ checks with early shared execution enabled. CTest exposes this arm as
 
 `DGPP_DSV41_GPU_CANDIDATES=1` makes the single-request eager DSpark verifier
 reduce each rank's target logits to exact local candidates on the GPU.
-It copies those candidates to the CPU and keeps the existing distributed
-row-pick collective. It omits full logits and hidden-state host outputs for
-this call; the device hidden-state storage and rollback snapshots remain.
+Each 128-thread block finds the maximum of up to 1,024 vocabulary entries
+and writes its token ID and logit to mapped host memory. The CPU reduces the
+tile winners in vocabulary order before the distributed row pick. With
+`DGPP_DSV41_PAGED_GRAPH_TAIL=1`, the paged target graph can capture the
+vocabulary projection and tile reduction together.
 
-Tool grammars retain their lazy masking rule: an allowed unmasked local
-winner is already the masked winner. If the grammar forbids it, only that
-row's target logits are downloaded and the existing host mask is applied.
-This happens before rollback or drafting can reuse the logits buffer.
-Temperature sampling, penalties, logprob reporting, bias, multi-request
-verification and diagnostic model calls retain full outputs. Draft-head
-output materialization is also unchanged.
+If the tool grammar rejects a rank's unmasked winner, the verifier downloads
+that row's logits and applies the mask before rollback or redrafting.
+With `DGPP_DSV41_SPARSE_GRAMMAR=1`, a mask admitting up to 32 tokens
+needs only the scores of the permitted IDs on that rank.
+Sampling, multi-request verification and callers that request full outputs
+use the ordinary logits path. The compact verification fixture compares the
+candidate IDs and scores with the host scan and exercises the grammar fallback.
 
-Persistent candidate scratch is charged to the memory plan. At eight decode
-rows its logical payload is 268 device bytes and 96 pinned bytes per rank;
-allocator and page overhead are additional. It does not
-release the existing host mirrors, which remain necessary for other paths.
-The compact fixture checks exact candidate IDs and logits, exact downloaded
-fallback rows, omitted host outputs, session position and rollback. The
-existing device-picker fixture covers canonical tie ordering and sharded
-vocabulary offsets.
+Each rank allocates eight pinned bytes per verification row per vocabulary
+tile on first use. For 64,640 local entries and eight rows, the allocation
+holds 4,096 bytes before page rounding. Full-output callers share the
+existing host mirrors.
 
-The same-binary on/off screen (SHA-256
+The earlier one-block-per-row implementation’s same-binary on/off screen (SHA-256
 `f2fd9a2406e2f46efb01af8bc91fecacbb0afbe5d68c03f18b826201939fac18`)
 showed no material end-to-end gain. Resident prose decode was 40.18 tokens/s
 in both arms; resident code moved from 41.00 to 41.21 tokens/s. Short tool
@@ -81,10 +79,10 @@ The first prose/code continuations still incurred reads; their repeated
 resident requests incurred none. The code probe had a 512-token output cap,
 so this is an execution comparison, not a completed-code quality evaluation.
 
-The shipped MXFP4 example and the Spark service enable early shared prefill,
-retain four attention splits and leave compact candidates disabled. The
-compact path remains available for future comparisons, rather than treating
-reduced host traffic as a demonstrated throughput improvement.
+The November 17 deployment enabled early shared prefill and four attention
+splits. It left the one-block-per-row candidate path disabled. The later
+tiled reduction also captures the output projection in the paged target
+graph. Its serving results are in the [warm execution profile](mxfp4-warm-execution-profile.md).
 
 ## Measurement scope
 

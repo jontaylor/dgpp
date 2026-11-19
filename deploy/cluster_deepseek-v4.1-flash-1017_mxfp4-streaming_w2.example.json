@@ -25,7 +25,7 @@
     "stats_interval_s": 10,
     "expert_streaming": {
       "policy": "whole_expert_cache",
-      "budget_bytes": 108047546368,
+      "budget_bytes": 109121288192,
       "image_directory": "~/.cache/dgpp/expert-streaming-1017-tp2",
       "chunk_intermediate": 64,
       "minimum_fraction": 0,
@@ -52,12 +52,15 @@
     "prefill_idle_floor_tokens": 4096,
     "mtp_depth": 3,
     "lookup_draft": true,
-    "lookup_tail": 2
+    "lookup_tail": 4,
+    "l2_prefetch_form": "ranges",
+    "l2_prefetch_merge": true
   },
   "paths": {
     "resident_cache": ""
   },
   "environment": {
+    "DGPP_MEMORY_HEADROOM_MIB": "2048",
     "DGPP_MOE_B12X": "1",
     "DGPP_MX_PACKED_SCALES": "1",
     "DGPP_MOE_FP4_GROUPED_DECODE": "0",
@@ -77,7 +80,8 @@
     "DGPP_EXPERT_BATCH_SCATTER": "1",
     "DGPP_EXPERT_SHARED_PREFILL_EARLY": "1",
     "DGPP_CSA2_PREFILL_SPLITS": "4",
-    "DGPP_DSV41_GPU_CANDIDATES": "0",
+    "DGPP_CSA2_LISTED_PREFILL": "1",
+    "DGPP_DSV41_GPU_CANDIDATES": "1",
     "DGPP_MOE_MX_NATIVE_PREFILL": "1",
     "DGPP_MX_FUSED_ACTIVATION": "3",
     "DGPP_MOE_MX_NATIVE_TILE_ROWS": "128",
@@ -85,6 +89,14 @@
     "DGPP_MOE_MX_NATIVE_TAIL_SKIP": "1",
     "DGPP_CSA2_PREFILL_MERGE4": "1",
     "DGPP_DSV41_MX_WOA_DECODE": "1",
-    "DGPP_DSV41_NATIVE_FP8_PREFILL": "0"
+    "DGPP_DSV41_NATIVE_FP8_PREFILL": "0",
+    "DGPP_DSV41_PAGED_DRAFT_GRAPH": "1",
+    "DGPP_EXPERT_ADJACENT_READS": "4",
+    "DGPP_EXPERT_PREFILL_ADJACENT_READS": "2",
+    "DGPP_DSV41_MX_DRAFT_HEAD": "2",
+    "DGPP_DSV41_GRAMMAR_PROPOSALS": "1",
+    "DGPP_DSV41_PAGED_GRAPH_TAIL": "1",
+    "DGPP_DSV41_MARKOV_LAYOUT": "1",
+    "DGPP_DSV41_LOOKUP_PROPOSALS": "1"
   }
 }

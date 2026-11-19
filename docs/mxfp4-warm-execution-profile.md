@@ -435,3 +435,147 @@ To reproduce the candidate export, add `--reuse-route-offset` and
 `--stage-weights-first` to `--format mxfp4-nibble --pipeline-stages 5
 --stream-weight-codes`. The down projection's copy depth can be set
 independently with `--down-pipeline-stages`.
+
+### Which work already overlaps during decode
+
+The two-rank, 31-round resident trace described above also identifies which
+kernels ran simultaneously. The following values are elapsed milliseconds
+per target pass between the layer 0 route packet and the last routed kernel
+in layer 39. Each row measures the union of its intervals on one GPU.
+
+| Interval | Spark 1 | Spark 2 |
+| --- | ---: | ---: |
+| Whole span | 53.46 | 53.46 |
+| Routed expert active | 28.93 | 28.59 |
+| Routed expert running alone | 24.48 | 24.01 |
+| Dense projection running alone | 6.65 | 6.67 |
+| TP collective active | 2.19 | 2.66 |
+| TP collective running alongside L2 prefetch | 2.09 | 2.56 |
+| Shared expert running alone | 0.014 | 0.010 |
+| No kernel running | 0.225 | 0.220 |
+
+The TP collective already overlaps weight prefetch for about 95–96% of its
+duration. Eliminating every kernel-free interval in this span could recover
+at most 0.23 ms per pass. The larger opportunities are inside active kernels
+and in the number of target passes needed to generate the answer. Between
+successive spans, the ranks spent 5.22–5.33 ms running projection kernels
+alone. Only about 0.05 ms of that 10.52 ms interval had a CUDA copy active
+with no kernel running. Device loads in kernels, including weight reads on
+the unified memory bus, are invisible to the CUDA copy count.
+
+### Reusing the aligned prefix in a tool reply
+
+When DSpark commits several tokens in one verification pass, the committed
+prefix can cross a cache block boundary inside that pass. The eager engine
+can save the target and draft state at that interior row. A fixture resumes
+with a changed suffix and compares prefill, draft and verification logits
+bit for bit with a snapshot taken at the same position during ordinary execution.
+
+The two-Spark comparison used the same directory request, actual directory
+entries and follow-up at concurrency one. On two fresh starts each, the
+previous binary (`ec9a7886`, SHA-256
+`c1e700be2cd9eaa898ceb835167044c9b8b4cf0802df449223a4f890e9e19b88`)
+attached 24,192 reply-prefix tokens and processed 178. With the interior
+snapshot (`37ca0482`, SHA-256
+`92ebbaa02c9960797c67e7db8b8ffeea72c1f8c42006194d3f7cb5e4f2f51f84`),
+those figures were 24,320 and 50. Across the two warm directory exchanges
+on each start, combined call and reply wall time fell from 1.95–1.99 s to
+1.60–1.73 s. The first exchange after the workload change took 2.39–2.42 s
+before and 2.49–2.51 s after. The request still needed nine verification
+rounds to produce the tool call. These are direct service times for the
+tool-enabled conversation, including prefill on both legs.
+
+### Four-token history tail on a completed edit
+
+The tool-enabled edit contains 82,756 prompt tokens and requires reproducing
+a small Python fixture with exactly one value changed. Each arm ran the edit
+three times. The last two reused 82,688 prompt tokens, read zero expert bytes
+and returned the correct 376-token answer. A separate directory request
+checked the tool name, its arguments and the reply after the tool returned.
+
+The two configurations below used the same `37ca0482` binary and fixed neural
+depth three. The wider configuration also lets a sufficiently long history
+match supply the complete proposal block. The target verifies the proposed
+tokens in both cases.
+
+| C1 measurement | Two extra tokens | Four extra tokens with whole-block lookup |
+| --- | ---: | ---: |
+| Warm edit, engine decode (tok/s) | 74.38 | 87.87 |
+| Warm edit, complete request (s) | 5.41 | 4.65 |
+| Target passes per completed edit | 65 | 50 |
+| Target passes per directory tool call | 9 | 7 |
+| Warm directory call plus reply (s) | 1.69 | 1.56 |
+| Ordinary warm prose and code, zero expert reads (tok/s) | 46.38 | 46.45 |
+| First prose and code continuations, with expert reads (tok/s) | 33.63 | 33.53 |
+| Cold 24,292-token tool prefill (s) | 36.53 | 36.85 |
+
+These are one process start per configuration with both ranks at zero swap.
+The directory time averages two completed exchanges. The seven standard
+responses matched, including both prose and code continuations. The wider
+tail helped where the prompt contained text the answer needed to reproduce.
+
+A fresh start on revision `f0a3a1f7`, SHA-256
+`aecb709392c95b404d4f33bdf43578e3154f664f55b1c22cea74907fd9156297`,
+repeated the wider result at 87.85 tok/s for the edit and 1.56 s for the
+directory exchange. The two-token and four-token warm edits each processed
+68 uncached prompt tokens. Rank-local expert executions over the whole
+request fell from 71,863 to 67,774. Wider verification reuses some experts
+across rows and still needs more distinct experts in an individual pass.
+
+This revision can also shorten the optional history tail when requests join
+a batch. On a 16-row fixture, a single request committed eight tokens,
+three requests each committed five on the next tick, and the original
+request went back to eight when it ran alone. On both Sparks, 16 simultaneous
+tool calls returned the requested name and exact path, each in 180 output
+tokens. The scheduler recorded 16 requests in one decode step and the ranks'
+operation streams matched. This checks service capacity on a constrained
+request. Concurrency throughput requires the deployment campaign.
+
+The native packed-scale expert object on these builds uses five copy
+stages, low-retention weight-code loads and the native FP4 nibble decoder.
+After generating the standard NVFP4 and MXFP4 b12x objects, generate the
+packed-scale specialization in the same AOT directory on SM121:
+
+```sh
+python scripts/export_b12x_moe.py --format mxfp4-nibble --pipeline-stages 5 \
+  --stream-weight-codes --nibble-decoder native-fp4 --output "$aot_dir"
+```
+
+Configure the server build with `-DDGPP_B12X_AOT_DIR="$aot_dir"`. The
+two-rank MXFP4 streaming template contains the runtime settings. The
+expert policy is whole-expert caching on local SSD with 109,121,288,192
+bytes per rank budgeted for paging, including its staging and execution
+space and the resident draft experts. The target graph issues 20 MiB
+merged-range prefetch windows alongside TP collectives.
+
+### Moving work across the draft and target boundary
+
+The two-Spark screen used fixed depth three, the four-token lookup tail and
+the same native expert object throughout. Each experimental setting used a
+fresh process. Prose, code, tool arguments, acceptance counts and per-rank
+read volumes matched the wider-tail reference for all seven requests. The
+LRU implementation passed executable checks in each arm. Times below use
+engine decode for prose and code and combined service wall time for the
+two warm directory exchanges.
+
+| Change from wider-tail reference | Warm decode (tok/s) | Decode with reads (tok/s) | Directory exchange (s) |
+| --- | ---: | ---: | ---: |
+| Reference before individual changes | 46.55 | 33.51 | 1.560 |
+| Project draft input after the last required target layer | 46.27 | 33.51 | 1.567 |
+| Project draft input during token selection | 46.49 | 32.86 | 1.577 |
+| Route before issuing shared-expert reads | 46.23 | 33.56 | 1.587 |
+| Return tile winners for neural draft logits | 46.52 | 33.56 | 1.580 |
+| Draft tile winners plus sparse grammar fallback | 46.48 | 33.39 | 1.589 |
+| Reference after individual changes | 46.51 | 33.65 | 1.582 |
+
+Both ranks captured and used the side-stream projected input. Earlier issue
+can compete with work still running on the same memory controller. The
+timings show the net effect of each schedule. They cannot isolate a change
+in physical bus utilization.
+
+Two separate fixed-width checks kept the lookup tail at two and changed
+the neural depth. Depth two took 109 prose and 144 code verification passes.
+Depth four took 74 and 113. Depth three took 82 and 117. Six of the seven
+standard responses changed at depths two and four, so their respective
+42.29 and 43.76 warm tok/s also reflect different generated text. The
+completed LRU and directory tasks passed at both widths.

@@ -474,6 +474,12 @@ With `lookup_tail: 0`, matching text can replace DSpark predictions at the confi
 With a positive tail and fixed depth, eager DSpark keeps its predictions and
 adds up to `lookup_tail` tokens when a strong history match agrees with the
 entire draft. Verification includes the extra rows only on those steps.
+Each eager decode batch reserves enough rows per request for both the neural
+draft block and the target's pending token plus its neural proposals. History
+and grammar tails share the remaining verification rows. At depth three and
+lookup tail four, one request can verify eight rows. Sixteen requests on the
+96-row DeepSeek V4.1 deployment can each verify up to six. A request that
+prepared a longer tail while running alone is trimmed when more clients join.
 For single-request eager DeepSeek V4.1 decode, setting the deployment
 environment variable `DGPP_DSV41_LOOKUP_PROPOSALS=1` also lets history
 supply the entire block. This requires a positive lookup tail, a suffix
@@ -519,6 +525,14 @@ projection with BF16 outputs. The default is `0`.
 CPU for single-request eager neural proposals. The reduction runs after
 Markov bias and any configured rescoring. If the grammar forbids the local
 winner, the engine downloads that row for masking. The default is `0`.
+
+`DGPP_DSV41_SPARSE_GRAMMAR=1` limits this download when a compact target
+or draft row has at most 32 legal tokens across the vocabulary. A rank with
+no legal tokens can finish its local pick on the CPU. A rank with legal
+tokens reads their FP32 scores in token order, using a contiguous copy or
+a one-warp gather into the existing pinned logits mirror. The rank-local
+and distributed tie rules are the same as for the full row. The default is
+`0`.
 
 The DSpark Markov projection uses resident BF16 weights.
 `DGPP_DSV41_MARKOV_LAYOUT=1` reverses the vocabulary tile traversal on odd
